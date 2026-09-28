@@ -103,7 +103,7 @@ const Toolbar: React.FC = () => {
       {/* Map info */}
       {project.map && (
         <span className="text-xs text-gray-400 px-2">
-          {project.map.name} ({project.map.width}×{project.map.height})
+          {project.map.name || 'Карта'} ({project.map.width || 0}×{project.map.height || 0})
         </span>
       )}
 

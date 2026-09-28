@@ -55,10 +55,10 @@ const App: React.FC = () => {
 
     // Grid toggle
     if (e.key === 'g' || e.key === 'G' || e.key === 'п' || e.key === 'П') {
-      updateSettings({ showGrid: !project.settings.showGrid });
+      updateSettings({ showGrid: !project.settings?.showGrid });
     }
   }, [currentTool, viewState, selectedMarkerId, setTool, setViewState,
-    clearDrawingPoints, setMeasurementPoints, deleteMarker, project.settings.showGrid, updateSettings]);
+    clearDrawingPoints, setMeasurementPoints, deleteMarker, project.settings?.showGrid, updateSettings]);
 
   useEffect(() => {
     window.addEventListener('keydown', handleKeyDown);
@@ -94,7 +94,7 @@ const App: React.FC = () => {
           <label className="flex items-center gap-1 text-xs text-gray-400 cursor-pointer">
             <input
               type="checkbox"
-              checked={project.settings.showGrid}
+              checked={project.settings?.showGrid || false}
               onChange={(e) => updateSettings({ showGrid: e.target.checked })}
               className="rounded"
             />

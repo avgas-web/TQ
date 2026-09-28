@@ -34,8 +34,8 @@ const StatusBar: React.FC = () => {
                 const geo = pixelToGeoFromBounds(
                   cursorPosition,
                   project.map.bounds,
-                  project.map.width,
-                  project.map.height
+                  project.map.width || 0,
+                  project.map.height || 0
                 );
                 return (
                   <span className="ml-2 text-green-400">
@@ -44,7 +44,7 @@ const StatusBar: React.FC = () => {
                 );
               }
               // Иначе показываем калибровочные координаты
-              if (project.calibration.enabled && project.calibration.points.length >= 2) {
+              if (project.calibration?.enabled && project.calibration?.points?.length >= 2) {
                 return (
                   <span className="ml-2 text-cyan-400">
                     | Geo: {cursorPosition.x.toFixed(4)}, {cursorPosition.y.toFixed(4)}
@@ -76,7 +76,7 @@ const StatusBar: React.FC = () => {
 
         {/* Map size */}
         {project.map && (
-          <span>🗺️ {project.map.width}×{project.map.height}</span>
+          <span>🗺️ {project.map.width || 0}×{project.map.height || 0}</span>
         )}
       </div>
     </div>

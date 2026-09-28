@@ -120,7 +120,7 @@ const MapCanvas: React.FC = () => {
     ctx.restore();
 
     // Draw grid
-    if (project.settings.showGrid) {
+    if (project.settings?.showGrid) {
       drawGrid(ctx);
     }
 
@@ -147,7 +147,7 @@ const MapCanvas: React.FC = () => {
 
     function drawGrid(ctx: CanvasRenderingContext2D) {
       if (!project.map) return;
-      const gridSize = project.settings.gridSize;
+      const gridSize = project.settings?.gridSize || 100;
       ctx.save();
       ctx.translate(viewState.offsetX, viewState.offsetY);
       ctx.scale(viewState.scale, viewState.scale);

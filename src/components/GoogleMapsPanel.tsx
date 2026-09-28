@@ -107,7 +107,7 @@ const GoogleMapsPanel: React.FC = () => {
         zoom,
         width,
         height,
-        project.googleMaps.apiKey,
+        project.googleMaps?.apiKey || '',
         mapTypeInput
       );
 
@@ -153,7 +153,7 @@ const GoogleMapsPanel: React.FC = () => {
             {loading ? '...' : 'Сохранить'}
           </button>
         </div>
-        {project.googleMaps.enabled && (
+        {project.googleMaps?.enabled && (
           <p className="text-xs text-green-400 mt-1">✓ Google Maps активен</p>
         )}
       </div>
@@ -228,7 +228,7 @@ const GoogleMapsPanel: React.FC = () => {
       {/* Load map button */}
       <button
         onClick={handleLoadGoogleMap}
-        disabled={loading || !project.googleMaps.enabled}
+        disabled={loading || !project.googleMaps?.enabled}
         className="w-full px-3 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 text-white rounded text-sm font-medium"
       >
         {loading ? 'Загрузка...' : '🗺️ Загрузить карту Google Maps'}

@@ -240,8 +240,8 @@ const Sidebar: React.FC = () => {
                         const geo = pixelToGeoFromBounds(
                           { x: marker.x, y: marker.y },
                           project.map.bounds,
-                          project.map.width,
-                          project.map.height
+                          project.map.width || 0,
+                          project.map.height || 0
                         );
                         return (
                           <span className="ml-2 text-green-400">
@@ -383,8 +383,8 @@ const Sidebar: React.FC = () => {
                 const geo = pixelToGeoFromBounds(
                   { x: selectedMarker.x, y: selectedMarker.y },
                   project.map.bounds,
-                  project.map.width,
-                  project.map.height
+                  project.map.width || 0,
+                  project.map.height || 0
                 );
                 return (
                   <>

@@ -283,7 +283,7 @@ export const useStore = create<AppState>()(
           ...state.project,
           calibration: {
             ...state.project.calibration,
-            points: [...state.project.calibration.points, point],
+            points: [...(state.project.calibration?.points || []), point],
           },
           updatedAt: new Date().toISOString(),
         },
@@ -294,7 +294,7 @@ export const useStore = create<AppState>()(
           ...state.project,
           calibration: {
             ...state.project.calibration,
-            points: state.project.calibration.points.filter((_, i) => i !== index),
+            points: (state.project.calibration?.points || []).filter((_, i) => i !== index),
           },
           updatedAt: new Date().toISOString(),
         },
@@ -345,6 +345,32 @@ export const useStore = create<AppState>()(
       partialize: (state) => ({
         project: state.project,
       }),
+      migrate: (persistedState: any, version: number) => {
+        // Миграция для старых проектов без googleMaps
+        if (persistedState.project && !persistedState.project.googleMaps) {
+          persistedState.project.googleMaps = {
+            apiKey: '',
+            enabled: false,
+          };
+        }
+        // Миграция для старых проектов без calibration
+        if (persistedState.project && !persistedState.project.calibration) {
+          persistedState.project.calibration = {
+            enabled: false,
+            points: [],
+          };
+        }
+        // Миграция для старых проектов без settings
+        if (persistedState.project && !persistedState.project.settings) {
+          persistedState.project.settings = {
+            showGrid: false,
+            gridSize: 100,
+            showCoordinates: true,
+            theme: 'dark',
+          };
+        }
+        return persistedState;
+      },
     }
   )
 );
