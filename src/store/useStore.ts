@@ -389,54 +389,42 @@ export const useStore = create<AppState>()(
       })),
 
       loadMapWithStorage: async (mapData) => {
-        // Сохраняем карту в IndexedDB
+        // Сохраняем карту в IndexedDB для персистентности
         const mapId = mapData.name + '_' + Date.now();
-        const saved = await saveMapToIndexedDB(mapId, mapData.dataUrl);
+        await saveMapToIndexedDB(mapId, mapData.dataUrl);
         
-        if (saved) {
-          // Сохраняем в state только метаданные карты (без dataUrl)
-          set((state) => ({
-            project: {
-              ...state.project,
-              map: {
-                ...mapData,
-                dataUrl: '', // Не храним dataUrl в state
-              },
-              updatedAt: new Date().toISOString(),
-            },
-            // Сохраняем mapId для последующей загрузки
-            _currentMapId: mapId,
-          }));
-        } else {
-          console.error('Не удалось сохранить карту в IndexedDB');
-          // Всё равно загружаем карту в state
-          set((state) => ({
-            project: {
-              ...state.project,
-              map: mapData,
-              updatedAt: new Date().toISOString(),
-            },
-          }));
-        }
+        // Сохраняем карту в state С dataUrl (для немедленного отображения)
+        // dataUrl будет очищен только при сохранении в localStorage через partialize
+        set((state) => ({
+          project: {
+            ...state.project,
+            map: mapData, // Сохраняем полную карту с dataUrl
+            updatedAt: new Date().toISOString(),
+          },
+          _currentMapId: mapId, // ID для восстановления из IndexedDB
+        }));
       },
 
       restoreMapFromStorage: async () => {
-        const state = get();
-        const mapId = (state as any)._currentMapId;
+        // Небольшая задержка для гарантии инициализации state из localStorage
+        await new Promise(resolve => setTimeout(resolve, 100));
         
-        if (mapId && state.project.map) {
+        const state = get();
+        const mapId = state._currentMapId;
+        
+        if (mapId && state.project.map && !state.project.map.dataUrl) {
           const dataUrl = await loadMapFromIndexedDB(mapId);
           
           if (dataUrl) {
-            set((state) => ({
+            set({
               project: {
                 ...state.project,
                 map: {
-                  ...state.project.map!,
+                  ...state.project.map,
                   dataUrl: dataUrl,
                 },
               },
-            }));
+            });
           }
         }
       },
@@ -452,6 +440,7 @@ export const useStore = create<AppState>()(
             dataUrl: '', // Очищаем dataUrl перед сохранением
           } : null,
         },
+        _currentMapId: state._currentMapId, // Сохраняем ID карты для восстановления
       }),
       migrate: (persistedState: any, version: number) => {
         // Миграция для старых проектов без googleMaps

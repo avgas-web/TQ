@@ -38,7 +38,9 @@ const Toolbar: React.FC = () => {
           width: img.width,
           height: img.height,
           dataUrl,
+          source: 'local',
         };
+        // Сохраняем карту в IndexedDB (для персистентности)
         await loadMapWithStorage(mapData);
       };
       img.src = dataUrl;

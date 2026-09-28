@@ -35,7 +35,7 @@ const MapCanvas: React.FC = () => {
 
   // Load map image when map data changes
   useEffect(() => {
-    if (!project.map) {
+    if (!project.map || !project.map.dataUrl) {
       mapImageRef.current = null;
       setMapLoaded(false);
       return;
@@ -45,6 +45,10 @@ const MapCanvas: React.FC = () => {
     img.onload = () => {
       mapImageRef.current = img;
       setMapLoaded(true);
+    };
+    img.onerror = () => {
+      console.error('Ошибка загрузки изображения карты');
+      setMapLoaded(false);
     };
     img.src = project.map.dataUrl;
   }, [project.map?.dataUrl]);
@@ -67,7 +71,7 @@ const MapCanvas: React.FC = () => {
     return () => observer.disconnect();
   }, []);
 
-  // Fit map to view on load
+  // Fit map to view on load or when map changes
   useEffect(() => {
     if (project.map && mapLoaded && canvasSize.width > 0) {
       const scaleX = canvasSize.width / project.map.width;
@@ -77,7 +81,7 @@ const MapCanvas: React.FC = () => {
       const offsetY = (canvasSize.height - project.map.height * scale) / 2;
       setViewState({ scale, offsetX, offsetY });
     }
-  }, [mapLoaded, canvasSize.width > 0]);
+  }, [project.map?.dataUrl, mapLoaded, canvasSize.width, canvasSize.height]);
 
   // Convert screen coordinates to map coordinates
   const screenToMap = useCallback((screenX: number, screenY: number): Point => {
