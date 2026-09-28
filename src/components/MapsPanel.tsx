@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { useStore } from '../store/useStore';
 import { loadGoogleMapsApi, geocodeAddress, loadStaticMap, isGoogleMapsLoaded } from '../utils/googleMaps';
 import { loadYandexMapsApi, yandexGeocode, loadYandexStaticMap, isYandexMapsLoaded } from '../utils/yandexMaps';
-import { initOpenStreetMap, osmGeocode, loadOSMStaticMap, isOSMLoaded } from '../utils/openStreetMap';
+import { osmGeocode, loadOSMStaticMap } from '../utils/openStreetMap';
 import type { MapProvider } from '../types';
 
 const MapsPanel: React.FC = () => {
@@ -26,7 +26,6 @@ const MapsPanel: React.FC = () => {
     toggleGoogleMaps,
     setYandexMapsApiKey,
     toggleYandexMaps,
-    toggleOpenStreetMap,
     setOSMTileServer,
     loadMapWithStorage,
     setMapBounds,
@@ -89,21 +88,7 @@ const MapsPanel: React.FC = () => {
     }
   };
 
-  const handleEnableOSM = async () => {
-    setLoading(true);
-    setError('');
-    setSuccess('');
 
-    try {
-      await initOpenStreetMap();
-      toggleOpenStreetMap(true);
-      setSuccess('OpenStreetMap активирован');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Ошибка инициализации OSM');
-    } finally {
-      setLoading(false);
-    }
-  };
 
   const handleGeocode = async () => {
     if (!addressInput.trim()) {
@@ -122,7 +107,7 @@ const MapsPanel: React.FC = () => {
         result = await geocodeAddress(addressInput);
       } else if (activeProvider === 'yandex' && isYandexMapsLoaded()) {
         result = await yandexGeocode(addressInput);
-      } else if (activeProvider === 'osm' && isOSMLoaded()) {
+      } else if (activeProvider === 'osm') {
         result = await osmGeocode(addressInput);
       } else {
         setError('Провайдер не инициализирован');
@@ -223,12 +208,7 @@ const MapsPanel: React.FC = () => {
           source: 'yandex',
         });
       } else if (activeProvider === 'osm') {
-        if (!isOSMLoaded()) {
-          setError('OpenStreetMap не инициализирован');
-          setLoading(false);
-          return;
-        }
-
+        // OSM не требует загрузки API, просто загружаем карту
         geoResult = await osmGeocode(addressInput);
         if (!geoResult) {
           setError('Адрес не найден');
@@ -354,15 +334,7 @@ const MapsPanel: React.FC = () => {
             <option value="opentopomap">OpenTopoMap</option>
             <option value="carto">CartoDB Light</option>
           </select>
-          {!project.openStreetMap?.enabled && (
-            <button
-              onClick={handleEnableOSM}
-              disabled={loading}
-              className="w-full mt-2 px-3 py-1 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 text-white rounded text-xs"
-            >
-              Активировать OSM
-            </button>
-          )}
+          <p className="text-xs text-green-400 mt-2">✓ OSM активен (не требует API ключа)</p>
         </div>
       )}
 
@@ -460,7 +432,7 @@ const MapsPanel: React.FC = () => {
       {/* Load map button */}
       <button
         onClick={handleLoadMap}
-        disabled={loading || !providers.find(p => p.id === activeProvider)?.enabled}
+        disabled={loading || (activeProvider !== 'osm' && !providers.find(p => p.id === activeProvider)?.enabled)}
         className="w-full px-3 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 text-white rounded text-sm font-medium"
       >
         {loading ? 'Загрузка...' : `🗺️ Загрузить карту ${providers.find(p => p.id === activeProvider)?.name}`}
@@ -499,6 +471,7 @@ const MapsPanel: React.FC = () => {
           <div className="space-y-0.5">
             <p>• Не требует API ключа</p>
             <p>• Бесплатно и открыто</p>
+            <p>• Автоматически активирован</p>
             <p>• Ограничения: 1 запрос/сек</p>
             <p>• Уважайте правила использования</p>
           </div>

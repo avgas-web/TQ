@@ -166,7 +166,7 @@ const Sidebar: React.FC = () => {
           onClick={() => setActiveTab('google')}
           className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'google' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
         >
-          🌍 Google
+          🗺️ Карты
         </button>
         <button
           onClick={() => setActiveTab('export')}

@@ -4,6 +4,7 @@ import Toolbar from './components/Toolbar';
 import Sidebar from './components/Sidebar';
 import StatusBar from './components/StatusBar';
 import { useStore } from './store/useStore';
+import { initOpenStreetMap } from './utils/openStreetMap';
 
 const App: React.FC = () => {
   const {
@@ -77,6 +78,15 @@ const App: React.FC = () => {
       await useStore.getState().restoreMapFromStorage();
     };
     restoreMap();
+  }, []);
+
+  // Initialize OpenStreetMap on app load (doesn't require API key)
+  useEffect(() => {
+    const initOSM = async () => {
+      await initOpenStreetMap();
+      useStore.getState().toggleOpenStreetMap(true);
+    };
+    initOSM();
   }, []);
 
   return (
