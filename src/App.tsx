@@ -71,6 +71,14 @@ const App: React.FC = () => {
     document.documentElement.setAttribute('data-theme', 'dark');
   }, []);
 
+  // Restore map from IndexedDB on app load
+  useEffect(() => {
+    const restoreMap = async () => {
+      await useStore.getState().restoreMapFromStorage();
+    };
+    restoreMap();
+  }, []);
+
   return (
     <div className="h-screen w-screen flex flex-col bg-gray-900 text-white overflow-hidden">
       {/* Header */}

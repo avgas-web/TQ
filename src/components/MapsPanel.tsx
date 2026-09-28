@@ -28,7 +28,7 @@ const MapsPanel: React.FC = () => {
     toggleYandexMaps,
     toggleOpenStreetMap,
     setOSMTileServer,
-    loadMap,
+    loadMapWithStorage,
     setMapBounds,
   } = useStore();
 
@@ -183,7 +183,7 @@ const MapsPanel: React.FC = () => {
           googleMapType
         );
 
-        loadMap({
+        await loadMapWithStorage({
           name: `Google Maps - ${addressInput}`,
           width,
           height,
@@ -214,7 +214,7 @@ const MapsPanel: React.FC = () => {
           yandexMapType
         );
 
-        loadMap({
+        await loadMapWithStorage({
           name: `Яндекс.Карты - ${addressInput}`,
           width,
           height,
@@ -244,7 +244,7 @@ const MapsPanel: React.FC = () => {
           osmTileServer
         );
 
-        loadMap({
+        await loadMapWithStorage({
           name: `OpenStreetMap - ${addressInput}`,
           width,
           height,

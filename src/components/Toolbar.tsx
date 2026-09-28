@@ -8,7 +8,7 @@ const Toolbar: React.FC = () => {
     currentTool,
     project,
     setTool,
-    loadMap,
+    loadMapWithStorage,
     resetProject,
     clearDrawingPoints,
     setMeasurementPoints,
@@ -29,17 +29,17 @@ const Toolbar: React.FC = () => {
     }
 
     const reader = new FileReader();
-    reader.onload = (event) => {
+    reader.onload = async (event) => {
       const dataUrl = event.target?.result as string;
       const img = new Image();
-      img.onload = () => {
+      img.onload = async () => {
         const mapData: MapData = {
           name: file.name,
           width: img.width,
           height: img.height,
           dataUrl,
         };
-        loadMap(mapData);
+        await loadMapWithStorage(mapData);
       };
       img.src = dataUrl;
     };

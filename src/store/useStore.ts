@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { v4 as uuidv4 } from 'uuid';
 import type { Project, Marker, Restriction, Layer, Tool, ViewState, MapData, Point, CalibrationPoint, MapBounds } from '../types';
+import { saveMapToIndexedDB, loadMapFromIndexedDB, deleteMapFromIndexedDB } from '../utils/storage';
 
 interface AppState {
   project: Project;
@@ -16,6 +17,7 @@ interface AppState {
   measurementPoints: Point[];
   searchQuery: string;
   filterType: string;
+  _currentMapId?: string; // ID текущей карты в IndexedDB
 
   // Actions
   setTool: (tool: Tool) => void;
@@ -54,6 +56,8 @@ interface AppState {
   toggleYandexMaps: (enabled: boolean) => void;
   toggleOpenStreetMap: (enabled: boolean) => void;
   setOSMTileServer: (server: 'osm' | 'opentopomap' | 'carto') => void;
+  loadMapWithStorage: (mapData: MapData) => Promise<void>;
+  restoreMapFromStorage: () => Promise<void>;
 }
 
 const defaultProject: Project = {
@@ -383,11 +387,71 @@ export const useStore = create<AppState>()(
           updatedAt: new Date().toISOString(),
         },
       })),
+
+      loadMapWithStorage: async (mapData) => {
+        // Сохраняем карту в IndexedDB
+        const mapId = mapData.name + '_' + Date.now();
+        const saved = await saveMapToIndexedDB(mapId, mapData.dataUrl);
+        
+        if (saved) {
+          // Сохраняем в state только метаданные карты (без dataUrl)
+          set((state) => ({
+            project: {
+              ...state.project,
+              map: {
+                ...mapData,
+                dataUrl: '', // Не храним dataUrl в state
+              },
+              updatedAt: new Date().toISOString(),
+            },
+            // Сохраняем mapId для последующей загрузки
+            _currentMapId: mapId,
+          }));
+        } else {
+          console.error('Не удалось сохранить карту в IndexedDB');
+          // Всё равно загружаем карту в state
+          set((state) => ({
+            project: {
+              ...state.project,
+              map: mapData,
+              updatedAt: new Date().toISOString(),
+            },
+          }));
+        }
+      },
+
+      restoreMapFromStorage: async () => {
+        const state = get();
+        const mapId = (state as any)._currentMapId;
+        
+        if (mapId && state.project.map) {
+          const dataUrl = await loadMapFromIndexedDB(mapId);
+          
+          if (dataUrl) {
+            set((state) => ({
+              project: {
+                ...state.project,
+                map: {
+                  ...state.project.map!,
+                  dataUrl: dataUrl,
+                },
+              },
+            }));
+          }
+        }
+      },
     }),
     {
       name: 'totalquadro-storage',
       partialize: (state) => ({
-        project: state.project,
+        project: {
+          ...state.project,
+          // Не сохраняем map.dataUrl в localStorage - он слишком большой
+          map: state.project.map ? {
+            ...state.project.map,
+            dataUrl: '', // Очищаем dataUrl перед сохранением
+          } : null,
+        },
       }),
       migrate: (persistedState: any, version: number) => {
         // Миграция для старых проектов без googleMaps
