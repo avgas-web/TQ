@@ -20,14 +20,15 @@
     "react-dom": "^18.2.0",
     "react-router-dom": "^6.8.0",
     "recharts": "^2.10.0",
-    "uuid": "^9.0.1"
+    "uuid": "^9.0.1",
+    "zustand": "^5.0.15"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.7",
     "@types/canvas-confetti": "^1.6.4",
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
-    "@types/uuid": "^9.0.7",
+    "@types/uuid": "^9.0.8",
     "@vitejs/plugin-react": "^4.3.4",
     "tailwindcss": "^4.1.7",
     "typescript": "^5.7.0",
