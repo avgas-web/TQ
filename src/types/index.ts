@@ -43,11 +43,20 @@ export interface CalibrationPoint {
   lon: number;
 }
 
+export interface MapBounds {
+  north: number;
+  south: number;
+  east: number;
+  west: number;
+}
+
 export interface MapData {
   name: string;
   width: number;
   height: number;
   dataUrl: string;
+  bounds?: MapBounds; // Географические границы карты
+  source?: 'local' | 'google'; // Источник карты
 }
 
 export interface Project {
@@ -68,6 +77,10 @@ export interface Project {
     gridSize: number;
     showCoordinates: boolean;
     theme: 'dark' | 'light';
+  };
+  googleMaps: {
+    apiKey: string;
+    enabled: boolean;
   };
 }
 

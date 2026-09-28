@@ -1,14 +1,34 @@
 // Утилиты экспорта/импорта
 import type { Marker, Project } from '../types';
+import { pixelToGeoFromBounds } from './googleMaps';
+
+/**
+ * Получение координат маркера с учётом привязки к Google Maps
+ */
+function getMarkerGeoCoords(marker: Marker, project?: Project): { lat: number | null; lon: number | null } {
+  // Если есть привязка к Google Maps, вычисляем координаты автоматически
+  if (project?.map?.bounds && project.map.source === 'google') {
+    const geo = pixelToGeoFromBounds(
+      { x: marker.x, y: marker.y },
+      project.map.bounds,
+      project.map.width,
+      project.map.height
+    );
+    return { lat: geo.lat, lon: geo.lng };
+  }
+  // Иначе используем сохранённые координаты
+  return { lat: marker.lat, lon: marker.lon };
+}
 
 /**
  * Экспорт маркеров в CSV
  */
-export function exportToCSV(markers: Marker[]): string {
+export function exportToCSV(markers: Marker[], project?: Project): string {
   const header = 'id;name;x;y;lat;lon;type;comment';
-  const rows = markers.map(m =>
-    `${m.id};${m.name};${m.x};${m.y};${m.lat ?? ''};${m.lon ?? ''};${m.type};${m.comment}`
-  );
+  const rows = markers.map(m => {
+    const geo = getMarkerGeoCoords(m, project);
+    return `${m.id};${m.name};${m.x};${m.y};${geo.lat ?? ''};${geo.lon ?? ''};${m.type};${m.comment}`;
+  });
   return [header, ...rows].join('\n');
 }
 
@@ -22,25 +42,29 @@ export function exportToJSON(markers: Marker[]): string {
 /**
  * Экспорт маркеров в GeoJSON
  */
-export function exportToGeoJSON(markers: Marker[]): string {
+export function exportToGeoJSON(markers: Marker[], project?: Project): string {
   const features = markers
-    .filter(m => m.lat !== null && m.lon !== null)
-    .map(m => ({
-      type: 'Feature',
-      geometry: {
-        type: 'Point',
-        coordinates: [m.lon, m.lat],
-      },
-      properties: {
-        id: m.id,
-        name: m.name,
-        type: m.type,
-        color: m.color,
-        comment: m.comment,
-        pixelX: m.x,
-        pixelY: m.y,
-      },
-    }));
+    .map(m => {
+      const geo = getMarkerGeoCoords(m, project);
+      if (geo.lat === null || geo.lon === null) return null;
+      return {
+        type: 'Feature',
+        geometry: {
+          type: 'Point',
+          coordinates: [geo.lon, geo.lat],
+        },
+        properties: {
+          id: m.id,
+          name: m.name,
+          type: m.type,
+          color: m.color,
+          comment: m.comment,
+          pixelX: m.x,
+          pixelY: m.y,
+        },
+      };
+    })
+    .filter(f => f !== null);
 
   return JSON.stringify({
     type: 'FeatureCollection',
@@ -51,14 +75,18 @@ export function exportToGeoJSON(markers: Marker[]): string {
 /**
  * Экспорт маркеров в GPX
  */
-export function exportToGPX(markers: Marker[]): string {
+export function exportToGPX(markers: Marker[], project?: Project): string {
   const waypoints = markers
-    .filter(m => m.lat !== null && m.lon !== null)
-    .map(m => `  <wpt lat="${m.lat}" lon="${m.lon}">
+    .map(m => {
+      const geo = getMarkerGeoCoords(m, project);
+      if (geo.lat === null || geo.lon === null) return null;
+      return `  <wpt lat="${geo.lat}" lon="${geo.lon}">
     <name>${escapeXml(m.name)}</name>
     <desc>${escapeXml(m.comment)}</desc>
     <type>${escapeXml(m.type)}</type>
-  </wpt>`)
+  </wpt>`;
+    })
+    .filter(w => w !== null)
     .join('\n');
 
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -70,16 +98,20 @@ ${waypoints}
 /**
  * Экспорт маркеров в KML
  */
-export function exportToKML(markers: Marker[]): string {
+export function exportToKML(markers: Marker[], project?: Project): string {
   const placemarks = markers
-    .filter(m => m.lat !== null && m.lon !== null)
-    .map(m => `    <Placemark>
+    .map(m => {
+      const geo = getMarkerGeoCoords(m, project);
+      if (geo.lat === null || geo.lon === null) return null;
+      return `    <Placemark>
       <name>${escapeXml(m.name)}</name>
       <description>${escapeXml(m.comment)}</description>
       <Point>
-        <coordinates>${m.lon},${m.lat},0</coordinates>
+        <coordinates>${geo.lon},${geo.lat},0</coordinates>
       </Point>
-    </Placemark>`)
+    </Placemark>`;
+    })
+    .filter(p => p !== null)
     .join('\n');
 
   return `<?xml version="1.0" encoding="UTF-8"?>

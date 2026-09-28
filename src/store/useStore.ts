@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { v4 as uuidv4 } from 'uuid';
-import type { Project, Marker, Restriction, Layer, Tool, ViewState, MapData, Point, CalibrationPoint } from '../types';
+import type { Project, Marker, Restriction, Layer, Tool, ViewState, MapData, Point, CalibrationPoint, MapBounds } from '../types';
 
 interface AppState {
   project: Project;
@@ -47,6 +47,9 @@ interface AppState {
   removeCalibrationPoint: (index: number) => void;
   toggleCalibration: (enabled: boolean) => void;
   updateSettings: (settings: Partial<Project['settings']>) => void;
+  setGoogleMapsApiKey: (apiKey: string) => void;
+  toggleGoogleMaps: (enabled: boolean) => void;
+  setMapBounds: (bounds: MapBounds) => void;
 }
 
 const defaultProject: Project = {
@@ -69,6 +72,10 @@ const defaultProject: Project = {
     gridSize: 100,
     showCoordinates: true,
     theme: 'dark',
+  },
+  googleMaps: {
+    apiKey: '',
+    enabled: false,
   },
 };
 
@@ -305,6 +312,30 @@ export const useStore = create<AppState>()(
         project: {
           ...state.project,
           settings: { ...state.project.settings, ...settings },
+          updatedAt: new Date().toISOString(),
+        },
+      })),
+
+      setGoogleMapsApiKey: (apiKey) => set((state) => ({
+        project: {
+          ...state.project,
+          googleMaps: { ...state.project.googleMaps, apiKey },
+          updatedAt: new Date().toISOString(),
+        },
+      })),
+
+      toggleGoogleMaps: (enabled) => set((state) => ({
+        project: {
+          ...state.project,
+          googleMaps: { ...state.project.googleMaps, enabled },
+          updatedAt: new Date().toISOString(),
+        },
+      })),
+
+      setMapBounds: (bounds) => set((state) => ({
+        project: {
+          ...state.project,
+          map: state.project.map ? { ...state.project.map, bounds } : null,
           updatedAt: new Date().toISOString(),
         },
       })),

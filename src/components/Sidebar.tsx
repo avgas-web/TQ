@@ -1,13 +1,15 @@
 import React, { useState, useMemo } from 'react';
 import { useStore } from '../store/useStore';
 import { decimalToDMS } from '../utils/geometry';
+import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import {
   exportToCSV, exportToJSON, exportToGeoJSON, exportToGPX, exportToKML,
   downloadFile, importFromCSV, importFromGeoJSON, exportProject, importProject,
 } from '../utils/export';
+import GoogleMapsPanel from './GoogleMapsPanel';
 
 const Sidebar: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'points' | 'restrictions' | 'export'>('points');
+  const [activeTab, setActiveTab] = useState<'points' | 'restrictions' | 'export' | 'google'>('points');
   const [editingMarker, setEditingMarker] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const [editX, setEditX] = useState('');
@@ -56,19 +58,19 @@ const Sidebar: React.FC = () => {
 
     switch (format) {
       case 'csv':
-        downloadFile(exportToCSV(markers), `${projectName}_markers.csv`, 'text/csv');
+        downloadFile(exportToCSV(markers, project), `${projectName}_markers.csv`, 'text/csv');
         break;
       case 'json':
         downloadFile(exportToJSON(markers), `${projectName}_markers.json`, 'application/json');
         break;
       case 'geojson':
-        downloadFile(exportToGeoJSON(markers), `${projectName}_markers.geojson`, 'application/geo+json');
+        downloadFile(exportToGeoJSON(markers, project), `${projectName}_markers.geojson`, 'application/geo+json');
         break;
       case 'gpx':
-        downloadFile(exportToGPX(markers), `${projectName}_markers.gpx`, 'application/gpx+xml');
+        downloadFile(exportToGPX(markers, project), `${projectName}_markers.gpx`, 'application/gpx+xml');
         break;
       case 'kml':
-        downloadFile(exportToKML(markers), `${projectName}_markers.kml`, 'application/vnd.google-earth.kml+xml');
+        downloadFile(exportToKML(markers, project), `${projectName}_markers.kml`, 'application/vnd.google-earth.kml+xml');
         break;
       case 'project':
         downloadFile(exportProject(project), `${projectName}.tqproj`, 'application/json');
@@ -147,22 +149,28 @@ const Sidebar: React.FC = () => {
   return (
     <div className="w-80 bg-gray-800 border-l border-gray-700 flex flex-col h-full overflow-hidden">
       {/* Tabs */}
-      <div className="flex border-b border-gray-700">
+      <div className="flex border-b border-gray-700 flex-wrap">
         <button
           onClick={() => setActiveTab('points')}
-          className={`flex-1 px-3 py-2 text-sm font-medium ${activeTab === 'points' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
+          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'points' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
         >
           📍 Точки ({project.markers.length})
         </button>
         <button
           onClick={() => setActiveTab('restrictions')}
-          className={`flex-1 px-3 py-2 text-sm font-medium ${activeTab === 'restrictions' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
+          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'restrictions' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
         >
           🚧 Зоны ({project.restrictions.length})
         </button>
         <button
+          onClick={() => setActiveTab('google')}
+          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'google' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
+        >
+          🌍 Google
+        </button>
+        <button
           onClick={() => setActiveTab('export')}
-          className={`flex-1 px-3 py-2 text-sm font-medium ${activeTab === 'export' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
+          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'export' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
         >
           💾 Экспорт
         </button>
@@ -226,11 +234,31 @@ const Sidebar: React.FC = () => {
                   </div>
                   <div className="text-xs text-gray-400 mt-1">
                     X: {Math.round(marker.x)}, Y: {Math.round(marker.y)}
-                    {marker.lat !== null && marker.lon !== null && (
-                      <span className="ml-2">
-                        | {marker.lat.toFixed(5)}, {marker.lon.toFixed(5)}
-                      </span>
-                    )}
+                    {(() => {
+                      // Если есть привязка к Google Maps, вычисляем координаты автоматически
+                      if (project.map?.bounds && project.map?.source === 'google') {
+                        const geo = pixelToGeoFromBounds(
+                          { x: marker.x, y: marker.y },
+                          project.map.bounds,
+                          project.map.width,
+                          project.map.height
+                        );
+                        return (
+                          <span className="ml-2 text-green-400">
+                            | {geo.lat.toFixed(5)}, {geo.lng.toFixed(5)}
+                          </span>
+                        );
+                      }
+                      // Иначе показываем сохранённые координаты
+                      if (marker.lat !== null && marker.lon !== null) {
+                        return (
+                          <span className="ml-2">
+                            | {marker.lat.toFixed(5)}, {marker.lon.toFixed(5)}
+                          </span>
+                        );
+                      }
+                      return null;
+                    })()}
                     {marker.type !== 'default' && (
                       <span className="ml-2 text-cyan-400">[{marker.type}]</span>
                     )}
@@ -297,6 +325,10 @@ const Sidebar: React.FC = () => {
           </div>
         )}
 
+        {activeTab === 'google' && (
+          <GoogleMapsPanel />
+        )}
+
         {activeTab === 'export' && (
           <div className="p-3 space-y-3">
             <h3 className="text-sm font-medium text-gray-300">Экспорт точек</h3>
@@ -345,12 +377,33 @@ const Sidebar: React.FC = () => {
             <p><span className="text-gray-500">ID:</span> {selectedMarker.id.slice(0, 8)}...</p>
             <p><span className="text-gray-500">Имя:</span> {selectedMarker.name}</p>
             <p><span className="text-gray-500">Пиксели:</span> X={Math.round(selectedMarker.x)}, Y={Math.round(selectedMarker.y)}</p>
-            {selectedMarker.lat !== null && selectedMarker.lon !== null && (
-              <>
-                <p><span className="text-gray-500">Координаты:</span> {selectedMarker.lat.toFixed(6)}, {selectedMarker.lon.toFixed(6)}</p>
-                <p><span className="text-gray-500">DMS:</span> {decimalToDMS(selectedMarker.lat, true)} {decimalToDMS(selectedMarker.lon, false)}</p>
-              </>
-            )}
+            {(() => {
+              // Если есть привязка к Google Maps, вычисляем координаты автоматически
+              if (project.map?.bounds && project.map?.source === 'google') {
+                const geo = pixelToGeoFromBounds(
+                  { x: selectedMarker.x, y: selectedMarker.y },
+                  project.map.bounds,
+                  project.map.width,
+                  project.map.height
+                );
+                return (
+                  <>
+                    <p><span className="text-gray-500">Координаты:</span> <span className="text-green-400">{geo.lat.toFixed(6)}, {geo.lng.toFixed(6)}</span></p>
+                    <p><span className="text-gray-500">DMS:</span> {decimalToDMS(geo.lat, true)} {decimalToDMS(geo.lng, false)}</p>
+                  </>
+                );
+              }
+              // Иначе показываем сохранённые координаты
+              if (selectedMarker.lat !== null && selectedMarker.lon !== null) {
+                return (
+                  <>
+                    <p><span className="text-gray-500">Координаты:</span> {selectedMarker.lat.toFixed(6)}, {selectedMarker.lon.toFixed(6)}</p>
+                    <p><span className="text-gray-500">DMS:</span> {decimalToDMS(selectedMarker.lat, true)} {decimalToDMS(selectedMarker.lon, false)}</p>
+                  </>
+                );
+              }
+              return null;
+            })()}
             <p><span className="text-gray-500">Тип:</span> {selectedMarker.type}</p>
             <p><span className="text-gray-500">Слой:</span> {project.layers.find(l => l.id === selectedMarker.layer)?.name || '—'}</p>
             {selectedMarker.comment && <p><span className="text-gray-500">Комментарий:</span> {selectedMarker.comment}</p>}

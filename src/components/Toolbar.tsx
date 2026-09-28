@@ -109,6 +109,13 @@ const Toolbar: React.FC = () => {
 
       <div className="flex-1" />
 
+      {/* Map source indicator */}
+      {project.map?.source === 'google' && (
+        <span className="text-xs text-green-400 px-2">
+          🌍 Google Maps
+        </span>
+      )}
+
       {/* Reset */}
       <button
         onClick={() => {

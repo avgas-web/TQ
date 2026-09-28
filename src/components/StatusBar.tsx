@@ -1,5 +1,6 @@
 import React from 'react';
 import { useStore } from '../store/useStore';
+import { pixelToGeoFromBounds } from '../utils/googleMaps';
 
 
 const StatusBar: React.FC = () => {
@@ -27,11 +28,31 @@ const StatusBar: React.FC = () => {
         {cursorPosition && (
           <span>
             📍 X: {Math.round(cursorPosition.x)}, Y: {Math.round(cursorPosition.y)}
-            {project.calibration.enabled && project.calibration.points.length >= 2 && (
-              <span className="ml-2 text-cyan-400">
-                | Geo: {cursorPosition.x.toFixed(4)}, {cursorPosition.y.toFixed(4)}
-              </span>
-            )}
+            {(() => {
+              // Если есть привязка к Google Maps, показываем географические координаты
+              if (project.map?.bounds && project.map?.source === 'google') {
+                const geo = pixelToGeoFromBounds(
+                  cursorPosition,
+                  project.map.bounds,
+                  project.map.width,
+                  project.map.height
+                );
+                return (
+                  <span className="ml-2 text-green-400">
+                    | 🌍 {geo.lat.toFixed(6)}, {geo.lng.toFixed(6)}
+                  </span>
+                );
+              }
+              // Иначе показываем калибровочные координаты
+              if (project.calibration.enabled && project.calibration.points.length >= 2) {
+                return (
+                  <span className="ml-2 text-cyan-400">
+                    | Geo: {cursorPosition.x.toFixed(4)}, {cursorPosition.y.toFixed(4)}
+                  </span>
+                );
+              }
+              return null;
+            })()}
           </span>
         )}
 
