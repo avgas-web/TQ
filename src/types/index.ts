@@ -50,13 +50,15 @@ export interface MapBounds {
   west: number;
 }
 
+export type MapProvider = 'local' | 'google' | 'yandex' | 'osm';
+
 export interface MapData {
   name: string;
   width: number;
   height: number;
   dataUrl: string;
   bounds?: MapBounds; // Географические границы карты
-  source?: 'local' | 'google'; // Источник карты
+  source?: MapProvider; // Источник карты
 }
 
 export interface Project {
@@ -81,6 +83,14 @@ export interface Project {
   googleMaps: {
     apiKey: string;
     enabled: boolean;
+  };
+  yandexMaps: {
+    apiKey: string;
+    enabled: boolean;
+  };
+  openStreetMap: {
+    enabled: boolean;
+    tileServer: 'osm' | 'opentopomap' | 'carto';
   };
 }
 

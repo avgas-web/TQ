@@ -6,7 +6,7 @@ import {
   exportToCSV, exportToJSON, exportToGeoJSON, exportToGPX, exportToKML,
   downloadFile, importFromCSV, importFromGeoJSON, exportProject, importProject,
 } from '../utils/export';
-import GoogleMapsPanel from './GoogleMapsPanel';
+import MapsPanel from './MapsPanel';
 
 const Sidebar: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'points' | 'restrictions' | 'export' | 'google'>('points');
@@ -235,8 +235,8 @@ const Sidebar: React.FC = () => {
                   <div className="text-xs text-gray-400 mt-1">
                     X: {Math.round(marker.x)}, Y: {Math.round(marker.y)}
                     {(() => {
-                      // Если есть привязка к Google Maps, вычисляем координаты автоматически
-                      if (project.map?.bounds && project.map?.source === 'google') {
+                      // Если есть привязка к онлайн-картам, вычисляем координаты автоматически
+                      if (project.map?.bounds && (project.map?.source === 'google' || project.map?.source === 'yandex' || project.map?.source === 'osm')) {
                         const geo = pixelToGeoFromBounds(
                           { x: marker.x, y: marker.y },
                           project.map.bounds,
@@ -326,7 +326,7 @@ const Sidebar: React.FC = () => {
         )}
 
         {activeTab === 'google' && (
-          <GoogleMapsPanel />
+          <MapsPanel />
         )}
 
         {activeTab === 'export' && (
@@ -378,8 +378,8 @@ const Sidebar: React.FC = () => {
             <p><span className="text-gray-500">Имя:</span> {selectedMarker.name}</p>
             <p><span className="text-gray-500">Пиксели:</span> X={Math.round(selectedMarker.x)}, Y={Math.round(selectedMarker.y)}</p>
             {(() => {
-              // Если есть привязка к Google Maps, вычисляем координаты автоматически
-              if (project.map?.bounds && project.map?.source === 'google') {
+              // Если есть привязка к онлайн-картам, вычисляем координаты автоматически
+              if (project.map?.bounds && (project.map?.source === 'google' || project.map?.source === 'yandex' || project.map?.source === 'osm')) {
                 const geo = pixelToGeoFromBounds(
                   { x: selectedMarker.x, y: selectedMarker.y },
                   project.map.bounds,

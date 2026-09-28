@@ -50,6 +50,10 @@ interface AppState {
   setGoogleMapsApiKey: (apiKey: string) => void;
   toggleGoogleMaps: (enabled: boolean) => void;
   setMapBounds: (bounds: MapBounds) => void;
+  setYandexMapsApiKey: (apiKey: string) => void;
+  toggleYandexMaps: (enabled: boolean) => void;
+  toggleOpenStreetMap: (enabled: boolean) => void;
+  setOSMTileServer: (server: 'osm' | 'opentopomap' | 'carto') => void;
 }
 
 const defaultProject: Project = {
@@ -76,6 +80,14 @@ const defaultProject: Project = {
   googleMaps: {
     apiKey: '',
     enabled: false,
+  },
+  yandexMaps: {
+    apiKey: '',
+    enabled: false,
+  },
+  openStreetMap: {
+    enabled: false,
+    tileServer: 'osm',
   },
 };
 
@@ -339,6 +351,38 @@ export const useStore = create<AppState>()(
           updatedAt: new Date().toISOString(),
         },
       })),
+
+      setYandexMapsApiKey: (apiKey) => set((state) => ({
+        project: {
+          ...state.project,
+          yandexMaps: { ...state.project.yandexMaps, apiKey },
+          updatedAt: new Date().toISOString(),
+        },
+      })),
+
+      toggleYandexMaps: (enabled) => set((state) => ({
+        project: {
+          ...state.project,
+          yandexMaps: { ...state.project.yandexMaps, enabled },
+          updatedAt: new Date().toISOString(),
+        },
+      })),
+
+      toggleOpenStreetMap: (enabled) => set((state) => ({
+        project: {
+          ...state.project,
+          openStreetMap: { ...state.project.openStreetMap, enabled },
+          updatedAt: new Date().toISOString(),
+        },
+      })),
+
+      setOSMTileServer: (server) => set((state) => ({
+        project: {
+          ...state.project,
+          openStreetMap: { ...state.project.openStreetMap, tileServer: server },
+          updatedAt: new Date().toISOString(),
+        },
+      })),
     }),
     {
       name: 'totalquadro-storage',
@@ -351,6 +395,20 @@ export const useStore = create<AppState>()(
           persistedState.project.googleMaps = {
             apiKey: '',
             enabled: false,
+          };
+        }
+        // Миграция для старых проектов без yandexMaps
+        if (persistedState.project && !persistedState.project.yandexMaps) {
+          persistedState.project.yandexMaps = {
+            apiKey: '',
+            enabled: false,
+          };
+        }
+        // Миграция для старых проектов без openStreetMap
+        if (persistedState.project && !persistedState.project.openStreetMap) {
+          persistedState.project.openStreetMap = {
+            enabled: false,
+            tileServer: 'osm',
           };
         }
         // Миграция для старых проектов без calibration

@@ -115,6 +115,16 @@ const Toolbar: React.FC = () => {
           🌍 Google Maps
         </span>
       )}
+      {project.map?.source === 'yandex' && (
+        <span className="text-xs text-yellow-400 px-2">
+          🗺️ Яндекс.Карты
+        </span>
+      )}
+      {project.map?.source === 'osm' && (
+        <span className="text-xs text-blue-400 px-2">
+          🌐 OpenStreetMap
+        </span>
+      )}
 
       {/* Reset */}
       <button

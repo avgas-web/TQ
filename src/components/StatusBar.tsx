@@ -29,8 +29,8 @@ const StatusBar: React.FC = () => {
           <span>
             📍 X: {Math.round(cursorPosition.x)}, Y: {Math.round(cursorPosition.y)}
             {(() => {
-              // Если есть привязка к Google Maps, показываем географические координаты
-              if (project.map?.bounds && project.map?.source === 'google') {
+              // Если есть привязка к онлайн-картам, показываем географические координаты
+              if (project.map?.bounds && (project.map?.source === 'google' || project.map?.source === 'yandex' || project.map?.source === 'osm')) {
                 const geo = pixelToGeoFromBounds(
                   cursorPosition,
                   project.map.bounds,

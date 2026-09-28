@@ -6,8 +6,8 @@ import { pixelToGeoFromBounds } from './googleMaps';
  * Получение координат маркера с учётом привязки к Google Maps
  */
 function getMarkerGeoCoords(marker: Marker, project?: Project): { lat: number | null; lon: number | null } {
-  // Если есть привязка к Google Maps, вычисляем координаты автоматически
-  if (project?.map?.bounds && project.map.source === 'google') {
+  // Если есть привязка к онлайн-картам, вычисляем координаты автоматически
+  if (project?.map?.bounds && (project.map.source === 'google' || project.map.source === 'yandex' || project.map.source === 'osm')) {
     const geo = pixelToGeoFromBounds(
       { x: marker.x, y: marker.y },
       project.map.bounds,
