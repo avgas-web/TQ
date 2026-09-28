@@ -94,7 +94,7 @@ export function getOSMTileUrl(
     case 'opentopomap':
       return `https://tile.opentopomap.org/${zoom}/${x}/${y}.png`;
     case 'carto':
-      return `https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/${zoom}/${x}/${y}.png`;
+      return `https://basemaps.cartocdn.com/light_all/${zoom}/${x}/${y}.png`;
     case 'osm':
     default:
       return `https://tile.openstreetmap.org/${zoom}/${x}/${y}.png`;
@@ -141,6 +141,8 @@ export async function loadOSMStaticMap(
   height: number,
   tileServer: 'osm' | 'opentopomap' | 'carto' = 'osm'
 ): Promise<{ dataUrl: string; bounds: { north: number; south: number; east: number; west: number } }> {
+  console.log(`Загрузка карты OSM: сервер=${tileServer}, центр=(${center.lat}, ${center.lng}), зум=${zoom}, размер=${width}x${height}`);
+  
   // Вычисляем границы
   const bounds = calculateOSMBoundsFromCenter(center, zoom, width, height);
   
@@ -195,6 +197,15 @@ export async function loadOSMStaticMap(
         };
         
         img.onerror = () => {
+          console.warn(`Не удалось загрузить тайл: ${tileUrl}`);
+          // Рисуем placeholder для неудачного тайла
+          const pixelX = dx * 256;
+          const pixelY = dy * 256;
+          ctx.fillStyle = '#cccccc';
+          ctx.fillRect(pixelX, pixelY, 256, 256);
+          ctx.strokeStyle = '#999999';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(pixelX, pixelY, 256, 256);
           resolve(); // Продолжаем даже если тайл не загрузился
         };
         
@@ -206,6 +217,8 @@ export async function loadOSMStaticMap(
   }
   
   await Promise.all(tilePromises);
+  
+  console.log(`Загружено ${tilePromises.length} тайлов для сервера ${tileServer}`);
   
   // Смещаем изображение чтобы центр был в центре canvas
   const offsetX = (width - tilesX * 256) / 2;

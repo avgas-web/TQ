@@ -327,7 +327,11 @@ const MapsPanel: React.FC = () => {
           <label className="text-xs text-gray-400 block mb-1">Сервер тайлов</label>
           <select
             value={osmTileServer}
-            onChange={(e) => setOsmTileServer(e.target.value as any)}
+            onChange={(e) => {
+              const value = e.target.value as 'osm' | 'opentopomap' | 'carto';
+              setOsmTileServer(value);
+              setOSMTileServer(value);
+            }}
             className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white"
           >
             <option value="osm">OpenStreetMap</option>
@@ -400,7 +404,11 @@ const MapsPanel: React.FC = () => {
           {activeProvider === 'osm' && (
             <select
               value={osmTileServer}
-              onChange={(e) => setOsmTileServer(e.target.value as any)}
+              onChange={(e) => {
+                const value = e.target.value as 'osm' | 'opentopomap' | 'carto';
+                setOsmTileServer(value);
+                setOSMTileServer(value);
+              }}
               className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white"
             >
               <option value="osm">OSM Standard</option>
