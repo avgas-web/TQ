@@ -1,0 +1,44 @@
+@import "tailwindcss";
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #1f2937;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #4b5563;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #6b7280;
+}
+
+/* Ensure canvas doesn't have touch issues */
+canvas {
+  touch-action: none;
+}
+
+/* Smooth transitions */
+button {
+  transition: all 0.15s ease;
+}
+
+/* Selection color */
+::selection {
+  background-color: #0891b2;
+  color: white;
+}
