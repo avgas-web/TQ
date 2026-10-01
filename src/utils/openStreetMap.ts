@@ -1,4 +1,5 @@
 // Утилиты для работы с OpenStreetMap
+import { calculateBoundsFromCenter } from './googleMaps';
 
 export interface OSMConfig {
   loaded: boolean;
@@ -244,36 +245,8 @@ export async function loadOSMStaticMap(
   return { dataUrl, bounds };
 }
 
-/**
- * Вычисление границ карты из центра и зума (OSM)
- */
-function calculateOSMBoundsFromCenter(
-  center: { lat: number; lng: number },
-  zoom: number,
-  width: number,
-  height: number
-): { north: number; south: number; east: number; west: number } {
-  // Для OSM используем Mercator projection
-  const tilesX = Math.ceil(width / 256);
-  const tilesY = Math.ceil(height / 256);
-  
-  const centerTile = latLngToTile(center.lat, center.lng, zoom);
-  
-  const startTileX = centerTile.x - Math.floor(tilesX / 2);
-  const startTileY = centerTile.y - Math.floor(tilesY / 2);
-  const endTileX = startTileX + tilesX;
-  const endTileY = startTileY + tilesY;
-  
-  const topLeft = tileToLatLng(startTileX, startTileY, zoom);
-  const bottomRight = tileToLatLng(endTileX, endTileY, zoom);
-  
-  return {
-    north: topLeft.lat,
-    south: bottomRight.lat,
-    east: bottomRight.lng,
-    west: topLeft.lng,
-  };
-}
+// Границы считаются через общую Web Mercator-функцию (googleMaps.ts)
+const calculateOSMBoundsFromCenter = calculateBoundsFromCenter;
 
 /**
  * Проверка статуса инициализации OSM

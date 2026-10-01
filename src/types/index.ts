@@ -59,6 +59,7 @@ export interface MapData {
   dataUrl: string;
   bounds?: MapBounds; // Географические границы карты
   source?: MapProvider; // Источник карты
+  mapId?: string; // Стабильный ID изображения в IndexedDB (для восстановления после перезагрузки)
 }
 
 export interface Project {

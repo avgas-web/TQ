@@ -33,6 +33,9 @@ const MapCanvas: React.FC = () => {
     setMeasurementPoints,
   } = useStore();
 
+  // devicePixelRatio — для чёткого рендера на Retina/HiDPI экранах
+  const dpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
+
   // Load map image when map data changes
   useEffect(() => {
     if (!project.map || !project.map.dataUrl) {
@@ -71,9 +74,12 @@ const MapCanvas: React.FC = () => {
     return () => observer.disconnect();
   }, []);
 
-  // Fit map to view on load or when map changes
+  // Fit map to view when a new map image is loaded (не сбрасывать вид при ресайзе окна)
+  const lastFittedMapRef = useRef<string | null>(null);
   useEffect(() => {
-    if (project.map && mapLoaded && canvasSize.width > 0) {
+    const dataUrl = project.map?.dataUrl;
+    if (project.map && mapLoaded && canvasSize.width > 0 && dataUrl && lastFittedMapRef.current !== dataUrl) {
+      lastFittedMapRef.current = dataUrl;
       const scaleX = canvasSize.width / project.map.width;
       const scaleY = canvasSize.height / project.map.height;
       const scale = Math.min(scaleX, scaleY) * 0.9;
@@ -97,6 +103,13 @@ const MapCanvas: React.FC = () => {
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+
+    // HiDPI: физический размер канваса больше логического в dpr раз
+    const physW = Math.max(1, Math.round(canvasSize.width * dpr));
+    const physH = Math.max(1, Math.round(canvasSize.height * dpr));
+    if (canvas.width !== physW) canvas.width = physW;
+    if (canvas.height !== physH) canvas.height = physH;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     // Clear
     ctx.fillStyle = '#0f1729';
@@ -394,7 +407,7 @@ const MapCanvas: React.FC = () => {
 
       ctx.restore();
     }
-  }, [project, viewState, canvasSize, selectedMarkerId, drawingPoints, measurementPoints, mapLoaded, currentTool]);
+  }, [project, viewState, canvasSize, selectedMarkerId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr]);
 
   // Mouse wheel zoom
   const handleWheel = useCallback((e: React.WheelEvent) => {
@@ -571,10 +584,12 @@ const MapCanvas: React.FC = () => {
     <div ref={containerRef} className="relative w-full h-full overflow-hidden bg-[#0f1729]">
       <canvas
         ref={canvasRef}
-        width={canvasSize.width}
-        height={canvasSize.height}
+        style={{
+          width: `${canvasSize.width}px`,
+          height: `${canvasSize.height}px`,
+          cursor: cursorStyle,
+        }}
         className="absolute inset-0"
-        style={{ cursor: cursorStyle }}
         onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
