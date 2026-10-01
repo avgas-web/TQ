@@ -16,6 +16,7 @@ const App: React.FC = () => {
     setMeasurementPoints,
     project,
     updateSettings,
+    setProjectName,
     deleteMarker,
     selectedMarkerId,
   } = useStore();
@@ -102,10 +103,7 @@ const App: React.FC = () => {
           <input
             type="text"
             value={project.projectName}
-            onChange={(e) => useStore.getState().importProject({
-              ...project,
-              projectName: e.target.value,
-            })}
+            onChange={(e) => setProjectName(e.target.value)}
             className="px-2 py-0.5 bg-gray-800 border border-gray-600 rounded text-xs text-white w-40"
             placeholder="Название проекта"
           />

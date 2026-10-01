@@ -101,36 +101,6 @@ export function polygonPerimeter(polygon: Point[]): number {
 }
 
 /**
- * Конвертация пикселей в географические координаты (линейная интерполяция)
- */
-export function pixelToGeo(
-  pixel: Point,
-  calibrationPoints: { pixelX: number; pixelY: number; lat: number; lon: number }[]
-): { lat: number; lon: number } | null {
-  if (calibrationPoints.length < 2) return null;
-
-  // Используем первые две точки для линейной интерполяции
-  const p1 = calibrationPoints[0];
-  const p2 = calibrationPoints[1];
-
-  const dxPixel = p2.pixelX - p1.pixelX;
-  const dyPixel = p2.pixelY - p1.pixelY;
-  const dLat = p2.lat - p1.lat;
-  const dLon = p2.lon - p1.lon;
-
-  if (dxPixel === 0 && dyPixel === 0) return null;
-
-  // Простая линейная интерполяция (для более точных результатов нужна аффинная трансформация)
-  const scaleX = dLon / (dxPixel || 1);
-  const scaleY = dLat / (dyPixel || 1);
-
-  const lon = p1.lon + (pixel.x - p1.pixelX) * scaleX;
-  const lat = p1.lat + (pixel.y - p1.pixelY) * scaleY;
-
-  return { lat, lon };
-}
-
-/**
  * Валидация координат точки
  */
 export function validateMarkerPosition(x: number, y: number, mapWidth: number, mapHeight: number): string | null {
