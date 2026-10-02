@@ -1,4 +1,5 @@
 // Утилиты для работы с Google Maps API
+import type { MapBounds } from "../types";
 
 export interface GoogleMapsConfig {
   apiKey: string;
@@ -66,9 +67,9 @@ export async function geocodeAddress(address: string): Promise<{ lat: number; ln
     throw new Error('Google Maps API не загружен');
   }
 
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const geocoder = new window.google.maps.Geocoder();
-    
+
     geocoder.geocode({ address }, (results, status) => {
       if (status === 'OK' && results && results.length > 0) {
         const location = results[0].geometry.location;
@@ -91,10 +92,10 @@ export async function reverseGeocode(lat: number, lng: number): Promise<string |
     throw new Error('Google Maps API не загружен');
   }
 
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const geocoder = new window.google.maps.Geocoder();
     const latlng = { lat, lng };
-    
+
     geocoder.geocode({ location: latlng }, (results, status) => {
       if (status === 'OK' && results && results.length > 0) {
         resolve(results[0].formatted_address);
@@ -106,7 +107,7 @@ export async function reverseGeocode(lat: number, lng: number): Promise<string |
 }
 
 /**
- * Получение статической карты как изображение
+ * Получение URL статической карты Google
  */
 export function getStaticMapUrl(
   center: { lat: number; lng: number },
@@ -137,104 +138,126 @@ export async function loadStaticMap(
   height: number,
   apiKey: string,
   mapType: 'roadmap' | 'satellite' | 'hybrid' | 'terrain' = 'satellite'
-): Promise<{ dataUrl: string; bounds: { north: number; south: number; east: number; west: number } }> {
+): Promise<{ dataUrl: string; bounds: MapBounds }> {
   const url = getStaticMapUrl(center, zoom, width, height, apiKey, mapType);
 
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
-    
+
     img.onload = () => {
       const canvas = document.createElement('canvas');
       canvas.width = width;
       canvas.height = height;
       const ctx = canvas.getContext('2d');
-      
+
       if (!ctx) {
         reject(new Error('Не удалось создать canvas'));
         return;
       }
-      
+
       ctx.drawImage(img, 0, 0);
-      
+
       try {
         const dataUrl = canvas.toDataURL('image/png');
-        
-        // Вычисляем границы карты
         const bounds = calculateBoundsFromCenter(center, zoom, width, height);
-        
         resolve({ dataUrl, bounds });
-      } catch (e) {
+      } catch {
         reject(new Error('Ошибка конвертации изображения'));
       }
     };
-    
+
     img.onerror = () => {
       reject(new Error('Ошибка загрузки карты'));
     };
-    
+
     img.src = url;
   });
 }
 
+// --- Web Mercator (EPSG:3857) — точная проекция для тайловых карт ---
+
+
+const DEG2RAD = Math.PI / 180;
+
+/** Широта -> нормализованная координата Mercator y (0..1, сверху вниз) */
+export function latToMercatorY(lat: number): number {
+  const clamped = Math.max(-89.9, Math.min(89.9, lat));
+  const sinLat = Math.sin(clamped * DEG2RAD);
+  return 0.5 - Math.log((1 + sinLat) / (1 - sinLat)) / (4 * Math.PI);
+}
+
+/** Нормализованная координата Mercator y (0..1) -> широта */
+export function mercatorYToLat(y: number): number {
+  const n = Math.PI * (1 - 2 * y);
+  return (Math.atan(Math.sinh(n)) * 180) / Math.PI;
+}
+
 /**
- * Вычисление границ карты из центра и зума
+ * Вычисление границ карты из центра и зума (Web Mercator)
  */
-function calculateBoundsFromCenter(
+export function calculateBoundsFromCenter(
   center: { lat: number; lng: number },
   zoom: number,
   width: number,
   height: number
-): { north: number; south: number; east: number; west: number } {
-  // Приблизительное вычисление границ
-  const latPerPx = 360 / Math.pow(2, zoom + 8);
-  const lngPerPx = 360 / Math.pow(2, zoom + 8);
-  
-  const halfHeightLat = (height / 2) * latPerPx;
+): MapBounds {
+  const worldPx = 256 * Math.pow(2, zoom); // размер мира в пикселях на данном зуме
+
+  const centerY = latToMercatorY(center.lat);
+  const northY = centerY - (height / 2) / worldPx;
+  const southY = centerY + (height / 2) / worldPx;
+
+  const lngPerPx = 360 / worldPx;
   const halfWidthLng = (width / 2) * lngPerPx;
-  
+
   return {
-    north: center.lat + halfHeightLat,
-    south: center.lat - halfHeightLat,
+    north: mercatorYToLat(northY),
+    south: mercatorYToLat(southY),
     east: center.lng + halfWidthLng,
     west: center.lng - halfWidthLng,
   };
 }
 
 /**
- * Конвертация пиксельных координат в географические
+ * Конвертация пиксельных координат изображения в географические
+ * (корректная обратная Mercator-проекция по широте)
  */
 export function pixelToGeoFromBounds(
   pixel: { x: number; y: number },
-  bounds: { north: number; south: number; east: number; west: number },
+  bounds: MapBounds,
   mapWidth: number,
   mapHeight: number
 ): { lat: number; lng: number } {
-  const latRange = bounds.north - bounds.south;
-  const lngRange = bounds.east - bounds.west;
-  
-  const lat = bounds.north - (pixel.y / mapHeight) * latRange;
-  const lng = bounds.west + (pixel.x / mapWidth) * lngRange;
-  
+  if (!mapWidth || !mapHeight) return { lat: 0, lng: 0 };
+
+  const topY = latToMercatorY(bounds.north);
+  const bottomY = latToMercatorY(bounds.south);
+  const fx = Math.max(0, Math.min(1, pixel.x / mapWidth));
+  const fy = Math.max(0, Math.min(1, pixel.y / mapHeight));
+
+  const lat = mercatorYToLat(topY + (bottomY - topY) * fy);
+  const lng = bounds.west + (bounds.east - bounds.west) * fx;
+
   return { lat, lng };
 }
 
 /**
- * Конвертация географических координат в пиксельные
+ * Конвертация географических координат в пиксельные координаты изображения
  */
 export function geoToPixelFromBounds(
   geo: { lat: number; lng: number },
-  bounds: { north: number; south: number; east: number; west: number },
+  bounds: MapBounds,
   mapWidth: number,
   mapHeight: number
 ): { x: number; y: number } {
-  const latRange = bounds.north - bounds.south;
-  const lngRange = bounds.east - bounds.west;
-  
-  const x = ((geo.lng - bounds.west) / lngRange) * mapWidth;
-  const y = ((bounds.north - geo.lat) / latRange) * mapHeight;
-  
-  return { x, y };
+  const topY = latToMercatorY(bounds.north);
+  const bottomY = latToMercatorY(bounds.south);
+
+  const fy = (latToMercatorY(geo.lat) - topY) / (bottomY - topY);
+  const fx = (geo.lng - bounds.west) / (bounds.east - bounds.west);
+
+  return { x: fx * mapWidth, y: fy * mapHeight };
 }
 
 /**

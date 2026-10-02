@@ -1,4 +1,5 @@
 // Утилиты для работы с Яндекс.Картами API
+import { calculateBoundsFromCenter } from './googleMaps';
 
 export interface YandexMapsConfig {
   apiKey: string;
@@ -134,6 +135,11 @@ export function getYandexStaticMapUrl(
     lang: 'ru_RU',
   });
 
+  // Статический API Яндекс.Карт требует API-ключ (иначе возвращает 403)
+  if (apiKey) {
+    params.set('key', apiKey);
+  }
+
   return `https://static-maps.yandex.ru/1.x/?${params.toString()}`;
 }
 
@@ -170,8 +176,8 @@ export async function loadYandexStaticMap(
       try {
         const dataUrl = canvas.toDataURL('image/png');
         
-        // Вычисляем границы карты
-        const bounds = calculateYandexBoundsFromCenter(center, zoom, width, height);
+        // Вычисляем границы карты (Web Mercator — та же проекция, что у Яндекс.Карт)
+        const bounds = calculateBoundsFromCenter(center, zoom, width, height);
         
         resolve({ dataUrl, bounds });
       } catch (e) {
@@ -185,30 +191,6 @@ export async function loadYandexStaticMap(
     
     img.src = url;
   });
-}
-
-/**
- * Вычисление границ карты из центра и зума (Яндекс)
- */
-function calculateYandexBoundsFromCenter(
-  center: { lat: number; lng: number },
-  zoom: number,
-  width: number,
-  height: number
-): { north: number; south: number; east: number; west: number } {
-  // Приблизительное вычисление границ для Яндекс.Карт
-  const latPerPx = 360 / Math.pow(2, zoom + 8);
-  const lngPerPx = 360 / Math.pow(2, zoom + 8);
-  
-  const halfHeightLat = (height / 2) * latPerPx;
-  const halfWidthLng = (width / 2) * lngPerPx;
-  
-  return {
-    north: center.lat + halfHeightLat,
-    south: center.lat - halfHeightLat,
-    east: center.lng + halfWidthLng,
-    west: center.lng - halfWidthLng,
-  };
 }
 
 /**

@@ -43,6 +43,7 @@ interface AppState {
   setSearchQuery: (query: string) => void;
   setFilterType: (type: string) => void;
   importProject: (project: Project) => void;
+  setProjectName: (name: string) => void;
   exportProject: () => Project;
   resetProject: () => void;
   addCalibrationPoint: (point: CalibrationPoint) => void;
@@ -61,7 +62,7 @@ interface AppState {
 }
 
 const defaultProject: Project = {
-  version: '1.0',
+  version: '1.1',
   projectName: 'Новый проект',
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
@@ -281,6 +282,10 @@ export const useStore = create<AppState>()(
 
       exportProject: () => get().project,
 
+      setProjectName: (name) => set((state) => ({
+        project: { ...state.project, projectName: name, updatedAt: new Date().toISOString() },
+      })),
+
       resetProject: () => set({
         project: { ...defaultProject, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
         currentTool: 'pan',
@@ -389,43 +394,39 @@ export const useStore = create<AppState>()(
       })),
 
       loadMapWithStorage: async (mapData) => {
-        // Сохраняем карту в IndexedDB для персистентности
-        const mapId = mapData.name + '_' + Date.now();
+        // Сохраняем карту в IndexedDB под стабильным ID — старые карты не затираются
+        const mapId = uuidv4();
         await saveMapToIndexedDB(mapId, mapData.dataUrl);
-        
-        // Сохраняем карту в state С dataUrl (для немедленного отображения)
-        // dataUrl будет очищен только при сохранении в localStorage через partialize
+
+        // dataUrl остаётся в памяти для немедленного отображения;
+        // в localStorage он не сохраняется (см. partialize) и восстанавливается из IndexedDB
         set((state) => ({
           project: {
             ...state.project,
-            map: mapData, // Сохраняем полную карту с dataUrl
+            map: { ...mapData, mapId },
             updatedAt: new Date().toISOString(),
           },
-          _currentMapId: mapId, // ID для восстановления из IndexedDB
+          _currentMapId: mapId,
         }));
       },
 
       restoreMapFromStorage: async () => {
-        // Небольшая задержка для гарантии инициализации state из localStorage
-        await new Promise(resolve => setTimeout(resolve, 100));
-        
         const state = get();
-        const mapId = state._currentMapId;
-        
-        if (mapId && state.project.map && !state.project.map.dataUrl) {
-          const dataUrl = await loadMapFromIndexedDB(mapId);
-          
-          if (dataUrl) {
-            set({
-              project: {
-                ...state.project,
-                map: {
-                  ...state.project.map,
-                  dataUrl: dataUrl,
-                },
-              },
-            });
-          }
+        const map = state.project.map;
+        if (!map || map.dataUrl) return; // изображение уже в памяти
+
+        // Стабильный ID хранится в самой карте; _currentMapId — обратная совместимость со старыми проектами
+        const mapId = map.mapId || state._currentMapId;
+        if (!mapId) return;
+
+        const dataUrl = await loadMapFromIndexedDB(mapId);
+        if (dataUrl) {
+          set((cur) => ({
+            project: {
+              ...cur.project,
+              map: cur.project.map ? { ...cur.project.map, dataUrl } : cur.project.map,
+            },
+          }));
         }
       },
     }),
