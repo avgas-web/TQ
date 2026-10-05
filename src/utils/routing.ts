@@ -18,12 +18,21 @@ export function pixelToGeoExact(p: Point, bounds: MapBounds, mapW: number, mapH:
   };
 }
 
-/** Пиксельные границы зоны ограничения */
+/** Пиксельные границы зоны ограничения (без запаса) */
 export function restrictionPixelBox(r: Restriction): { minX: number; minY: number; maxX: number; maxY: number } | null {
   if (r.type === 'circle') {
     if (r.points.length < 1 || !r.radius) return null;
     const c = r.points[0];
     return { minX: c.x - r.radius, minY: c.y - r.radius, maxX: c.x + r.radius, maxY: c.y + r.radius };
+  }
+  // rectangle хранится как два противоположных угла — нормализуем в полноценный бокс
+  if (r.type === 'rectangle' && r.points.length >= 2) {
+    return {
+      minX: Math.min(r.points[0].x, r.points[1].x),
+      maxX: Math.max(r.points[0].x, r.points[1].x),
+      minY: Math.min(r.points[0].y, r.points[1].y),
+      maxY: Math.max(r.points[0].y, r.points[1].y),
+    };
   }
   if (r.points.length < 2) return null;
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -194,16 +203,17 @@ function buildObstacles(restrictions: Restriction[], margin: number): Obstacle[]
   return out;
 }
 
-/** Точка внутри расширенной (с запасом margin) запретной области */
+/** Точка внутри буферной полосы ВДОЛЬ границ зон (сами зоны — проходимы) */
 function blockedPoint(p: Point, obstacles: Obstacle[]): boolean {
   for (const o of obstacles) {
     if (p.x < o.box.minX || p.x > o.box.maxX || p.y < o.box.minY || p.y > o.box.maxY) continue;
     if (!o.r) continue;
-    // сама зона
-    if (isPointInZone(p, o.r)) return true;
-    // буфер вокруг зоны
+    // «Ограничения работают только внутри себя»: если точка внутри самой зоны —
+    // она НЕ запретная. Маршрут может проходить через зону (с предупреждением).
+    if (isPointInZone(p, o.r)) return false;
+    // запретна только буферная полоса снаружи границы зоны
     if (o.type === 'rectangle') {
-      return true; // bbox с margin полностью покрывает расширенный прямоугольник
+      return true; // bbox с margin без внутренней части = рамка-буфер
     }
     if (o.type === 'circle' && o.r.points.length >= 1) {
       const c = o.r.points[0];
@@ -212,6 +222,32 @@ function blockedPoint(p: Point, obstacles: Obstacle[]): boolean {
       if (dx * dx + dy * dy <= rad * rad) return true;
     }
     if (o.type === 'polygon' && pointNearPolygonEdges(p, o.r.points, o.margin)) return true;
+  }
+  return false;
+}
+
+function isInsideAnyZone(p: Point, obstacles: Obstacle[]): boolean {
+  for (const o of obstacles) {
+    if (!o.r) continue;
+    if (isPointInZone(p, o.r)) return true;
+  }
+  return false;
+}
+
+/** Отрезок запрещён, если хоть где-то попадает в буферную полосу вдоль границ зон */
+function segmentBlocked(a: Point, b: Point, obstacles: Obstacle[]): boolean {
+  if (obstacles.length === 0) return false;
+  const aIn = isInsideAnyZone(a, obstacles);
+  const bIn = isInsideAnyZone(b, obstacles);
+  if (!aIn && blockedPoint(a, obstacles)) return true;
+  if (!bIn && blockedPoint(b, obstacles)) return true;
+  // семплирование отрезка: попадание в буфер (вне зон) запрещено
+  const len = Math.hypot(b.x - a.x, b.y - a.y);
+  const steps = Math.min(96, Math.max(4, Math.ceil(len / 16)));
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    const p = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+    if (!isInsideAnyZone(p, obstacles) && blockedPoint(p, obstacles)) return true;
   }
   return false;
 }
@@ -233,55 +269,11 @@ function pointToSegmentDist(p: Point, a: Point, b: Point): number {
   return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
 }
 
-/** Отрезок пересекает расширенную запретную область (bbox-отсев + точная проверка) */
-function segmentBlocked(a: Point, b: Point, obstacles: Obstacle[]): boolean {
-  for (const o of obstacles) {
-    if (Math.max(a.x, b.x) < o.box.minX || Math.min(a.x, b.x) > o.box.maxX) continue;
-    if (Math.max(a.y, b.y) < o.box.minY || Math.min(a.y, b.y) > o.box.maxY) continue;
-    if (!o.r) continue;
-    if (blockedPoint(a, [o]) || blockedPoint(b, [o])) return true;
-    if (o.type === 'rectangle') {
-      // пересечение отрезка с расширенным прямоугольником = bbox obstacle
-      if (segmentRectOverlap(a, b, o.box)) return true;
-    } else if (o.type === 'circle' && o.r.points.length >= 1) {
-      const c = o.r.points[0];
-      if (segmentCircleIntersect(a, b, c, (o.r.radius || 0) + o.margin)) return true;
-    } else if (o.type === 'polygon') {
-      // буфер полигона приближаем расширением каждого ребра наружу через семплирование
-      if (sampleSegmentBlocked(a, b, o)) return true;
-    }
-  }
-  return false;
-}
-
-function segmentRectOverlap(a: Point, b: Point, box: { minX: number; minY: number; maxX: number; maxY: number }): boolean {
-  const corners: Point[] = [
-    { x: box.minX, y: box.minY }, { x: box.maxX, y: box.minY },
-    { x: box.maxX, y: box.maxY }, { x: box.minX, y: box.maxY },
-  ];
-  for (let i = 0; i < 4; i++) {
-    if (segmentsIntersect(a, b, corners[i], corners[(i + 1) % 4])) return true;
-  }
-  return false;
-}
-
-function sampleSegmentBlocked(a: Point, b: Point, o: Obstacle): boolean {
-  const len = Math.hypot(b.x - a.x, b.y - a.y);
-  const steps = Math.min(96, Math.max(8, Math.ceil(len / 20)));
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps;
-    const p = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
-    if (blockedPoint(p, [o])) return true;
-  }
-  return false;
-}
-
-/** Граф видимости: узлы = start/goal + углы зон (расширенные) */
+/** Граф видимости: узлы = start/goal + углы зон (вынесенные за буфер) */
 function visibilityGraph(start: Point, goal: Point, obstacles: Obstacle[]): { nodes: Point[]; adj: Map<number, Set<number>> } {
   const nodes: Point[] = [start, goal];
   for (const o of obstacles) {
     if (o.type === 'polygon' && o.r) {
-      // вершины буфера приблизим углами полигона, слегка вынесенными наружу от центра
       const cx = (o.box.minX + o.box.maxX) / 2, cy = (o.box.minY + o.box.maxY) / 2;
       for (const v of o.r.points) {
         const dx = v.x - cx, dy = v.y - cy;
@@ -297,9 +289,7 @@ function visibilityGraph(start: Point, goal: Point, obstacles: Obstacle[]): { no
   const adj = new Map<number, Set<number>>();
   for (let i = 0; i < n; i++) adj.set(i, new Set());
   for (let i = 0; i < n; i++) {
-    if (blockedPoint(nodes[i], obstacles)) continue;
     for (let j = i + 1; j < n; j++) {
-      if (blockedPoint(nodes[j], obstacles)) continue;
       if (!segmentBlocked(nodes[i], nodes[j], obstacles)) {
         adj.get(i)!.add(j);
         adj.get(j)!.add(i);
