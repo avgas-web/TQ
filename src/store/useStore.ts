@@ -17,10 +17,12 @@ interface AppState {
   measurementPoints: Point[];
   searchQuery: string;
   filterType: string;
+  actionMode: boolean; // «Режим действий»: маршрут старт→цель с гео-расчётами
   _currentMapId?: string; // ID текущей карты в IndexedDB
 
   // Actions
   setTool: (tool: Tool) => void;
+  setActionMode: (enabled: boolean) => void;
   loadMap: (mapData: MapData) => void;
   addMarker: (marker: Partial<Marker>) => void;
   updateMarker: (id: string, updates: Partial<Marker>) => void;
@@ -111,8 +113,11 @@ export const useStore = create<AppState>()(
       measurementPoints: [],
       searchQuery: '',
       filterType: '',
+      actionMode: false,
 
       setTool: (tool) => set({ currentTool: tool, isDrawing: false, drawingPoints: [] }),
+
+      setActionMode: (enabled) => set({ actionMode: enabled }),
 
       loadMap: (mapData) => set((state) => ({
         project: {

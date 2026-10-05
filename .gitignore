@@ -1,2 +1,2 @@
-# Git bundle files
-*.bundle
+# Build output
+dist/
