@@ -3,7 +3,11 @@ import { useStore } from '../store/useStore';
 import { isPointInActiveRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg } from '../utils/actionMode';
+import { analyzeRoute } from '../utils/routing';
 import type { Point, Route, RoutePoint } from '../types';
+
+/** Палитра цветов маршрутов (повторяется циклически при большом числе маршрутов) */
+const ROUTE_PALETTE = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#fb923c', '#38bdf8', '#e879f9'];
 
 /** Максимальный масштаб: 1 метр на пиксель экрана (зум «до 100 метров» с запасом) */
 const MAX_SCALE = 1.0;
@@ -490,7 +494,110 @@ const MapCanvas: React.FC = () => {
       ctx.restore();
     }
 
-  }, [project, viewState, canvasSize, selectedMarkerId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, actionMode]);
+    // ─── Маршруты режима действий ────────────────────────────────────────────
+    // Все точки маршрутов хранятся в WGS-84; пиксельные координаты (x, y)
+    // пересчитаны из bounds при загрузке — привязка строго географическая.
+    function drawRoutes(ctx: CanvasRenderingContext2D) {
+      const routes = project.routes || [];
+      if (routes.length === 0) return;
+
+      ctx.save();
+      ctx.translate(viewState.offsetX, viewState.offsetY);
+      ctx.scale(viewState.scale, viewState.scale);
+      const s = viewState.scale;
+
+      for (let ri = 0; ri < routes.length; ri++) {
+        const route = routes[ri];
+        if (!route.visible || route.points.length < 2) continue;
+
+        const color = route.color || ROUTE_PALETTE[ri % ROUTE_PALETTE.length];
+        const isActive = route.id === activeRouteId;
+
+        // Предупреждения о пересечении зон ограничений
+        let crossed: { name: string }[] = [];
+        try {
+          crossed = analyzeRoute(route, project.restrictions).crossedZones;
+        } catch { /* зоны могут быть невалидными — не роняем отрисовку */ }
+
+        // Линии сегментов: авто-обходные сегменты — пунктир, ключевые — сплошные
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        for (let i = 0; i < route.points.length - 1; i++) {
+          const a = route.points[i];
+          const b = route.points[i + 1];
+          ctx.strokeStyle = color;
+          ctx.lineWidth = (isActive ? 3.5 : 2.2) / s;
+          if (a.auto || b.auto) ctx.setLineDash([8 / s, 5 / s]);
+          else ctx.setLineDash([]);
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.stroke();
+        }
+        ctx.setLineDash([]);
+
+        // Точки маршрута
+        const drawR = (isActive ? 5 : 3.5) / s;
+        for (let i = 0; i < route.points.length; i++) {
+          const p = route.points[i];
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, drawR, 0, Math.PI * 2);
+          ctx.fillStyle = p.auto ? 'rgba(255,255,255,0.75)' : color;
+          ctx.fill();
+          ctx.lineWidth = 1.2 / s;
+          ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+          ctx.stroke();
+        }
+
+        // Стрелка направления на финише
+        const last = route.points[route.points.length - 1];
+        const prev = route.points[route.points.length - 2];
+        const ang = Math.atan2(last.y - prev.y, last.x - prev.x);
+        const ah = 12 / s;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(last.x, last.y);
+        ctx.lineTo(last.x - ah * Math.cos(ang - 0.4), last.y - ah * Math.sin(ang - 0.4));
+        ctx.lineTo(last.x - ah * Math.cos(ang + 0.4), last.y - ah * Math.sin(ang + 0.4));
+        ctx.closePath();
+        ctx.fill();
+
+        // Подписи показываем только для активного маршрута или при малом числе маршрутов
+        if (isActive || routes.length <= 20) {
+          const fs = Math.max(10, 12 / s);
+          const first = route.points[0];
+          ctx.font = `bold ${fs}px sans-serif`;
+          ctx.textAlign = 'left';
+          const label = `${route.name}${isActive ? ' ●' : ''}`;
+          const tw = ctx.measureText(label).width;
+          const lx = first.x + 8 / s;
+          const ly = first.y - 8 / s;
+          ctx.fillStyle = 'rgba(0,0,0,0.7)';
+          ctx.fillRect(lx - 3 / s, ly - fs, tw + 6 / s, fs + 5 / s);
+          ctx.fillStyle = color;
+          ctx.fillText(label, lx, ly);
+        }
+
+        // Предупреждение о зонах ограничений прямо на карте (для активного маршрута)
+        if (isActive && crossed.length > 0) {
+          const mid = route.points[Math.floor(route.points.length / 2)];
+          const fs = Math.max(11, 13 / s);
+          const warn = `⚠ Пересекает: ${crossed.map((z) => z.name).join(', ')}`;
+          ctx.font = `bold ${fs}px sans-serif`;
+          const tw = ctx.measureText(warn).width;
+          ctx.fillStyle = 'rgba(120,20,20,0.85)';
+          ctx.fillRect(mid.x - tw / 2 - 5 / s, mid.y - fs - 5 / s, tw + 10 / s, fs + 9 / s);
+          ctx.fillStyle = '#ffd166';
+          ctx.textAlign = 'center';
+          ctx.fillText(warn, mid.x, mid.y - 2 / s);
+          ctx.textAlign = 'left';
+        }
+      }
+
+      ctx.restore();
+    }
+
+  }, [project, viewState, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, actionMode]);
 
   // Mouse wheel zoom
   const handleWheel = useCallback((e: React.WheelEvent) => {
