@@ -1,6 +1,8 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
 import { useStore } from '../store/useStore';
 import { isPointInActiveRestriction, distanceBetween } from '../utils/geometry';
+import { pixelToGeoFromBounds } from '../utils/googleMaps';
+import { haversineDistanceM, bearingDeg } from '../utils/actionMode';
 import type { Point } from '../types';
 
 const MapCanvas: React.FC = () => {
@@ -16,6 +18,7 @@ const MapCanvas: React.FC = () => {
   const {
     project,
     currentTool,
+    actionMode,
     viewState,
     selectedMarkerId,
     isDrawing,
@@ -152,6 +155,11 @@ const MapCanvas: React.FC = () => {
 
     // Draw current drawing
     drawCurrentDrawing(ctx);
+
+    // Draw action-mode route (СТАРТ → ЦЕЛЬ) in real geographic coordinates
+    if (actionMode) {
+      drawActionRoute(ctx);
+    }
 
     // Draw map border
     ctx.save();
@@ -348,7 +356,16 @@ const MapCanvas: React.FC = () => {
           const midX = (measurementPoints[i - 1].x + p.x) / 2;
           const midY = (measurementPoints[i - 1].y + p.y) / 2;
           ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-          const label = `${Math.round(dist)} px`;
+          let label: string;
+          if (project.map?.bounds) {
+            // Географически привязанная карта — расстояние в метрах (WGS-84)
+            const gA = pixelToGeoFromBounds(measurementPoints[i - 1], project.map.bounds, project.map.width, project.map.height);
+            const gB = pixelToGeoFromBounds(p, project.map.bounds, project.map.width, project.map.height);
+            const m = haversineDistanceM(gA, gB);
+            label = m >= 1000 ? `${(m / 1000).toFixed(2)} км` : `${Math.round(m)} м`;
+          } else {
+            label = `${Math.round(dist)} px`;
+          }
           const tw = ctx.measureText(label).width;
           ctx.fillRect(midX - tw / 2 - 3 / viewState.scale, midY - 18 / viewState.scale, tw + 6 / viewState.scale, 14 / viewState.scale);
           ctx.fillStyle = '#ffdd00';
@@ -407,7 +424,60 @@ const MapCanvas: React.FC = () => {
 
       ctx.restore();
     }
-  }, [project, viewState, canvasSize, selectedMarkerId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr]);
+
+    function drawActionRoute(ctx: CanvasRenderingContext2D) {
+      if (!project.map?.bounds) return;
+      const start = project.markers.find(m => m.name === 'СТАРТ' && m.lat != null && m.lon != null);
+      const goal = project.markers.find(m => m.name === 'ЦЕЛЬ' && m.lat != null && m.lon != null);
+      if (!start || !goal) return;
+
+      ctx.save();
+      ctx.translate(viewState.offsetX, viewState.offsetY);
+      ctx.scale(viewState.scale, viewState.scale);
+
+      const geoStart = { lat: start.lat as number, lng: start.lon as number };
+      const geoGoal = { lat: goal.lat as number, lng: goal.lon as number };
+      const distM = haversineDistanceM(geoStart, geoGoal);
+      const az = bearingDeg(geoStart, geoGoal);
+
+      // Line start->goal
+      ctx.strokeStyle = '#ff9500';
+      ctx.lineWidth = 3 / viewState.scale;
+      ctx.setLineDash([10 / viewState.scale, 6 / viewState.scale]);
+      ctx.beginPath();
+      ctx.moveTo(start.x, start.y);
+      ctx.lineTo(goal.x, goal.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Arrow at goal
+      const ang = Math.atan2(goal.y - start.y, goal.x - start.x);
+      const ah = 14 / viewState.scale;
+      ctx.fillStyle = '#ff9500';
+      ctx.beginPath();
+      ctx.moveTo(goal.x, goal.y);
+      ctx.lineTo(goal.x - ah * Math.cos(ang - 0.4), goal.y - ah * Math.sin(ang - 0.4));
+      ctx.lineTo(goal.x - ah * Math.cos(ang + 0.4), goal.y - ah * Math.sin(ang + 0.4));
+      ctx.closePath();
+      ctx.fill();
+
+      // Labels with real geo data
+      const fs = Math.max(11, 13 / viewState.scale);
+      ctx.font = `bold ${fs}px sans-serif`;
+      ctx.textAlign = 'left';
+      const midX = (start.x + goal.x) / 2;
+      const midY = (start.y + goal.y) / 2;
+      const label = `${distM >= 1000 ? (distM / 1000).toFixed(2) + ' км' : Math.round(distM) + ' м'} | Азимут ${az.toFixed(0)}°`;
+      const tw = ctx.measureText(label).width;
+      ctx.fillStyle = 'rgba(0,0,0,0.75)';
+      ctx.fillRect(midX - tw / 2 - 4 / viewState.scale, midY - fs - 4 / viewState.scale, tw + 8 / viewState.scale, fs + 8 / viewState.scale);
+      ctx.fillStyle = '#ffcc66';
+      ctx.fillText(label, midX - tw / 2, midY - 4 / viewState.scale);
+
+      ctx.restore();
+    }
+
+  }, [project, viewState, canvasSize, selectedMarkerId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, actionMode]);
 
   // Mouse wheel zoom
   const handleWheel = useCallback((e: React.WheelEvent) => {
@@ -418,7 +488,9 @@ const MapCanvas: React.FC = () => {
     const mouseX = e.clientX - rect.left;
     const mouseY = e.clientY - rect.top;
 
-    const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+    // Дискретный зум с коэффициентом 2 (уровни масштаба как у тайловых карт):
+    // один шаг колеса = один уровень, масштабирование точно к позиции курсора
+    const zoomFactor = e.deltaY > 0 ? 0.5 : 2;
     const newScale = Math.max(0.01, Math.min(50, viewState.scale * zoomFactor));
 
     const newOffsetX = mouseX - (mouseX - viewState.offsetX) * (newScale / viewState.scale);
@@ -543,7 +615,13 @@ const MapCanvas: React.FC = () => {
     if (draggingMarker && project.map) {
       const clampedX = Math.max(0, Math.min(project.map.width, mapPoint.x));
       const clampedY = Math.max(0, Math.min(project.map.height, mapPoint.y));
-      updateMarker(draggingMarker, { x: clampedX, y: clampedY });
+      // Объекты строго привязаны к географии: при перемещении пересчитываем lat/lon
+      if (project.map.bounds) {
+        const geo = pixelToGeoFromBounds({ x: clampedX, y: clampedY }, project.map.bounds, project.map.width, project.map.height);
+        updateMarker(draggingMarker, { x: clampedX, y: clampedY, lat: geo.lat, lon: geo.lng });
+      } else {
+        updateMarker(draggingMarker, { x: clampedX, y: clampedY });
+      }
     }
   }, [isPanning, panStart, viewState, screenToMap, setCursorPosition, setViewState,
     draggingMarker, project.map, updateMarker]);
