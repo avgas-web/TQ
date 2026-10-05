@@ -3,7 +3,7 @@ import { useStore } from '../store/useStore';
 import { isPointInActiveRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg } from '../utils/actionMode';
-import { analyzeRoute } from '../utils/routing';
+import { analyzeRoute, pixelToGeoExact } from '../utils/routing';
 import type { Point, Route, RoutePoint } from '../types';
 
 /** Палитра цветов маршрутов (повторяется циклически при большом числе маршрутов) */
@@ -11,6 +11,25 @@ const ROUTE_PALETTE = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#
 
 /** Максимальный масштаб: 1 метр на пиксель экрана (зум «до 100 метров» с запасом) */
 const MAX_SCALE = 1.0;
+
+/**
+ * Расстояние в экранных пикселях от точки до ломаной маршрута.
+ * Используется для «прицела» к точкам и сегментам маршрута при редактировании.
+ */
+function distPxToPolyline(p: Point, pts: Point[]): number {
+  if (pts.length === 0) return Infinity;
+  let best = Math.hypot(p.x - pts[0].x, p.y - pts[0].y);
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const len2 = dx * dx + dy * dy || 1e-9;
+    let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const d = Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+    if (d < best) best = d;
+  }
+  return best;
+}
 
 const MapCanvas: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -150,6 +169,11 @@ const MapCanvas: React.FC = () => {
     ctx.save();
     ctx.translate(viewState.offsetX, viewState.offsetY);
     ctx.scale(viewState.scale, viewState.scale);
+    // Чёткость при увеличении: при сильном зуме — резкая (пиксельная) интерполяция,
+    // при уменьшении — сглаженная. Canvas физически рендерится в dpr-разрешении,
+    // поэтому тайлы OSM z19 (~0.3 м/пикс) остаются читаемыми вплоть до 100 м и ближе.
+    ctx.imageSmoothingEnabled = viewState.scale < 1;
+    if (ctx.imageSmoothingEnabled) (ctx as any).imageSmoothingQuality = 'high';
     ctx.drawImage(mapImageRef.current, 0, 0, project.map.width, project.map.height);
     ctx.restore();
 
@@ -635,6 +659,53 @@ const MapCanvas: React.FC = () => {
     }
 
     if (currentTool === 'select') {
+      // 1) Прицел к точкам маршрутов активного режима редактирования:
+      //    клик рядом с точкой — «цепляем» её и тянем (drag), двойной клик — удаляем.
+      const routes = project.routes || [];
+      const activeRoute = routes.find((r) => r.id === activeRouteId && r.visible);
+      const grabPx = 12 / viewState.scale; // радиус захвата в пикселях карты (~12 экранных px)
+
+      if (activeRoute) {
+        let bestI = -1;
+        let bestD = Infinity;
+        for (let i = 0; i < activeRoute.points.length; i++) {
+          const p = activeRoute.points[i];
+          const d = Math.hypot(mapPoint.x - p.x, mapPoint.y - p.y);
+          if (d < bestD) { bestD = d; bestI = i; }
+        }
+        if (bestI >= 0 && bestD <= grabPx) {
+          setActiveRoute(activeRoute.id);
+          setDraggingRoute({ routeId: activeRoute.id, index: bestI });
+          return;
+        }
+      }
+
+      // 2) Клик по линии любого видимого маршрута — сделать его активным
+      //    (дальше можно цеплять точки и добавлять новые кликами)
+      if (e.altKey || e.button === 0) {
+        let hitRoute: Route | null = null;
+        let hitD = Infinity;
+        for (const r of routes) {
+          if (!r.visible || r.points.length < 2) continue;
+          const d = distPxToPolyline(mapPoint, r.points);
+          if (d < hitD) { hitD = d; hitRoute = r; }
+        }
+        if (hitRoute && hitD <= grabPx) {
+          setActiveRoute(hitRoute.id);
+          // если попали точно на точку активного маршрута — сразу цепляем
+          if (hitRoute.points.length) {
+            let bi = -1, bd = Infinity;
+            for (let i = 0; i < hitRoute.points.length; i++) {
+              const p = hitRoute.points[i];
+              const d = Math.hypot(mapPoint.x - p.x, mapPoint.y - p.y);
+              if (d < bd) { bd = d; bi = i; }
+            }
+            if (bi >= 0 && bd <= grabPx) setDraggingRoute({ routeId: hitRoute.id, index: bi });
+          }
+          return;
+        }
+      }
+
       // Check if clicked on a marker
       const clickedMarker = [...project.markers].reverse().find(m => {
         const dx = mapPoint.x - m.x;
@@ -707,9 +778,49 @@ const MapCanvas: React.FC = () => {
       setMeasurementPoints(newPoints);
       return;
     }
-  }, [currentTool, viewState, project, isDrawing, drawingPoints, measurementPoints,
+
+    // Режим действий: клик по карте добавляет/вставляет точку в активный маршрут
+    // (рядом с существующей точкой — перемещаем её, на линии — вставляем в середину)
+    if (actionMode && e.button === 0 && project.map) {
+      const active = (project.routes || []).find((r) => r.id === activeRouteId && r.visible);
+      if (active) {
+        appendRoutePoint(active.id, mapPoint);
+      } else {
+        // нет активного маршрута — создаём новый из двух точек (кнопка «Новый маршрут» или второй клик)
+        addRouteFromClick(mapPoint);
+      }
+      return;
+    }
+  }, [currentTool, actionMode, viewState, project, isDrawing, drawingPoints, measurementPoints,
     screenToMap, addMarker, selectMarker, addDrawingPoint, addRestriction,
-    clearDrawingPoints, setDrawing, setMeasurementPoints]);
+    clearDrawingPoints, setDrawing, setMeasurementPoints,
+    activeRouteId, appendRoutePoint, setActiveRoute]);
+
+  // Быстрое создание маршрута кликами в режиме действий:
+  // первый клик — точка старта (маршрут-заготовка), каждый следующий — новая точка.
+  const pendingRouteRef = useRef<string | null>(null);
+  const addRouteFromClick = useCallback((mapPoint: Point) => {
+    const st = useStore.getState();
+    if (!st.project.map) return;
+    if (pendingRouteRef.current) {
+      // уже есть заготовка — добавляем точку
+      st.appendRoutePoint(pendingRouteRef.current, mapPoint);
+      st.setActiveRoute(pendingRouteRef.current);
+      return;
+    }
+    const rp: RoutePoint = (() => {
+      const bounds = st.project.map!.bounds;
+      const geo = bounds
+        ? pixelToGeoExact(mapPoint, bounds, st.project.map!.width, st.project.map!.height)
+        : { lat: NaN, lng: NaN };
+      return { x: mapPoint.x, y: mapPoint.y, lat: geo.lat, lng: geo.lng };
+    })();
+    const id = st.addRoute([rp], undefined, undefined);
+    if (id) {
+      pendingRouteRef.current = id;
+      st.setActiveRoute(id);
+    }
+  }, []);
 
   // Mouse move
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
@@ -743,17 +854,25 @@ const MapCanvas: React.FC = () => {
         updateMarker(draggingMarker, { x: clampedX, y: clampedY });
       }
     }
+
+    // Перетаскивание точки маршрута («цепляем за точку») — гео-привязка пересчитывается в store
+    if (draggingRoute && project.map) {
+      const clampedX = Math.max(0, Math.min(project.map.width, mapPoint.x));
+      const clampedY = Math.max(0, Math.min(project.map.height, mapPoint.y));
+      moveRoutePoint(draggingRoute.routeId, draggingRoute.index, { x: clampedX, y: clampedY });
+    }
   }, [isPanning, panStart, viewState, screenToMap, setCursorPosition, setViewState,
-    draggingMarker, project.map, updateMarker]);
+    draggingMarker, draggingRoute, project.map, updateMarker, moveRoutePoint]);
 
   // Mouse up
   const handleMouseUp = useCallback(() => {
     setIsPanning(false);
     setDraggingMarker(null);
+    setDraggingRoute(null);
   }, []);
 
-  // Double click - finish polygon drawing or clear measurement
-  const handleDoubleClick = useCallback(() => {
+  // Double click - finish polygon drawing / clear measurement / удалить точку маршрута
+  const handleDoubleClick = useCallback((e: React.MouseEvent) => {
     if (currentTool === 'drawPolygon' && drawingPoints.length >= 3) {
       addRestriction({ type: 'polygon', points: [...drawingPoints] });
       clearDrawingPoints();
@@ -761,7 +880,28 @@ const MapCanvas: React.FC = () => {
     if (currentTool === 'measure') {
       setMeasurementPoints([]);
     }
-  }, [currentTool, drawingPoints, addRestriction, clearDrawingPoints, setMeasurementPoints]);
+    // Двойной клик по точке активного маршрута — удалить её (маршрут перестроится)
+    if ((currentTool === 'select' || actionMode) && activeRouteId && project.map) {
+      const rect = canvasRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const mp = screenToMap(e.clientX - rect.left, e.clientY - rect.top);
+      const route = (project.routes || []).find((r) => r.id === activeRouteId);
+      if (route) {
+        const grabPx = 12 / viewState.scale;
+        let bi = -1, bd = Infinity;
+        for (let i = 0; i < route.points.length; i++) {
+          const p = route.points[i];
+          const d = Math.hypot(mp.x - p.x, mp.y - p.y);
+          if (d < bd) { bd = d; bi = i; }
+        }
+        if (bi >= 0 && bd <= grabPx) {
+          removeRoutePoint(activeRouteId, bi);
+          pendingRouteRef.current = null;
+        }
+      }
+    }
+  }, [currentTool, actionMode, drawingPoints, addRestriction, clearDrawingPoints, setMeasurementPoints,
+    activeRouteId, project.map, project.routes, viewState.scale, screenToMap, removeRoutePoint]);
 
   // Right click - cancel drawing
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
