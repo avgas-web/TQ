@@ -338,6 +338,44 @@ export const useStore = create<AppState>()(
         }));
       },
 
+      rerouteAllRoutes: () => {
+        const state = get();
+        const map = state.project.map;
+        const routes = state.project.routes || [];
+        if (!map || routes.length === 0) return;
+        // Быстрая пакетовая перестройка: все маршруты за один set() вместо N штук
+        const keyBy = state.project.restrictions.filter((r) => r.active && r.points.length >= 2);
+        const newRoutes: Route[] = [];
+        const warningsMap: Record<string, string[]> = {};
+        for (const route of routes) {
+          if (route.points.length < 2) { newRoutes.push(route); continue; }
+          const ki: number[] = [];
+          for (let i = 0; i < route.points.length; i++) if (!route.points[i].auto) ki.push(i);
+          if (ki.length < 2) { newRoutes.push(route); continue; }
+          const pts: RoutePoint[] = [];
+          for (let k = 0; k < ki.length - 1; k++) {
+            const a = route.points[ki[k]];
+            const b = route.points[ki[k + 1]];
+            pts.push({ ...a, auto: undefined as any });
+            const path = planPathAroundZones({ x: a.x, y: a.y }, { x: b.x, y: b.y }, keyBy, map.width, map.height);
+            for (let i = 1; i < path.length - 1; i++) {
+              const px = path[i];
+              const geo = map.bounds ? pixelToGeoStrict(px, map.bounds, map.width, map.height) : { lat: NaN, lng: NaN };
+              pts.push({ x: px.x, y: px.y, lat: geo.lat, lng: geo.lng, auto: true });
+            }
+          }
+          pts.push({ ...route.points[ki[ki.length - 1]] });
+          const crossed = zonesCrossedBy(pts.map((p) => ({ x: p.x, y: p.y })), keyBy);
+          if (crossed.length > 0) warningsMap[route.id] = crossed.map((z) => `Пересекает зону «${z.name}»`);
+          else delete warningsMap[route.id];
+          newRoutes.push({ ...route, points: pts });
+        }
+        set((cur) => ({
+          routeWarnings: { ...cur.routeWarnings, ...warningsMap },
+          project: { ...cur.project, routes: newRoutes, updatedAt: new Date().toISOString() },
+        }));
+      },
+
       refreshAllRoutesAfterMapChange: () => {
         const state = get();
         const map = state.project.map;
@@ -348,6 +386,7 @@ export const useStore = create<AppState>()(
             routes: (cur.project.routes || []).map((r) => recomputeRoutePixels(r, map.bounds!, map.width, map.height)),
           },
         }));
+        get().rerouteAllRoutes(); // новые границы карты — пересобираем обходы зон
       },
 
       clearRouteWarnings: (id) => set((state) => {
@@ -436,39 +475,48 @@ export const useStore = create<AppState>()(
         };
       }),
 
-      updateRestriction: (id, updates) => set((state) => ({
-        project: {
-          ...state.project,
-          restrictions: state.project.restrictions.map((r) =>
-            r.id === id ? { ...r, ...updates } : r
-          ),
-          updatedAt: new Date().toISOString(),
-        },
-      })),
+      updateRestriction: (id, updates) => {
+        set((state) => ({
+          project: {
+            ...state.project,
+            restrictions: state.project.restrictions.map((r) =>
+              r.id === id ? { ...r, ...updates } : r
+            ),
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+        get().rerouteAllRoutes(); // зоны изменились — маршруты перестраиваются автоматически
+      },
 
-      deleteRestriction: (id) => set((state) => ({
-        project: {
-          ...state.project,
-          restrictions: state.project.restrictions.filter((r) => r.id !== id),
-          updatedAt: new Date().toISOString(),
-        },
-        activeRestrictionId: state.activeRestrictionId === id ? null : state.activeRestrictionId,
-        selectedRestrictionId: state.selectedRestrictionId === id ? null : state.selectedRestrictionId,
-      })),
+      deleteRestriction: (id) => {
+        set((state) => ({
+          project: {
+            ...state.project,
+            restrictions: state.project.restrictions.filter((r) => r.id !== id),
+            updatedAt: new Date().toISOString(),
+          },
+          activeRestrictionId: state.activeRestrictionId === id ? null : state.activeRestrictionId,
+          selectedRestrictionId: state.selectedRestrictionId === id ? null : state.selectedRestrictionId,
+        }));
+        get().rerouteAllRoutes();
+      },
 
       selectRestriction: (id) => set({ selectedRestrictionId: id, selectedMarkerId: null }),
 
-      setActiveRestriction: (id) => set((state) => ({
-        activeRestrictionId: id,
-        project: {
-          ...state.project,
-          restrictions: state.project.restrictions.map((r) => ({
-            ...r,
-            active: r.id === id,
-          })),
-          updatedAt: new Date().toISOString(),
-        },
-      })),
+      setActiveRestriction: (id) => {
+        set((state) => ({
+          activeRestrictionId: id,
+          project: {
+            ...state.project,
+            restrictions: state.project.restrictions.map((r) => ({
+              ...r,
+              active: r.id === id,
+            })),
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+        get().rerouteAllRoutes();
+      },
 
       addLayer: (name) => set((state) => {
         const id = uuidv4();
