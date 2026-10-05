@@ -3,7 +3,10 @@ import { useStore } from '../store/useStore';
 import { isPointInActiveRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg } from '../utils/actionMode';
-import type { Point } from '../types';
+import type { Point, Route, RoutePoint } from '../types';
+
+/** Максимальный масштаб: 1 метр на пиксель экрана (зум «до 100 метров» с запасом) */
+const MAX_SCALE = 1.0;
 
 const MapCanvas: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -14,6 +17,8 @@ const MapCanvas: React.FC = () => {
   const [canvasSize, setCanvasSize] = useState({ width: 800, height: 600 });
   const [draggingMarker, setDraggingMarker] = useState<string | null>(null);
   const [mapLoaded, setMapLoaded] = useState(false);
+  // Перетаскивание точки маршрута: id + индекс (для moveRoutePoint)
+  const [draggingRoute, setDraggingRoute] = useState<{ routeId: string; index: number } | null>(null);
 
   const {
     project,
@@ -21,6 +26,7 @@ const MapCanvas: React.FC = () => {
     actionMode,
     viewState,
     selectedMarkerId,
+    activeRouteId,
     isDrawing,
     drawingPoints,
     measurementPoints,
@@ -34,6 +40,10 @@ const MapCanvas: React.FC = () => {
     clearDrawingPoints,
     setDrawing,
     setMeasurementPoints,
+    appendRoutePoint,
+    moveRoutePoint,
+    removeRoutePoint,
+    setActiveRoute,
   } = useStore();
 
   // devicePixelRatio — для чёткого рендера на Retina/HiDPI экранах
@@ -160,6 +170,9 @@ const MapCanvas: React.FC = () => {
     if (actionMode) {
       drawActionRoute(ctx);
     }
+
+    // Draw routes (маршруты режима действий: редактирование, обход зон, предупреждения)
+    drawRoutes(ctx);
 
     // Draw map border
     ctx.save();
