@@ -1,6 +1,7 @@
 import React from 'react';
 import { useStore } from '../store/useStore';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
+import { haversineDistanceM } from '../utils/actionMode';
 
 
 const StatusBar: React.FC = () => {
@@ -65,6 +66,34 @@ const StatusBar: React.FC = () => {
       </div>
 
       <div className="flex items-center gap-4">
+        {/* Масштабная линейка для гео-привязанных карт */}
+        {project.map?.bounds && (() => {
+          const gCenter = pixelToGeoFromBounds(
+            { x: project.map!.width / 2, y: project.map!.height / 2 },
+            project.map.bounds, project.map.width, project.map.height
+          );
+          // Метров на 1 экранный пиксель — из точных границ карты (WGS-84)
+          const gRight = pixelToGeoFromBounds(
+            { x: project.map!.width / 2 + 1 / viewState.scale, y: project.map!.height / 2 },
+            project.map.bounds, project.map.width, project.map.height
+          );
+          const metersPerScreenPx = haversineDistanceM(gCenter, gRight);
+          if (!isFinite(metersPerScreenPx) || metersPerScreenPx <= 0) return null;
+          const niceSteps = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000];
+          const targetPx = 120;
+          let best = niceSteps[0];
+          for (const st of niceSteps) {
+            if (st / metersPerScreenPx <= targetPx) best = st;
+          }
+          const barW = Math.round(best / metersPerScreenPx);
+          return (
+            <span className="flex items-center gap-1" title="Масштабная линейка">
+              <span className="inline-block border-b-2 border-l-2 border-r-2 border-gray-300" style={{ width: `${barW}px`, height: '4px' }} />
+              <span className="text-gray-300">{best >= 1000 ? `${best / 1000} км` : `${best} м`}</span>
+            </span>
+          );
+        })()}
+
         {/* Zoom */}
         <span>🔍 {(viewState.scale * 100).toFixed(0)}%</span>
 
