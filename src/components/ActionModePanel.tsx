@@ -28,7 +28,26 @@ const ActionModePanel: React.FC = () => {
   const [error, setError] = useState('');
   const [route, setRoute] = useState<RouteInfo | null>(null);
 
-  const { project, loadMapWithStorage, addMarker, selectMarker, actionMode, setActionMode } = useStore();
+  const { project, loadMapWithStorage, addMarker, selectMarker, actionMode, setActionMode,
+    addRoute, activeRouteId, setActiveRoute, deleteRoute } = useStore();
+  const routesList = project.routes || [];
+
+  /** Быстрый старт маршрута кликами по карте (без геокодера): создать и активировать */
+  const handleNewRouteByClicks = () => {
+    if (!project.map) { alert('Сначала загрузите карту или постройте её по координатам старта/цели.'); return; }
+    // Создаём «болванку» из двух точек в центре текущего вида — дальше пользователь тянет их мышью
+    const map = project.map;
+    const bounds = map.bounds;
+    const c1 = bounds ? { lat: (bounds.north + bounds.south) / 2, lng: (bounds.west + bounds.east) / 2 } : null;
+    if (!c1) { alert('У карты нет гео-границ — включите привязку координат.'); return; }
+    const p1 = geoToPixelFromBounds(c1, bounds!, map.width, map.height);
+    const p2 = { x: Math.min(map.width - 1, p1.x + 80), y: p1.y };
+    const c2 = { lat: c1.lat, lng: bounds!.west + (bounds!.east - bounds!.west) * (p2.x / map.width) };
+    addRoute([
+      { ...p1, lat: c1.lat, lng: c1.lng },
+      { ...p2, lat: c2.lat, lng: c2.lng },
+    ], undefined, undefined);
+  };
 
   /** Разрешить ввод: координаты парсятся локально, название — через OSM-геокодер */
   const resolvePlace = async (raw: string): Promise<GeoPoint> => {
@@ -245,6 +264,62 @@ const ActionModePanel: React.FC = () => {
               </button>
             </div>
           )}
+
+          {/* Список маршрутов: создание, выбор, удаление (до 10000) */}
+          <div className="border-t border-gray-600 pt-2 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-gray-300">
+                Маршруты: {routesList.length} / 10000
+              </span>
+              <button
+                onClick={handleNewRouteByClicks}
+                disabled={routesList.length >= 10000}
+                className="px-2 py-1 bg-cyan-700 hover:bg-cyan-600 disabled:bg-gray-600 text-white rounded text-xs"
+              >
+                + Новый маршрут
+              </button>
+            </div>
+            <p className="text-[10px] leading-snug text-gray-400">
+              Инструмент «Выбор»: клик по линии — сделать маршрут активным (●), тяните точки мышью
+              («цепляйте»), двойной клик по точке — удалить. Включённый режим действий: клики по карте
+              добавляют/вставляют точки активного маршрута; обход зон ограничений выполняется автоматически,
+              пересечения подсвечиваются предупреждением ⚠.
+            </p>
+            {routesList.length > 0 && (
+              <div className="max-h-40 overflow-y-auto space-y-1 pr-1">
+                {routesList.slice(0, 200).map((r) => {
+                  const warn = useStore.getState().routeWarnings?.[r.id]?.length > 0;
+                  return (
+                    <div
+                      key={r.id}
+                      className={`flex items-center gap-2 px-2 py-1 rounded text-xs cursor-pointer ${
+                        r.id === activeRouteId ? 'bg-gray-600 ring-1 ring-cyan-400' : 'bg-gray-700/50 hover:bg-gray-700'
+                      }`}
+                      onClick={() => setActiveRoute(r.id)}
+                      title={r.name}
+                    >
+                      <span className="w-3 h-3 rounded-full shrink-0" style={{ background: r.color }} />
+                      <span className="truncate flex-1 text-gray-200">
+                        {r.id === activeRouteId ? '● ' : ''}{r.name}
+                        <span className="text-gray-400"> ({r.points.length})</span>
+                        {warn && <span className="ml-1 text-red-400">⚠</span>}
+                      </span>
+                      <button
+                        className="text-gray-400 hover:text-red-400 shrink-0"
+                        onClick={(e) => { e.stopPropagation(); deleteRoute(r.id); }}
+                        title="Удалить маршрут"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  );
+                })}
+                {routesList.length > 200 && (
+                  <p className="text-[10px] text-gray-500">…показаны первые 200 из {routesList.length}</p>
+                )}
+              </div>
+            )}
+          </div>
         </>
       )}
     </div>
