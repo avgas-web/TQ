@@ -74,6 +74,7 @@ export interface Project {
   };
   restrictions: Restriction[];
   markers: Marker[];
+  routes?: Route[]; // маршруты режима действий (до MAX_ROUTES)
   layers: Layer[];
   settings: {
     showGrid: boolean;
@@ -107,3 +108,26 @@ export interface Measurement {
   points: Point[];
   distance: number; // in pixels
 }
+
+// ─── Маршруты (режим действий) ──────────────────────────────────────────────
+
+/** Точка маршрута: гео-координаты WGS-84 первичны, пиксели — производные */
+export interface RoutePoint {
+  lat: number;
+  lng: number;
+  x: number; // пиксель карты (пересчитывается при загрузке/изменении bounds)
+  y: number;
+  auto?: boolean; // точка добавлена автообходом зон (не ключевая)
+}
+
+export interface Route {
+  id: string;
+  name: string;
+  color: string;
+  points: RoutePoint[]; // >= 2
+  active: boolean;     // активный маршрут редактируется кликами по карте
+  visible: boolean;
+  createdAt: string;
+}
+
+export const MAX_ROUTES = 10000;
