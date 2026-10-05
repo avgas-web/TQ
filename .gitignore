@@ -1,4 +1,6 @@
-node_modules/
-.DS_Store
-*.log
-TQ-*.bundle
+# Build artifacts
+dist/
+
+# Compressed archives
+*.zip
+*.tar.gz
