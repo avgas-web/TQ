@@ -1,4 +1,11 @@
+(empty)
+# Dependencies
 node_modules/
-*.tar.gz
+
+# Build artifacts (кроме dist — он публикуется на Pages)
+build/
+
+# Archives / bundles
 *.zip
 *.bundle
+*.tar.gz
