@@ -62,7 +62,7 @@ interface AppState {
   rerouteAllRoutes: () => void; // пакетная перестройка всех маршрутов после изменения зон/карты
   setRouteShape: (id: string, shape: 'straight' | 'curve') => void; // прямая или кривая
   setRouteRangeLimit: (id: string, mode: 'off' | 'max' | 'min', meters?: number) => void; // ограничение по дальности
-  importLists: (starts: { label: string; lat: number; lng: number }[], goals: { label: string; lat: number; lng: number }[]) => number; // импорт списков + привязка к маршрутам
+  importLists: (starts: { label: string; lat: number; lng: number; placeName?: string }[], goals: { label: string; lat: number; lng: number; placeName?: string }[]) => number; // импорт списков + привязка к маршрутам
   clearImportLists: () => void;
   undoDrawingPoint: () => void; // undo последней точки рисования полигона
   redoDrawingPoint: () => void; // redo убранной точки
@@ -510,8 +510,8 @@ export const useStore = create<AppState>()(
             createdAt: new Date().toISOString(),
             shape: 'straight',
           });
-          impStarts.push({ id: uuidv4(), label: s.label || `Старт ${i + 1}`, lat: s.lat, lng: s.lng, routeId: id });
-          impGoals.push({ id: uuidv4(), label: g.label || `Цель ${i + 1}`, lat: g.lat, lng: g.lng, routeId: id });
+          impStarts.push({ id: uuidv4(), label: s.label || `Старт ${i + 1}`, lat: s.lat, lng: s.lng, routeId: id, placeName: s.placeName });
+          impGoals.push({ id: uuidv4(), label: g.label || `Цель ${i + 1}`, lat: g.lat, lng: g.lng, routeId: id, placeName: g.placeName });
         }
         set((cur) => {
           const prevLists = cur.project.importLists;
