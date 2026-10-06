@@ -94,21 +94,23 @@ export function getOSMTileUrl(
   tileServer: 'osm' | 'opentopomap' | 'carto' = 'osm',
   style: TileStyle = 'scheme'
 ): string {
-  // detectRetina: true → tileSize 512 (тайлы @2x), maxNativeZoom 19
+  // detectRetina: тайлы @2x доступны ТОЛЬКО у tile.openstreetmap.org и basemaps.cartocdn.com
+  // (макс. уровень их нативного зума — 19). Esri World_Imagery отдаёт 512-px тайлы без @2x,
+  // opentopomap — только до z17. maxNativeZoom учитывается вызывающим кодом.
   const z = Math.min(Math.max(zoom, 0), 19);
   const retina = typeof window !== 'undefined' && (window.devicePixelRatio || 1) >= 1.5;
   const at = retina ? '@2x' : '';
   switch (tileServer) {
     case 'opentopomap':
-      return `https://tile.opentopomap.org/${z}/${x}/${y}.png`;
+      return `https://tile.opentopomap.org/${Math.min(z, 17)}/${x}/${y}.png`;
     case 'carto':
-      if (style === 'satellite') return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
-      if (style === 'hybrid') return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+      if (style === 'satellite' || style === 'hybrid')
+        return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
       return `https://basemaps.cartocdn.com/dark_all${at}/${z}/${x}/${y}.png`;
     case 'osm':
     default:
-      if (style === 'satellite') return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
-      if (style === 'hybrid') return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+      if (style === 'satellite' || style === 'hybrid')
+        return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
       return `https://tile.openstreetmap.org/${z}/${x}/${y}${at}.png`;
   }
 }

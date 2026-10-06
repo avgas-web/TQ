@@ -4,9 +4,11 @@ import { v4 as uuidv4 } from 'uuid';
 import type { Project, Marker, Restriction, Layer, Tool, ViewState, MapData, Point, CalibrationPoint, MapBounds, Route, RoutePoint } from '../types';
 import { MAX_ROUTES } from '../types';
 import { saveMapToIndexedDB, loadMapFromIndexedDB, deleteMapFromIndexedDB } from '../utils/storage';
-import { geoToPixelFromBounds } from '../utils/googleMaps';
+import { geoToPixelFromBounds, calculateBoundsFromCenter, latToMercatorY } from '../utils/googleMaps';
 import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, smoothPolyline, routeLengthM } from '../utils/routing';
 import type { RouteShape, RangeLimitMode, ImportPoint, ImportLists } from '../types';
+
+const MIN_MAP_ZOOM_FLOOR = 6;
 
 const ROUTE_COLORS = ['#00d0ff', '#ff9500', '#a78bfa', '#34d399', '#f472b6', '#facc15', '#fb7185', '#60a5fa'];
 
@@ -107,6 +109,8 @@ interface AppState {
   toggleOpenStreetMap: (enabled: boolean) => void;
   setOSMTileServer: (server: 'osm' | 'opentopomap' | 'carto') => void;
   loadMapWithStorage: (mapData: MapData) => Promise<void>;
+  /** Активная тайловая карта без снимка: центр (lat/lng) + зум 10..19 */
+  loadActiveTileMap: (center: { lat: number; lng: number }, zoom: number) => void;
   restoreMapFromStorage: () => Promise<void>;
 }
 
@@ -131,6 +135,9 @@ const defaultProject: Project = {
     gridSize: 0,
     showCoordinates: true,
     theme: 'dark',
+    // Карта активная по умолчанию: тайловая подложка (не фотография), зум/pan/линейка.
+    tilesEnabled: true,
+    tileStyle: 'scheme',
   },
   googleMaps: {
     apiKey: '',
@@ -873,6 +880,39 @@ export const useStore = create<AppState>()(
         get().refreshAllRoutesAfterMapChange();
       },
 
+      /**
+       * Активная тайловая карта без растрового снимка: создаёт «виртуальную» карту
+       * с точной Mercator-привязкой (bounds → world px z19), чтобы все режимы
+       * (маршруты, зоны, сетка, клик по карте) работали от реальных координат,
+       * а подложка масштабировалась интерактивно до 1 см ≈ 100 м и ближе.
+       */
+      loadActiveTileMap: (center, zoom) => {
+        const z = Math.max(MIN_MAP_ZOOM_FLOOR, Math.min(19, Math.round(zoom)));
+        const worldPx = 256 * Math.pow(2, z);
+        const b = calculateBoundsFromCenter(center, z, worldPx, worldPx);
+        const mapW = Math.round(worldPx * ((b.east - b.west) / 360));
+        const topY = latToMercatorY(b.north);
+        const botY = latToMercatorY(b.south);
+        const mapH = Math.max(1, Math.round(worldPx * (botY - topY)));
+        const mapData: MapData = {
+          name: `Активная карта: ${center.lat.toFixed(5)}, ${center.lng.toFixed(5)} (z${z})`,
+          width: mapW,
+          height: mapH,
+          dataUrl: '', // без фотографии — подложка грузится тайлами динамически
+          bounds: b,
+          source: 'osm',
+        };
+        set((state) => ({
+          project: {
+            ...state.project,
+            map: mapData,
+            settings: { ...state.project.settings, tilesEnabled: true },
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+        get().refreshAllRoutesAfterMapChange();
+      },
+
       restoreMapFromStorage: async () => {
         const state = get();
         const map = state.project.map;
@@ -942,7 +982,13 @@ export const useStore = create<AppState>()(
             gridSize: 0,
             showCoordinates: true,
             theme: 'dark',
+            tilesEnabled: true,
+            tileStyle: 'scheme',
           };
+        } else if (persistedState.project?.settings && persistedState.project.settings.tilesEnabled === undefined) {
+          // существующие проекты: включаем активную тайловую карту по умолчанию
+          persistedState.project.settings.tilesEnabled = true;
+          persistedState.project.settings.tileStyle = persistedState.project.settings.tileStyle || 'scheme';
         }
         // Миграция для старых проектов без маршрутов
         if (persistedState.project && !Array.isArray(persistedState.project.routes)) {
