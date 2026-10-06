@@ -1,4 +1,4 @@
-import React, { useEffect, useCallback } from 'react';
+import React, { useEffect, useCallback, useState } from 'react';
 import MapCanvas from './components/MapCanvas';
 import Toolbar from './components/Toolbar';
 import Sidebar from './components/Sidebar';
@@ -82,6 +82,13 @@ const App: React.FC = () => {
       updateSettings({ theme: project.settings?.theme === 'light' ? 'dark' : 'light' });
     }
 
+    // Полный экран: F (и русские а)
+    if (e.key === 'f' || e.key === 'F' || e.key === 'а' || e.key === 'А') {
+      const el = document.querySelector('[data-testid="map-container"]');
+      if (el && document.fullscreenElement) document.exitFullscreen().catch(() => {});
+      else if (el) (el as HTMLElement).requestFullscreen?.().catch(() => {});
+    }
+
     // Режим действий: R (и русские к/я)
     if (e.key === 'r' || e.key === 'R' || e.key === 'к' || e.key === 'К') {
       setActionMode(!actionMode);
@@ -95,6 +102,17 @@ const App: React.FC = () => {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [handleKeyDown]);
+
+  // Адаптив: на мобильных (<768px) — карта фикс. высотой 300–400 px + панель слоёв снизу;
+  // на десктопе — 2 колонки (карта + сайдбар) либо полный экран по клавише F.
+  const [isMobile, setIsMobile] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 767px)');
+    const apply = () => setIsMobile(mq.matches);
+    apply();
+    mq.addEventListener('change', apply);
+    return () => mq.removeEventListener('change', apply);
+  }, []);
 
   // Apply theme (dark по умолчанию, light — переключается кнопкой или клавишей T)
   const theme = project.settings?.theme || 'dark';
@@ -175,10 +193,10 @@ const App: React.FC = () => {
       {/* Toolbar */}
       <Toolbar />
 
-      {/* Main content */}
-      <div className="flex-1 flex overflow-hidden relative">
+      {/* Main content: desktop — 2 колонки; mobile — вертикально, карта 300–400 px + панель */}
+      <div className={"flex-1 flex overflow-hidden relative " + (isMobile ? "flex-col" : "flex-row")}>
         {/* Canvas */}
-        <div className="flex-1 relative">
+        <div className={isMobile ? "relative w-full shrink-0" : "flex-1 relative"} style={isMobile ? { height: 350 } : undefined}>
           <MapCanvas />
 
           {/* Help overlay */}
@@ -204,7 +222,9 @@ const App: React.FC = () => {
         </div>
 
         {/* Sidebar */}
-        <Sidebar />
+        <div className={isMobile ? "flex-1 min-h-0 overflow-y-auto" : ""}>
+          <Sidebar />
+        </div>
       </div>
 
       {/* Status bar */}
