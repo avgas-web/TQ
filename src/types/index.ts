@@ -75,6 +75,7 @@ export interface Project {
   restrictions: Restriction[];
   markers: Marker[];
   routes?: Route[]; // маршруты режима действий (до MAX_ROUTES)
+  importLists?: ImportLists; // импортированные списки стартов и целей
   layers: Layer[];
   settings: {
     showGrid: boolean;
@@ -120,6 +121,12 @@ export interface RoutePoint {
   auto?: boolean; // точка добавлена автообходом зон (не ключевая)
 }
 
+/** Тип линии маршрута: прямая или кривая (сглаженная сплайн-ломаная) */
+export type RouteShape = 'straight' | 'curve';
+
+/** Режим ограничения маршрута по дальности */
+export type RangeLimitMode = 'off' | 'max' | 'min';
+
 export interface Route {
   id: string;
   name: string;
@@ -128,6 +135,23 @@ export interface Route {
   active: boolean;     // активный маршрут редактируется кликами по карте
   visible: boolean;
   createdAt: string;
+  shape?: RouteShape;          // линия маршрута (по умолчанию straight)
+  rangeMode?: RangeLimitMode;  // ограничение по дальности (по умолчанию off)
+  rangeM?: number;             // предельная дистанция в метрах
+}
+
+/** Импортные списки: стартовые позиции и цели, каждая привязана к маршруту */
+export interface ImportPoint {
+  id: string;
+  label: string;
+  lat: number;
+  lng: number;
+  routeId: string | null; // id маршрута, к которому привязана точка ('' / null — без привязки)
+}
+
+export interface ImportLists {
+  starts: ImportPoint[];
+  goals: ImportPoint[];
 }
 
 export const MAX_ROUTES = 10000;
