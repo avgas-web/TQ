@@ -4,7 +4,24 @@ import { isPointInActiveRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
 import { analyzeRoute, pixelToGeoExact, routeLengthM } from '../utils/routing';
+import { getOSMTileUrl, loadTileImage } from '../utils/openStreetMap';
 import type { Point, Route, RoutePoint } from '../types';
+
+/** Границы зума тайловой карты: minZoom 10, maxZoom 19 (уровни OSM) */
+const MIN_ZOOM = 10;
+const MAX_ZOOM = 19;
+
+/**
+ * Соответствие «viewState.scale ↔ zoom» из строгой Mercator-привязки:
+ * масштаб 1.0 = исходный растр карты (его bounds покрывают весь экран карты).
+ */
+function scaleForZoom(mapW: number, north: number, south: number, zoom: number): number {
+  return mapW * Math.pow(2, zoom) / 360 / ((latToMerc(south) - latToMerc(north)) * mapW);
+}
+function zoomFromScale(mapW: number, north: number, south: number, scale: number): number {
+  const f = (scale * (latToMerc(south) - latToMerc(north))) / (mapW / 360);
+  return Math.log2(Math.max(f, 1e-9));
+}
 
 /** Палитра цветов маршрутов (повторяется циклически при большом числе маршрутов) */
 const ROUTE_PALETTE = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#fb923c', '#38bdf8', '#e879f9'];
@@ -109,6 +126,13 @@ const MapCanvas: React.FC = () => {
   const [mapLoaded, setMapLoaded] = useState(false);
   // Перетаскивание точки маршрута: id + индекс (для moveRoutePoint)
   const [draggingRoute, setDraggingRoute] = useState<{ routeId: string; index: number } | null>(null);
+  // Popup по клику на объект (координаты, высота, расстояние)
+  const [popup, setPopup] = useState<{ x: number; y: number; title: string; lines: string[] } | null>(null);
+  // Кэш тайлов подложки: url -> изображение (или undefined при ошибке)
+  const tileCache = useRef<Map<string, HTMLImageElement | undefined>>(new Map());
+  const [tilesVersion, setTilesVersion] = useState(0);
+  // Геолокация пользователя
+  const [userPos, setUserPos] = useState<{ lat: number; lng: number; acc: number } | null>(null);
 
   const {
     project,
@@ -138,6 +162,125 @@ const MapCanvas: React.FC = () => {
 
   // devicePixelRatio — для чёткого рендера на Retina/HiDPI экранах
   const dpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
+
+  // ===== Тайловая подложка: карта активна, а НЕ статичная фотография =====
+  // Кэш тайлов, дозагрузка при изменении вида; maxNativeZoom 19 — выше не растягиваем.
+  const tilesEnabled = !!project.settings?.tilesEnabled && !!project.map?.bounds;
+  const tileStyle = project.settings?.tileStyle || 'scheme';
+  useEffect(() => {
+    if (!tilesEnabled || !project.map?.bounds) return;
+    const map = project.map;
+    const bounds = project.map.bounds;
+    // вид: центр в пикселях карты -> lat/lng строго через Mercator-привязку
+    const cxMap = (canvasSize.width / 2 - viewState.offsetX) / viewState.scale;
+    const cyMap = (canvasSize.height / 2 - viewState.offsetY) / viewState.scale;
+    if (!isFinite(cxMap) || !isFinite(cyMap)) return;
+    const topM = latToMerc(bounds.north);
+    const botM = latToMerc(bounds.south);
+    const latC = mercToLat(topM + ((botM - topM) / map.height) * Math.max(0, Math.min(map.height, cyMap)));
+    const lngC = -180 + (Math.max(0, Math.min(map.width, cxMap)) / map.width) * (bounds.east - bounds.west);
+    let zoom = Math.round(zoomFromScale(map.width, bounds.north, bounds.south, viewState.scale));
+    zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));
+    const n = Math.pow(2, zoom);
+    const xC = ((lngC + 180) / 360) * n;
+    const yC = latToMerc(latC) * n;
+    // Точный расчёт: весь мир по X = (map.width * scale) * (360 / lngSpanDeg) экранных px
+    const lngSpan = Math.abs(bounds.east - bounds.west);
+    const worldPx = map.width * viewState.scale * (360 / lngSpan);
+    const tileSizePx = worldPx / n; // экранных px на тайл текущего zoom
+    const tilesX = Math.ceil(canvasSize.width / tileSizePx) + 2;
+    const tilesY = Math.ceil(canvasSize.height / tileSizePx) + 2;
+    const server = (project.openStreetMap?.tileServer as any) || 'osm';
+    const urls: string[] = [];
+    for (let dx = -Math.ceil(tilesX / 2); dx <= Math.ceil(tilesX / 2); dx++) {
+      for (let dy = -Math.ceil(tilesY / 2); dy <= Math.ceil(tilesY / 2); dy++) {
+        const tx = Math.floor(xC) + dx;
+        const ty = Math.floor(yC) + dy;
+        if (tx < 0 || ty < 0 || tx >= n || ty >= n) continue;
+        const url = getOSMTileUrl(zoom, tx, ty, server, tileStyle);
+        if (!tileCache.current.has(url)) urls.push(url);
+      }
+    }
+    if (urls.length === 0) return;
+    let cancelled = false;
+    Promise.all(urls.map((u) => loadTileImage(u).then((img) => { if (!cancelled) tileCache.current.set(u, img || undefined); })))
+      .then(() => { if (!cancelled) setTilesVersion((v) => v + 1); });
+    return () => { cancelled = true; };
+  }, [tilesEnabled, tileStyle, viewState, canvasSize, project.map?.bounds, project.openStreetMap?.tileServer]);
+
+  // Геолокация пользователя (по требованию — кнопка 📍)
+  const locateUser = useCallback(() => {
+    if (!navigator.geolocation) { alert('Геолокация не поддерживается браузером'); return; }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => setUserPos({ lat: pos.coords.latitude, lng: pos.coords.longitude, acc: pos.coords.accuracy }),
+      (err) => alert('Ошибка геолокации: ' + err.message),
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  }, []);
+
+  // Внешние слои: аэропорты (Overpass), NOTAM-районы, геозоны — по видимой области
+  type ExtObj = { kind: 'airport' | 'notam' | 'geozone'; lat: number; lng: number; name: string; r?: number };
+  const [extObjs, setExtObjs] = useState<ExtObj[]>([]);
+  const layersOn = !!(project.settings?.airportsLayer || project.settings?.notamLayer || project.settings?.geozonesLayer);
+  useEffect(() => {
+    if (!layersOn || !project.map?.bounds) { setExtObjs([]); return; }
+    const b = project.map.bounds;
+    const box = `${b.south},${b.west},${b.north},${b.east}`;
+    let cancelled = false;
+    const out: ExtObj[] = [];
+    const jobs: Promise<void>[] = [];
+    if (project.settings?.airportsLayer) {
+      const q = `[out:json][timeout:15];(node["aeroway"="aerodrome"](${box});node["amenity"="airfield"](${box});way["aeroway"="aerodrome"](${box}););out center 40;`;
+      jobs.push(fetch('https://overpass-api.de/api/interpreter', { method: 'POST', body: 'data=' + encodeURIComponent(q) })
+        .then((r) => r.ok ? r.json() : null)
+        .then((d) => { if (d && !cancelled) for (const el of d.elements || []) out.push({ kind: 'airport', lat: el.lat ?? el.center?.lat, lng: el.lon ?? el.center?.lon, name: el.tags?.name || 'Аэродром' }); })
+        .catch(() => {}));
+    }
+    if (project.settings?.notamLayer) {
+      // Демо-источник NOTAM-подобных районов (без ключей API): крупные запретные районы OSM boundary=military
+      const q = `[out:json][timeout:15];way["boundary"="military"](${box});out center 20;`;
+      jobs.push(fetch('https://overpass-api.de/api/interpreter', { method: 'POST', body: 'data=' + encodeURIComponent(q) })
+        .then((r) => r.ok ? r.json() : null)
+        .then((d) => { if (d && !cancelled) for (const el of d.elements || []) out.push({ kind: 'notam', lat: el.center?.lat ?? el.lat, lng: el.center?.lon ?? el.lon, name: (el.tags?.name || 'Военный район') + ' (NOTAM)', r: 3000 }); })
+        .catch(() => {}));
+    }
+    if (project.settings?.geozonesLayer) {
+      const q = `[out:json][timeout:15];way["landuse"="military"](${box});relation["boundary"="protected_area"](${box});out center 20;`;
+      jobs.push(fetch('https://overpass-api.de/api/interpreter', { method: 'POST', body: 'data=' + encodeURIComponent(q) })
+        .then((r) => r.ok ? r.json() : null)
+        .then((d) => { if (d && !cancelled) for (const el of d.elements || []) out.push({ kind: 'geozone', lat: el.center?.lat ?? el.lat, lng: el.center?.lon ?? el.lon, name: el.tags?.name || 'Геозона', r: 2000 }); })
+        .catch(() => {}));
+    }
+    Promise.all(jobs).then(() => { if (!cancelled) setExtObjs(out.filter((o) => isFinite(o.lat) && isFinite(o.lng))); });
+    return () => { cancelled = true; };
+  }, [layersOn, project.settings?.airportsLayer, project.settings?.notamLayer, project.settings?.geozonesLayer, project.map?.bounds]);
+
+  // Полный экран
+  const toggleFullscreen = useCallback(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else el.requestFullscreen?.().catch(() => {});
+  }, []);
+
+  // Zoom колесом/кнопками к точке фокуса с ограничением minZoom/maxZoom
+  const zoomAt = useCallback((factor: number, focusX?: number, focusY?: number) => {
+    const map = project.map;
+    const fx = focusX ?? canvasSize.width / 2;
+    const fy = focusY ?? canvasSize.height / 2;
+    let newScale = viewState.scale * factor;
+    if (map?.bounds) {
+      const sMin = scaleForZoom(map.width, map.bounds.north, map.bounds.south, MIN_ZOOM);
+      const sMax = scaleForZoom(map.width, map.bounds.north, map.bounds.south, MAX_ZOOM);
+      // предельное приближение: не грубее 1 м/пиксель даже если maxZoom smaller
+      newScale = Math.max(sMin, Math.min(Math.max(sMax, 40), newScale));
+    } else {
+      newScale = Math.max(0.01, Math.min(50, newScale));
+    }
+    const newOffsetX = fx - (fx - viewState.offsetX) * (newScale / viewState.scale);
+    const newOffsetY = fy - (fy - viewState.offsetY) * (newScale / viewState.scale);
+    setViewState({ scale: newScale, offsetX: newOffsetX, offsetY: newOffsetY });
+  }, [viewState, setViewState, project.map, canvasSize]);
 
   // Load map image when map data changes
   useEffect(() => {
@@ -260,17 +403,72 @@ const MapCanvas: React.FC = () => {
       return;
     }
 
-    // Draw map
-    ctx.save();
-    ctx.translate(viewState.offsetX, viewState.offsetY);
-    ctx.scale(viewState.scale, viewState.scale);
-    // Чёткость при увеличении: при сильном зуме — резкая (пиксельная) интерполяция,
-    // при уменьшении — сглаженная. Canvas физически рендерится в dpr-разрешении,
-    // поэтому тайлы OSM z19 (~0.3 м/пикс) остаются читаемыми вплоть до 100 м и ближе.
-    ctx.imageSmoothingEnabled = viewState.scale < 1;
-    if (ctx.imageSmoothingEnabled) (ctx as any).imageSmoothingQuality = 'high';
-    ctx.drawImage(mapImageRef.current, 0, 0, project.map.width, project.map.height);
-    ctx.restore();
+    // Draw map: тайловая подложка (активная карта) или загруженный растр как fallback-картинка
+    const tilesOn = !!project.settings?.tilesEnabled && project.map?.bounds;
+    if (tilesOn && project.map?.bounds) {
+      drawTiles(ctx);
+    } else if (mapImageRef.current) {
+      ctx.save();
+      ctx.translate(viewState.offsetX, viewState.offsetY);
+      ctx.scale(viewState.scale, viewState.scale);
+      // Чёткость при увеличении: при сильном зуме — резкая (пиксельная) интерполяция,
+      // при уменьшении — сглаженная. Canvas физически рендерится в dpr-разрешении.
+      ctx.imageSmoothingEnabled = viewState.scale < 1;
+      if (ctx.imageSmoothingEnabled) (ctx as any).imageSmoothingQuality = 'high';
+      ctx.drawImage(mapImageRef.current, 0, 0, project.map.width, project.map.height);
+      ctx.restore();
+    }
+
+    function drawTiles(g: CanvasRenderingContext2D) {
+      // Строгая Mercator-привязка тайлов к карте проекта: тот же bounds и та же формула,
+      // что используют маркеры/маршруты → привязка координат соблюдается автоматически.
+      const map = project.map!;
+      const bounds = map.bounds!;
+      const topM = latToMerc(bounds.north);
+      const botM = latToMerc(bounds.south);
+      let zoom = Math.round(zoomFromScale(map.width, bounds.north, bounds.south, viewState.scale));
+      zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));
+      const n = Math.pow(2, zoom);
+      const lngSpan = Math.abs(bounds.east - bounds.west);
+      const worldPx = map.width * viewState.scale * (360 / lngSpan); // экранных px на весь мир по X
+      const tilePx = worldPx / n;
+      const server = (project.openStreetMap?.tileServer as any) || 'osm';
+      const style = project.settings?.tileStyle || 'scheme';
+      // Границы видимой области в гео-координатах (через ту же привязку)
+      const leftMap = screenToMap(0, 0);
+      const rightMap = screenToMap(canvasSize.width, canvasSize.height);
+      const westLng = -180 + (leftMap.x / map.width) * lngSpan;
+      const eastLng = -180 + (rightMap.x / map.width) * lngSpan;
+      const northLat = mercToLat(topM + ((botM - topM) / map.height) * Math.max(0, Math.min(map.height, leftMap.y)));
+      const southLat = mercToLat(topM + ((botM - topM) / map.height) * Math.max(0, Math.min(map.height, rightMap.y)));
+      const txMin = Math.floor(((westLng + 180) / 360) * n);
+      const txMax = Math.floor(((eastLng + 180) / 360) * n);
+      const tyMin = Math.floor(latToMerc(northLat) * n);
+      const tyMax = Math.floor(latToMerc(southLat) * n);
+      g.save();
+      g.fillStyle = '#1a2744';
+      for (let tx = txMin; tx <= txMax; tx++) {
+        for (let ty = tyMin; ty <= tyMax; ty++) {
+          if (tx < 0 || ty < 0 || tx >= n || ty >= n) continue;
+          // позиция левого верхнего угла тайла: гео -> пиксель карты -> экранные px (та же Mercator-привязка)
+          const tileWest = (tx / n) * 360 - 180;
+          const scrX = (((tileWest + 180) / lngSpan) * map.width) * viewState.scale + viewState.offsetX;
+          const mercTop = ty / n; // нормализованная Mercator Y северной границы тайла
+          const mapYTop = ((topM - mercTop) / (botM - topM)) * map.height;
+          const scrY = mapYTop * viewState.scale + viewState.offsetY;
+          const url = getOSMTileUrl(zoom, tx, ty, server, style);
+          const img = tileCache.current.get(url);
+          if (img) {
+            // НЕ растягиваем выше maxNativeZoom: рисуем ровно tilePx (при scale > нативного
+            // тайл z19 остаётся чётким до ~1 м/px за счёт dpr-канваса)
+            g.drawImage(img, scrX, scrY, tilePx + 0.5, tilePx + 0.5);
+          } else if (img === undefined) {
+            g.fillRect(scrX, scrY, tilePx, tilePx);
+          }
+        }
+      }
+      g.restore();
+    }
 
     // Draw restrictions
     drawRestrictions(ctx);
@@ -306,8 +504,65 @@ const MapCanvas: React.FC = () => {
       drawGrid(ctx);
     }
 
+    // Внешние слои: аэропорты / NOTAM / геозоны + позиция пользователя (гео-привязка строгая)
+    drawExternalLayers(ctx);
+
     // Масштабная линейка + плашка масштаба — всегда поверх всего
     drawScaleOverlay(ctx);
+
+    function drawExternalLayers(g: CanvasRenderingContext2D) {
+      const map = project.map;
+      if (!map?.bounds) return;
+      const b = map.bounds;
+      // гео -> пиксель карты -> экранные px (та же Mercator-привязка, что и у всех объектов)
+      const toScreen = (lat: number, lng: number) => {
+        const mx = ((lng - b.west) / (b.east - b.west)) * map.width;
+        const my = ((latToMerc(b.north) - latToMerc(lat)) / (latToMerc(b.south) - latToMerc(b.north))) * map.height;
+        return { x: mx * viewState.scale + viewState.offsetX, y: my * viewState.scale + viewState.offsetY };
+      };
+      g.save();
+      for (const o of extObjs) {
+        const p = toScreen(o.lat, o.lng);
+        if (p.x < -50 || p.y < -50 || p.x > canvasSize.width + 50 || p.y > canvasSize.height + 50) continue;
+        // радиус зоны в экранных px (для notam/geozone)
+        if (o.r && (o.kind === 'notam' || o.kind === 'geozone')) {
+          const mppLoc = metersPerPixel(map.width, map.height, b.north, b.south, viewState.scale, o.lat);
+          const rpx = Math.min(3000, o.r / Math.max(mppLoc, 1e-6));
+          g.beginPath();
+          g.arc(p.x, p.y, rpx, 0, Math.PI * 2);
+          g.fillStyle = o.kind === 'notam' ? 'rgba(245,158,11,0.10)' : 'rgba(239,68,68,0.10)';
+          g.fill();
+          g.strokeStyle = o.kind === 'notam' ? 'rgba(245,158,11,0.6)' : 'rgba(239,68,68,0.6)';
+          g.setLineDash([6, 4]);
+          g.lineWidth = 1.5;
+          g.stroke();
+          g.setLineDash([]);
+        }
+        // маркер объекта
+        g.font = 'bold 14px sans-serif';
+        g.textAlign = 'center';
+        g.fillStyle = o.kind === 'airport' ? '#34d399' : o.kind === 'notam' ? '#fbbf24' : '#f87171';
+        g.fillText(o.kind === 'airport' ? '✈' : o.kind === 'notam' ? '⚠' : '⛔', p.x, p.y + 5);
+        g.font = '10px sans-serif';
+        g.fillStyle = 'rgba(226,232,240,0.9)';
+        const nm = o.name.length > 24 ? o.name.slice(0, 23) + '…' : o.name;
+        g.fillText(nm, p.x, p.y + 18);
+      }
+      // позиция пользователя (геолокация)
+      if (userPos) {
+        const p = toScreen(userPos.lat, userPos.lng);
+        const mppLoc = metersPerPixel(map.width, map.height, b.north, b.south, viewState.scale, userPos.lat);
+        const accPx = Math.min(400, userPos.acc / Math.max(mppLoc, 1e-6));
+        g.beginPath(); g.arc(p.x, p.y, accPx, 0, Math.PI * 2);
+        g.fillStyle = 'rgba(59,130,246,0.15)'; g.fill();
+        g.beginPath(); g.arc(p.x, p.y, 7, 0, Math.PI * 2);
+        g.fillStyle = '#3b82f6'; g.fill();
+        g.strokeStyle = '#fff'; g.lineWidth = 2; g.stroke();
+        g.font = '10px sans-serif'; g.textAlign = 'center'; g.fillStyle = '#93c5fd';
+        g.fillText(`Вы здесь ±${Math.round(userPos.acc)} м`, p.x, p.y - 12);
+      }
+      g.restore();
+    }
 
     function drawGrid(ctx: CanvasRenderingContext2D) {
       // ГЕОГРАФИЧЕСКАЯ адаптивная сетка: шаг в реальных метрах подбирается
@@ -902,27 +1157,51 @@ const MapCanvas: React.FC = () => {
       ctx.restore();
     }
 
-  }, [project, viewState, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, actionMode]);
+  }, [project, viewState, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, actionMode, tilesVersion, extObjs, userPos]);
 
-  // Mouse wheel zoom
+  // Mouse wheel zoom (к колесу курсора; границы minZoom/maxZoom внутри zoomAt)
   const handleWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect) return;
+    const factor = e.deltaY > 0 ? 0.5 : 2;
+    zoomAt(factor, e.clientX - rect.left, e.clientY - rect.top);
+  }, [zoomAt]);
 
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
-
-    // Дискретный зум с коэффициентом 2 (уровни масштаба как у тайловых карт):
-    // один шаг колеса = один уровень, масштабирование точно к позиции курсора
-    const zoomFactor = e.deltaY > 0 ? 0.5 : 2;
-    const newScale = Math.max(0.01, Math.min(50, viewState.scale * zoomFactor));
-
-    const newOffsetX = mouseX - (mouseX - viewState.offsetX) * (newScale / viewState.scale);
-    const newOffsetY = mouseY - (mouseY - viewState.offsetY) * (newScale / viewState.scale);
-
-    setViewState({ scale: newScale, offsetX: newOffsetX, offsetY: newOffsetY });
-  }, [viewState, setViewState]);
+  // Touch: одноfinger панорама, pinch — зум к центру щипка
+  const touchState = useRef<{ mode: 'pan' | 'pinch'; x: number; y: number; dist: number } | null>(null);
+  const handleTouchStart = useCallback((e: React.TouchEvent) => {
+    if (e.touches.length === 1) {
+      touchState.current = { mode: 'pan', x: e.touches[0].clientX, y: e.touches[0].clientY, dist: 0 };
+    } else if (e.touches.length === 2) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      touchState.current = { mode: 'pinch', x: (e.touches[0].clientX + e.touches[1].clientX) / 2, y: (e.touches[0].clientY + e.touches[1].clientY) / 2, dist: Math.hypot(dx, dy) };
+    }
+  }, []);
+  const handleTouchMove = useCallback((e: React.TouchEvent) => {
+    const st = touchState.current;
+    if (!st) return;
+    e.preventDefault();
+    if (st.mode === 'pan' && e.touches.length === 1) {
+      const dx = e.touches[0].clientX - st.x;
+      const dy = e.touches[0].clientY - st.y;
+      setViewState({ offsetX: viewState.offsetX + dx, offsetY: viewState.offsetY + dy });
+      touchState.current = { ...st, x: e.touches[0].clientX, y: e.touches[0].clientY };
+    } else if (st.mode === 'pinch' && e.touches.length === 2) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const dist = Math.hypot(dx, dy);
+      if (dist > 8 && st.dist > 8) {
+        const rect = canvasRef.current?.getBoundingClientRect();
+        const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2 - (rect?.left || 0);
+        const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2 - (rect?.top || 0);
+        zoomAt(dist / st.dist, cx, cy);
+        touchState.current = { ...st, dist };
+      }
+    }
+  }, [viewState, setViewState, zoomAt]);
+  const handleTouchEnd = useCallback(() => { touchState.current = null; }, []);
 
   // Mouse down
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
@@ -996,8 +1275,24 @@ const MapCanvas: React.FC = () => {
       if (clickedMarker) {
         selectMarker(clickedMarker.id);
         setDraggingMarker(clickedMarker.id);
+        // Popup: координаты, высота, расстояние до точки запуска/маршрута
+        const geo = project.map?.bounds
+          ? pixelToGeoExact({ x: clickedMarker.x, y: clickedMarker.y }, project.map.bounds, project.map.width, project.map.height)
+          : { lat: NaN, lng: NaN };
+        const lines: string[] = [];
+        if (isFinite(geo.lat)) lines.push(`Широта: ${geo.lat.toFixed(6)}°`);
+        if (isFinite(geo.lng)) lines.push(`Долгота: ${geo.lng.toFixed(6)}°`);
+        lines.push(`Высота: ${(clickedMarker as any).altitude ?? (clickedMarker as any).elevation ?? '—'} м`);
+        const start = (project.routes || []).find((r) => r.id === activeRouteId)?.points[0]
+          || project.markers.find((m) => (m.type as any) === 'start');
+        if (start) {
+          const d = distanceBetween({ x: clickedMarker.x, y: clickedMarker.y }, { x: (start as any).x, y: (start as any).y });
+          lines.push(`До старта: ${d >= 1000 ? (d / 1000).toFixed(2) + ' км' : Math.round(d) + ' м'}`);
+        }
+        setPopup({ x: screenX, y: screenY, title: clickedMarker.name || 'Маркер', lines });
       } else {
         selectMarker(null);
+        setPopup(null);
       }
       return;
     }
@@ -1199,16 +1494,51 @@ const MapCanvas: React.FC = () => {
     currentTool === 'select' ? (draggingMarker ? 'move' : 'default') :
     'crosshair';
 
+  // Управление видом: зум/геолокация/полный экран + переключатели слоёв
+  const updateSettings = useStore((s) => s.updateSettings);
+  const setViewStateForZoom10k = useCallback(() => {
+    // Целевой масштаб 1:10 000 (1 см ≈ 100 м): подбираем scale из Mercator-привязки
+    const map = project.map;
+    if (!map?.bounds) return;
+    // mpp для 1 см = 100 м: 100 м / (0.3937 css px) ≈ 254 м на css px... считаем через zoom:
+    // mppEq(z) * cos(lat) = 100 / 37.795 → z = log2(156543.0339*cos(lat)/mpp)
+    const latC = (map.bounds.north + map.bounds.south) / 2;
+    const targetMpp = 100 / (2.54 / 96 * 100); // 100 м на 1 см экрана
+    const z = Math.log2((156543.0339280412 * Math.cos((latC * Math.PI) / 180)) / targetMpp);
+    const sMin = scaleForZoom(map.width, map.bounds.north, map.bounds.south, MIN_ZOOM);
+    const sMax = scaleForZoom(map.width, map.bounds.north, map.bounds.south, MAX_ZOOM);
+    let sc = scaleForZoom(map.width, map.bounds.north, map.bounds.south, Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z)));
+    sc = Math.max(sMin, Math.min(Math.max(sMax, 40), sc));
+    const cx = canvasSize.width / 2, cy = canvasSize.height / 2;
+    const newOffsetX = cx - (cx - viewState.offsetX) * (sc / viewState.scale);
+    const newOffsetY = cy - (cy - viewState.offsetY) * (sc / viewState.scale);
+    setViewState({ scale: sc, offsetX: newOffsetX, offsetY: newOffsetY });
+  }, [project.map, viewState, setViewState, canvasSize]);
+
+  const btnCls = 'w-9 h-9 flex items-center justify-center rounded-md bg-gray-800/90 hover:bg-gray-700 text-gray-100 border border-gray-600 shadow text-base select-none';
+
   return (
-    <div ref={containerRef} className="relative w-full h-full overflow-hidden bg-[#0f1729]">
+    <div ref={containerRef} className="relative w-full h-full overflow-hidden bg-[#0f1729]" data-testid="map-container">
       <canvas
         ref={canvasRef}
         style={{
           width: `${canvasSize.width}px`,
           height: `${canvasSize.height}px`,
           cursor: cursorStyle,
+          touchAction: 'none',
         }}
         className="absolute inset-0"
+        role="application"
+        aria-label="Интерактивная карта: перетаскивание, зум колесом, кнопки управления справа"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === '+' || e.key === '=') zoomAt(2);
+          else if (e.key === '-') zoomAt(0.5);
+          else if (e.key === 'ArrowLeft') setViewState({ offsetX: viewState.offsetX + 40 });
+          else if (e.key === 'ArrowRight') setViewState({ offsetX: viewState.offsetX - 40 });
+          else if (e.key === 'ArrowUp') setViewState({ offsetY: viewState.offsetY + 40 });
+          else if (e.key === 'ArrowDown') setViewState({ offsetY: viewState.offsetY - 40 });
+        }}
         onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
@@ -1216,7 +1546,71 @@ const MapCanvas: React.FC = () => {
         onMouseLeave={handleMouseUp}
         onDoubleClick={handleDoubleClick}
         onContextMenu={handleContextMenu}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
       />
+
+      {/* Popup объекта: координаты, высота, расстояние */}
+      {popup && (
+        <div
+          className="absolute z-20 max-w-[260px] rounded-lg bg-gray-900/95 border border-cyan-500/50 text-gray-100 text-xs shadow-xl p-2 pointer-events-auto"
+          style={{ left: Math.min(popup.x + 12, canvasSize.width - 270), top: Math.min(popup.y + 12, canvasSize.height - 120) }}
+          role="dialog"
+          aria-label="Информация об объекте"
+          onClick={() => setPopup(null)}
+        >
+          <div className="font-bold text-cyan-300 mb-1">{popup.title}</div>
+          {popup.lines.map((l, i) => (<div key={i} className="leading-relaxed">{l}</div>))}
+          <div className="text-gray-400 mt-1">клик — закрыть</div>
+        </div>
+      )}
+
+      {/* Кнопки управления картой (доступность: aria-label, клавиатура) */}
+      <div className="absolute top-3 right-3 z-10 flex flex-col gap-1.5" aria-label="Управление картой">
+        <button className={btnCls} aria-label="Приблизить" title="Приблизить (+)" onClick={() => zoomAt(2)}>＋</button>
+        <button className={btnCls} aria-label="Отдалить" title="Отдалить (−)" onClick={() => zoomAt(0.5)}>－</button>
+        <button className={btnCls} aria-label="Масштаб 1 к 10000" title="Целевой масштаб 1:10 000 (1 см ≈ 100 м)" onClick={setViewStateForZoom10k}>⌖</button>
+        <button className={btnCls} aria-label="Геолокация" title="Моё местоположение" onClick={locateUser}>📍</button>
+        <button className={btnCls} aria-label="Полный экран" title="Полный экран (F)" onClick={toggleFullscreen}>⛶</button>
+        <button
+          className={`${btnCls} ${project.settings?.tilesEnabled ? 'ring-1 ring-cyan-400' : ''}`}
+          aria-label="Тайловая подложка" title="Активная тайловая карта (T)"
+          onClick={() => updateSettings({ tilesEnabled: !project.settings?.tilesEnabled })}
+        >▦</button>
+        {/* Слои: схема / спутник / гибрид */}
+        <div className="flex flex-col gap-1 mt-1" role="group" aria-label="Слои карты">
+          {(['scheme', 'satellite', 'hybrid'] as const).map((st) => (
+            <button
+              key={st}
+              className={`h-7 px-1.5 rounded-md text-[10px] font-semibold ${btnCls} !w-auto ${(project.settings?.tileStyle || 'scheme') === st ? 'bg-cyan-700/80 ring-1 ring-cyan-300' : ''}`}
+              aria-pressed={(project.settings?.tileStyle || 'scheme') === st}
+              title={st === 'scheme' ? 'Схема' : st === 'satellite' ? 'Спутник' : 'Гибрид'}
+              onClick={() => updateSettings({ tileStyle: st, tilesEnabled: true })}
+            >
+              {st === 'scheme' ? 'СХЕМА' : st === 'satellite' ? 'СПУТ' : 'ГИБР'}
+            </button>
+          ))}
+          <button
+            className={`h-7 px-1.5 rounded-md text-[10px] font-semibold ${btnCls} !w-auto ${project.settings?.airportsLayer ? 'bg-emerald-700/80 ring-1 ring-emerald-300' : ''}`}
+            aria-pressed={!!project.settings?.airportsLayer}
+            title="Аэропорты (Overpass API)"
+            onClick={() => updateSettings({ airportsLayer: !project.settings?.airportsLayer })}
+          >✈ АЭРО</button>
+          <button
+            className={`h-7 px-1.5 rounded-md text-[10px] font-semibold ${btnCls} !w-auto ${project.settings?.geozonesLayer ? 'bg-red-700/80 ring-1 ring-red-300' : ''}`}
+            aria-pressed={!!project.settings?.geozonesLayer}
+            title="Геозоны / No-Fly зоны"
+            onClick={() => updateSettings({ geozonesLayer: !project.settings?.geozonesLayer })}
+          >⛔ ГЕО</button>
+          <button
+            className={`h-7 px-1.5 rounded-md text-[10px] font-semibold ${btnCls} !w-auto ${project.settings?.notamLayer ? 'bg-amber-700/80 ring-1 ring-amber-300' : ''}`}
+            aria-pressed={!!project.settings?.notamLayer}
+            title="NOTAM-уведомления"
+            onClick={() => updateSettings({ notamLayer: !project.settings?.notamLayer })}
+          >! NOTAM</button>
+        </div>
+      </div>
     </div>
   );
 };
