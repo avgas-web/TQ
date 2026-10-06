@@ -11,34 +11,55 @@ import type { Point, Route, RoutePoint } from '../types';
 const MIN_ZOOM = 10;
 const MAX_ZOOM = 19;
 
-/**
- * Соответствие «viewState.scale ↔ zoom» из строгой Mercator-привязки:
- * масштаб 1.0 = исходный растр карты (его bounds покрывают весь экран карты).
- */
-function scaleForZoom(mapW: number, north: number, south: number, zoom: number): number {
-  return mapW * Math.pow(2, zoom) / 360 / ((latToMerc(south) - latToMerc(north)) * mapW);
-}
-function zoomFromScale(mapW: number, north: number, south: number, scale: number): number {
-  const f = (scale * (latToMerc(south) - latToMerc(north))) / (mapW / 360);
-  return Math.log2(Math.max(f, 1e-9));
-}
-
 /** Палитра цветов маршрутов (повторяется циклически при большом числе маршрутов) */
 const ROUTE_PALETTE = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#fb923c', '#38bdf8', '#e879f9'];
 
-/** Максимальный масштаб: 1 метр на пиксель экрана (зум «до 100 метров» с запасом) */
-const MAX_SCALE = 1.0;
+/** Нативный max zoom тайловых серверов (выше НЕ поднимаемся — нет данных, только растяжение) */
+const NATIVE_MAX_BY_SERVER: Record<string, number> = { osm: 19, carto: 18, opentopomap: 17 };
+
+/** Стартовый zoom z0 из Mercator-высоты bounds и высоты экрана (z10–z19) */
+function startZoomForBounds(bounds: { north: number; south: number }, vh: number): number {
+  const mercSpan = Math.max(1e-9, latToMerc(bounds.north) - latToMerc(bounds.south));
+  const z = Math.log2((vh * 360) / (256 * mercSpan)); // целый мир по Y = vh px при зуме z
+  return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.round(z)));
+}
+/** scale, соответствующий целому zoom поверх z0 */
+function scaleForZoom(viewW: number, z0: number, zoom: number): number {
+  return Math.pow(2, zoom - z0);
+}
 
 /**
- * Метров на один ЭКРАННЫЙ пиксель при текущем виде (строгая формула Web Mercator).
- * 1 см = 100 м соответствует ~37.8 px/m по горизонтали на обычных экранах
- * (96 CSS-px = 2.54 см), т.е. mpp ≈ 0.0265 м/px — наш предел масштаба намного ниже.
+ * ЕДИНАЯ инвариантная привязка вида «экран ↔ география» (Web Mercator EPSG:3857):
+ *   worldPx = размер мира в экранных px при текущем масштабе.
+ * Всё (тайлы, сетка, линейка, зум, курсор) считается ТОЛЬКО через worldPx —
+ * поэтому масштаб не может «сбиться»: он одинаков для подложки и объектов,
+ * устойчив к ресайзу окна и корректен на любой широте.
+ * Стартовый zoom z0 фиксируется один раз при загрузке карты; scale — множитель
+ * поверх него (scale=1 ⇔ мир = canvasWidth·2^z0 px).
  */
-function metersPerPixel(mapW: number, mapH: number, north: number, south: number, viewScale: number, latRef: number): number {
-  const lngSpanDeg = Math.abs((mapW / mapH) * (north - south)); // из точной Mercator-привязки bounds
-  const worldPx = (mapW * viewScale) / (lngSpanDeg / 360);      // размер мира в экранных px
-  const mppEq = (156543.0339280412 / Math.pow(2, Math.log2(worldPx / 256)));
-  return mppEq * Math.cos((latRef * Math.PI) / 180);
+function worldPxOf(canvasW: number, scale: number, z0: number): number {
+  return Math.max(256, canvasW * scale * Math.pow(2, z0));
+}
+function zoomAtWorldPx(worldPx: number): number {
+  return Math.log2(Math.max(worldPx / 256, 1e-9));
+}
+/** Метров на ЭКРАННЫЙ пиксель (учёт широты обязателен — иначе линейка врёт) */
+function metersPerPixelFromWorld(worldPx: number, latRef: number): number {
+  const z = zoomAtWorldPx(worldPx);
+  return (156543.0339280412 / Math.pow(2, z)) * Math.cos((latRef * Math.PI) / 180);
+}
+/** Обратное преобразование: мир в px под целевые м/пиксель */
+function worldPxForMetersPerPixel(mpp: number, latRef: number): number {
+  const mppEq = mpp / Math.max(0.05, Math.cos((latRef * Math.PI) / 180));
+  return 256 * Math.pow(2, Math.log2(156543.0339280412 / Math.max(mppEq, 1e-9)));
+}
+/** Границы scale для minZoom..maxNativeZoom (не выше нативного уровня сервера) */
+function scaleBoundsForZooms(canvasW: number, z0: number, server: string): { min: number; max: number } {
+  const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[server] ?? MAX_ZOOM);
+  return {
+    min: scaleForZoom(canvasW, z0, MIN_ZOOM),
+    max: scaleForZoom(canvasW, z0, nativeMax),
+  };
 }
 
 /** Человекочитаемая подпись масштаба */
@@ -47,6 +68,11 @@ function scaleLabel(mpp: number): string {
   if (mpp >= 1) return `1 px ≈ ${mpp.toFixed(1)} м`;
   if (mpp >= 0.01) return `1 px ≈ ${Math.round(mpp * 100)} см`;
   return `1 px ≈ ${(mpp * 1000).toFixed(1)} мм`;
+}
+
+/** Широта центра bounds — для точного расчёта метров/пиксель */
+function centerLatOf(bounds: { north: number; south: number }): number {
+  return (bounds.north + bounds.south) / 2;
 }
 
 /**
@@ -164,40 +190,45 @@ const MapCanvas: React.FC = () => {
   const dpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
 
   // ===== Тайловая подложка: карта активна, а НЕ статичная фотография =====
-  // Кэш тайлов, дозагрузка при изменении вида; maxNativeZoom 19 — выше не растягиваем.
+  // Кэш тайлов, дозагрузка при изменении вида; maxNativeZoom — выше не растягиваем.
   const tilesEnabled = !!project.settings?.tilesEnabled && !!project.map?.bounds;
   const tileStyle = project.settings?.tileStyle || 'scheme';
+  const tileServer = (project.openStreetMap?.tileServer as any) || 'osm';
+  // ЕДИНАЯ инвариантная привязка вида (worldPx = размер мира в экранных px):
+  //   worldPx = canvasWidth · scale · 2^z0  (z0 фиксируется при загрузке карты).
+  // Объекты хранятся в пикселях растра map.width×map.height, которые покрывают bounds,
+  // поэтому worldPx также = map.width·scale·360/lngSpan — обе формулы совпадают
+  // благодаря тому, что z0 подбирается ПОД ФАКТИЧЕСКИЙ РАЗМЕР РАСТРА (см. initial fit).
+  const effZ0 = viewState.z0 ?? (project.map?.bounds ? startZoomForBounds(project.map.bounds, canvasSize.height) : 14);
+  const worldPx = Math.max(256, canvasSize.width * viewState.scale * Math.pow(2, effZ0));
   useEffect(() => {
     if (!tilesEnabled || !project.map?.bounds) return;
-    const map = project.map;
     const bounds = project.map.bounds;
-    // вид: центр в пикселях карты -> lat/lng строго через Mercator-привязку
-    const cxMap = (canvasSize.width / 2 - viewState.offsetX) / viewState.scale;
-    const cyMap = (canvasSize.height / 2 - viewState.offsetY) / viewState.scale;
-    if (!isFinite(cxMap) || !isFinite(cyMap)) return;
-    const topM = latToMerc(bounds.north);
-    const botM = latToMerc(bounds.south);
-    const latC = mercToLat(topM + ((botM - topM) / map.height) * Math.max(0, Math.min(map.height, cyMap)));
-    const lngC = -180 + (Math.max(0, Math.min(map.width, cxMap)) / map.width) * (bounds.east - bounds.west);
-    let zoom = Math.round(zoomFromScale(map.width, bounds.north, bounds.south, viewState.scale));
-    zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));
+    // центр экрана -> гео напрямую через инвариантную Mercator-привязку
+    const lngC = -180 + ((canvasSize.width / 2 - viewState.offsetX) / worldPx) * 360;
+    const mercTop = latToMerc(bounds.north);
+    const mercBot = latToMerc(bounds.south);
+    if (!isFinite(lngC)) return;
+    let zoom = Math.round(zoomAtWorldPx(worldPx));
+    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[tileServer] ?? MAX_ZOOM);
+    zoom = Math.max(MIN_ZOOM, Math.min(nativeMax, zoom));
     const n = Math.pow(2, zoom);
     const xC = ((lngC + 180) / 360) * n;
-    const yC = latToMerc(latC) * n;
-    // Точный расчёт: весь мир по X = (map.width * scale) * (360 / lngSpanDeg) экранных px
-    const lngSpan = Math.abs(bounds.east - bounds.west);
-    const worldPx = map.width * viewState.scale * (360 / lngSpan);
+    // широта центра экрана — через ту же raster-привязку Y, что и у всех объектов
+    const mapH = project.map.height;
+    const mercPerScreenPxY = (mercBot - mercTop) / (mapH * viewState.scale);
+    const cyMerc = mercTop + (canvasSize.height / 2 - viewState.offsetY) * mercPerScreenPxY;
+    const yTile = cyMerc * n;
     const tileSizePx = worldPx / n; // экранных px на тайл текущего zoom
     const tilesX = Math.ceil(canvasSize.width / tileSizePx) + 2;
     const tilesY = Math.ceil(canvasSize.height / tileSizePx) + 2;
-    const server = (project.openStreetMap?.tileServer as any) || 'osm';
     const urls: string[] = [];
     for (let dx = -Math.ceil(tilesX / 2); dx <= Math.ceil(tilesX / 2); dx++) {
       for (let dy = -Math.ceil(tilesY / 2); dy <= Math.ceil(tilesY / 2); dy++) {
         const tx = Math.floor(xC) + dx;
-        const ty = Math.floor(yC) + dy;
+        const ty = Math.floor(yTile) + dy;
         if (tx < 0 || ty < 0 || tx >= n || ty >= n) continue;
-        const url = getOSMTileUrl(zoom, tx, ty, server, tileStyle);
+        const url = getOSMTileUrl(zoom, tx, ty, tileServer, tileStyle);
         if (!tileCache.current.has(url)) urls.push(url);
       }
     }
@@ -206,7 +237,7 @@ const MapCanvas: React.FC = () => {
     Promise.all(urls.map((u) => loadTileImage(u).then((img) => { if (!cancelled) tileCache.current.set(u, img || undefined); })))
       .then(() => { if (!cancelled) setTilesVersion((v) => v + 1); });
     return () => { cancelled = true; };
-  }, [tilesEnabled, tileStyle, viewState, canvasSize, project.map?.bounds, project.openStreetMap?.tileServer]);
+  }, [tilesEnabled, tileStyle, tileServer, viewState, canvasSize, project.map?.bounds, worldPx]);
 
   // Геолокация пользователя (по требованию — кнопка 📍)
   const locateUser = useCallback(() => {
@@ -270,10 +301,12 @@ const MapCanvas: React.FC = () => {
     const fy = focusY ?? canvasSize.height / 2;
     let newScale = viewState.scale * factor;
     if (map?.bounds) {
-      const sMin = scaleForZoom(map.width, map.bounds.north, map.bounds.south, MIN_ZOOM);
-      const sMax = scaleForZoom(map.width, map.bounds.north, map.bounds.south, MAX_ZOOM);
-      // предельное приближение: не грубее 1 м/пиксель даже если maxZoom smaller
-      newScale = Math.max(sMin, Math.min(Math.max(sMax, 40), newScale));
+      // Границы зума из единой инвариантной привязки: minZoom..maxNativeZoom сервера.
+      const bnds = scaleBoundsForZooms(canvasSize.width, effZ0, tileServer);
+      // предельное приближение: не грубее ~1 м/пиксель даже если нативный max меньше
+      const mppAtMax = metersPerPixelFromWorld(worldPxOf(canvasSize.width, bnds.max, effZ0), centerLatOf(map.bounds));
+      const maxExtra = mppAtMax > 1 ? bnds.max * Math.pow(2, Math.log2(mppAtMax)) : bnds.max;
+      newScale = Math.max(bnds.min, Math.min(Math.max(maxExtra, bnds.max), newScale));
     } else {
       newScale = Math.max(0.01, Math.min(50, newScale));
     }
@@ -306,57 +339,97 @@ const MapCanvas: React.FC = () => {
     img.src = project.map.dataUrl;
   }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled]);
 
-  // Resize observer
+  // Resize observer: при изменении размера окна МАСШТАБ НЕ СБИВАЕТСЯ —
+  // смещаем offsetX/offsetY так, чтобы географическая точка в центре экрана осталась в центре.
+  const viewRef = useRef(viewState);
+  useEffect(() => { viewRef.current = viewState; }, [viewState]);
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
     const observer = new ResizeObserver((entries) => {
       for (const entry of entries) {
-        setCanvasSize({
-          width: entry.contentRect.width,
-          height: entry.contentRect.height,
+        const w = entry.contentRect.width;
+        const h = entry.contentRect.height;
+        setCanvasSize((prev) => {
+          if (prev.width > 0 && prev.height > 0 && (w !== prev.width || h !== prev.height)) {
+            // инвариант вида: scale и z0 сохраняются, центр карты не «прыгает»
+            const v = viewRef.current;
+            setViewState({
+              offsetX: v.offsetX + (w - prev.width) / 2,
+              offsetY: v.offsetY + (h - prev.height) / 2,
+            });
+          }
+          return { width: w, height: h };
         });
       }
     });
 
     observer.observe(container);
     return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Стартовый zoom-инвариант z0: фиксируется ОДИН РАЗ на карту (не пересчитывается
+  // при ресайзе — иначе масштаб «сбивается»). Тайлы, сетка и линейка используют его всегда.
+  const lastFittedMapRef = useRef<string | null>(null);
+  useEffect(() => {
+    const map = project.map;
+    if (!map?.bounds || canvasSize.height <= 0) return;
+    const key = `${map.name}|${map.bounds.north.toFixed(6)},${map.bounds.south.toFixed(6)}`;
+    if (lastFittedMapRef.current === key && viewState.z0 != null) return;
+    lastFittedMapRef.current = key;
+    const z0 = startZoomForBounds(map.bounds, canvasSize.height);
+    if (viewState.z0 !== z0) setViewState({ z0 });
+  }, [project.map?.name, project.map?.bounds, canvasSize.height]);
 
   // Auto-fit view: при загрузке карты — вписать её; если на карте есть объекты
   // (маршруты/маркеры/зоны) — автоматически масштабировать вид ПОД НИХ,
   // карта остаётся интерактивной (зум/панорама доступны всегда).
-  const lastFittedMapRef = useRef<string | null>(null);
+  const lastInitialFitRef = useRef<string | null>(null);
   useEffect(() => {
     const tilesActive = !!project.settings?.tilesEnabled && !!project.map?.bounds;
-    const fitKey = project.map ? `${project.map.dataUrl || 'tiles'}|${canvasSize.width}x${canvasSize.height}` : null;
-    if (project.map && mapLoaded && canvasSize.width > 0 && fitKey && lastFittedMapRef.current !== fitKey) {
-      lastFittedMapRef.current = fitKey;
-      if (mapImageRef.current) {
-        // Растровая карта: вписать изображение целиком
-        const scaleX = canvasSize.width / project.map.width;
-        const scaleY = canvasSize.height / project.map.height;
-        const scale = Math.min(scaleX, scaleY) * 0.9;
-        const offsetX = (canvasSize.width - project.map.width * scale) / 2;
-        const offsetY = (canvasSize.height - project.map.height * scale) / 2;
-        setViewState({ scale, offsetX, offsetY });
-      } else if (tilesActive && project.map.bounds) {
-        // Только тайловая подложка: стартовый вид ≈ z15–16 вокруг центра bounds,
-        // масштаб считается из строгой Mercator-привязки (scaleForZoom) — линейка точна.
-        const map = project.map;
-        const cLat = (map.bounds.north + map.bounds.south) / 2;
-        const cLng = (map.bounds.east + map.bounds.west) / 2;
-        const zoom = 15;
-        const scale = Math.max(0.05, Math.min(40, scaleForZoom(map.width, map.bounds.north, map.bounds.south, zoom)));
-        const cxMap = ((cLng + 180) / 360) * map.width;
-        const topM = latToMerc(map.bounds.north);
-        const botM = latToMerc(map.bounds.south);
-        const cyMap = ((topM - latToMerc(cLat)) / (botM - topM)) * map.height;
-        setViewState({ scale, offsetX: canvasSize.width / 2 - cxMap * scale, offsetY: canvasSize.height / 2 - cyMap * scale });
-      }
+    const map = project.map;
+    if (!map || !mapLoaded || canvasSize.width <= 0) return;
+    const boundsKey = map.bounds ? `${map.bounds.north},${map.bounds.south}` : 'nobounds';
+    const fitKey = `${map.dataUrl ? 'img' : 'tiles'}|${boundsKey}`;
+    if (lastInitialFitRef.current === fitKey) return; // только ОДИН раз на карту — ресайз вид не трогает
+    lastInitialFitRef.current = fitKey;
+    if (!map.bounds) return;
+    const z0 = startZoomForBounds(map.bounds, Math.max(1, canvasSize.height));
+    if (mapImageRef.current) {
+      // Растровая карта: вписать изображение целиком. Привязка тайлов/сетки/линейки
+      // согласуется с ФАКТИЧЕСКИМ размером растра относительно bounds: scale=1 ⇔
+      // мир по X = map.width·2^z0 экранных px ⇒ z0 = log2(worldPxNeeded/(256·fitScale)).
+      const lngSpan = Math.abs(map.bounds.east - map.bounds.west);
+      const worldPxNeeded = (canvasSize.width * 360) / Math.max(lngSpan, 1e-9);
+      const fitScale = Math.min(canvasSize.width / map.width, canvasSize.height / map.height) * 0.9;
+      const zFit = Math.log2(worldPxNeeded / (256 * fitScale));
+      setViewState({
+        scale: fitScale,
+        offsetX: (canvasSize.width - map.width * fitScale) / 2,
+        offsetY: (canvasSize.height - map.height * fitScale) / 2,
+        z0: zFit,
+      });
+    } else if (tilesActive) {
+      // Только тайловая подложка: стартовый вид ≈ z15 вокруг центра bounds.
+      const cLat = (map.bounds.north + map.bounds.south) / 2;
+      const cLng = (map.bounds.east + map.bounds.west) / 2;
+      const zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, 15));
+      const scale = scaleForZoom(canvasSize.width, z0, zoom);
+      const lngSpan = Math.abs(map.bounds.east - map.bounds.west);
+      const scrX = ((cLng - map.bounds.west) / lngSpan) * map.width * scale;
+      const topM = latToMerc(map.bounds.north);
+      const botM = latToMerc(map.bounds.south);
+      const cyMap = ((topM - latToMerc(cLat)) / (botM - topM)) * map.height;
+      setViewState({
+        scale,
+        offsetX: canvasSize.width / 2 - scrX,
+        offsetY: canvasSize.height / 2 - cyMap * scale,
+        z0,
+      });
     }
-  }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled, mapLoaded, canvasSize.width, canvasSize.height]);
+  }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled, mapLoaded, canvasSize.width]);
 
   // Отдельный эффект: как только появляются точки маршрутов/маркеров —
   // автоматически подогнать вид под все объекты (один раз на набор объектов)
@@ -448,48 +521,54 @@ const MapCanvas: React.FC = () => {
       const bounds = map.bounds!;
       const topM = latToMerc(bounds.north);
       const botM = latToMerc(bounds.south);
-      let zoom = Math.round(zoomFromScale(map.width, bounds.north, bounds.south, viewState.scale));
-      zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));
+      // zoom из ЕДИНОЙ инвариантной привязки worldPx (не выше нативного уровня сервера)
+      let zoom = Math.round(zoomAtWorldPx(worldPx));
+      const nativeMaxT = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[(project.openStreetMap?.tileServer as any) || 'osm'] ?? MAX_ZOOM);
+      zoom = Math.max(MIN_ZOOM, Math.min(nativeMaxT, zoom));
       const n = Math.pow(2, zoom);
       const lngSpan = Math.abs(bounds.east - bounds.west);
-      const worldPx = map.width * viewState.scale * (360 / lngSpan); // экранных px на весь мир по X
-      const tilePx = worldPx / n;
+      const tilePx = worldPx / n; // экранных px на тайл текущего zoom
       const server = (project.openStreetMap?.tileServer as any) || 'osm';
       const style = project.settings?.tileStyle || 'scheme';
-      // Границы видимой области в гео-координатах (через ту же привязку)
-      const leftMap = screenToMap(0, 0);
-      const rightMap = screenToMap(canvasSize.width, canvasSize.height);
-      const westLng = -180 + (leftMap.x / map.width) * lngSpan;
-      const eastLng = -180 + (rightMap.x / map.width) * lngSpan;
-      const northLat = mercToLat(topM + ((botM - topM) / map.height) * Math.max(0, Math.min(map.height, leftMap.y)));
-      const southLat = mercToLat(topM + ((botM - topM) / map.height) * Math.max(0, Math.min(map.height, rightMap.y)));
+      // Границы видимой области в гео-координатах (через ту же инвариантную привязку):
+      // X — через worldPx; Y — через raster-привязку mercPerScreenPxY (то же, что у объектов).
+      const mercPerScreenPxY = (botM - topM) / (map.height * viewState.scale);
+      const westLng = -180 + ((0 - viewState.offsetX) / worldPx) * 360;
+      const eastLng = -180 + ((canvasSize.width - viewState.offsetX) / worldPx) * 360;
+      const northLat = mercToLat(topM + (0 - viewState.offsetY) * mercPerScreenPxY);
+      const southLat = mercToLat(topM + (canvasSize.height - viewState.offsetY) * mercPerScreenPxY);
       const txMin = Math.floor(((westLng + 180) / 360) * n);
       const txMax = Math.floor(((eastLng + 180) / 360) * n);
-      const tyMin = Math.floor(latToMerc(northLat) * n);
-      const tyMax = Math.floor(latToMerc(southLat) * n);
+      const tyMin = Math.floor(Math.max(0, latToMerc(northLat) * n));
+      const tyMax = Math.floor(Math.min(n - 1, latToMerc(southLat) * n));
       g.save();
       g.fillStyle = '#1a2744';
+      // Экранный x левой границы мира (lng=-180): из привязки центра экрана
+      const worldOriginX = canvasSize.width / 2 - (((lngFromScreen(canvasSize.width / 2)) + 180) / 360) * worldPx;
       for (let tx = txMin; tx <= txMax; tx++) {
         for (let ty = tyMin; ty <= tyMax; ty++) {
           if (tx < 0 || ty < 0 || tx >= n || ty >= n) continue;
-          // позиция левого верхнего угла тайла: гео -> пиксель карты -> экранные px (та же Mercator-привязка)
-          const tileWest = (tx / n) * 360 - 180;
-          const scrX = (((tileWest + 180) / lngSpan) * map.width) * viewState.scale + viewState.offsetX;
-          const mercTop = ty / n; // нормализованная Mercator Y северной границы тайла
-          const mapYTop = ((topM - mercTop) / (botM - topM)) * map.height;
+          // позиция левого верхнего угла тайла: гео -> экранные px (та же привязка worldPx/X, raster/Y)
+          const scrXTile = worldOriginX + (tx / n) * worldPx;
+          const mercTopT = ty / n; // нормализованная Mercator Y северной границы тайла
+          const mapYTop = ((topM - mercTopT) / (botM - topM)) * map.height;
           const scrY = mapYTop * viewState.scale + viewState.offsetY;
           const url = getOSMTileUrl(zoom, tx, ty, server, style);
           const img = tileCache.current.get(url);
           if (img) {
             // НЕ растягиваем выше maxNativeZoom: рисуем ровно tilePx (при scale > нативного
             // тайл z19 остаётся чётким до ~1 м/px за счёт dpr-канваса)
-            g.drawImage(img, scrX, scrY, tilePx + 0.5, tilePx + 0.5);
+            g.drawImage(img, scrXTile, scrY, tilePx + 0.5, tilePx + 0.5);
           } else if (img === undefined) {
-            g.fillRect(scrX, scrY, tilePx, tilePx);
+            g.fillRect(scrXTile, scrY, tilePx, tilePx);
           }
         }
       }
       g.restore();
+
+      function lngFromScreen(x: number): number {
+        return -180 + ((x - viewState.offsetX) / worldPx) * 360;
+      }
     }
 
     // Draw restrictions
@@ -548,7 +627,7 @@ const MapCanvas: React.FC = () => {
         if (p.x < -50 || p.y < -50 || p.x > canvasSize.width + 50 || p.y > canvasSize.height + 50) continue;
         // радиус зоны в экранных px (для notam/geozone)
         if (o.r && (o.kind === 'notam' || o.kind === 'geozone')) {
-          const mppLoc = metersPerPixel(map.width, map.height, b.north, b.south, viewState.scale, o.lat);
+          const mppLoc = metersPerPixelFromWorld(worldPx, o.lat);
           const rpx = Math.min(3000, o.r / Math.max(mppLoc, 1e-6));
           g.beginPath();
           g.arc(p.x, p.y, rpx, 0, Math.PI * 2);
@@ -573,7 +652,7 @@ const MapCanvas: React.FC = () => {
       // позиция пользователя (геолокация)
       if (userPos) {
         const p = toScreen(userPos.lat, userPos.lng);
-        const mppLoc = metersPerPixel(map.width, map.height, b.north, b.south, viewState.scale, userPos.lat);
+        const mppLoc = metersPerPixelFromWorld(worldPx, userPos.lat);
         const accPx = Math.min(400, userPos.acc / Math.max(mppLoc, 1e-6));
         g.beginPath(); g.arc(p.x, p.y, accPx, 0, Math.PI * 2);
         g.fillStyle = 'rgba(59,130,246,0.15)'; g.fill();
@@ -601,7 +680,7 @@ const MapCanvas: React.FC = () => {
       // Шаг сетки: пользовательский gridSize по умолчанию, иначе авто-подбор
       let stepM = project.settings?.gridSize && project.settings.gridSize > 0 ? project.settings.gridSize : 0;
       if (!stepM) {
-        const mppX = metersPerPixel(map.width, map.height, bounds?.north ?? 0, bounds?.south ?? 0, s, 0);
+        const mppX = metersPerPixelFromWorld(worldPx, centerLatOf(bounds ?? { north: 0, south: 0 }));
         const targetPx = 90; // желаемый шаг ~90 экранных px
         const raw = targetPx * mppX;
         const pow = Math.pow(10, Math.floor(Math.log10(raw)));
@@ -734,7 +813,7 @@ const MapCanvas: React.FC = () => {
     function drawScaleOverlay(g: CanvasRenderingContext2D) {
       const map = project.map;
       if (!map?.bounds) return;
-      const mpp = metersPerPixel(map.width, map.height, map.bounds.north, map.bounds.south, viewState.scale, centerLatRef);
+      const mpp = metersPerPixelFromWorld(worldPx, centerLatRef);
       // Отрезок в 2 см по экрану (96 css px = 2.54 см → 2 см ≈ 75.6 px)
       const rulerPx = 75.6;
       const metersFor2cm = mpp * rulerPx;
@@ -1527,13 +1606,14 @@ const MapCanvas: React.FC = () => {
     if (!map?.bounds) return;
     // mpp для 1 см = 100 м: 100 м / (0.3937 css px) ≈ 254 м на css px... считаем через zoom:
     // mppEq(z) * cos(lat) = 100 / 37.795 → z = log2(156543.0339*cos(lat)/mpp)
-    const latC = (map.bounds.north + map.bounds.south) / 2;
+    const latC = centerLatOf(map.bounds);
     const targetMpp = 100 / (2.54 / 96 * 100); // 100 м на 1 см экрана
-    const z = Math.log2((156543.0339280412 * Math.cos((latC * Math.PI) / 180)) / targetMpp);
-    const sMin = scaleForZoom(map.width, map.bounds.north, map.bounds.south, MIN_ZOOM);
-    const sMax = scaleForZoom(map.width, map.bounds.north, map.bounds.south, MAX_ZOOM);
-    let sc = scaleForZoom(map.width, map.bounds.north, map.bounds.south, Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z)));
-    sc = Math.max(sMin, Math.min(Math.max(sMax, 40), sc));
+    // Обратная задача: мир в px под целевые м/пиксель, затем scale относительно z0
+    const worldTarget = worldPxForMetersPerPixel(targetMpp, latC);
+    const z0 = viewState.z0 ?? startZoomForBounds(map.bounds, Math.max(1, canvasSize.height));
+    let sc = worldTarget / (Math.max(1, canvasSize.width) * Math.pow(2, z0));
+    const bnds = scaleBoundsForZooms(canvasSize.width, z0, (project.openStreetMap?.tileServer as any) || 'osm');
+    sc = Math.max(bnds.min, Math.min(Math.max(bnds.max * 4, bnds.max), sc));
     const cx = canvasSize.width / 2, cy = canvasSize.height / 2;
     const newOffsetX = cx - (cx - viewState.offsetX) * (sc / viewState.scale);
     const newOffsetY = cy - (cy - viewState.offsetY) * (sc / viewState.scale);
