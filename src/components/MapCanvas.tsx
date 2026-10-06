@@ -158,6 +158,8 @@ const MapCanvas: React.FC = () => {
   const [popup, setPopup] = useState<{ x: number; y: number; title: string; lines: string[] } | null>(null);
   // Кэш тайлов подложки: url -> изображение (или undefined при ошибке)
   const tileCache = useRef<Map<string, HTMLImageElement | undefined>>(new Map());
+  // pending-загрузки тайлов: url -> промис (дедупликация — один запрос на тайл)
+  const tilePending = useRef<Map<string, Promise<void>>>(new Map());
   const [tilesVersion, setTilesVersion] = useState(0);
   // Геолокация пользователя
   const [userPos, setUserPos] = useState<{ lat: number; lng: number; acc: number } | null>(null);
@@ -270,10 +272,21 @@ const MapCanvas: React.FC = () => {
       }
     }
     if (urls.length === 0) return;
-    let cancelled = false;
-    Promise.all(urls.map((u) => loadTileImage(u).then((img) => { if (!cancelled) tileCache.current.set(u, img || undefined); })))
-      .then(() => { if (!cancelled) setTilesVersion((t2) => t2 + 1); });
-    return () => { cancelled = true; };
+    // Де дупликация: тайл, уже находящийся в загрузке (в т.ч. из ранее «отменённого»
+    // эффекта), НЕ запрашивается повторно. Прежняя логика отменяла промисы при каждом
+    // сдвиге вида, кэш почти не наполнялся и на каждое движение мыши стартовала новая
+    // волна из сотен параллельных запросов — это и была причина зависания при загрузке карты.
+    const jobs = urls
+      .filter((u) => !tilePending.current.has(u))
+      .map((u) => {
+        const p = loadTileImage(u)
+          .then((img) => { tileCache.current.set(u, img || undefined); })
+          .finally(() => { tilePending.current.delete(u); });
+        tilePending.current.set(u, p);
+        return p;
+      });
+    if (jobs.length === 0) return;
+    Promise.all(jobs).then(() => setTilesVersion((t2) => t2 + 1));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tilesEnabled, tileStyle, tileServer, offXq, offYq, zoomQ, kxq, kyq, boundsRef, mapHRef]);
 
