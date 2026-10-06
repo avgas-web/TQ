@@ -147,6 +147,21 @@ const App: React.FC = () => {
             />
             Сетка
           </label>
+          <select
+            title="Шаг гео-сетки в метрах (0 = автоподбор под масштаб)"
+            value={String(project.settings?.gridSize ?? 0)}
+            onChange={(e) => updateSettings({ gridSize: Number(e.target.value) })}
+            className="px-1 py-0.5 bg-gray-800 border border-gray-600 rounded text-xs text-white"
+          >
+            <option value="0">Сетка: авто</option>
+            <option value="10">10 м</option>
+            <option value="50">50 м</option>
+            <option value="100">100 м</option>
+            <option value="200">200 м</option>
+            <option value="500">500 м</option>
+            <option value="1000">1 км</option>
+            <option value="5000">5 км</option>
+          </select>
           <button
             onClick={() => updateSettings({ theme: theme === 'dark' ? 'light' : 'dark' })}
             className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 border border-gray-600 rounded text-xs text-white"
