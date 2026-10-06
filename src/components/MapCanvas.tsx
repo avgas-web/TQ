@@ -1356,6 +1356,32 @@ const MapCanvas: React.FC = () => {
   }, [setViewState, zoomAt]);
   const handleTouchEnd = useCallback(() => { touchState.current = null; }, []);
 
+  // Быстрое создание маршрута кликами в режиме действий:
+  // первый клик — точка старта (маршрут-заготовка), каждый следующий — новая точка.
+  const pendingRouteRef = useRef<string | null>(null);
+  const addRouteFromClick = useCallback((mapPoint: Point) => {
+    const st = useStore.getState();
+    if (!st.project.map) return;
+    if (pendingRouteRef.current) {
+      // уже есть заготовка — добавляем точку
+      st.appendRoutePoint(pendingRouteRef.current, mapPoint);
+      st.setActiveRoute(pendingRouteRef.current);
+      return;
+    }
+    const rp: RoutePoint = (() => {
+      const bounds = st.project.map!.bounds;
+      const geo = bounds
+        ? pixelToGeoExact(mapPoint, bounds, st.project.map!.width, st.project.map!.height)
+        : { lat: NaN, lng: NaN };
+      return { x: mapPoint.x, y: mapPoint.y, lat: geo.lat, lng: geo.lng };
+    })();
+    const id = st.addRoute([rp], undefined, undefined);
+    if (id) {
+      pendingRouteRef.current = id;
+      st.setActiveRoute(id);
+    }
+  }, []);
+
   // Mouse down
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     const rect = canvasRef.current?.getBoundingClientRect();
@@ -1523,33 +1549,7 @@ const MapCanvas: React.FC = () => {
   }, [currentTool, actionMode, project, isDrawing, drawingPoints, measurementPoints,
     screenToMap, addMarker, selectMarker, addDrawingPoint, addRestriction,
     clearDrawingPoints, setDrawing, setMeasurementPoints,
-    activeRouteId, appendRoutePoint, setActiveRoute]);
-
-  // Быстрое создание маршрута кликами в режиме действий:
-  // первый клик — точка старта (маршрут-заготовка), каждый следующий — новая точка.
-  const pendingRouteRef = useRef<string | null>(null);
-  const addRouteFromClick = useCallback((mapPoint: Point) => {
-    const st = useStore.getState();
-    if (!st.project.map) return;
-    if (pendingRouteRef.current) {
-      // уже есть заготовка — добавляем точку
-      st.appendRoutePoint(pendingRouteRef.current, mapPoint);
-      st.setActiveRoute(pendingRouteRef.current);
-      return;
-    }
-    const rp: RoutePoint = (() => {
-      const bounds = st.project.map!.bounds;
-      const geo = bounds
-        ? pixelToGeoExact(mapPoint, bounds, st.project.map!.width, st.project.map!.height)
-        : { lat: NaN, lng: NaN };
-      return { x: mapPoint.x, y: mapPoint.y, lat: geo.lat, lng: geo.lng };
-    })();
-    const id = st.addRoute([rp], undefined, undefined);
-    if (id) {
-      pendingRouteRef.current = id;
-      st.setActiveRoute(id);
-    }
-  }, []);
+    activeRouteId, appendRoutePoint, setActiveRoute, addRouteFromClick]);
 
   // Mouse move
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
