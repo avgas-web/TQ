@@ -109,6 +109,9 @@ export interface ViewState {
   offsetX: number;
   offsetY: number;
   scale: number;
+  /** Стартовый zoom (z0) тайловой привязки: мир = canvasWidth·2^z0 px при scale=1.
+   *  Фиксируется при загрузке карты — масштаб больше не «сбивается» при ресайзе окна. */
+  z0?: number;
 }
 
 export interface Measurement {
