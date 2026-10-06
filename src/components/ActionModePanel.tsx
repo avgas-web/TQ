@@ -38,37 +38,123 @@ const ActionModePanel: React.FC = () => {
   const [startsText, setStartsText] = useState('');
   const [goalsText, setGoalsText] = useState('');
 
-  /** Парсинг строки списка: «метка; 55.75, 37.62» | «55.75 37.62» | таб/; разделители */
-  const parseCoordList = (text: string): { label: string; lat: number; lng: number }[] => {
-    const out: { label: string; lat: number; lng: number }[] = [];
+  /** Парсинг строки с поддержкой названий: возвращает координаты ИЛИ название для геокодинга */
+  type ParsedEntry = { label: string; lat: number; lng: number } | { label: string; placeName: string };
+  
+  const parseListWithNames = (text: string): ParsedEntry[] => {
+    const out: ParsedEntry[] = [];
     for (const rawLine of text.split(/\r?\n/)) {
       const line = rawLine.trim();
       if (!line) continue;
+      
+      // Пробуем распарсить как координаты
       let label = '';
       let coordPart = line;
-      // Отделяем метку: всё до первого «;», табуляции или двоеточия, если дальше есть числа
       const m = line.match(/^(.*?)[;:\t]\s*(.+)$/);
       if (m && /\d/.test(m[2])) { label = m[1].trim(); coordPart = m[2].trim(); }
+      
       const nums = coordPart.match(/-?\d+(?:[.,]\d+)?/g);
-      if (!nums || nums.length < 2) continue;
-      const lat = parseFloat(nums[0].replace(',', '.'));
-      const lng = parseFloat(nums[1].replace(',', '.'));
-      if (!isValidGeo({ lat, lng })) continue;
-      out.push({ label: label || `Позиция ${out.length + 1}`, lat, lng });
+      if (nums && nums.length >= 2) {
+        const lat = parseFloat(nums[0].replace(',', '.'));
+        const lng = parseFloat(nums[1].replace(',', '.'));
+        if (isValidGeo({ lat, lng })) {
+          out.push({ label: label || `Точка ${out.length + 1}`, lat, lng });
+          continue;
+        }
+      }
+      
+      // Если координаты не найдены — это название объекта
+      const placeName = coordPart || line;
+      out.push({ label: label || placeName.slice(0, 30), placeName });
     }
     return out;
   };
 
-  const handleImportLists = () => {
-    const starts = parseCoordList(startsText);
-    const goals = parseCoordList(goalsText);
-    if (starts.length === 0 || goals.length === 0) {
-      setError('В обоих списках нужна хотя бы одна точка в формате «метка; 55.75, 37.62».');
+  /** Геокодинг названия через OSM Nominatim */
+  const geocodePlace = async (placeName: string): Promise<{ lat: number; lng: number } | null> => {
+    try {
+      const geo = await osmGeocode(placeName);
+      return geo && isValidGeo(geo) ? geo : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const [importing, setImporting] = useState(false);
+
+  const handleImportLists = async () => {
+    setError('');
+    setCreatedMsg('');
+    
+    const startEntries = parseListWithNames(startsText);
+    const goalEntries = parseListWithNames(goalsText);
+    
+    if (startEntries.length === 0 || goalEntries.length === 0) {
+      setError('В обоих списках нужна хотя бы одна точка (координаты или название объекта).');
       return;
     }
-    setError('');
-    const n = importLists(starts, goals);
-    if (n > 0) setCreatedMsg(`Импортировано маршрутов: ${n} (каждая точка привязана к своему маршруту).`);
+    
+    setImporting(true);
+    
+    // Разделяем на те, что уже с координатами, и те, что требуют геокодинга
+    const startsResolved: ({ label: string; lat: number; lng: number; placeName?: string })[] = [];
+    const goalsResolved: ({ label: string; lat: number; lng: number; placeName?: string })[] = [];
+    const toGeocode: { index: number; isStart: boolean; name: string }[] = [];
+    
+    startEntries.forEach((e, i) => {
+      if ('lat' in e) startsResolved[i] = e;
+      else toGeocode.push({ index: i, isStart: true, name: e.placeName });
+    });
+    
+    goalEntries.forEach((e, i) => {
+      if ('lat' in e) goalsResolved[i] = e;
+      else toGeocode.push({ index: i, isStart: false, name: e.placeName });
+    });
+    
+    // Геокодим названия пакетно (с прогрессом)
+    let geocodedCount = 0;
+    const failedNames: string[] = [];
+    
+    for (const item of toGeocode) {
+      const coords = await geocodePlace(item.name);
+      if (coords) {
+        const entry = { label: item.name, placeName: item.name, ...coords };
+        if (item.isStart) startsResolved[item.index] = entry;
+        else goalsResolved[item.index] = entry;
+      } else {
+        failedNames.push(item.name);
+      }
+      geocodedCount++;
+      setCreatedMsg(`Геокодинг: ${geocodedCount}/${toGeocode.length}...`);
+    }
+    
+    setImporting(false);
+
+    // Разрешаем индексы: если точка не найдена — повторяем предыдущую найденную (чтобы пары старт/цель не разъезжались)
+    const resolveGaps = (arr: ({ label: string; lat: number; lng: number; placeName?: string })[], total: number, kind: string) => {
+      const out: { label: string; lat: number; lng: number; placeName?: string }[] = [];
+      let last: { label: string; lat: number; lng: number; placeName?: string } | null = null;
+      for (let i = 0; i < total; i++) {
+        if (arr[i]) { last = arr[i]; out.push(arr[i]); }
+        else if (last) out.push({ ...last, label: `${last.label} (${kind} ${i + 1})` });
+      }
+      return out;
+    };
+    const validStarts = resolveGaps(startsResolved, startEntries.length, 'старт');
+    const validGoals = resolveGaps(goalsResolved, goalEntries.length, 'цель');
+
+    if (validStarts.length === 0 || validGoals.length === 0) {
+      setError(`Не удалось определить координаты ни для одной точки. Проверьте названия/формат: ${failedNames.slice(0, 5).join(', ')}`);
+      return;
+    }
+    
+    const n = importLists(validStarts, validGoals);
+    
+    let msg = `Импортировано маршрутов: ${n}.`;
+    if (failedNames.length > 0) {
+      msg += ` Не найдено: ${failedNames.slice(0, 3).join(', ')}${failedNames.length > 3 ? '…' : ''}`;
+    }
+    setCreatedMsg(msg);
   };
 
   /** Быстрый старт маршрута кликами по карте (без геокодера): создать и активировать */
@@ -366,7 +452,7 @@ const ActionModePanel: React.FC = () => {
 
             {/* Импорт списков координат: старты и цели -> маршруты с привязкой */}
             <details className="text-xs">
-              <summary className="cursor-pointer text-gray-300 font-medium">📋 Импорт координат (списки старт/цель)</summary>
+              <summary className="cursor-pointer text-gray-300 font-medium">📋 Импорт точек (координаты или названия объектов)</summary>
               <div className="mt-2 space-y-2">
                 <div>
                   <label className="text-[10px] text-gray-400 block mb-0.5">Стартовые позиции (каждая с новой строки)</label>
@@ -374,7 +460,7 @@ const ActionModePanel: React.FC = () => {
                     value={startsText}
                     onChange={(e) => setStartsText(e.target.value)}
                     rows={3}
-                    placeholder={'Альфа; 55.7558, 37.6176\nБета\t55.76 37.64\n55.77, 37.65'}
+                    placeholder={'Альфа; 55.7558, 37.6176\nКремль\nБета\t55.76 37.64'}
                     className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white font-mono"
                   />
                 </div>
@@ -384,21 +470,24 @@ const ActionModePanel: React.FC = () => {
                     value={goalsText}
                     onChange={(e) => setGoalsText(e.target.value)}
                     rows={3}
-                    placeholder={'Гамма; 55.79, 37.67\n55.80, 37.68'}
+                    placeholder={'Гамма; 55.79, 37.67\nВокзал\n55.80, 37.68'}
                     className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white font-mono"
                   />
                 </div>
                 <p className="text-[10px] text-gray-400 leading-snug">
-                  Формат строки: «метка; широта, долгота» или просто «широта долгота» (разделители ; таб : запятая).
+                  Формат строки: «метка; широта, долгота», просто «широта долгота» ИЛИ <b>название объекта</b>
+                  {' '}— названия автоматически привязываются к реальным координатам через OSM Nominatim
+                  (например: «Кремль», «Красная площадь, Москва», «аэропорт Шереметьево»).
                   i-й старт соединяется с i-й целью в отдельный маршрут (при разных длинах — последняя точка повторяется).
                   Максимум всего маршрутов в сессии — 10000.
                 </p>
                 <div className="flex gap-2">
                   <button
                     onClick={handleImportLists}
-                    className="flex-1 px-2 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded text-xs font-medium"
+                    disabled={importing}
+                    className="flex-1 px-2 py-1.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 disabled:cursor-wait text-white rounded text-xs font-medium"
                   >
-                    Импортировать и построить маршруты
+                    {importing ? 'Определение координат…' : 'Импортировать и построить маршруты'}
                   </button>
                   <button
                     onClick={() => { clearImportLists(); setCreatedMsg('Списки импорта очищены.'); }}
