@@ -6,4 +6,6 @@ node_modules/
 
 # Compressed archives
 *.zip
-*.tar.gz
+*.tar.gzTQ-*.zip
+TQ-*.tar.gz
+*.bundle
