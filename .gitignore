@@ -1,0 +1,10 @@
+# Dependencies
+node_modules/
+
+# Build artifacts (кроме dist — он публикуется на Pages)
+build/
+
+# Archives / bundles
+*.zip
+*.bundle
+*.tar.gz
