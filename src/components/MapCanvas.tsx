@@ -2,7 +2,7 @@ import React, { useRef, useEffect, useCallback, useState } from 'react';
 import { useStore } from '../store/useStore';
 import { isPointInActiveRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
-import { haversineDistanceM, bearingDeg } from '../utils/actionMode';
+import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
 import { analyzeRoute, pixelToGeoExact, routeLengthM } from '../utils/routing';
 import type { Point, Route, RoutePoint } from '../types';
 
@@ -11,6 +11,73 @@ const ROUTE_PALETTE = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#
 
 /** Максимальный масштаб: 1 метр на пиксель экрана (зум «до 100 метров» с запасом) */
 const MAX_SCALE = 1.0;
+
+/**
+ * Метров на один ЭКРАННЫЙ пиксель при текущем виде (строгая формула Web Mercator).
+ * 1 см = 100 м соответствует ~37.8 px/m по горизонтали на обычных экранах
+ * (96 CSS-px = 2.54 см), т.е. mpp ≈ 0.0265 м/px — наш предел масштаба намного ниже.
+ */
+function metersPerPixel(mapW: number, mapH: number, north: number, south: number, viewScale: number, latRef: number): number {
+  const lngSpanDeg = Math.abs((mapW / mapH) * (north - south)); // из точной Mercator-привязки bounds
+  const worldPx = (mapW * viewScale) / (lngSpanDeg / 360);      // размер мира в экранных px
+  const mppEq = (156543.0339280412 / Math.pow(2, Math.log2(worldPx / 256)));
+  return mppEq * Math.cos((latRef * Math.PI) / 180);
+}
+
+/** Человекочитаемая подпись масштаба */
+function scaleLabel(mpp: number): string {
+  if (mpp >= 1000) return `1 px ≈ ${(mpp / 1000).toFixed(1)} км`;
+  if (mpp >= 1) return `1 px ≈ ${mpp.toFixed(1)} м`;
+  if (mpp >= 0.01) return `1 px ≈ ${Math.round(mpp * 100)} см`;
+  return `1 px ≈ ${(mpp * 1000).toFixed(1)} мм`;
+}
+
+/**
+ * Автоподбор вида под все объекты (маршруты, маркеры, зоны) — карта загружается
+ * НЕ статичной картинкой «в размер окна», а активным видом, охватывающим данные,
+ * с запасом до предела приближения (сетка и тайлы остаются чёткими).
+ */
+function fitViewToData(
+  mapW: number, mapH: number, bounds: { north: number; south: number },
+  pts: Point[], vw: number, vh: number
+): { scale: number; offsetX: number; offsetY: number } | null {
+  if (pts.length === 0) return null;
+  const b = boundsFromPoints(pts as any, 0.15);
+  // Пиксели карты -> география через точную Mercator-привязку bounds
+  const topY = latToMerc(bounds.north);
+  const botY = latToMerc(bounds.south);
+  const xL = ((b.west - (-180)) / 360) * mapW;
+  const xR = ((b.east - (-180)) / 360) * mapW;
+  const yT = ((topY - latToMerc(b.north)) / (botY - topY)) * mapH;
+  const yB = ((topY - latToMerc(b.south)) / (botY - topY)) * mapH;
+  const w = Math.max(1e-6, xR - xL);
+  const h = Math.max(1e-6, yB - yT);
+  let scale = Math.min(vw / w, vh / h) * 0.85;
+  scale = Math.min(Math.max(scale, 0.02), 40); // в пределах допустимого диапазона зума
+  const cx = (xL + xR) / 2;
+  const cy = (yT + yB) / 2;
+  return { scale, offsetX: vw / 2 - cx * scale, offsetY: vh / 2 - cy * scale };
+}
+
+/** Нормализованная Mercator Y широты (0..1) */
+function latToMerc(lat: number): number {
+  const s = Math.sin((lat * Math.PI) / 180);
+  return 0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI);
+}
+
+/** Обратная Mercator: нормализованная Y -> широта */
+function mercToLat(y: number): number {
+  const n = Math.PI - 2 * Math.PI * y;
+  return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+}
+
+/** Подпись «1 см на экране = N м» при текущем масштабе (96 css px = 2.54 см) */
+function rulerScaleText(mpp: number): string {
+  const m1cm = mpp * (2.54 / 96) * 100; // метров в 1 см экрана
+  if (m1cm >= 1000) return `1 см ≈ ${(m1cm / 1000).toFixed(m1cm >= 10000 ? 0 : 1)} км`;
+  if (m1cm >= 1) return `1 см ≈ ${m1cm.toFixed(m1cm < 10 ? 1 : 0)} м`;
+  return `1 см ≈ ${(m1cm * 100).toFixed(0)} см`;
+}
 
 /**
  * Расстояние в экранных пикселях от точки до ломаной маршрута.
@@ -110,7 +177,9 @@ const MapCanvas: React.FC = () => {
     return () => observer.disconnect();
   }, []);
 
-  // Fit map to view when a new map image is loaded (не сбрасывать вид при ресайзе окна)
+  // Auto-fit view: при загрузке карты — вписать её; если на карте есть объекты
+  // (маршруты/маркеры/зоны) — автоматически масштабировать вид ПОД НИХ,
+  // карта остаётся интерактивной (зум/панорама доступны всегда).
   const lastFittedMapRef = useRef<string | null>(null);
   useEffect(() => {
     const dataUrl = project.map?.dataUrl;
@@ -124,6 +193,23 @@ const MapCanvas: React.FC = () => {
       setViewState({ scale, offsetX, offsetY });
     }
   }, [project.map?.dataUrl, mapLoaded, canvasSize.width, canvasSize.height]);
+
+  // Отдельный эффект: как только появляются точки маршрутов/маркеров —
+  // автоматически подогнать вид под все объекты (один раз на набор объектов)
+  const lastFitKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const map = project.map;
+    if (!map || !map.bounds || !mapLoaded || canvasSize.width <= 0) return;
+    const pts: Point[] = [];
+    for (const r of project.routes || []) if (r.visible !== false) for (const p of r.points) pts.push({ x: p.x, y: p.y });
+    for (const m of project.markers) pts.push({ x: m.x, y: m.y });
+    if (pts.length < 2) return;
+    const key = `${map.dataUrl}|${pts.length}`;
+    if (lastFitKeyRef.current === key) return;
+    lastFitKeyRef.current = key;
+    const fit = fitViewToData(map.width, map.height, map.bounds, pts, canvasSize.width, canvasSize.height);
+    if (fit) setViewState(fit);
+  }, [project.routes, project.markers, mapLoaded, canvasSize.width, canvasSize.height, project.map?.bounds]);
 
   // Convert screen coordinates to map coordinates
   const screenToMap = useCallback((screenX: number, screenY: number): Point => {
@@ -146,6 +232,15 @@ const MapCanvas: React.FC = () => {
     if (canvas.width !== physW) canvas.width = physW;
     if (canvas.height !== physH) canvas.height = physH;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // Широта центра видимой области — для точного расчёта метров/пиксель
+    let centerLatRef = project.map?.bounds ? (project.map.bounds.north + project.map.bounds.south) / 2 : 0;
+    if (project.map?.bounds && project.map.height > 0) {
+      const topM = latToMerc(project.map.bounds.north);
+      const botM = latToMerc(project.map.bounds.south);
+      const cyMapPx = (canvasSize.height / 2 - viewState.offsetY) / viewState.scale;
+      centerLatRef = mercToLat(topM + ((botM - topM) / project.map.height) * Math.max(0, Math.min(project.map.height, cyMapPx)));
+    }
 
     // Clear
     ctx.fillStyle = '#0f1729';
@@ -177,11 +272,6 @@ const MapCanvas: React.FC = () => {
     ctx.drawImage(mapImageRef.current, 0, 0, project.map.width, project.map.height);
     ctx.restore();
 
-    // Draw grid
-    if (project.settings?.showGrid) {
-      drawGrid(ctx);
-    }
-
     // Draw restrictions
     drawRestrictions(ctx);
 
@@ -211,39 +301,190 @@ const MapCanvas: React.FC = () => {
     ctx.strokeRect(0, 0, project.map.width, project.map.height);
     ctx.restore();
 
+    // Сетка поверх карты (чтобы линии и подписи НЕ тонули в подложке тайлов)
+    if (project.settings?.showGrid) {
+      drawGrid(ctx);
+    }
+
+    // Масштабная линейка + плашка масштаба — всегда поверх всего
+    drawScaleOverlay(ctx);
+
     function drawGrid(ctx: CanvasRenderingContext2D) {
+      // ГЕОГРАФИЧЕСКАЯ адаптивная сетка: шаг в реальных метрах подбирается
+      // под текущий масштаб (1/2/5 × 10^n), линии строго привязаны к координатам,
+      // подписи всегда рисуются поверх карты фиксированным размером (не тонут в тайлах).
       if (!project.map) return;
-      const gridSize = project.settings?.gridSize || 100;
+      const map = project.map;
+      const s = viewState.scale;
+      const bounds = map.bounds;
+
+      // Шаг сетки: пользовательский gridSize по умолчанию, иначе авто-подбор
+      let stepM = project.settings?.gridSize && project.settings.gridSize > 0 ? project.settings.gridSize : 0;
+      if (!stepM) {
+        const mppX = metersPerPixel(map.width, map.height, bounds?.north ?? 0, bounds?.south ?? 0, s, 0);
+        const targetPx = 90; // желаемый шаг ~90 экранных px
+        const raw = targetPx * mppX;
+        const pow = Math.pow(10, Math.floor(Math.log10(raw)));
+        const mults = [1, 2, 5, 10];
+        stepM = mults.map((m) => m * pow).find((v) => v >= raw) || 10 * pow;
+      }
+
+      // Метров на пиксель КАРТЫ по долготе (через точную Mercator-привязку bounds)
+      let mppMap: number | null = null;
+      if (bounds && bounds.north !== bounds.south && map.width > 0 && map.height > 0) {
+        const lngSpan = Math.abs((map.width / map.height) * (bounds.north - bounds.south));
+        mppMap = (lngSpan / 360) * 40075016.686 * Math.cos(0) / map.width; // на экваторе
+      }
+
       ctx.save();
-      ctx.translate(viewState.offsetX, viewState.offsetY);
-      ctx.scale(viewState.scale, viewState.scale);
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
-      ctx.lineWidth = 1 / viewState.scale;
 
-      for (let x = 0; x <= project.map!.width; x += gridSize) {
-        ctx.beginPath();
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, project.map!.height);
-        ctx.stroke();
-      }
-      for (let y = 0; y <= project.map!.height; y += gridSize) {
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(project.map!.width, y);
-        ctx.stroke();
-      }
+      if (mppMap != null && bounds) {
+        // --- Гео-привязанная сетка: узлы в реальных метрах от левого верхнего угла bounds ---
+        const stepPxX = stepM / mppMap;                       // шаг по X в пикселях карты (экваториальный эталон)
+        const latTop = bounds.north;
+        const cosTop = Math.max(0.05, Math.cos((latTop * Math.PI) / 180));
+        // Видимая область в пикселях карты:
+        const vx0 = (0 - viewState.offsetX) / s;
+        const vy0 = (0 - viewState.offsetY) / s;
+        const vx1 = (canvasSize.width - viewState.offsetX) / s;
+        const vy1 = (canvasSize.height - viewState.offsetY) / s;
 
-      // Grid labels
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
-      ctx.font = `${10 / viewState.scale}px monospace`;
-      ctx.textAlign = 'left';
-      for (let x = 0; x <= project.map!.width; x += gridSize) {
-        ctx.fillText(`${x}`, x + 2 / viewState.scale, 12 / viewState.scale);
-      }
-      for (let y = gridSize; y <= project.map!.height; y += gridSize) {
-        ctx.fillText(`${y}`, 2 / viewState.scale, y - 2 / viewState.scale);
+        ctx.lineWidth = 1 / s;
+        ctx.strokeStyle = 'rgba(140, 190, 255, 0.35)';
+
+        // Вертикальные линии (постоянный шаг по долготе)
+        const startXi = Math.floor(vx0 / stepPxX);
+        const endXi = Math.ceil(vx1 / stepPxX);
+        for (let i = startXi; i <= endXi; i++) {
+          const x = i * stepPxX;
+          if (x < 0 || x > map.width) continue;
+          ctx.beginPath();
+          ctx.moveTo(x, Math.max(0, vy0));
+          ctx.lineTo(x, Math.min(map.height, vy1));
+          ctx.stroke();
+        }
+
+        // Горизонтальные линии: шаг по широте = stepM / (mppMap * cos²(lat)) — корректный Mercator.
+        // Идём сверху вниз с переменной плотностью.
+        const topMercY = latToMerc(bounds.north);
+        const botMercY = latToMerc(bounds.south);
+        const mercPerMapPx = (botMercY - topMercY) / map.height;
+        let my = Math.max(0, vy0);
+        let accM = 0;
+        const yLines: number[] = [];
+        if (my > 0) {
+          // найти первый узел ниже верха экрана: интегрируем метры от верха bounds
+          // (для простоты стартуем с 0 от северной границы)
+        }
+        while (true) {
+          const latAtY = mercToLat(topMercY + my * mercPerMapPx);
+          const cosLat = Math.max(0.05, Math.cos((latAtY * Math.PI) / 180));
+          const dMerc = (stepM / (mppMap * cosLat * cosLat)) * mercPerMapPx; // Mercator Δ на один шаг
+          my += dMerc;
+          accM += stepM;
+          if (my > Math.min(map.height, vy1)) break;
+          yLines.push(my);
+          if (yLines.length > 500) break; // защита от вырожденных случаев
+        }
+        void accM; void cosTop;
+        ctx.beginPath();
+        for (const y of yLines) {
+          ctx.moveTo(Math.max(0, vx0), y);
+          ctx.lineTo(Math.min(map.width, vx1), y);
+        }
+        ctx.stroke();
+
+        // Подписи шага (фиксированный размер на экране, поверх карты)
+        const fs = 11;
+        ctx.font = `${fs}px monospace`;
+        ctx.textAlign = 'left';
+        const label = stepM >= 1000 ? `${stepM / 1000} км` : `${stepM} м`;
+        for (let i = Math.max(0, startXi); i <= Math.min(endXi, Math.ceil(map.width / stepPxX)); i++) {
+          const sx = i * stepPxX * s + viewState.offsetX;
+          if (sx < 0 || sx > canvasSize.width) continue;
+          if ((i - Math.max(0, startXi)) % 2 !== 0) continue; // реже подписи при густой сетке
+          ctx.fillStyle = 'rgba(0,0,0,0.55)';
+          ctx.fillRect(sx + 2, 2, fs * 3.4, fs + 4);
+          ctx.fillStyle = 'rgba(190, 220, 255, 0.9)';
+          ctx.fillText(`${i * stepM >= 1000 ? ((i * stepM) / 1000).toFixed(i * stepM % 1000 ? 1 : 0) + 'км' : i * stepM + 'м'}`, sx + 4, 2 + fs);
+        }
+        let li = 1;
+        for (const y of yLines) {
+          const sy = y * s + viewState.offsetY;
+          if (sy < 14 || sy > canvasSize.height - 4) { li++; continue; }
+          if (li % 2 === 0) { li++; continue; }
+          ctx.fillStyle = 'rgba(0,0,0,0.55)';
+          ctx.fillRect(2, sy - fs - 2, fs * 3.4, fs + 4);
+          ctx.fillStyle = 'rgba(190, 220, 255, 0.9)';
+          const mtr = li * stepM;
+          ctx.fillText(`${mtr >= 1000 ? (mtr / 1000).toFixed(mtr % 1000 ? 1 : 0) + 'км' : mtr + 'м'}`, 4, sy - 4);
+          li++;
+        }
+        void label;
+      } else {
+        // --- Нет гео-привязки: классическая пиксельная сетка ---
+        const gridSize = project.settings?.gridSize || 100;
+        ctx.translate(viewState.offsetX, viewState.offsetY);
+        ctx.scale(s, s);
+        ctx.strokeStyle = 'rgba(140, 190, 255, 0.3)';
+        ctx.lineWidth = 1 / s;
+        ctx.beginPath();
+        for (let x = 0; x <= map.width; x += gridSize) { ctx.moveTo(x, 0); ctx.lineTo(x, map.height); }
+        for (let y = 0; y <= map.height; y += gridSize) { ctx.moveTo(0, y); ctx.lineTo(map.width, y); }
+        ctx.stroke();
+        ctx.restore();
+        ctx.save();
+        ctx.font = '11px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillStyle = 'rgba(190, 220, 255, 0.8)';
+        for (let x = 0; x <= map.width; x += gridSize * 2) {
+          const sx = x * s + viewState.offsetX;
+          if (sx < 0 || sx > canvasSize.width) continue;
+          ctx.fillText(`${x}`, sx + 2, 12);
+        }
+        for (let y = gridSize; y <= map.height; y += gridSize * 2) {
+          const sy = y * s + viewState.offsetY;
+          if (sy < 14 || sy > canvasSize.height) continue;
+          ctx.fillText(`${y}`, 2, sy - 3);
+        }
       }
       ctx.restore();
+    }
+
+    function drawScaleOverlay(g: CanvasRenderingContext2D) {
+      const map = project.map;
+      if (!map?.bounds) return;
+      const mpp = metersPerPixel(map.width, map.height, map.bounds.north, map.bounds.south, viewState.scale, centerLatRef);
+      // Отрезок в 2 см по экрану (96 css px = 2.54 см → 2 см ≈ 75.6 px)
+      const rulerPx = 75.6;
+      const metersFor2cm = mpp * rulerPx;
+      const nice = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000];
+      const chosen = nice.find((n) => n >= metersFor2cm) || Math.round(metersFor2cm);
+      const linePx = Math.min(chosen / mpp, canvasSize.width * 0.4);
+      const rx = canvasSize.width - linePx - 24;
+      const ry = canvasSize.height - 22;
+      g.save();
+      g.strokeStyle = '#e2e8f0';
+      g.lineWidth = 2;
+      g.beginPath();
+      g.moveTo(rx, ry); g.lineTo(rx + linePx, ry);
+      g.moveTo(rx, ry - 5); g.lineTo(rx, ry + 5);
+      g.moveTo(rx + linePx, ry - 5); g.lineTo(rx + linePx, ry + 5);
+      g.stroke();
+      g.font = 'bold 11px sans-serif';
+      g.textAlign = 'center';
+      const txt = chosen >= 1000 ? `${chosen / 1000} км` : `${chosen} м`;
+      g.fillStyle = 'rgba(0,0,0,0.6)';
+      g.fillRect(rx + linePx / 2 - 26, ry - 20, 52, 14);
+      g.fillStyle = '#e2e8f0';
+      g.fillText(txt, rx + linePx / 2, ry - 9);
+      g.textAlign = 'right';
+      g.fillStyle = 'rgba(148,197,255,0.95)';
+      g.fillRect(canvasSize.width - 210, ry - 40, 202, 16);
+      g.fillStyle = '#0c1a2e';
+      g.font = 'bold 11px sans-serif';
+      g.fillText(`${scaleLabel(mpp)} · ${rulerScaleText(mpp)}`, canvasSize.width - 12, ry - 28);
+      g.restore();
     }
 
     function drawRestrictions(ctx: CanvasRenderingContext2D) {
