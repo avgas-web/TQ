@@ -1,1 +1,4 @@
-(empty)
+node_modules/
+*.tar.gz
+*.zip
+*.bundle
