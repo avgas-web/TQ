@@ -5,9 +5,23 @@ import type { Project, Marker, Restriction, Layer, Tool, ViewState, MapData, Poi
 import { MAX_ROUTES } from '../types';
 import { saveMapToIndexedDB, loadMapFromIndexedDB, deleteMapFromIndexedDB } from '../utils/storage';
 import { geoToPixelFromBounds } from '../utils/googleMaps';
-import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact } from '../utils/routing';
+import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, smoothPolyline, routeLengthM } from '../utils/routing';
+import type { RouteShape, RangeLimitMode, ImportPoint, ImportLists } from '../types';
 
 const ROUTE_COLORS = ['#00d0ff', '#ff9500', '#a78bfa', '#34d399', '#f472b6', '#facc15', '#fb7185', '#60a5fa'];
+
+/** Предупреждение о нарушении ограничения маршрута по дальности */
+function rangeLimitWarning(route: Route, pts: RoutePoint[]): string | null {
+  if (!route.rangeMode || route.rangeMode === 'off' || !route.rangeM || route.rangeM <= 0) return null;
+  const len = routeLengthM(pts.map((p) => ({ lat: p.lat, lng: p.lng })));
+  if (route.rangeMode === 'max' && len > route.rangeM) {
+    return `Дальность ${Math.round(len)} м превышает лимит ${Math.round(route.rangeM)} м`;
+  }
+  if (route.rangeMode === 'min' && len < route.rangeM) {
+    return `Дальность ${Math.round(len)} м меньше минимума ${Math.round(route.rangeM)} м`;
+  }
+  return null;
+}
 
 /** Строгая привязка пикселя к WGS-84 (обратная Mercator-проекция) */
 function pixelToGeoStrict(p: Point, bounds: MapBounds, mapW: number, mapH: number) {
@@ -30,6 +44,7 @@ interface AppState {
   actionMode: boolean; // «Режим действий»: маршрут старт→цель с гео-расчётами
   activeRouteId: string | null; // активный маршрут для редактирования кликами
   routeWarnings: Record<string, string[]>; // id маршрута -> предупреждения о пересечении зон (в сессии)
+  redoDrawingStack: Point[]; // redo-стек для рисования полигонов
   _currentMapId?: string; // ID текущей карты в IndexedDB
 
   // Actions — маршруты
@@ -44,6 +59,13 @@ interface AppState {
   moveRoutePoint: (id: string, index: number, p: Point) => void;
   removeRoutePoint: (id: string, index: number) => void;
   rerouteAroundZones: (id: string) => void; // перестроить обход зон для всего маршрута
+  rerouteAllRoutes: () => void; // пакетная перестройка всех маршрутов после изменения зон/карты
+  setRouteShape: (id: string, shape: 'straight' | 'curve') => void; // прямая или кривая
+  setRouteRangeLimit: (id: string, mode: 'off' | 'max' | 'min', meters?: number) => void; // ограничение по дальности
+  importLists: (starts: { label: string; lat: number; lng: number }[], goals: { label: string; lat: number; lng: number }[]) => number; // импорт списков + привязка к маршрутам
+  clearImportLists: () => void;
+  undoDrawingPoint: () => void; // undo последней точки рисования полигона
+  redoDrawingPoint: () => void; // redo убранной точки
   refreshAllRoutesAfterMapChange: () => void; // пересчёт пикселей из lat/lng при загрузке новой карты
   clearRouteWarnings: (id: string) => void;
   setTool: (tool: Tool) => void;
@@ -142,6 +164,7 @@ export const useStore = create<AppState>()(
       actionMode: false,
       activeRouteId: null,
       routeWarnings: {},
+      redoDrawingStack: [],
 
       // ─── Маршруты (режим действий) ────────────────────────────────────────
 
@@ -325,9 +348,27 @@ export const useStore = create<AppState>()(
           }
         }
         newPts.push({ ...route.points[keyIdx[keyIdx.length - 1]] });
+        // Кривая: сглаживаем обходную ломаную (ключевые точки остаются на месте)
+        if (route.shape === 'curve') {
+          const smooth = smoothPolyline(newPts.map((p) => ({ x: p.x, y: p.y })), 6);
+          const bounds2 = map.bounds;
+          const merged: RoutePoint[] = [];
+          for (let i = 0; i < smooth.length; i++) {
+            const sp = smooth[i];
+            const near = newPts.find((p) => Math.hypot(p.x - sp.x, p.y - sp.y) < 1.5);
+            if (near) { merged.push(near); continue; }
+            const geo = bounds2 ? pixelToGeoStrict(sp, bounds2, map.width, map.height) : { lat: NaN, lng: NaN };
+            merged.push({ x: sp.x, y: sp.y, lat: geo.lat, lng: geo.lng, auto: true });
+          }
+          newPts.length = 0;
+          newPts.push(...merged);
+        }
         // Предупреждения о зонах, через которые всё же проходит маршрут
         const crossed = zonesCrossedBy(newPts.map((p) => ({ x: p.x, y: p.y })), state.project.restrictions);
         const warnings = crossed.map((z) => `Пересекает зону «${z.name}»`);
+        // Проверка ограничения по дальности
+        const limitWarn = rangeLimitWarning(route, newPts);
+        if (limitWarn) warnings.push(limitWarn);
         set((cur) => ({
           routeWarnings: { ...cur.routeWarnings, [id]: warnings },
           project: {
@@ -365,8 +406,24 @@ export const useStore = create<AppState>()(
             }
           }
           pts.push({ ...route.points[ki[ki.length - 1]] });
+          // Кривая: сглаживание обходной ломаной (ключевые точки сохраняются)
+          if (route.shape === 'curve') {
+            const smooth = smoothPolyline(pts.map((p) => ({ x: p.x, y: p.y })), 6);
+            const merged: RoutePoint[] = [];
+            for (const sp of smooth) {
+              const near = pts.find((p) => Math.hypot(p.x - sp.x, p.y - sp.y) < 1.5);
+              if (near) { merged.push(near); continue; }
+              const geo = map.bounds ? pixelToGeoStrict(sp, map.bounds, map.width, map.height) : { lat: NaN, lng: NaN };
+              merged.push({ x: sp.x, y: sp.y, lat: geo.lat, lng: geo.lng, auto: true });
+            }
+            pts.length = 0;
+            pts.push(...merged);
+          }
           const crossed = zonesCrossedBy(pts.map((p) => ({ x: p.x, y: p.y })), keyBy);
-          if (crossed.length > 0) warningsMap[route.id] = crossed.map((z) => `Пересекает зону «${z.name}»`);
+          const warns = crossed.map((z) => `Пересекает зону «${z.name}»`);
+          const limitWarn = rangeLimitWarning(route, pts);
+          if (limitWarn) warns.push(limitWarn);
+          if (warns.length > 0) warningsMap[route.id] = warns;
           else delete warningsMap[route.id];
           newRoutes.push({ ...route, points: pts });
         }
@@ -394,6 +451,90 @@ export const useStore = create<AppState>()(
         delete copy[id];
         return { routeWarnings: copy };
       }),
+
+      setRouteShape: (id, shape) => {
+        set((cur) => ({
+          project: {
+            ...cur.project,
+            routes: (cur.project.routes || []).map((r) => (r.id === id ? { ...r, shape } : r)),
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+        get().rerouteAroundZones(id); // перестраиваем сглаживание/ломаную
+      },
+
+      setRouteRangeLimit: (id, mode, meters) => {
+        set((cur) => ({
+          project: {
+            ...cur.project,
+            routes: (cur.project.routes || []).map((r) =>
+              r.id === id ? { ...r, rangeMode: mode, rangeM: mode === 'off' ? undefined : meters ?? r.rangeM } : r
+            ),
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+        get().rerouteAroundZones(id); // пересчитать предупреждения по дальности
+      },
+
+      importLists: (starts, goals) => {
+        const state = get();
+        const map = state.project.map;
+        if (!map) { alert('⚠️ Сначала загрузите карту — точки привязываются к её координатам.'); return 0; }
+        const existing = state.project.routes || [];
+        const freeSlots = Math.max(0, MAX_ROUTES - existing.length);
+        const n = Math.min(Math.max(starts.length, goals.length), freeSlots);
+        if (n === 0) {
+          alert(`⚠️ Достигнут максимум маршрутов в сессии: ${MAX_ROUTES}.`);
+          return 0;
+        }
+        const toRoutePoint = (pt: { lat: number; lng: number }): RoutePoint => {
+          const px = map.bounds
+            ? geoToPixelFromBounds({ lat: pt.lat, lng: pt.lng }, map.bounds, map.width, map.height)
+            : { x: 0, y: 0 };
+          return { lat: pt.lat, lng: pt.lng, x: px.x, y: px.y };
+        };
+        const newRoutes: Route[] = [];
+        const impStarts: ImportPoint[] = [];
+        const impGoals: ImportPoint[] = [];
+        for (let i = 0; i < n; i++) {
+          const s = starts[Math.min(i, starts.length - 1)];
+          const g = goals[Math.min(i, goals.length - 1)];
+          const id = uuidv4();
+          newRoutes.push({
+            id,
+            name: `${s.label || `Старт ${i + 1}`} → ${g.label || `Цель ${i + 1}`}`,
+            color: ROUTE_COLORS[(existing.length + i) % ROUTE_COLORS.length],
+            points: [toRoutePoint(s), toRoutePoint(g)],
+            active: false,
+            visible: true,
+            createdAt: new Date().toISOString(),
+            shape: 'straight',
+          });
+          impStarts.push({ id: uuidv4(), label: s.label || `Старт ${i + 1}`, lat: s.lat, lng: s.lng, routeId: id });
+          impGoals.push({ id: uuidv4(), label: g.label || `Цель ${i + 1}`, lat: g.lat, lng: g.lng, routeId: id });
+        }
+        set((cur) => {
+          const prevLists = cur.project.importLists;
+          const lists: ImportLists = {
+            starts: [...(prevLists?.starts || []), ...impStarts],
+            goals: [...(prevLists?.goals || []), ...impGoals],
+          };
+          return {
+            project: {
+              ...cur.project,
+              routes: [...(cur.project.routes || []), ...newRoutes],
+              importLists: lists,
+              updatedAt: new Date().toISOString(),
+            },
+          };
+        });
+        get().rerouteAllRoutes(); // автообход зон для новых маршрутов
+        return n;
+      },
+
+      clearImportLists: () => set((cur) => ({
+        project: { ...cur.project, importLists: undefined, updatedAt: new Date().toISOString() },
+      })),
 
       setTool: (tool) => set({ currentTool: tool, isDrawing: false, drawingPoints: [] }),
 
@@ -472,6 +613,29 @@ export const useStore = create<AppState>()(
             updatedAt: new Date().toISOString(),
           },
           activeRestrictionId: restriction.id,
+        };
+      }),
+
+      // undo/redo для рисования полигонов (и любых точек рисования)
+      undoDrawingPoint: () => set((state) => {
+        if (state.drawingPoints.length === 0) return {};
+        const removed = state.drawingPoints[state.drawingPoints.length - 1];
+        const pts = state.drawingPoints.slice(0, -1);
+        return {
+          drawingPoints: pts,
+          isDrawing: pts.length > 0 && state.isDrawing,
+          redoDrawingStack: [...state.redoDrawingStack, removed],
+        };
+      }),
+
+      redoDrawingPoint: () => set((state) => {
+        const stack = state.redoDrawingStack;
+        if (stack.length === 0) return {};
+        const last = stack[stack.length - 1];
+        return {
+          drawingPoints: [...state.drawingPoints, last],
+          isDrawing: true,
+          redoDrawingStack: stack.slice(0, -1),
         };
       }),
 
@@ -557,9 +721,10 @@ export const useStore = create<AppState>()(
 
       addDrawingPoint: (point) => set((state) => ({
         drawingPoints: [...state.drawingPoints, point],
+        redoDrawingStack: [], // новое действие очищает redo-стек
       })),
 
-      clearDrawingPoints: () => set({ drawingPoints: [], isDrawing: false }),
+      clearDrawingPoints: () => set({ drawingPoints: [], isDrawing: false, redoDrawingStack: [] }),
 
       setMeasurementPoints: (points) => set({ measurementPoints: points }),
 
