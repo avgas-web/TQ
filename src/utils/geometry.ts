@@ -48,7 +48,7 @@ export function isPointInRestriction(point: Point, restriction: Restriction): bo
     case 'rectangle':
       return isPointInRect(point, restriction.points);
     case 'circle':
-      if (restriction.points.length < 2) return false;
+      if (restriction.points.length < 1) return false;
       return isPointInCircle(point, restriction.points[0], restriction.radius || 0);
     default:
       return true;
