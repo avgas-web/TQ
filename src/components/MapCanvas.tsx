@@ -282,11 +282,14 @@ const MapCanvas: React.FC = () => {
     setViewState({ scale: newScale, offsetX: newOffsetX, offsetY: newOffsetY });
   }, [viewState, setViewState, project.map, canvasSize]);
 
-  // Load map image when map data changes
+  // Load map image when map data changes.
+  // ВАЖНО: при активной тайловой подложке карта не обязана иметь растровое изображение —
+  // иначе mapLoaded никогда не станет true и все режимы (маршруты, зоны, сетка) «не грузятся».
   useEffect(() => {
+    const tilesActive = !!project.settings?.tilesEnabled && !!project.map?.bounds;
     if (!project.map || !project.map.dataUrl) {
       mapImageRef.current = null;
-      setMapLoaded(false);
+      setMapLoaded(tilesActive && !!project.map?.bounds);
       return;
     }
 
@@ -297,10 +300,11 @@ const MapCanvas: React.FC = () => {
     };
     img.onerror = () => {
       console.error('Ошибка загрузки изображения карты');
-      setMapLoaded(false);
+      // fallback-картинка не загрузилась — но активная тайловая карта всё равно работает
+      setMapLoaded(tilesActive);
     };
     img.src = project.map.dataUrl;
-  }, [project.map?.dataUrl]);
+  }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled]);
 
   // Resize observer
   useEffect(() => {
@@ -325,17 +329,34 @@ const MapCanvas: React.FC = () => {
   // карта остаётся интерактивной (зум/панорама доступны всегда).
   const lastFittedMapRef = useRef<string | null>(null);
   useEffect(() => {
-    const dataUrl = project.map?.dataUrl;
-    if (project.map && mapLoaded && canvasSize.width > 0 && dataUrl && lastFittedMapRef.current !== dataUrl) {
-      lastFittedMapRef.current = dataUrl;
-      const scaleX = canvasSize.width / project.map.width;
-      const scaleY = canvasSize.height / project.map.height;
-      const scale = Math.min(scaleX, scaleY) * 0.9;
-      const offsetX = (canvasSize.width - project.map.width * scale) / 2;
-      const offsetY = (canvasSize.height - project.map.height * scale) / 2;
-      setViewState({ scale, offsetX, offsetY });
+    const tilesActive = !!project.settings?.tilesEnabled && !!project.map?.bounds;
+    const fitKey = project.map ? `${project.map.dataUrl || 'tiles'}|${canvasSize.width}x${canvasSize.height}` : null;
+    if (project.map && mapLoaded && canvasSize.width > 0 && fitKey && lastFittedMapRef.current !== fitKey) {
+      lastFittedMapRef.current = fitKey;
+      if (mapImageRef.current) {
+        // Растровая карта: вписать изображение целиком
+        const scaleX = canvasSize.width / project.map.width;
+        const scaleY = canvasSize.height / project.map.height;
+        const scale = Math.min(scaleX, scaleY) * 0.9;
+        const offsetX = (canvasSize.width - project.map.width * scale) / 2;
+        const offsetY = (canvasSize.height - project.map.height * scale) / 2;
+        setViewState({ scale, offsetX, offsetY });
+      } else if (tilesActive && project.map.bounds) {
+        // Только тайловая подложка: стартовый вид ≈ z15–16 вокруг центра bounds,
+        // масштаб считается из строгой Mercator-привязки (scaleForZoom) — линейка точна.
+        const map = project.map;
+        const cLat = (map.bounds.north + map.bounds.south) / 2;
+        const cLng = (map.bounds.east + map.bounds.west) / 2;
+        const zoom = 15;
+        const scale = Math.max(0.05, Math.min(40, scaleForZoom(map.width, map.bounds.north, map.bounds.south, zoom)));
+        const cxMap = ((cLng + 180) / 360) * map.width;
+        const topM = latToMerc(map.bounds.north);
+        const botM = latToMerc(map.bounds.south);
+        const cyMap = ((topM - latToMerc(cLat)) / (botM - topM)) * map.height;
+        setViewState({ scale, offsetX: canvasSize.width / 2 - cxMap * scale, offsetY: canvasSize.height / 2 - cyMap * scale });
+      }
     }
-  }, [project.map?.dataUrl, mapLoaded, canvasSize.width, canvasSize.height]);
+  }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled, mapLoaded, canvasSize.width, canvasSize.height]);
 
   // Отдельный эффект: как только появляются точки маршрутов/маркеров —
   // автоматически подогнать вид под все объекты (один раз на набор объектов)
@@ -389,8 +410,9 @@ const MapCanvas: React.FC = () => {
     ctx.fillStyle = '#0f1729';
     ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
 
-    if (!project.map || !mapImageRef.current) {
-      // No map - draw placeholder
+    const tilesOnNow = !!project.settings?.tilesEnabled && !!project.map?.bounds;
+    if (!project.map || (!mapImageRef.current && !tilesOnNow)) {
+      // No map - draw placeholder (fallback-состояние без тайловой подложки)
       ctx.fillStyle = '#1a2744';
       ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
       ctx.fillStyle = '#4a6fa5';
@@ -404,7 +426,7 @@ const MapCanvas: React.FC = () => {
     }
 
     // Draw map: тайловая подложка (активная карта) или загруженный растр как fallback-картинка
-    const tilesOn = !!project.settings?.tilesEnabled && project.map?.bounds;
+    const tilesOn = tilesOnNow;
     if (tilesOn && project.map?.bounds) {
       drawTiles(ctx);
     } else if (mapImageRef.current) {
@@ -563,6 +585,9 @@ const MapCanvas: React.FC = () => {
       }
       g.restore();
     }
+
+    // Масштабная линейка + плашка масштаба — всегда поверх всего
+    drawScaleOverlay(ctx);
 
     function drawGrid(ctx: CanvasRenderingContext2D) {
       // ГЕОГРАФИЧЕСКАЯ адаптивная сетка: шаг в реальных метрах подбирается
