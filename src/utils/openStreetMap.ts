@@ -82,6 +82,8 @@ export async function osmReverseGeocode(lat: number, lng: number): Promise<strin
   }
 }
 
+export type TileStyle = 'scheme' | 'satellite' | 'hybrid';
+
 /**
  * Получение URL тайла OSM
  */
@@ -89,17 +91,41 @@ export function getOSMTileUrl(
   zoom: number,
   x: number,
   y: number,
-  tileServer: 'osm' | 'opentopomap' | 'carto' = 'osm'
+  tileServer: 'osm' | 'opentopomap' | 'carto' = 'osm',
+  style: TileStyle = 'scheme'
 ): string {
+  // detectRetina: true → tileSize 512 (тайлы @2x), maxNativeZoom 19
+  const z = Math.min(Math.max(zoom, 0), 19);
+  const retina = typeof window !== 'undefined' && (window.devicePixelRatio || 1) >= 1.5;
+  const at = retina ? '@2x' : '';
   switch (tileServer) {
     case 'opentopomap':
-      return `https://tile.opentopomap.org/${zoom}/${x}/${y}.png`;
+      return `https://tile.opentopomap.org/${z}/${x}/${y}.png`;
     case 'carto':
-      return `https://basemaps.cartocdn.com/light_all/${zoom}/${x}/${y}.png`;
+      if (style === 'satellite') return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+      if (style === 'hybrid') return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+      return `https://basemaps.cartocdn.com/dark_all${at}/${z}/${x}/${y}.png`;
     case 'osm':
     default:
-      return `https://tile.openstreetmap.org/${zoom}/${x}/${y}.png`;
+      if (style === 'satellite') return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+      if (style === 'hybrid') return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+      return `https://tile.openstreetmap.org/${z}/${x}/${y}${at}.png`;
   }
+}
+
+/**
+ * Тайл с деградацией до maxNativeZoom: выше родного разрешения тайлы НЕ растягиваются —
+ * берётся ближайший доступный уровень и рисуется в физическом разрешении.
+ */
+export async function loadTileImage(url: string, timeoutMs = 8000): Promise<HTMLImageElement | null> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    const timer = setTimeout(() => { img.src = ''; resolve(null); }, timeoutMs);
+    img.onload = () => { clearTimeout(timer); resolve(img); };
+    img.onerror = () => { clearTimeout(timer); resolve(null); };
+    img.src = url;
+  });
 }
 
 /**
