@@ -147,6 +147,7 @@ export interface ImportPoint {
   lat: number;
   lng: number;
   routeId: string | null; // id маршрута, к которому привязана точка ('' / null — без привязки)
+  placeName?: string;     // исходное название объекта (если точка получена геокодингом)
 }
 
 export interface ImportLists {

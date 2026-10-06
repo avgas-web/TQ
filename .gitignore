@@ -1,9 +1,9 @@
 # Dependencies
 node_modules/
 
-# Build outputs
-# dist/
+# Build artifacts
+dist/
+build/
 
-# Compressed archives
+# Archives
 *.zip
-*.tar.gz
