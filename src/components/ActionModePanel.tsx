@@ -28,7 +28,7 @@ const ActionModePanel: React.FC = () => {
   const [error, setError] = useState('');
   const [route, setRoute] = useState<RouteInfo | null>(null);
 
-  const { project, loadMapWithStorage, addMarker, selectMarker, actionMode, setActionMode,
+  const { project, loadMapWithStorage, loadActiveTileMap, addMarker, selectMarker, actionMode, setActionMode,
     addRoute, activeRouteId, setActiveRoute, deleteRoute,
     setRouteShape, setRouteRangeLimit, importLists, clearImportLists } = useStore();
   const routesList = project.routes || [];
@@ -208,19 +208,29 @@ const ActionModePanel: React.FC = () => {
       // Центр области в пиксельных координатах зума -> точный центр под mask
       const center = { lat: (bounds.north + bounds.south) / 2, lng: (bounds.east + bounds.west) / 2 };
 
-      const mapResult = await loadOSMStaticMap(center, zoom, size, size, tileServer);
-
-      const mapData: MapData = {
-        name: `Действие: ${startInput.trim()} → ${goalInput.trim()}`,
-        width: size,
-        height: size,
-        dataUrl: mapResult.dataUrl,
-        bounds: mapResult.bounds,
-        source: 'osm',
-      };
-      await loadMapWithStorage(mapData);
-
+      // Активная карта: тайловая подложка грузится динамически (без «фотографии»-стоп-кадра),
+      // поэтому построение быстрее и зум/pan остаются интерактивными до масштаба 1 см ≈ 100 м.
+      // Растровый снимок остаётся как fallback-картинка при офлайне/ошибке тайлов.
+      loadActiveTileMap(center, zoom);
       setRoute({ start, goal, distanceM, azimuth, rbfStart, rbfGoal });
+
+      // Фоновая дозагрузка снимка (не блокирует интерфейс и не отменяет активную карту)
+      if (!navigator.onLine) throw new Error('Нет сети — используется активная тайловая карта из кэша');
+      loadOSMStaticMap(center, zoom, size, size, tileServer)
+        .then((mapResult) => {
+          const cur = useStore.getState().project.map;
+          if (!cur || !cur.bounds) return; // карта уже заменена пользователем
+          const mapData: MapData = {
+            name: `Действие: ${startInput.trim()} → ${goalInput.trim()}`,
+            width: size,
+            height: size,
+            dataUrl: mapResult.dataUrl,
+            bounds: mapResult.bounds,
+            source: 'osm',
+          };
+          void loadMapWithStorage(mapData);
+        })
+        .catch(() => { /* тайловая подложка уже активна — снимок опционален */ });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Ошибка построения маршрута');
     } finally {
