@@ -61,6 +61,8 @@ interface AppState {
   moveRoutePoint: (id: string, index: number, p: Point) => void;
   removeRoutePoint: (id: string, index: number) => void;
   rerouteAroundZones: (id: string) => void; // перестроить обход зон для всего маршрута
+  /** Внутренний: немедленная пакетная перестройка (rerouteAllRoutes — троттлинг-обёртка) */
+  __rerouteAllRoutesNow?: () => void;
   rerouteAllRoutes: () => void; // пакетная перестройка всех маршрутов после изменения зон/карты
   setRouteShape: (id: string, shape: 'straight' | 'curve') => void; // прямая или кривая
   setRouteRangeLimit: (id: string, mode: 'off' | 'max' | 'min', meters?: number) => void; // ограничение по дальности
@@ -387,6 +389,18 @@ export const useStore = create<AppState>()(
       },
 
       rerouteAllRoutes: () => {
+        // ТРОТТЛИНГ: пакетная перестройка ВСЕХ маршрутов — дорогая операция
+        // (обход зон для каждого). Без троттлинга каждое движение мыши / зум
+        // вызывали полный пересчёт -> вкладка «виснет» намертво.
+        const s = get() as any;
+        if (s.__rerouteTimer) { clearTimeout(s.__rerouteTimer); }
+        s.__rerouteTimer = setTimeout(() => {
+          (get() as any).__rerouteTimer = null;
+          get().__rerouteAllRoutesNow();
+        }, 250);
+      },
+
+      __rerouteAllRoutesNow: () => {
         const state = get();
         const map = state.project.map;
         const routes = state.project.routes || [];
@@ -613,6 +627,9 @@ export const useStore = create<AppState>()(
           name: restrictionData.name || `Ограничение ${state.project.restrictions.length + 1}`,
           active: restrictionData.active !== undefined ? restrictionData.active : true,
         };
+        // ВАЖНО: НЕ вызываем rerouteAllRoutes() синхронно здесь — добавление зоны
+        // происходит из обработчика клика/двойного клика; перестройку выполняет
+        // троттлинговый подписчик на изменения restrictions (см. useEffect в MapCanvas).
         return {
           project: {
             ...state.project,
