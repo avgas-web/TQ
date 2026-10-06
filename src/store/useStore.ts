@@ -127,8 +127,8 @@ const defaultProject: Project = {
     { id: 'default', name: 'Основной', visible: true, locked: false },
   ],
   settings: {
-    showGrid: false,
-    gridSize: 100,
+    showGrid: true,
+    gridSize: 0,
     showCoordinates: true,
     theme: 'dark',
   },
@@ -939,7 +939,7 @@ export const useStore = create<AppState>()(
         if (persistedState.project && !persistedState.project.settings) {
           persistedState.project.settings = {
             showGrid: false,
-            gridSize: 100,
+            gridSize: 0,
             showCoordinates: true,
             theme: 'dark',
           };
