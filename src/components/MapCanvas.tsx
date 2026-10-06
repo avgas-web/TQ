@@ -145,9 +145,11 @@ const MapCanvas: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const mapImageRef = useRef<HTMLImageElement | null>(null);
-  const [isPanning, setIsPanning] = useState(false);
-  const [panStart, setPanStart] = useState<Point>({ x: 0, y: 0 });
+  const isPanningRef = useRef(false); // без state — панорама не вызывает ре-рендер на каждый mousemove
+  const panStartRef = useRef<Point>({ x: 0, y: 0 });
   const [canvasSize, setCanvasSize] = useState({ width: 800, height: 600 });
+  const canvasSizeRef = useRef(canvasSize);
+  useEffect(() => { canvasSizeRef.current = canvasSize; }, [canvasSize]);
   const [draggingMarker, setDraggingMarker] = useState<string | null>(null);
   const [mapLoaded, setMapLoaded] = useState(false);
   // Перетаскивание точки маршрута: id + индекс (для moveRoutePoint)
@@ -186,6 +188,28 @@ const MapCanvas: React.FC = () => {
     setActiveRoute,
   } = useStore();
 
+  // ===== viewTick: троттлинг перерисовки канваса (rAF) =====
+  // viewState обновляется на каждое движение мыши. Реакция на него идёт НЕ через
+  // подписку useStore() на весь store (это тянуло полный React-рендер и шторм
+  // запросов тайлов на каждый mousemove -> страница «виснет»), а через лёгкую
+  // zustand-подписку с requestAnimationFrame: вид читается из viewRef, canvas
+  // перерисовывается не чаще одного кадра, обработчики мыши стабильны.
+  const viewRef = useRef(viewState);
+  useEffect(() => { viewRef.current = viewState; }, [viewState]);
+  const [renderTick, setRenderTick] = useState(0);
+  useEffect(() => {
+    let raf = 0;
+    const unsub = useStore.subscribe((s) => {
+      if (s.viewState === viewRef.current) return;
+      viewRef.current = s.viewState;
+      if (raf) return; // уже запланировано — не плодим рендеры (троттлинг до 1/кадр)
+      raf = requestAnimationFrame(() => { raf = 0; setRenderTick((t) => t + 1); });
+    });
+    return () => { unsub(); if (raf) cancelAnimationFrame(raf); };
+  }, []);
+  // Актуальный вид для РЕНДЕРА (обновлён в последнем кадре)
+  const vs = viewRef.current;
+
   // devicePixelRatio — для чёткого рендера на Retina/HiDPI экранах
   const dpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
 
@@ -199,29 +223,42 @@ const MapCanvas: React.FC = () => {
   // Объекты хранятся в пикселях растра map.width×map.height, которые покрывают bounds,
   // поэтому worldPx также = map.width·scale·360/lngSpan — обе формулы совпадают
   // благодаря тому, что z0 подбирается ПОД ФАКТИЧЕСКИЙ РАЗМЕР РАСТРА (см. initial fit).
-  const effZ0 = viewState.z0 ?? (project.map?.bounds ? startZoomForBounds(project.map.bounds, canvasSize.height) : 14);
-  const worldPx = Math.max(256, canvasSize.width * viewState.scale * Math.pow(2, effZ0));
+  const effZ0 = v.z0 ?? (project.map?.bounds ? startZoomForBounds(project.map.bounds, canvasSize.height) : 14);
+  const worldPx = Math.max(256, canvasSize.width * v.scale * Math.pow(2, effZ0));
+
+  // Стабильные примитивы для эффекта загрузки тайлов: сам viewState меняется на
+  // каждом движении мыши — подписывать эффект на весь объект нельзя (шторм запросов).
+  const offXq = Math.round(v.offsetX / 24);
+  const offYq = Math.round(v.offsetY / 24);
+  const zoomQ = Math.round(zoomAtWorldPx(worldPx));
+  const kxq = Math.round(canvasSize.width / 96);
+  const kyq = Math.round(canvasSize.height / 96);
+  const boundsRef = project.map?.bounds;
+  const mapHRef = project.map?.height || 0;
+
   useEffect(() => {
-    if (!tilesEnabled || !project.map?.bounds) return;
-    const bounds = project.map.bounds;
+    if (!tilesEnabled || !boundsRef) return;
+    const bounds = boundsRef;
+    const vs = viewRef.current;
+    const cs = canvasSizeRef.current;
+    const wp = Math.max(256, cs.width * vs.scale * Math.pow(2, vs.z0 ?? effZ0));
     // центр экрана -> гео напрямую через инвариантную Mercator-привязку
-    const lngC = -180 + ((canvasSize.width / 2 - viewState.offsetX) / worldPx) * 360;
+    const lngC = -180 + ((cs.width / 2 - vs.offsetX) / wp) * 360;
     const mercTop = latToMerc(bounds.north);
     const mercBot = latToMerc(bounds.south);
     if (!isFinite(lngC)) return;
-    let zoom = Math.round(zoomAtWorldPx(worldPx));
+    let zoom = Math.round(zoomAtWorldPx(wp));
     const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[tileServer] ?? MAX_ZOOM);
     zoom = Math.max(MIN_ZOOM, Math.min(nativeMax, zoom));
     const n = Math.pow(2, zoom);
     const xC = ((lngC + 180) / 360) * n;
     // широта центра экрана — через ту же raster-привязку Y, что и у всех объектов
-    const mapH = project.map.height;
-    const mercPerScreenPxY = (mercBot - mercTop) / (mapH * viewState.scale);
-    const cyMerc = mercTop + (canvasSize.height / 2 - viewState.offsetY) * mercPerScreenPxY;
+    const mercPerScreenPxY = (mercBot - mercTop) / (mapHRef * vs.scale);
+    const cyMerc = mercTop + (cs.height / 2 - vs.offsetY) * mercPerScreenPxY;
     const yTile = cyMerc * n;
-    const tileSizePx = worldPx / n; // экранных px на тайл текущего zoom
-    const tilesX = Math.ceil(canvasSize.width / tileSizePx) + 2;
-    const tilesY = Math.ceil(canvasSize.height / tileSizePx) + 2;
+    const tileSizePx = wp / n; // экранных px на тайл текущего zoom
+    const tilesX = Math.ceil(cs.width / tileSizePx) + 2;
+    const tilesY = Math.ceil(cs.height / tileSizePx) + 2;
     const urls: string[] = [];
     for (let dx = -Math.ceil(tilesX / 2); dx <= Math.ceil(tilesX / 2); dx++) {
       for (let dy = -Math.ceil(tilesY / 2); dy <= Math.ceil(tilesY / 2); dy++) {
@@ -235,9 +272,10 @@ const MapCanvas: React.FC = () => {
     if (urls.length === 0) return;
     let cancelled = false;
     Promise.all(urls.map((u) => loadTileImage(u).then((img) => { if (!cancelled) tileCache.current.set(u, img || undefined); })))
-      .then(() => { if (!cancelled) setTilesVersion((v) => v + 1); });
+      .then(() => { if (!cancelled) setTilesVersion((t2) => t2 + 1); });
     return () => { cancelled = true; };
-  }, [tilesEnabled, tileStyle, tileServer, viewState, canvasSize, project.map?.bounds, worldPx]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tilesEnabled, tileStyle, tileServer, offXq, offYq, zoomQ, kxq, kyq, boundsRef, mapHRef]);
 
   // Геолокация пользователя (по требованию — кнопка 📍)
   const locateUser = useCallback(() => {
@@ -343,6 +381,30 @@ const MapCanvas: React.FC = () => {
   // смещаем offsetX/offsetY так, чтобы географическая точка в центре экрана осталась в центре.
   const viewRef = useRef(viewState);
   useEffect(() => { viewRef.current = viewState; }, [viewState]);
+
+  // Подписка на изменения вида (панорама/зум) через zustand.subscribe + rAF:
+  // обработчики мыши читают актуальный viewState из ref и НЕ зависят от state —
+  // поэтому drag не пересоздаётся на каждый mousemove и карта прокручивается плавно.
+  useEffect(() => {
+    let raf = 0;
+    const unsub = useStore.subscribe((s) => {
+      if (s.viewState === viewRef.current) return;
+      viewRef.current = s.viewState;
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => setViewTick((t) => t + 1));
+    });
+    return () => { unsub(); cancelAnimationFrame(raf); };
+  }, []);
+
+  // Троттлинговый подписчик: зоны ограничений изменились -> маршруты автоматически
+  // перестраиваются (обход зон). rerouteAllRoutes внутри — с троттлингом 250 мс.
+  useEffect(() => {
+    const unsub = useStore.subscribe((s, prev) => {
+      if (s.project.restrictions !== prev.project.restrictions) s.rerouteAllRoutes();
+    });
+    return unsub;
+  }, []);
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
