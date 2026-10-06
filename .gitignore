@@ -1,1 +1,9 @@
-(empty)
+# Dependencies
+node_modules/
+
+# Build outputs
+# dist/
+
+# Compressed archives
+*.zip
+*.tar.gz

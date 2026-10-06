@@ -3,7 +3,7 @@ import { useStore } from '../store/useStore';
 import { isPointInActiveRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg } from '../utils/actionMode';
-import { analyzeRoute, pixelToGeoExact } from '../utils/routing';
+import { analyzeRoute, pixelToGeoExact, routeLengthM } from '../utils/routing';
 import type { Point, Route, RoutePoint } from '../types';
 
 /** Палитра цветов маршрутов (повторяется циклически при большом числе маршрутов) */
@@ -543,22 +543,49 @@ const MapCanvas: React.FC = () => {
           crossed = analyzeRoute(route, project.restrictions).crossedZones;
         } catch { /* зоны могут быть невалидными — не роняем отрисовку */ }
 
-        // Линии сегментов: авто-обходные сегменты — пунктир, ключевые — сплошные
+        // Ограничение по дальности (max/min) — нарушение помечаем красным
+        let rangeViolation = false;
+        if (route.rangeMode && route.rangeMode !== 'off' && route.rangeM && route.rangeM > 0) {
+          const len = routeLengthM(route.points.map((p) => ({ lat: p.lat, lng: p.lng })));
+          rangeViolation = route.rangeMode === 'max' ? len > route.rangeM : len < route.rangeM;
+        }
+
+        // Линии сегментов: авто-обходные сегменты — пунктир, ключевые — сплошные.
+        // shape==='curve': рисуем сглаженную кривую Catmull-Rom через все точки
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
-        for (let i = 0; i < route.points.length - 1; i++) {
-          const a = route.points[i];
-          const b = route.points[i + 1];
-          ctx.strokeStyle = color;
+        if (route.shape === 'curve') {
+          ctx.strokeStyle = rangeViolation ? '#ff4d4d' : color;
           ctx.lineWidth = (isActive ? 3.5 : 2.2) / s;
-          if (a.auto || b.auto) ctx.setLineDash([8 / s, 5 / s]);
-          else ctx.setLineDash([]);
+          ctx.setLineDash([]);
           ctx.beginPath();
-          ctx.moveTo(a.x, a.y);
-          ctx.lineTo(b.x, b.y);
+          const cp = route.points;
+          ctx.moveTo(cp[0].x, cp[0].y);
+          for (let i = 0; i < cp.length - 1; i++) {
+            const p0 = cp[Math.max(0, i - 1)];
+            const p1 = cp[i];
+            const p2 = cp[i + 1];
+            const p3 = cp[Math.min(cp.length - 1, i + 2)];
+            const c1x = p1.x + (p2.x - p0.x) / 6, c1y = p1.y + (p2.y - p0.y) / 6;
+            const c2x = p2.x - (p3.x - p1.x) / 6, c2y = p2.y - (p3.y - p1.y) / 6;
+            ctx.bezierCurveTo(c1x, c1y, c2x, c2y, p2.x, p2.y);
+          }
           ctx.stroke();
+        } else {
+          for (let i = 0; i < route.points.length - 1; i++) {
+            const a = route.points[i];
+            const b = route.points[i + 1];
+            ctx.strokeStyle = rangeViolation ? '#ff4d4d' : color;
+            ctx.lineWidth = (isActive ? 3.5 : 2.2) / s;
+            if (a.auto || b.auto) ctx.setLineDash([8 / s, 5 / s]);
+            else ctx.setLineDash([]);
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(b.x, b.y);
+            ctx.stroke();
+          }
+          ctx.setLineDash([]);
         }
-        ctx.setLineDash([]);
 
         // Точки маршрута
         const drawR = (isActive ? 5 : 3.5) / s;
@@ -615,6 +642,19 @@ const MapCanvas: React.FC = () => {
           ctx.textAlign = 'center';
           ctx.fillText(warn, mid.x, mid.y - 2 / s);
           ctx.textAlign = 'left';
+        }
+
+        // Отметка нарушения ограничения по дальности (красный маркер у финиша)
+        if (rangeViolation) {
+          const len = routeLengthM(route.points.map((p) => ({ lat: p.lat, lng: p.lng })));
+          const txt = `${route.rangeMode === 'max' ? '>' : '<'} лимита: ${Math.round(len)} м / ${Math.round(route.rangeM || 0)} м`;
+          const fs = Math.max(10, 12 / s);
+          ctx.font = `bold ${fs}px sans-serif`;
+          const tw = ctx.measureText(txt).width;
+          ctx.fillStyle = 'rgba(150,20,20,0.9)';
+          ctx.fillRect(last.x + 8 / s, last.y + 4 / s, tw + 8 / s, fs + 6 / s);
+          ctx.fillStyle = '#ffb3b3';
+          ctx.fillText(txt, last.x + 12 / s, last.y + 4 / s + fs + 1 / s);
         }
       }
 

@@ -19,12 +19,29 @@ const App: React.FC = () => {
     setProjectName,
     deleteMarker,
     selectedMarkerId,
+    actionMode,
+    setActionMode,
+    undoDrawingPoint,
+    redoDrawingPoint,
   } = useStore();
 
   // Keyboard shortcuts
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
     // Ignore if typing in input
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+
+    // Undo/redo для рисования полигонов (Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z)
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+      e.preventDefault();
+      if (e.shiftKey) redoDrawingPoint();
+      else undoDrawingPoint();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || e.key === 'Y')) {
+      e.preventDefault();
+      redoDrawingPoint();
+      return;
+    }
 
     if (e.key === 'Escape') {
       clearDrawingPoints();
@@ -59,19 +76,33 @@ const App: React.FC = () => {
     if (e.key === 'g' || e.key === 'G' || e.key === 'п' || e.key === 'П') {
       updateSettings({ showGrid: !project.settings?.showGrid });
     }
+
+    // Тема: T / M (и русские е/ь)
+    if (e.key === 't' || e.key === 'T' || e.key === 'm' || e.key === 'M' || e.key === 'е' || e.key === 'м') {
+      updateSettings({ theme: project.settings?.theme === 'light' ? 'dark' : 'light' });
+    }
+
+    // Режим действий: R (и русские к/я)
+    if (e.key === 'r' || e.key === 'R' || e.key === 'к' || e.key === 'К') {
+      setActionMode(!actionMode);
+    }
   }, [currentTool, viewState, selectedMarkerId, setTool, setViewState,
-    clearDrawingPoints, setMeasurementPoints, deleteMarker, project.settings?.showGrid, updateSettings]);
+    clearDrawingPoints, setMeasurementPoints, deleteMarker, project.settings?.showGrid,
+    project.settings?.theme, updateSettings, actionMode, setActionMode,
+    undoDrawingPoint, redoDrawingPoint]);
 
   useEffect(() => {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [handleKeyDown]);
 
-  // Apply theme
+  // Apply theme (dark по умолчанию, light — переключается кнопкой или клавишей T)
+  const theme = project.settings?.theme || 'dark';
   useEffect(() => {
-    document.documentElement.classList.add('dark');
-    document.documentElement.setAttribute('data-theme', 'dark');
-  }, []);
+    const root = document.documentElement;
+    root.classList.toggle('dark', theme === 'dark');
+    root.setAttribute('data-theme', theme);
+  }, [theme]);
 
   // Restore map from IndexedDB on app load
   useEffect(() => {
@@ -91,9 +122,9 @@ const App: React.FC = () => {
   }, []);
 
   return (
-    <div className="h-screen w-screen flex flex-col bg-gray-900 text-white overflow-hidden">
+    <div className={theme === "dark" ? "h-screen w-screen flex flex-col bg-gray-900 text-white overflow-hidden" : "h-screen w-screen flex flex-col bg-gray-100 text-gray-900 overflow-hidden"}>
       {/* Header */}
-      <div className="flex items-center px-3 py-1 bg-gray-900 border-b border-gray-700">
+      <div className={theme === "dark" ? "flex items-center px-3 py-1 bg-gray-900 border-b border-gray-700" : "flex items-center px-3 py-1 bg-white border-b border-gray-300"}>
         <h1 className="text-sm font-bold text-cyan-400">
           🎯 TotalQuadro Coordinate Marker
         </h1>
@@ -116,6 +147,13 @@ const App: React.FC = () => {
             />
             Сетка
           </label>
+          <button
+            onClick={() => updateSettings({ theme: theme === 'dark' ? 'light' : 'dark' })}
+            className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 border border-gray-600 rounded text-xs text-white"
+            title="Переключить тему (клавиша T)"
+          >
+            {theme === 'dark' ? '🌙 Тёмная' : '☀️ Светлая'}
+          </button>
         </div>
       </div>
 
@@ -143,7 +181,7 @@ const App: React.FC = () => {
                   <p>⬡ <strong>Полиг.</strong> — нарисовать полигональное ограничение</p>
                   <p>⭕ <strong>Круг</strong> — нарисовать круглое ограничение</p>
                   <p>📏 <strong>Линейка</strong> — измерить расстояние</p>
-                  <p className="mt-2 text-gray-500">Горячие клавиши: 1-7 — инструменты, +/- — зум, G — сетка, Del — удалить, Esc — отмена</p>
+                  <p className="mt-2 text-gray-500">Горячие клавиши: 1–7 — инструменты · R — режим действий · T — тема · Ctrl+Z/Ctrl+Y — undo/redo рисования · +/- — зум · G — сетка · Del — удалить · Esc — отмена</p>
                 </div>
               </div>
             </div>

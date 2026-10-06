@@ -495,3 +495,28 @@ export function recomputeRoutePixels(route: Route, bounds: MapBounds, mapW: numb
 export function routePointsToGeo(points: RoutePoint[]): GeoPoint[] {
   return points.map((p) => ({ lat: p.lat, lng: p.lng }));
 }
+
+/**
+ * Сглаживание ломаной (Catmull-Rom → «кривая»): ключевые точки остаются на месте,
+ * между ними добавляются промежуточные точки для плавного изгиба.
+ */
+export function smoothPolyline(pts: Point[], steps = 8): Point[] {
+  if (pts.length < 3 || steps <= 0) return pts;
+  const out: Point[] = [pts[0]];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(0, i - 1)];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[Math.min(pts.length - 1, i + 2)];
+    for (let s = 1; s <= steps; s++) {
+      const t = s / (steps + 1);
+      const t2 = t * t, t3 = t2 * t;
+      out.push({
+        x: 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+        y: 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3),
+      });
+    }
+    out.push(p2);
+  }
+  return out;
+}
