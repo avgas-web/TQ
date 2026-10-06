@@ -29,8 +29,47 @@ const ActionModePanel: React.FC = () => {
   const [route, setRoute] = useState<RouteInfo | null>(null);
 
   const { project, loadMapWithStorage, addMarker, selectMarker, actionMode, setActionMode,
-    addRoute, activeRouteId, setActiveRoute, deleteRoute } = useStore();
+    addRoute, activeRouteId, setActiveRoute, deleteRoute,
+    setRouteShape, setRouteRangeLimit, importLists, clearImportLists } = useStore();
   const routesList = project.routes || [];
+  const activeRoute = routesList.find((r) => r.id === activeRouteId) || null;
+
+  // ─── Импорт списков координат (стартовые позиции / цели) ────────────────
+  const [startsText, setStartsText] = useState('');
+  const [goalsText, setGoalsText] = useState('');
+
+  /** Парсинг строки списка: «метка; 55.75, 37.62» | «55.75 37.62» | таб/; разделители */
+  const parseCoordList = (text: string): { label: string; lat: number; lng: number }[] => {
+    const out: { label: string; lat: number; lng: number }[] = [];
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      let label = '';
+      let coordPart = line;
+      // Отделяем метку: всё до первого «;», табуляции или двоеточия, если дальше есть числа
+      const m = line.match(/^(.*?)[;:\t]\s*(.+)$/);
+      if (m && /\d/.test(m[2])) { label = m[1].trim(); coordPart = m[2].trim(); }
+      const nums = coordPart.match(/-?\d+(?:[.,]\d+)?/g);
+      if (!nums || nums.length < 2) continue;
+      const lat = parseFloat(nums[0].replace(',', '.'));
+      const lng = parseFloat(nums[1].replace(',', '.'));
+      if (!isValidGeo({ lat, lng })) continue;
+      out.push({ label: label || `Позиция ${out.length + 1}`, lat, lng });
+    }
+    return out;
+  };
+
+  const handleImportLists = () => {
+    const starts = parseCoordList(startsText);
+    const goals = parseCoordList(goalsText);
+    if (starts.length === 0 || goals.length === 0) {
+      setError('В обоих списках нужна хотя бы одна точка в формате «метка; 55.75, 37.62».');
+      return;
+    }
+    setError('');
+    const n = importLists(starts, goals);
+    if (n > 0) setCreatedMsg(`Импортировано маршрутов: ${n} (каждая точка привязана к своему маршруту).`);
+  };
 
   /** Быстрый старт маршрута кликами по карте (без геокодера): создать и активировать */
   const handleNewRouteByClicks = () => {
@@ -279,6 +318,104 @@ const ActionModePanel: React.FC = () => {
                 + Новый маршрут
               </button>
             </div>
+
+            {/* Параметры активного маршрута: линия и ограничение по дальности */}
+            {activeRoute && (
+              <div className="p-2 bg-gray-700/60 rounded space-y-2">
+                <p className="text-[11px] font-medium text-cyan-300 truncate">Активный: {activeRoute.name}</p>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[10px] text-gray-400 block mb-0.5">Линия маршрута</label>
+                    <select
+                      value={activeRoute.shape || 'straight'}
+                      onChange={(e) => setRouteShape(activeRoute.id, e.target.value as 'straight' | 'curve')}
+                      className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white"
+                    >
+                      <option value="straight">Прямая (ломаная)</option>
+                      <option value="curve">Кривая (сглаженная)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-gray-400 block mb-0.5">Дальность</label>
+                    <select
+                      value={activeRoute.rangeMode || 'off'}
+                      onChange={(e) => setRouteRangeLimit(activeRoute.id, e.target.value as 'off' | 'max' | 'min')}
+                      className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white"
+                    >
+                      <option value="off">Без лимита</option>
+                      <option value="max">Максимум (м)</option>
+                      <option value="min">Минимум (м)</option>
+                    </select>
+                  </div>
+                </div>
+                {activeRoute.rangeMode && activeRoute.rangeMode !== 'off' && (
+                  <div className="flex items-center gap-2">
+                    <label className="text-[10px] text-gray-400">Лимит, м:</label>
+                    <input
+                      type="number"
+                      min={1}
+                      step={50}
+                      defaultValue={activeRoute.rangeM || 1000}
+                      onBlur={(e) => setRouteRangeLimit(activeRoute.id, activeRoute.rangeMode!, parseInt(e.target.value) || undefined)}
+                      className="flex-1 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white"
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Импорт списков координат: старты и цели -> маршруты с привязкой */}
+            <details className="text-xs">
+              <summary className="cursor-pointer text-gray-300 font-medium">📋 Импорт координат (списки старт/цель)</summary>
+              <div className="mt-2 space-y-2">
+                <div>
+                  <label className="text-[10px] text-gray-400 block mb-0.5">Стартовые позиции (каждая с новой строки)</label>
+                  <textarea
+                    value={startsText}
+                    onChange={(e) => setStartsText(e.target.value)}
+                    rows={3}
+                    placeholder={'Альфа; 55.7558, 37.6176\nБета\t55.76 37.64\n55.77, 37.65'}
+                    className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] text-gray-400 block mb-0.5">Цели</label>
+                  <textarea
+                    value={goalsText}
+                    onChange={(e) => setGoalsText(e.target.value)}
+                    rows={3}
+                    placeholder={'Гамма; 55.79, 37.67\n55.80, 37.68'}
+                    className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white font-mono"
+                  />
+                </div>
+                <p className="text-[10px] text-gray-400 leading-snug">
+                  Формат строки: «метка; широта, долгота» или просто «широта долгота» (разделители ; таб : запятая).
+                  i-й старт соединяется с i-й целью в отдельный маршрут (при разных длинах — последняя точка повторяется).
+                  Максимум всего маршрутов в сессии — 10000.
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={handleImportLists}
+                    className="flex-1 px-2 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded text-xs font-medium"
+                  >
+                    Импортировать и построить маршруты
+                  </button>
+                  <button
+                    onClick={() => { clearImportLists(); setCreatedMsg('Списки импорта очищены.'); }}
+                    className="px-2 py-1.5 bg-gray-600 hover:bg-gray-500 text-white rounded text-xs"
+                    title="Очистить сохранённые списки импорта"
+                  >
+                    Очистить
+                  </button>
+                </div>
+                {project.importLists && (
+                  <p className="text-[10px] text-gray-400">
+                    Сохранено: стартов {project.importLists.starts.length}, целей {project.importLists.goals.length}
+                  </p>
+                )}
+              </div>
+            </details>
+
             <p className="text-[10px] leading-snug text-gray-400">
               Инструмент «Выбор»: клик по линии — сделать маршрут активным (●), тяните точки мышью
               («цепляйте»), двойной клик по точке — удалить. Включённый режим действий: клики по карте

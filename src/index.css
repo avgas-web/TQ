@@ -42,3 +42,21 @@ button {
   background-color: #0891b2;
   color: white;
 }
+
+/* ─── Светлая тема: переопределяем тёмные утилиты Tailwind через CSS-переменные data-theme ─── */
+[data-theme="light"] body { background: #f3f4f6; }
+[data-theme="light"] .bg-gray-900 { background-color: #f9fafb !important; }
+[data-theme="light"] .bg-gray-800,
+[data-theme="light"] .bg-gray-800\/90 { background-color: #ffffff !important; color: #111827; }
+[data-theme="light"] .bg-gray-700,
+[data-theme="light"] .bg-gray-700\/50,
+[data-theme="light"] .bg-gray-700\/60 { background-color: #e5e7eb !important; color: #111827; }
+[data-theme="light"] .text-white { color: #111827 !important; }
+[data-theme="light"] .text-gray-200,
+[data-theme="light"] .text-gray-300 { color: #374151 !important; }
+[data-theme="light"] .text-gray-400,
+[data-theme="light"] .text-gray-500 { color: #6b7280 !important; }
+[data-theme="light"] .border-gray-600,
+[data-theme="light"] .border-gray-700 { border-color: #d1d5db !important; }
+[data-theme="light"] ::-webkit-scrollbar-track { background: #e5e7eb; }
+[data-theme="light"] ::-webkit-scrollbar-thumb { background: #9ca3af; }
