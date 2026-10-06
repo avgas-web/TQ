@@ -223,13 +223,13 @@ const MapCanvas: React.FC = () => {
   // Объекты хранятся в пикселях растра map.width×map.height, которые покрывают bounds,
   // поэтому worldPx также = map.width·scale·360/lngSpan — обе формулы совпадают
   // благодаря тому, что z0 подбирается ПОД ФАКТИЧЕСКИЙ РАЗМЕР РАСТРА (см. initial fit).
-  const effZ0 = v.z0 ?? (project.map?.bounds ? startZoomForBounds(project.map.bounds, canvasSize.height) : 14);
-  const worldPx = Math.max(256, canvasSize.width * v.scale * Math.pow(2, effZ0));
+  const effZ0 = vs.z0 ?? (project.map?.bounds ? startZoomForBounds(project.map.bounds, canvasSize.height) : 14);
+  const worldPx = Math.max(256, canvasSize.width * vs.scale * Math.pow(2, effZ0));
 
   // Стабильные примитивы для эффекта загрузки тайлов: сам viewState меняется на
   // каждом движении мыши — подписывать эффект на весь объект нельзя (шторм запросов).
-  const offXq = Math.round(v.offsetX / 24);
-  const offYq = Math.round(v.offsetY / 24);
+  const offXq = Math.round(vs.offsetX / 24);
+  const offYq = Math.round(vs.offsetY / 24);
   const zoomQ = Math.round(zoomAtWorldPx(worldPx));
   const kxq = Math.round(canvasSize.width / 96);
   const kyq = Math.round(canvasSize.height / 96);
@@ -239,11 +239,11 @@ const MapCanvas: React.FC = () => {
   useEffect(() => {
     if (!tilesEnabled || !boundsRef) return;
     const bounds = boundsRef;
-    const vs = viewRef.current;
+    const vcur = viewRef.current; // актуальный вид (не из рендер-замыкания — эффект читает ref)
     const cs = canvasSizeRef.current;
-    const wp = Math.max(256, cs.width * vs.scale * Math.pow(2, vs.z0 ?? effZ0));
+    const wp = Math.max(256, cs.width * vcur.scale * Math.pow(2, vcur.z0 ?? effZ0));
     // центр экрана -> гео напрямую через инвариантную Mercator-привязку
-    const lngC = -180 + ((cs.width / 2 - vs.offsetX) / wp) * 360;
+    const lngC = -180 + ((cs.width / 2 - vcur.offsetX) / wp) * 360;
     const mercTop = latToMerc(bounds.north);
     const mercBot = latToMerc(bounds.south);
     if (!isFinite(lngC)) return;
@@ -253,8 +253,8 @@ const MapCanvas: React.FC = () => {
     const n = Math.pow(2, zoom);
     const xC = ((lngC + 180) / 360) * n;
     // широта центра экрана — через ту же raster-привязку Y, что и у всех объектов
-    const mercPerScreenPxY = (mercBot - mercTop) / (mapHRef * vs.scale);
-    const cyMerc = mercTop + (cs.height / 2 - vs.offsetY) * mercPerScreenPxY;
+    const mercPerScreenPxY = (mercBot - mercTop) / (mapHRef * vcur.scale);
+    const cyMerc = mercTop + (cs.height / 2 - vcur.offsetY) * mercPerScreenPxY;
     const yTile = cyMerc * n;
     const tileSizePx = wp / n; // экранных px на тайл текущего zoom
     const tilesX = Math.ceil(cs.width / tileSizePx) + 2;
@@ -337,21 +337,24 @@ const MapCanvas: React.FC = () => {
     const map = project.map;
     const fx = focusX ?? canvasSize.width / 2;
     const fy = focusY ?? canvasSize.height / 2;
-    let newScale = viewState.scale * factor;
+    // читаем актуальный вид из ref — колбэк стабилен и не пересоздаётся на каждый mousemove/wheel
+    const v = viewRef.current;
+    let newScale = v.scale * factor;
     if (map?.bounds) {
       // Границы зума из единой инвариантной привязки: minZoom..maxNativeZoom сервера.
-      const bnds = scaleBoundsForZooms(canvasSize.width, effZ0, tileServer);
+      const z0 = v.z0 ?? startZoomForBounds(map.bounds, Math.max(1, canvasSize.height));
+      const bnds = scaleBoundsForZooms(canvasSize.width, z0, tileServer);
       // предельное приближение: не грубее ~1 м/пиксель даже если нативный max меньше
-      const mppAtMax = metersPerPixelFromWorld(worldPxOf(canvasSize.width, bnds.max, effZ0), centerLatOf(map.bounds));
+      const mppAtMax = metersPerPixelFromWorld(worldPxOf(canvasSize.width, bnds.max, z0), centerLatOf(map.bounds));
       const maxExtra = mppAtMax > 1 ? bnds.max * Math.pow(2, Math.log2(mppAtMax)) : bnds.max;
       newScale = Math.max(bnds.min, Math.min(Math.max(maxExtra, bnds.max), newScale));
     } else {
       newScale = Math.max(0.01, Math.min(50, newScale));
     }
-    const newOffsetX = fx - (fx - viewState.offsetX) * (newScale / viewState.scale);
-    const newOffsetY = fy - (fy - viewState.offsetY) * (newScale / viewState.scale);
+    const newOffsetX = fx - (fx - v.offsetX) * (newScale / v.scale);
+    const newOffsetY = fy - (fy - v.offsetY) * (newScale / v.scale);
     setViewState({ scale: newScale, offsetX: newOffsetX, offsetY: newOffsetY });
-  }, [viewState, setViewState, project.map, canvasSize]);
+  }, [project.map, canvasSize, tileServer, setViewState]);
 
   // Load map image when map data changes.
   // ВАЖНО: при активной тайловой подложке карта не обязана иметь растровое изображение —
@@ -379,22 +382,7 @@ const MapCanvas: React.FC = () => {
 
   // Resize observer: при изменении размера окна МАСШТАБ НЕ СБИВАЕТСЯ —
   // смещаем offsetX/offsetY так, чтобы географическая точка в центре экрана осталась в центре.
-  const viewRef = useRef(viewState);
-  useEffect(() => { viewRef.current = viewState; }, [viewState]);
-
-  // Подписка на изменения вида (панорама/зум) через zustand.subscribe + rAF:
-  // обработчики мыши читают актуальный viewState из ref и НЕ зависят от state —
-  // поэтому drag не пересоздаётся на каждый mousemove и карта прокручивается плавно.
-  useEffect(() => {
-    let raf = 0;
-    const unsub = useStore.subscribe((s) => {
-      if (s.viewState === viewRef.current) return;
-      viewRef.current = s.viewState;
-      cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(() => setViewTick((t) => t + 1));
-    });
-    return () => { unsub(); cancelAnimationFrame(raf); };
-  }, []);
+  // (viewRef и rAF-подписка объявлены выше — дублирующий блок удалён.)
 
   // Троттлинговый подписчик: зоны ограничений изменились -> маршруты автоматически
   // перестраиваются (обход зон). rerouteAllRoutes внутри — с троттлингом 250 мс.
@@ -510,13 +498,14 @@ const MapCanvas: React.FC = () => {
     if (fit) setViewState(fit);
   }, [project.routes, project.markers, mapLoaded, canvasSize.width, canvasSize.height, project.map?.bounds]);
 
-  // Convert screen coordinates to map coordinates
+  // Convert screen coordinates to map coordinates (читаем вид из ref — стабильный колбэк)
   const screenToMap = useCallback((screenX: number, screenY: number): Point => {
+    const v = viewRef.current;
     return {
-      x: (screenX - viewState.offsetX) / viewState.scale,
-      y: (screenY - viewState.offsetY) / viewState.scale,
+      x: (screenX - v.offsetX) / v.scale,
+      y: (screenY - v.offsetY) / v.scale,
     };
-  }, [viewState]);
+  }, []);
 
   // Render canvas
   useEffect(() => {
@@ -537,7 +526,7 @@ const MapCanvas: React.FC = () => {
     if (project.map?.bounds && project.map.height > 0) {
       const topM = latToMerc(project.map.bounds.north);
       const botM = latToMerc(project.map.bounds.south);
-      const cyMapPx = (canvasSize.height / 2 - viewState.offsetY) / viewState.scale;
+      const cyMapPx = (canvasSize.height / 2 - vs.offsetY) / vs.scale;
       centerLatRef = mercToLat(topM + ((botM - topM) / project.map.height) * Math.max(0, Math.min(project.map.height, cyMapPx)));
     }
 
@@ -566,11 +555,11 @@ const MapCanvas: React.FC = () => {
       drawTiles(ctx);
     } else if (mapImageRef.current) {
       ctx.save();
-      ctx.translate(viewState.offsetX, viewState.offsetY);
-      ctx.scale(viewState.scale, viewState.scale);
+      ctx.translate(vs.offsetX, vs.offsetY);
+      ctx.scale(vs.scale, vs.scale);
       // Чёткость при увеличении: при сильном зуме — резкая (пиксельная) интерполяция,
       // при уменьшении — сглаженная. Canvas физически рендерится в dpr-разрешении.
-      ctx.imageSmoothingEnabled = viewState.scale < 1;
+      ctx.imageSmoothingEnabled = vs.scale < 1;
       if (ctx.imageSmoothingEnabled) (ctx as any).imageSmoothingQuality = 'high';
       ctx.drawImage(mapImageRef.current, 0, 0, project.map.width, project.map.height);
       ctx.restore();
@@ -594,11 +583,11 @@ const MapCanvas: React.FC = () => {
       const style = project.settings?.tileStyle || 'scheme';
       // Границы видимой области в гео-координатах (через ту же инвариантную привязку):
       // X — через worldPx; Y — через raster-привязку mercPerScreenPxY (то же, что у объектов).
-      const mercPerScreenPxY = (botM - topM) / (map.height * viewState.scale);
-      const westLng = -180 + ((0 - viewState.offsetX) / worldPx) * 360;
-      const eastLng = -180 + ((canvasSize.width - viewState.offsetX) / worldPx) * 360;
-      const northLat = mercToLat(topM + (0 - viewState.offsetY) * mercPerScreenPxY);
-      const southLat = mercToLat(topM + (canvasSize.height - viewState.offsetY) * mercPerScreenPxY);
+      const mercPerScreenPxY = (botM - topM) / (map.height * vs.scale);
+      const westLng = -180 + ((0 - vs.offsetX) / worldPx) * 360;
+      const eastLng = -180 + ((canvasSize.width - vs.offsetX) / worldPx) * 360;
+      const northLat = mercToLat(topM + (0 - vs.offsetY) * mercPerScreenPxY);
+      const southLat = mercToLat(topM + (canvasSize.height - vs.offsetY) * mercPerScreenPxY);
       const txMin = Math.floor(((westLng + 180) / 360) * n);
       const txMax = Math.floor(((eastLng + 180) / 360) * n);
       const tyMin = Math.floor(Math.max(0, latToMerc(northLat) * n));
@@ -614,7 +603,7 @@ const MapCanvas: React.FC = () => {
           const scrXTile = worldOriginX + (tx / n) * worldPx;
           const mercTopT = ty / n; // нормализованная Mercator Y северной границы тайла
           const mapYTop = ((topM - mercTopT) / (botM - topM)) * map.height;
-          const scrY = mapYTop * viewState.scale + viewState.offsetY;
+          const scrY = mapYTop * vs.scale + vs.offsetY;
           const url = getOSMTileUrl(zoom, tx, ty, server, style);
           const img = tileCache.current.get(url);
           if (img) {
@@ -629,7 +618,7 @@ const MapCanvas: React.FC = () => {
       g.restore();
 
       function lngFromScreen(x: number): number {
-        return -180 + ((x - viewState.offsetX) / worldPx) * 360;
+        return -180 + ((x - vs.offsetX) / worldPx) * 360;
       }
     }
 
@@ -655,10 +644,10 @@ const MapCanvas: React.FC = () => {
 
     // Draw map border
     ctx.save();
-    ctx.translate(viewState.offsetX, viewState.offsetY);
-    ctx.scale(viewState.scale, viewState.scale);
+    ctx.translate(vs.offsetX, vs.offsetY);
+    ctx.scale(vs.scale, vs.scale);
     ctx.strokeStyle = 'rgba(100, 200, 255, 0.3)';
-    ctx.lineWidth = 2 / viewState.scale;
+    ctx.lineWidth = 2 / vs.scale;
     ctx.strokeRect(0, 0, project.map.width, project.map.height);
     ctx.restore();
 
@@ -681,7 +670,7 @@ const MapCanvas: React.FC = () => {
       const toScreen = (lat: number, lng: number) => {
         const mx = ((lng - b.west) / (b.east - b.west)) * map.width;
         const my = ((latToMerc(b.north) - latToMerc(lat)) / (latToMerc(b.south) - latToMerc(b.north))) * map.height;
-        return { x: mx * viewState.scale + viewState.offsetX, y: my * viewState.scale + viewState.offsetY };
+        return { x: mx * vs.scale + vs.offsetX, y: my * vs.scale + vs.offsetY };
       };
       g.save();
       for (const o of extObjs) {
@@ -727,16 +716,13 @@ const MapCanvas: React.FC = () => {
       g.restore();
     }
 
-    // Масштабная линейка + плашка масштаба — всегда поверх всего
-    drawScaleOverlay(ctx);
-
     function drawGrid(ctx: CanvasRenderingContext2D) {
       // ГЕОГРАФИЧЕСКАЯ адаптивная сетка: шаг в реальных метрах подбирается
       // под текущий масштаб (1/2/5 × 10^n), линии строго привязаны к координатам,
       // подписи всегда рисуются поверх карты фиксированным размером (не тонут в тайлах).
       if (!project.map) return;
       const map = project.map;
-      const s = viewState.scale;
+      const s = vs.scale;
       const bounds = map.bounds;
 
       // Шаг сетки: пользовательский gridSize по умолчанию, иначе авто-подбор
@@ -765,10 +751,10 @@ const MapCanvas: React.FC = () => {
         const latTop = bounds.north;
         const cosTop = Math.max(0.05, Math.cos((latTop * Math.PI) / 180));
         // Видимая область в пикселях карты:
-        const vx0 = (0 - viewState.offsetX) / s;
-        const vy0 = (0 - viewState.offsetY) / s;
-        const vx1 = (canvasSize.width - viewState.offsetX) / s;
-        const vy1 = (canvasSize.height - viewState.offsetY) / s;
+        const vx0 = (0 - vs.offsetX) / s;
+        const vy0 = (0 - vs.offsetY) / s;
+        const vx1 = (canvasSize.width - vs.offsetX) / s;
+        const vy1 = (canvasSize.height - vs.offsetY) / s;
 
         ctx.lineWidth = 1 / s;
         ctx.strokeStyle = 'rgba(140, 190, 255, 0.35)';
@@ -821,7 +807,7 @@ const MapCanvas: React.FC = () => {
         ctx.textAlign = 'left';
         const label = stepM >= 1000 ? `${stepM / 1000} км` : `${stepM} м`;
         for (let i = Math.max(0, startXi); i <= Math.min(endXi, Math.ceil(map.width / stepPxX)); i++) {
-          const sx = i * stepPxX * s + viewState.offsetX;
+          const sx = i * stepPxX * s + vs.offsetX;
           if (sx < 0 || sx > canvasSize.width) continue;
           if ((i - Math.max(0, startXi)) % 2 !== 0) continue; // реже подписи при густой сетке
           ctx.fillStyle = 'rgba(0,0,0,0.55)';
@@ -831,7 +817,7 @@ const MapCanvas: React.FC = () => {
         }
         let li = 1;
         for (const y of yLines) {
-          const sy = y * s + viewState.offsetY;
+          const sy = y * s + vs.offsetY;
           if (sy < 14 || sy > canvasSize.height - 4) { li++; continue; }
           if (li % 2 === 0) { li++; continue; }
           ctx.fillStyle = 'rgba(0,0,0,0.55)';
@@ -845,7 +831,7 @@ const MapCanvas: React.FC = () => {
       } else {
         // --- Нет гео-привязки: классическая пиксельная сетка ---
         const gridSize = project.settings?.gridSize || 100;
-        ctx.translate(viewState.offsetX, viewState.offsetY);
+        ctx.translate(vs.offsetX, vs.offsetY);
         ctx.scale(s, s);
         ctx.strokeStyle = 'rgba(140, 190, 255, 0.3)';
         ctx.lineWidth = 1 / s;
@@ -859,12 +845,12 @@ const MapCanvas: React.FC = () => {
         ctx.textAlign = 'left';
         ctx.fillStyle = 'rgba(190, 220, 255, 0.8)';
         for (let x = 0; x <= map.width; x += gridSize * 2) {
-          const sx = x * s + viewState.offsetX;
+          const sx = x * s + vs.offsetX;
           if (sx < 0 || sx > canvasSize.width) continue;
           ctx.fillText(`${x}`, sx + 2, 12);
         }
         for (let y = gridSize; y <= map.height; y += gridSize * 2) {
-          const sy = y * s + viewState.offsetY;
+          const sy = y * s + vs.offsetY;
           if (sy < 14 || sy > canvasSize.height) continue;
           ctx.fillText(`${y}`, 2, sy - 3);
         }
@@ -910,14 +896,14 @@ const MapCanvas: React.FC = () => {
 
     function drawRestrictions(ctx: CanvasRenderingContext2D) {
       ctx.save();
-      ctx.translate(viewState.offsetX, viewState.offsetY);
-      ctx.scale(viewState.scale, viewState.scale);
+      ctx.translate(vs.offsetX, vs.offsetY);
+      ctx.scale(vs.scale, vs.scale);
 
       for (const restriction of project.restrictions) {
         const isActive = restriction.active;
         ctx.fillStyle = isActive ? 'rgba(255, 50, 50, 0.12)' : 'rgba(100, 100, 100, 0.08)';
         ctx.strokeStyle = isActive ? 'rgba(255, 80, 80, 0.7)' : 'rgba(150, 150, 150, 0.4)';
-        ctx.lineWidth = 2 / viewState.scale;
+        ctx.lineWidth = 2 / vs.scale;
 
         if (restriction.type === 'polygon') {
           if (restriction.points.length >= 2) {
@@ -933,7 +919,7 @@ const MapCanvas: React.FC = () => {
             // Draw vertices
             for (const p of restriction.points) {
               ctx.beginPath();
-              ctx.arc(p.x, p.y, 4 / viewState.scale, 0, Math.PI * 2);
+              ctx.arc(p.x, p.y, 4 / vs.scale, 0, Math.PI * 2);
               ctx.fillStyle = isActive ? 'rgba(255, 100, 100, 0.8)' : 'rgba(150, 150, 150, 0.6)';
               ctx.fill();
             }
@@ -959,7 +945,7 @@ const MapCanvas: React.FC = () => {
 
           // Draw center
           ctx.beginPath();
-          ctx.arc(center.x, center.y, 4 / viewState.scale, 0, Math.PI * 2);
+          ctx.arc(center.x, center.y, 4 / vs.scale, 0, Math.PI * 2);
           ctx.fillStyle = isActive ? 'rgba(255, 100, 100, 0.8)' : 'rgba(150, 150, 150, 0.6)';
           ctx.fill();
         }
@@ -969,8 +955,8 @@ const MapCanvas: React.FC = () => {
 
     function drawMarkers(ctx: CanvasRenderingContext2D) {
       ctx.save();
-      ctx.translate(viewState.offsetX, viewState.offsetY);
-      ctx.scale(viewState.scale, viewState.scale);
+      ctx.translate(vs.offsetX, vs.offsetY);
+      ctx.scale(vs.scale, vs.scale);
 
       for (const marker of project.markers) {
         const layer = project.layers.find(l => l.id === marker.layer);
@@ -982,11 +968,11 @@ const MapCanvas: React.FC = () => {
         );
 
         const isSelected = marker.id === selectedMarkerId;
-        const radius = (isSelected ? 12 : 8) / viewState.scale;
+        const radius = (isSelected ? 12 : 8) / vs.scale;
 
         // Shadow
         ctx.beginPath();
-        ctx.arc(marker.x + 1 / viewState.scale, marker.y + 1 / viewState.scale, radius, 0, Math.PI * 2);
+        ctx.arc(marker.x + 1 / vs.scale, marker.y + 1 / vs.scale, radius, 0, Math.PI * 2);
         ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
         ctx.fill();
 
@@ -996,7 +982,7 @@ const MapCanvas: React.FC = () => {
         ctx.fillStyle = isInRestriction ? marker.color : '#ff3333';
         ctx.fill();
         ctx.strokeStyle = isSelected ? '#ffffff' : 'rgba(0,0,0,0.6)';
-        ctx.lineWidth = (isSelected ? 3 : 1.5) / viewState.scale;
+        ctx.lineWidth = (isSelected ? 3 : 1.5) / vs.scale;
         ctx.stroke();
 
         // Inner dot
@@ -1006,17 +992,17 @@ const MapCanvas: React.FC = () => {
         ctx.fill();
 
         // Draw label
-        const fontSize = Math.max(10, 12 / viewState.scale);
+        const fontSize = Math.max(10, 12 / vs.scale);
         ctx.fillStyle = '#ffffff';
         ctx.font = `bold ${fontSize}px sans-serif`;
         ctx.textAlign = 'left';
 
         // Label background
-        const labelX = marker.x + radius + 5 / viewState.scale;
-        const labelY = marker.y + 4 / viewState.scale;
+        const labelX = marker.x + radius + 5 / vs.scale;
+        const labelY = marker.y + 4 / vs.scale;
         const textWidth = ctx.measureText(marker.name).width;
         ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-        ctx.fillRect(labelX - 2 / viewState.scale, labelY - fontSize, textWidth + 4 / viewState.scale, fontSize + 4 / viewState.scale);
+        ctx.fillRect(labelX - 2 / vs.scale, labelY - fontSize, textWidth + 4 / vs.scale, fontSize + 4 / vs.scale);
         ctx.fillStyle = isInRestriction ? '#ffffff' : '#ff6666';
         ctx.fillText(marker.name, labelX, labelY);
       }
@@ -1026,13 +1012,13 @@ const MapCanvas: React.FC = () => {
     function drawMeasurement(ctx: CanvasRenderingContext2D) {
       if (measurementPoints.length < 1) return;
       ctx.save();
-      ctx.translate(viewState.offsetX, viewState.offsetY);
-      ctx.scale(viewState.scale, viewState.scale);
+      ctx.translate(vs.offsetX, vs.offsetY);
+      ctx.scale(vs.scale, vs.scale);
 
       if (measurementPoints.length >= 2) {
         ctx.strokeStyle = '#ffdd00';
-        ctx.lineWidth = 2 / viewState.scale;
-        ctx.setLineDash([6 / viewState.scale, 4 / viewState.scale]);
+        ctx.lineWidth = 2 / vs.scale;
+        ctx.setLineDash([6 / vs.scale, 4 / vs.scale]);
 
         ctx.beginPath();
         ctx.moveTo(measurementPoints[0].x, measurementPoints[0].y);
@@ -1047,11 +1033,11 @@ const MapCanvas: React.FC = () => {
       for (let i = 0; i < measurementPoints.length; i++) {
         const p = measurementPoints[i];
         ctx.beginPath();
-        ctx.arc(p.x, p.y, 5 / viewState.scale, 0, Math.PI * 2);
+        ctx.arc(p.x, p.y, 5 / vs.scale, 0, Math.PI * 2);
         ctx.fillStyle = '#ffdd00';
         ctx.fill();
         ctx.strokeStyle = '#000';
-        ctx.lineWidth = 1 / viewState.scale;
+        ctx.lineWidth = 1 / vs.scale;
         ctx.stroke();
 
         if (i > 0) {
@@ -1070,11 +1056,11 @@ const MapCanvas: React.FC = () => {
             label = `${Math.round(dist)} px`;
           }
           const tw = ctx.measureText(label).width;
-          ctx.fillRect(midX - tw / 2 - 3 / viewState.scale, midY - 18 / viewState.scale, tw + 6 / viewState.scale, 14 / viewState.scale);
+          ctx.fillRect(midX - tw / 2 - 3 / vs.scale, midY - 18 / vs.scale, tw + 6 / vs.scale, 14 / vs.scale);
           ctx.fillStyle = '#ffdd00';
-          ctx.font = `bold ${11 / viewState.scale}px sans-serif`;
+          ctx.font = `bold ${11 / vs.scale}px sans-serif`;
           ctx.textAlign = 'center';
-          ctx.fillText(label, midX, midY - 7 / viewState.scale);
+          ctx.fillText(label, midX, midY - 7 / vs.scale);
         }
       }
       ctx.restore();
@@ -1083,12 +1069,12 @@ const MapCanvas: React.FC = () => {
     function drawCurrentDrawing(ctx: CanvasRenderingContext2D) {
       if (drawingPoints.length === 0) return;
       ctx.save();
-      ctx.translate(viewState.offsetX, viewState.offsetY);
-      ctx.scale(viewState.scale, viewState.scale);
+      ctx.translate(vs.offsetX, vs.offsetY);
+      ctx.scale(vs.scale, vs.scale);
 
       ctx.strokeStyle = '#00ddff';
-      ctx.lineWidth = 2 / viewState.scale;
-      ctx.setLineDash([5 / viewState.scale, 3 / viewState.scale]);
+      ctx.lineWidth = 2 / vs.scale;
+      ctx.setLineDash([5 / vs.scale, 3 / vs.scale]);
 
       if (drawingPoints.length >= 2) {
         ctx.beginPath();
@@ -1108,21 +1094,21 @@ const MapCanvas: React.FC = () => {
       for (let i = 0; i < drawingPoints.length; i++) {
         const p = drawingPoints[i];
         ctx.beginPath();
-        ctx.arc(p.x, p.y, 5 / viewState.scale, 0, Math.PI * 2);
+        ctx.arc(p.x, p.y, 5 / vs.scale, 0, Math.PI * 2);
         ctx.fillStyle = i === 0 ? '#00ff88' : '#00ddff';
         ctx.fill();
         ctx.strokeStyle = '#000';
-        ctx.lineWidth = 1 / viewState.scale;
+        ctx.lineWidth = 1 / vs.scale;
         ctx.stroke();
       }
 
       // Instructions
       if (currentTool === 'drawPolygon') {
         ctx.fillStyle = 'rgba(0, 200, 255, 0.9)';
-        ctx.font = `${12 / viewState.scale}px sans-serif`;
+        ctx.font = `${12 / vs.scale}px sans-serif`;
         ctx.textAlign = 'left';
         const lastP = drawingPoints[drawingPoints.length - 1];
-        ctx.fillText('Клик — добавить вершину, двойной клик — завершить', lastP.x + 10 / viewState.scale, lastP.y - 10 / viewState.scale);
+        ctx.fillText('Клик — добавить вершину, двойной клик — завершить', lastP.x + 10 / vs.scale, lastP.y - 10 / vs.scale);
       }
 
       ctx.restore();
@@ -1135,8 +1121,8 @@ const MapCanvas: React.FC = () => {
       if (!start || !goal) return;
 
       ctx.save();
-      ctx.translate(viewState.offsetX, viewState.offsetY);
-      ctx.scale(viewState.scale, viewState.scale);
+      ctx.translate(vs.offsetX, vs.offsetY);
+      ctx.scale(vs.scale, vs.scale);
 
       const geoStart = { lat: start.lat as number, lng: start.lon as number };
       const geoGoal = { lat: goal.lat as number, lng: goal.lon as number };
@@ -1145,8 +1131,8 @@ const MapCanvas: React.FC = () => {
 
       // Line start->goal
       ctx.strokeStyle = '#ff9500';
-      ctx.lineWidth = 3 / viewState.scale;
-      ctx.setLineDash([10 / viewState.scale, 6 / viewState.scale]);
+      ctx.lineWidth = 3 / vs.scale;
+      ctx.setLineDash([10 / vs.scale, 6 / vs.scale]);
       ctx.beginPath();
       ctx.moveTo(start.x, start.y);
       ctx.lineTo(goal.x, goal.y);
@@ -1155,7 +1141,7 @@ const MapCanvas: React.FC = () => {
 
       // Arrow at goal
       const ang = Math.atan2(goal.y - start.y, goal.x - start.x);
-      const ah = 14 / viewState.scale;
+      const ah = 14 / vs.scale;
       ctx.fillStyle = '#ff9500';
       ctx.beginPath();
       ctx.moveTo(goal.x, goal.y);
@@ -1165,7 +1151,7 @@ const MapCanvas: React.FC = () => {
       ctx.fill();
 
       // Labels with real geo data
-      const fs = Math.max(11, 13 / viewState.scale);
+      const fs = Math.max(11, 13 / vs.scale);
       ctx.font = `bold ${fs}px sans-serif`;
       ctx.textAlign = 'left';
       const midX = (start.x + goal.x) / 2;
@@ -1173,9 +1159,9 @@ const MapCanvas: React.FC = () => {
       const label = `${distM >= 1000 ? (distM / 1000).toFixed(2) + ' км' : Math.round(distM) + ' м'} | Азимут ${az.toFixed(0)}°`;
       const tw = ctx.measureText(label).width;
       ctx.fillStyle = 'rgba(0,0,0,0.75)';
-      ctx.fillRect(midX - tw / 2 - 4 / viewState.scale, midY - fs - 4 / viewState.scale, tw + 8 / viewState.scale, fs + 8 / viewState.scale);
+      ctx.fillRect(midX - tw / 2 - 4 / vs.scale, midY - fs - 4 / vs.scale, tw + 8 / vs.scale, fs + 8 / vs.scale);
       ctx.fillStyle = '#ffcc66';
-      ctx.fillText(label, midX - tw / 2, midY - 4 / viewState.scale);
+      ctx.fillText(label, midX - tw / 2, midY - 4 / vs.scale);
 
       ctx.restore();
     }
@@ -1188,9 +1174,9 @@ const MapCanvas: React.FC = () => {
       if (routes.length === 0) return;
 
       ctx.save();
-      ctx.translate(viewState.offsetX, viewState.offsetY);
-      ctx.scale(viewState.scale, viewState.scale);
-      const s = viewState.scale;
+      ctx.translate(vs.offsetX, vs.offsetY);
+      ctx.scale(vs.scale, vs.scale);
+      const s = vs.scale;
 
       for (let ri = 0; ri < routes.length; ri++) {
         const route = routes[ri];
@@ -1323,7 +1309,7 @@ const MapCanvas: React.FC = () => {
       ctx.restore();
     }
 
-  }, [project, viewState, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, actionMode, tilesVersion, extObjs, userPos]);
+  }, [project, renderTick, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, actionMode, tilesVersion, extObjs, userPos]);
 
   // Mouse wheel zoom (к колесу курсора; границы minZoom/maxZoom внутри zoomAt)
   const handleWheel = useCallback((e: React.WheelEvent) => {
@@ -1352,7 +1338,8 @@ const MapCanvas: React.FC = () => {
     if (st.mode === 'pan' && e.touches.length === 1) {
       const dx = e.touches[0].clientX - st.x;
       const dy = e.touches[0].clientY - st.y;
-      setViewState({ offsetX: viewState.offsetX + dx, offsetY: viewState.offsetY + dy });
+      const vcur = viewRef.current; // актуальный вид из ref — колбэк не зависит от state
+      setViewState({ offsetX: vcur.offsetX + dx, offsetY: vcur.offsetY + dy });
       touchState.current = { ...st, x: e.touches[0].clientX, y: e.touches[0].clientY };
     } else if (st.mode === 'pinch' && e.touches.length === 2) {
       const dx = e.touches[0].clientX - e.touches[1].clientX;
@@ -1366,7 +1353,7 @@ const MapCanvas: React.FC = () => {
         touchState.current = { ...st, dist };
       }
     }
-  }, [viewState, setViewState, zoomAt]);
+  }, [setViewState, zoomAt]);
   const handleTouchEnd = useCallback(() => { touchState.current = null; }, []);
 
   // Mouse down
@@ -1379,8 +1366,8 @@ const MapCanvas: React.FC = () => {
     const mapPoint = screenToMap(screenX, screenY);
 
     if (currentTool === 'pan' || e.button === 1 || (e.button === 0 && e.shiftKey)) {
-      setIsPanning(true);
-      setPanStart({ x: e.clientX, y: e.clientY });
+      isPanningRef.current = true;
+      panStartRef.current = { x: e.clientX, y: e.clientY };
       return;
     }
 
@@ -1389,7 +1376,7 @@ const MapCanvas: React.FC = () => {
       //    клик рядом с точкой — «цепляем» её и тянем (drag), двойной клик — удаляем.
       const routes = project.routes || [];
       const activeRoute = routes.find((r) => r.id === activeRouteId && r.visible);
-      const grabPx = 12 / viewState.scale; // радиус захвата в пикселях карты (~12 экранных px)
+      const grabPx = 12 / viewRef.current.scale; // радиус захвата в пикселях карты (~12 экранных px)
 
       if (activeRoute) {
         let bestI = -1;
@@ -1436,7 +1423,7 @@ const MapCanvas: React.FC = () => {
       const clickedMarker = [...project.markers].reverse().find(m => {
         const dx = mapPoint.x - m.x;
         const dy = mapPoint.y - m.y;
-        return Math.sqrt(dx * dx + dy * dy) < 15 / viewState.scale;
+        return Math.sqrt(dx * dx + dy * dy) < 15 / viewRef.current.scale;
       });
       if (clickedMarker) {
         selectMarker(clickedMarker.id);
@@ -1533,7 +1520,7 @@ const MapCanvas: React.FC = () => {
       }
       return;
     }
-  }, [currentTool, actionMode, viewState, project, isDrawing, drawingPoints, measurementPoints,
+  }, [currentTool, actionMode, project, isDrawing, drawingPoints, measurementPoints,
     screenToMap, addMarker, selectMarker, addDrawingPoint, addRestriction,
     clearDrawingPoints, setDrawing, setMeasurementPoints,
     activeRouteId, appendRoutePoint, setActiveRoute]);
@@ -1574,14 +1561,15 @@ const MapCanvas: React.FC = () => {
     const mapPoint = screenToMap(screenX, screenY);
     setCursorPosition(mapPoint);
 
-    if (isPanning) {
-      const dx = e.clientX - panStart.x;
-      const dy = e.clientY - panStart.y;
+    if (isPanningRef.current) {
+      const dx = e.clientX - panStartRef.current.x;
+      const dy = e.clientY - panStartRef.current.y;
+      const vcur = viewRef.current; // актуальный вид из ref — колбэк стабилен между mousemove
       setViewState({
-        offsetX: viewState.offsetX + dx,
-        offsetY: viewState.offsetY + dy,
+        offsetX: vcur.offsetX + dx,
+        offsetY: vcur.offsetY + dy,
       });
-      setPanStart({ x: e.clientX, y: e.clientY });
+      panStartRef.current = { x: e.clientX, y: e.clientY };
       return;
     }
 
@@ -1603,12 +1591,12 @@ const MapCanvas: React.FC = () => {
       const clampedY = Math.max(0, Math.min(project.map.height, mapPoint.y));
       moveRoutePoint(draggingRoute.routeId, draggingRoute.index, { x: clampedX, y: clampedY });
     }
-  }, [isPanning, panStart, viewState, screenToMap, setCursorPosition, setViewState,
+  }, [screenToMap, setCursorPosition, setViewState,
     draggingMarker, draggingRoute, project.map, updateMarker, moveRoutePoint]);
 
   // Mouse up
   const handleMouseUp = useCallback(() => {
-    setIsPanning(false);
+    isPanningRef.current = false;
     setDraggingMarker(null);
     setDraggingRoute(null);
   }, []);
@@ -1629,7 +1617,7 @@ const MapCanvas: React.FC = () => {
       const mp = screenToMap(e.clientX - rect.left, e.clientY - rect.top);
       const route = (project.routes || []).find((r) => r.id === activeRouteId);
       if (route) {
-        const grabPx = 12 / viewState.scale;
+        const grabPx = 12 / viewRef.current.scale;
         let bi = -1, bd = Infinity;
         for (let i = 0; i < route.points.length; i++) {
           const p = route.points[i];
@@ -1643,7 +1631,7 @@ const MapCanvas: React.FC = () => {
       }
     }
   }, [currentTool, actionMode, drawingPoints, addRestriction, clearDrawingPoints, setMeasurementPoints,
-    activeRouteId, project.map, project.routes, viewState.scale, screenToMap, removeRoutePoint]);
+    activeRouteId, project.map, project.routes, screenToMap, removeRoutePoint]);
 
   // Right click - cancel drawing
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
@@ -1656,9 +1644,22 @@ const MapCanvas: React.FC = () => {
     }
   }, [isDrawing, drawingPoints, measurementPoints, clearDrawingPoints, setMeasurementPoints]);
 
-  const cursorStyle = currentTool === 'pan' ? (isPanning ? 'grabbing' : 'grab') :
+  const cursorStyle = currentTool === 'pan' ? (isPanningRef.current ? 'grabbing' : 'grab') :
     currentTool === 'select' ? (draggingMarker ? 'move' : 'default') :
     'crosshair';
+  // Панорама без state: курсор «grabbing» обновляем напрямую через DOM —
+  // это не вызывает ре-рендер канваса на каждое движение мыши.
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    let last = false;
+    const id = window.setInterval(() => {
+      if (currentTool !== 'pan') { if (last) { el.style.cursor = 'crosshair'; last = false; } return; }
+      const p = isPanningRef.current;
+      if (p !== last) { el.style.cursor = p ? 'grabbing' : 'grab'; last = p; }
+    }, 120);
+    return () => window.clearInterval(id);
+  }, [currentTool]);
 
   // Управление видом: зум/геолокация/полный экран + переключатели слоёв
   const updateSettings = useStore((s) => s.updateSettings);
@@ -1669,18 +1670,19 @@ const MapCanvas: React.FC = () => {
     // mpp для 1 см = 100 м: 100 м / (0.3937 css px) ≈ 254 м на css px... считаем через zoom:
     // mppEq(z) * cos(lat) = 100 / 37.795 → z = log2(156543.0339*cos(lat)/mpp)
     const latC = centerLatOf(map.bounds);
+    const vcur = viewRef.current; // актуальный вид из ref — колбэк стабилен
     const targetMpp = 100 / (2.54 / 96 * 100); // 100 м на 1 см экрана
     // Обратная задача: мир в px под целевые м/пиксель, затем scale относительно z0
     const worldTarget = worldPxForMetersPerPixel(targetMpp, latC);
-    const z0 = viewState.z0 ?? startZoomForBounds(map.bounds, Math.max(1, canvasSize.height));
+    const z0 = vcur.z0 ?? startZoomForBounds(map.bounds, Math.max(1, canvasSize.height));
     let sc = worldTarget / (Math.max(1, canvasSize.width) * Math.pow(2, z0));
     const bnds = scaleBoundsForZooms(canvasSize.width, z0, (project.openStreetMap?.tileServer as any) || 'osm');
     sc = Math.max(bnds.min, Math.min(Math.max(bnds.max * 4, bnds.max), sc));
     const cx = canvasSize.width / 2, cy = canvasSize.height / 2;
-    const newOffsetX = cx - (cx - viewState.offsetX) * (sc / viewState.scale);
-    const newOffsetY = cy - (cy - viewState.offsetY) * (sc / viewState.scale);
+    const newOffsetX = cx - (cx - vcur.offsetX) * (sc / vcur.scale);
+    const newOffsetY = cy - (cy - vcur.offsetY) * (sc / vcur.scale);
     setViewState({ scale: sc, offsetX: newOffsetX, offsetY: newOffsetY });
-  }, [project.map, viewState, setViewState, canvasSize]);
+  }, [project.map, project.openStreetMap?.tileServer, setViewState, canvasSize]);
 
   const btnCls = 'w-9 h-9 flex items-center justify-center rounded-md bg-gray-800/90 hover:bg-gray-700 text-gray-100 border border-gray-600 shadow text-base select-none';
 
@@ -1701,10 +1703,10 @@ const MapCanvas: React.FC = () => {
         onKeyDown={(e) => {
           if (e.key === '+' || e.key === '=') zoomAt(2);
           else if (e.key === '-') zoomAt(0.5);
-          else if (e.key === 'ArrowLeft') setViewState({ offsetX: viewState.offsetX + 40 });
-          else if (e.key === 'ArrowRight') setViewState({ offsetX: viewState.offsetX - 40 });
-          else if (e.key === 'ArrowUp') setViewState({ offsetY: viewState.offsetY + 40 });
-          else if (e.key === 'ArrowDown') setViewState({ offsetY: viewState.offsetY - 40 });
+          else if (e.key === 'ArrowLeft') setViewState({ offsetX: viewRef.current.offsetX + 40 });
+          else if (e.key === 'ArrowRight') setViewState({ offsetX: viewRef.current.offsetX - 40 });
+          else if (e.key === 'ArrowUp') setViewState({ offsetY: viewRef.current.offsetY + 40 });
+          else if (e.key === 'ArrowDown') setViewState({ offsetY: viewRef.current.offsetY - 40 });
         }}
         onWheel={handleWheel}
         onMouseDown={handleMouseDown}
