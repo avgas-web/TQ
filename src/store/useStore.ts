@@ -396,7 +396,7 @@ export const useStore = create<AppState>()(
         if (s.__rerouteTimer) { clearTimeout(s.__rerouteTimer); }
         s.__rerouteTimer = setTimeout(() => {
           (get() as any).__rerouteTimer = null;
-          get().__rerouteAllRoutesNow();
+          (get() as any).__rerouteAllRoutesNow?.();
         }, 250);
       },
 
