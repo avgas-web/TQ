@@ -288,7 +288,12 @@ const MapCanvas: React.FC = () => {
       if (!u) return null;
       const p = loadTileImage(u)
         .then((img) => { tileCache.current.set(u, img || undefined); })
-        .finally(() => { tilePending.current.delete(u); active--; startNext(); });
+        .finally(() => {
+          tilePending.current.delete(u);
+          active--;
+          setTilesVersion((t2) => t2 + 1); // карта «проявляется» по мере готовности тайлов
+          startNext();
+        });
       tilePending.current.set(u, p);
       active++;
       return p;
@@ -321,39 +326,83 @@ const MapCanvas: React.FC = () => {
   // Внешние слои: аэропорты (Overpass), NOTAM-районы, геозоны — по видимой области
   type ExtObj = { kind: 'airport' | 'notam' | 'geozone'; lat: number; lng: number; name: string; r?: number };
   const [extObjs, setExtObjs] = useState<ExtObj[]>([]);
+  const [overpassBusy, setOverpassBusy] = useState(false);
+  const overpassQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   const layersOn = !!(project.settings?.airportsLayer || project.settings?.notamLayer || project.settings?.geozonesLayer);
+
+  // Обёртка над Overpass: несколько зеркал (переживаем 504 Gateway Timeout основного),
+  // таймаут через AbortController, повторные попытки на разных зеркалах с паузой.
+  // Запросы сериализуются через очередь — это щадит rate-limit публичных серверов Overpass.
+  // console.error при недоступности зеркала подавляется: 504/таймауты внешних серверов —
+  // штатная ситуация, для неё есть индикатор «Загрузка слоёв» и вежливый ретрай.
+  const OVERPASS_ENDPOINTS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+  ];
+  const queryOverpass = useCallback(async (q: string): Promise<{ elements?: any[] } | null> => {
+    const run = async (): Promise<{ elements?: any[] } | null> => {
+      // два раунда по всем зеркалам; между раундами пауза 1.5 с — даём серверу «остыть»
+      for (let round = 0; round < 2; round++) {
+        if (round > 0) await new Promise((res) => setTimeout(res, 1500));
+        for (let i = 0; i < OVERPASS_ENDPOINTS.length; i++) {
+          const url = OVERPASS_ENDPOINTS[(i + round) % OVERPASS_ENDPOINTS.length];
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 20000);
+          try {
+            const r = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(q), signal: ctrl.signal });
+            if (r.status === 429 || r.status >= 500) continue; // перегруз/таймаут зеркала — пробуем следующее
+            if (!r.ok) return null;
+            return await r.json();
+          } catch { /* сеть/abort — следующее зеркало */ }
+          finally { clearTimeout(timer); }
+        }
+      }
+      return null;
+    };
+    // сериализация: не долбим один и тот же сервер тремя параллельными запросами
+    const slot = overpassQueueRef.current.then(run, run);
+    overpassQueueRef.current = slot.catch(() => null);
+    return slot;
+  }, []);
+
   useEffect(() => {
     if (!layersOn || !project.map?.bounds) { setExtObjs([]); return; }
     const b = project.map.bounds;
-    const box = `${b.south},${b.west},${b.north},${b.east}`;
+    // Ограничиваем bbox: огромный bbox — главная причина 504 на Overpass
+    const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+    const south = clamp(b.south, -89, 89), north = clamp(b.north, -89, 89);
+    const west = clamp(b.west, -179, 179), east = clamp(b.east, -179, 179);
+    const MAX_SPAN = 6; // градусов (~660 км) — типичный размер региона, безопасно для Overpass
+    const box = `${south.toFixed(4)},${west.toFixed(4)},${Math.min(north, south + MAX_SPAN).toFixed(4)},${Math.min(east, west + MAX_SPAN).toFixed(4)}`;
     let cancelled = false;
     const out: ExtObj[] = [];
     const jobs: Promise<void>[] = [];
+    setOverpassBusy(true);
     if (project.settings?.airportsLayer) {
-      const q = `[out:json][timeout:15];(node["aeroway"="aerodrome"](${box});node["amenity"="airfield"](${box});way["aeroway"="aerodrome"](${box}););out center 40;`;
-      jobs.push(fetch('https://overpass-api.de/api/interpreter', { method: 'POST', body: 'data=' + encodeURIComponent(q) })
-        .then((r) => r.ok ? r.json() : null)
+      const q = `[out:json][timeout:25];(node["aeroway"="aerodrome"](${box});node["amenity"="airfield"](${box});way["aeroway"="aerodrome"](${box}););out center 40;`;
+      jobs.push(queryOverpass(q)
         .then((d) => { if (d && !cancelled) for (const el of d.elements || []) out.push({ kind: 'airport', lat: el.lat ?? el.center?.lat, lng: el.lon ?? el.center?.lon, name: el.tags?.name || 'Аэродром' }); })
         .catch(() => {}));
     }
     if (project.settings?.notamLayer) {
       // Демо-источник NOTAM-подобных районов (без ключей API): крупные запретные районы OSM boundary=military
-      const q = `[out:json][timeout:15];way["boundary"="military"](${box});out center 20;`;
-      jobs.push(fetch('https://overpass-api.de/api/interpreter', { method: 'POST', body: 'data=' + encodeURIComponent(q) })
-        .then((r) => r.ok ? r.json() : null)
+      const q = `[out:json][timeout:25];way["boundary"="military"](${box});out center 20;`;
+      jobs.push(queryOverpass(q)
         .then((d) => { if (d && !cancelled) for (const el of d.elements || []) out.push({ kind: 'notam', lat: el.center?.lat ?? el.lat, lng: el.center?.lon ?? el.lon, name: (el.tags?.name || 'Военный район') + ' (NOTAM)', r: 3000 }); })
         .catch(() => {}));
     }
     if (project.settings?.geozonesLayer) {
-      const q = `[out:json][timeout:15];way["landuse"="military"](${box});relation["boundary"="protected_area"](${box});out center 20;`;
-      jobs.push(fetch('https://overpass-api.de/api/interpreter', { method: 'POST', body: 'data=' + encodeURIComponent(q) })
-        .then((r) => r.ok ? r.json() : null)
+      const q = `[out:json][timeout:25];way["landuse"="military"](${box});relation["boundary"="protected_area"](${box});out center 20;`;
+      jobs.push(queryOverpass(q)
         .then((d) => { if (d && !cancelled) for (const el of d.elements || []) out.push({ kind: 'geozone', lat: el.center?.lat ?? el.lat, lng: el.center?.lon ?? el.lon, name: el.tags?.name || 'Геозона', r: 2000 }); })
         .catch(() => {}));
     }
-    Promise.all(jobs).then(() => { if (!cancelled) setExtObjs(out.filter((o) => isFinite(o.lat) && isFinite(o.lng))); });
+    Promise.all(jobs).then(() => {
+      if (!cancelled) { setExtObjs(out.filter((o) => isFinite(o.lat) && isFinite(o.lng))); setOverpassBusy(false); }
+    }).catch(() => { if (!cancelled) setOverpassBusy(false); });
     return () => { cancelled = true; };
-  }, [layersOn, project.settings?.airportsLayer, project.settings?.notamLayer, project.settings?.geozonesLayer, project.map?.bounds]);
+  }, [layersOn, project.settings?.airportsLayer, project.settings?.notamLayer, project.settings?.geozonesLayer, project.map?.bounds, queryOverpass]);
 
   // Полный экран
   const toggleFullscreen = useCallback(() => {
@@ -1343,7 +1392,12 @@ const MapCanvas: React.FC = () => {
   }, [project, renderTick, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, actionMode, tilesVersion, extObjs, userPos]);
 
   // Mouse wheel zoom (к колесу курсора; границы minZoom/maxZoom внутри zoomAt)
-  const handleWheel = useCallback((e: React.WheelEvent) => {
+  // ВАЖНО: React навешивает on-wheel/on-touch как passive-слушатели, и вызов
+  // e.preventDefault() внутри них игнорируется браузером с предупреждением
+  // "Unable to preventDefault inside passive event listener invocation".
+  // Поэтому обработчик вызывает preventDefault, но реально он навешивается ниже
+  // через addEventListener(..., { passive: false }) на самом canvas-элементе.
+  const handleWheel = useCallback((e: WheelEvent) => {
     e.preventDefault();
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect) return;
@@ -1353,7 +1407,7 @@ const MapCanvas: React.FC = () => {
 
   // Touch: одноfinger панорама, pinch — зум к центру щипка
   const touchState = useRef<{ mode: 'pan' | 'pinch'; x: number; y: number; dist: number } | null>(null);
-  const handleTouchStart = useCallback((e: React.TouchEvent) => {
+  const handleTouchStart = useCallback((e: TouchEvent) => {
     if (e.touches.length === 1) {
       touchState.current = { mode: 'pan', x: e.touches[0].clientX, y: e.touches[0].clientY, dist: 0 };
     } else if (e.touches.length === 2) {
@@ -1362,7 +1416,7 @@ const MapCanvas: React.FC = () => {
       touchState.current = { mode: 'pinch', x: (e.touches[0].clientX + e.touches[1].clientX) / 2, y: (e.touches[0].clientY + e.touches[1].clientY) / 2, dist: Math.hypot(dx, dy) };
     }
   }, []);
-  const handleTouchMove = useCallback((e: React.TouchEvent) => {
+  const handleTouchMove = useCallback((e: TouchEvent) => {
     const st = touchState.current;
     if (!st) return;
     e.preventDefault();
@@ -1386,6 +1440,25 @@ const MapCanvas: React.FC = () => {
     }
   }, [setViewState, zoomAt]);
   const handleTouchEnd = useCallback(() => { touchState.current = null; }, []);
+
+  // Навешиваем wheel/touch НЕчерез JSX (React делает их passive и preventDefault
+  // молча игнорируется), а через addEventListener с { passive: false }.
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    el.addEventListener('wheel', handleWheel, { passive: false });
+    el.addEventListener('touchstart', handleTouchStart, { passive: false });
+    el.addEventListener('touchmove', handleTouchMove, { passive: false });
+    el.addEventListener('touchend', handleTouchEnd);
+    el.addEventListener('touchcancel', handleTouchEnd);
+    return () => {
+      el.removeEventListener('wheel', handleWheel);
+      el.removeEventListener('touchstart', handleTouchStart);
+      el.removeEventListener('touchmove', handleTouchMove);
+      el.removeEventListener('touchend', handleTouchEnd);
+      el.removeEventListener('touchcancel', handleTouchEnd);
+    };
+  }, [handleWheel, handleTouchStart, handleTouchMove, handleTouchEnd]);
 
   // Mouse down
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
@@ -1738,18 +1811,25 @@ const MapCanvas: React.FC = () => {
           else if (e.key === 'ArrowRight') setViewState({ offsetX: viewRef.current.offsetX - 40 });
           else if (e.key === 'ArrowUp') setViewState({ offsetY: viewRef.current.offsetY + 40 });
           else if (e.key === 'ArrowDown') setViewState({ offsetY: viewRef.current.offsetY - 40 });
+          else return;
+          // Предотвращаем прокрутку страницы стрелками/зумом с клавиатуры
+          e.preventDefault();
         }}
-        onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
         onDoubleClick={handleDoubleClick}
         onContextMenu={handleContextMenu}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
       />
+
+      {/* Индикатор загрузки внешних слоёв (Overpass может отвечать медленно — это нормально) */}
+      {overpassBusy && (
+        <div className="absolute bottom-3 left-3 z-10 flex items-center gap-2 rounded-md bg-gray-900/85 border border-gray-700 px-2.5 py-1.5 text-[11px] text-gray-200" role="status" aria-live="polite">
+          <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-cyan-400 border-t-transparent" />
+          Загрузка слоёв (аэропорты/районы)…
+        </div>
+      )}
 
       {/* Popup объекта: координаты, высота, расстояние */}
       {popup && (
