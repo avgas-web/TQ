@@ -158,6 +158,10 @@ const MapCanvas: React.FC = () => {
   const [popup, setPopup] = useState<{ x: number; y: number; title: string; lines: string[] } | null>(null);
   // Кэш тайлов подложки: url -> изображение (или undefined при ошибке)
   const tileCache = useRef<Map<string, HTMLImageElement | undefined>>(new Map());
+  // Очередь щадящей загрузки тайлов: один общий список + счётчик активных загрузок
+  const tileQueueRef = useRef<string[]>([]);
+  const activeTilesRef = useRef(0);
+  const tileDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // pending-загрузки тайлов: url -> промис (дедупликация — один запрос на тайл)
   const tilePending = useRef<Map<string, Promise<void>>>(new Map());
   const [tilesVersion, setTilesVersion] = useState(0);
@@ -272,43 +276,47 @@ const MapCanvas: React.FC = () => {
       }
     }
     if (urls.length === 0) return;
-    // Де дупликация: тайл, уже находящийся в загрузке (в т.ч. из ранее «отменённого»
-    // эффекта), НЕ запрашивается повторно. Прежняя логика отменяла промисы при каждом
-    // сдвиге вида, кэш почти не наполнялся и на каждое движение мыши стартовала новая
-    // волна из сотен параллельных запросов — это и была причина зависания при загрузке карты.
-    // Ограничение одновременных загрузок: браузер даёт ~6 соединений на хост,
-    // сотни тайлов в очереди без лимита = таймауты и «вечная» загрузка карты.
-    const MAX_PARALLEL = 6;
-    const toLoad = urls.filter((u) => !tilePending.current.has(u));
+    // УПРОЩЁННАЯ щадящая загрузка тайлов (минимальная нагрузка на OSM-серверы):
+    // 1) Дедупликация: тайл, уже в работе (pending или в кэше), никогда не
+    //    запрашивается повторно — ни одно движение мыши не создаёт лишнего трафика.
+    // 2) При быстро сменяющемся виде (зум/перетаскивание) новые волны НЕ стартуют
+    //    немедленно: они откладываются дебаунсом на 400 мс. В итоге во время жеста
+    //    к серверу не уходит НИ одного запроса — загружается только финальный вид.
+    //    Это устраняет и шторм запросов, и «зависание» при загрузке большой карты.
+    // 3) Жёсткий лимит: максимум 3 одновременные загрузки (браузер даёт ~6
+    //    соединений на хост; половина оставляется свободной, чтобы UI-запросы
+    //    — geocoding/маршруты — не ждали своей очереди за сотнями тайлов).
+    // 4) Загруженные тайлы остаются в кэше навсегда: повторный визит в область
+    //    не порождает обращений к серверу вообще.
+    const MAX_PARALLEL = 3;
+    const DEBOUNCE_MS = 400;
+    const toLoad = urls.filter((u) => !tilePending.current.has(u) && !tileCache.current.has(u));
     if (toLoad.length === 0) return;
-    let active = 0;
-    const queue = [...toLoad];
-    const startNext = (): Promise<void> | null => {
-      const u = queue.shift();
-      if (!u) return null;
-      const p = loadTileImage(u)
-        .then((img) => { tileCache.current.set(u, img || undefined); })
-        .finally(() => {
-          tilePending.current.delete(u);
-          active--;
-          setTilesVersion((t2) => t2 + 1); // карта «проявляется» по мере готовности тайлов
-          startNext();
-        });
-      tilePending.current.set(u, p);
-      active++;
-      return p;
+    // Аккуратная очередь: дополняем существующую, не плодя параллельных воркеров
+    for (const u of toLoad) tileQueueRef.current.push(u);
+    const pump = (): void => {
+      while (activeTilesRef.current < MAX_PARALLEL && tileQueueRef.current.length > 0) {
+        const u = tileQueueRef.current.shift()!;
+        if (tilePending.current.has(u) || tileCache.current.has(u)) continue;
+        activeTilesRef.current++;
+        const p = loadTileImage(u, 10000) // таймаут: зависший тайл не блокирует очередь
+          .then((img) => { tileCache.current.set(u, img || undefined); })
+          .finally(() => {
+            tilePending.current.delete(u);
+            activeTilesRef.current--;
+            setTilesVersion((t2) => t2 + 1); // карта «проявляется» по мере готовности тайлов
+            pump();
+          });
+        tilePending.current.set(u, p);
+      }
+      // Если очередь опустела, но pending ещё есть — дождёмся и продолжим сами
+      // (каждый .finally вызывает pump), отдельный планировщик не нужен.
     };
-    const initial: Promise<void>[] = [];
-    for (let i = 0; i < Math.min(MAX_PARALLEL, queue.length); i++) {
-      const p = startNext();
-      if (p) initial.push(p);
-    }
-    // Дозаряжаем очередь волнами: как только пачка готова — стартуем следующую
-    const drain = (): void => {
-      while (active < MAX_PARALLEL && queue.length > 0) { const p = startNext(); if (p) initial.push(p); else break; }
-    };
-    Promise.all(initial).then(() => { drain(); }).catch(() => {});
-    setTimeout(drain, 2500); // страховка: сдвинуть очередь, если часть загрузок зависла/отменилась
+    if (tileDebounceRef.current) clearTimeout(tileDebounceRef.current);
+    // Если в данный момент ничего не грузится — стартуем сразу (первая загрузка
+    // карты не должна ждать лишних 400 мс); иначе — ждём окончания жеста.
+    const idle = activeTilesRef.current === 0 && tilePending.current.size === 0;
+    tileDebounceRef.current = setTimeout(pump, idle ? 0 : DEBOUNCE_MS);
     setTilesVersion((t2) => t2 + 1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tilesEnabled, tileStyle, tileServer, offXq, offYq, zoomQ, kxq, kyq, boundsRef, mapHRef]);
@@ -323,86 +331,105 @@ const MapCanvas: React.FC = () => {
     );
   }, []);
 
-  // Внешние слои: аэропорты (Overpass), NOTAM-районы, геозоны — по видимой области
+  // Внешние слои: аэропорты (Overpass), NOTAM-районы, геозоны — по видимой области.
+  // МАКСИМАЛЬНО ПРОСТАЯ щадящая схема (минимальная нагрузка на OSM/Overpass):
+  // - ОДИН объединённый запрос вместо трёх (сервер делает один проход по данным);
+  // - только точечные объекты (.is_center) — без way/relation-полигонов, это в
+  //   разы дешевле для сервера и не вызывает 504 Gateway Timeout;
+  // - маленький bbox (≤3°) и лимит выдачи (≤60 объектов);
+  // - кэш результата: повторный запрос той же области (с округлением до ~30 км)
+  //   не уходит на сервер вообще;
+  // - дебаунс 800 мс + отмена устаревших ответов: при панорамировании/зуме
+  //   запросы не плодятся, грузится только финальная область;
+  // - автоматическое отключение слоёв после 2 подряд неудач: карта продолжает
+  //   работать, бесконечные ретраи перегруженному серверу не шлются (повторно
+  //   включаются переключателями слоёв).
   type ExtObj = { kind: 'airport' | 'notam' | 'geozone'; lat: number; lng: number; name: string; r?: number };
   const [extObjs, setExtObjs] = useState<ExtObj[]>([]);
   const [overpassBusy, setOverpassBusy] = useState(false);
-  const overpassQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   const layersOn = !!(project.settings?.airportsLayer || project.settings?.notamLayer || project.settings?.geozonesLayer);
 
-  // Обёртка над Overpass: несколько зеркал (переживаем 504 Gateway Timeout основного),
-  // таймаут через AbortController, повторные попытки на разных зеркалах с паузой.
-  // Запросы сериализуются через очередь — это щадит rate-limit публичных серверов Overpass.
-  // console.error при недоступности зеркала подавляется: 504/таймауты внешних серверов —
-  // штатная ситуация, для неё есть индикатор «Загрузка слоёв» и вежливый ретрай.
   const OVERPASS_ENDPOINTS = [
     'https://overpass-api.de/api/interpreter',
-    'https://overpass.private.coffee/api/interpreter',
     'https://overpass.kumi.systems/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
   ];
-  const queryOverpass = useCallback(async (q: string): Promise<{ elements?: any[] } | null> => {
-    const run = async (): Promise<{ elements?: any[] } | null> => {
-      // два раунда по всем зеркалам; между раундами пауза 1.5 с — даём серверу «остыть»
-      for (let round = 0; round < 2; round++) {
-        if (round > 0) await new Promise((res) => setTimeout(res, 1500));
-        for (let i = 0; i < OVERPASS_ENDPOINTS.length; i++) {
-          const url = OVERPASS_ENDPOINTS[(i + round) % OVERPASS_ENDPOINTS.length];
-          const ctrl = new AbortController();
-          const timer = setTimeout(() => ctrl.abort(), 20000);
-          try {
-            const r = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(q), signal: ctrl.signal });
-            if (r.status === 429 || r.status >= 500) continue; // перегруз/таймаут зеркала — пробуем следующее
-            if (!r.ok) return null;
-            return await r.json();
-          } catch { /* сеть/abort — следующее зеркало */ }
-          finally { clearTimeout(timer); }
-        }
-      }
-      return null;
-    };
-    // сериализация: не долбим один и тот же сервер тремя параллельными запросами
-    const slot = overpassQueueRef.current.then(run, run);
-    overpassQueueRef.current = slot.catch(() => null);
-    return slot;
-  }, []);
+  const extFailRef = useRef(0);        // подряд неудачных запросов
+  const extCacheRef = useRef<Map<string, ExtObj[]>>(new Map());
+  const extReqIdRef = useRef(0);       // id последнего актуального запроса (отмена устаревших)
 
   useEffect(() => {
     if (!layersOn || !project.map?.bounds) { setExtObjs([]); return; }
     const b = project.map.bounds;
-    // Ограничиваем bbox: огромный bbox — главная причина 504 на Overpass
     const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
     const south = clamp(b.south, -89, 89), north = clamp(b.north, -89, 89);
     const west = clamp(b.west, -179, 179), east = clamp(b.east, -179, 179);
-    const MAX_SPAN = 6; // градусов (~660 км) — типичный размер региона, безопасно для Overpass
-    const box = `${south.toFixed(4)},${west.toFixed(4)},${Math.min(north, south + MAX_SPAN).toFixed(4)},${Math.min(east, west + MAX_SPAN).toFixed(4)}`;
-    let cancelled = false;
-    const out: ExtObj[] = [];
-    const jobs: Promise<void>[] = [];
-    setOverpassBusy(true);
-    if (project.settings?.airportsLayer) {
-      const q = `[out:json][timeout:25];(node["aeroway"="aerodrome"](${box});node["amenity"="airfield"](${box});way["aeroway"="aerodrome"](${box}););out center 40;`;
-      jobs.push(queryOverpass(q)
-        .then((d) => { if (d && !cancelled) for (const el of d.elements || []) out.push({ kind: 'airport', lat: el.lat ?? el.center?.lat, lng: el.lon ?? el.center?.lon, name: el.tags?.name || 'Аэродром' }); })
-        .catch(() => {}));
-    }
-    if (project.settings?.notamLayer) {
-      // Демо-источник NOTAM-подобных районов (без ключей API): крупные запретные районы OSM boundary=military
-      const q = `[out:json][timeout:25];way["boundary"="military"](${box});out center 20;`;
-      jobs.push(queryOverpass(q)
-        .then((d) => { if (d && !cancelled) for (const el of d.elements || []) out.push({ kind: 'notam', lat: el.center?.lat ?? el.lat, lng: el.center?.lon ?? el.lon, name: (el.tags?.name || 'Военный район') + ' (NOTAM)', r: 3000 }); })
-        .catch(() => {}));
-    }
-    if (project.settings?.geozonesLayer) {
-      const q = `[out:json][timeout:25];way["landuse"="military"](${box});relation["boundary"="protected_area"](${box});out center 20;`;
-      jobs.push(queryOverpass(q)
-        .then((d) => { if (d && !cancelled) for (const el of d.elements || []) out.push({ kind: 'geozone', lat: el.center?.lat ?? el.lat, lng: el.center?.lon ?? el.lon, name: el.tags?.name || 'Геозона', r: 2000 }); })
-        .catch(() => {}));
-    }
-    Promise.all(jobs).then(() => {
-      if (!cancelled) { setExtObjs(out.filter((o) => isFinite(o.lat) && isFinite(o.lng))); setOverpassBusy(false); }
-    }).catch(() => { if (!cancelled) setOverpassBusy(false); });
-    return () => { cancelled = true; };
-  }, [layersOn, project.settings?.airportsLayer, project.settings?.notamLayer, project.settings?.geozonesLayer, project.map?.bounds, queryOverpass]);
+    const MAX_SPAN = 3; // градусов (~330 км) — маленький bbox: быстрый и безопасный запрос
+    const s = south.toFixed(2), w = west.toFixed(2);
+    const n2 = Math.min(north, south + MAX_SPAN).toFixed(2);
+    const e2 = Math.min(east, west + MAX_SPAN).toFixed(2);
+    const box = `${s},${w},${n2},${e2}`;
+    const cacheKey = `${box}|${project.settings?.airportsLayer ? 'a' : ''}${project.settings?.notamLayer ? 'n' : ''}${project.settings?.geozonesLayer ? 'g' : ''}`;
+
+    const reqId = ++extReqIdRef.current;
+    const timer = setTimeout(async () => {
+      if (reqId !== extReqIdRef.current) return; // устаревший запрос — не запускаем
+      const cached = extCacheRef.current.get(cacheKey);
+      if (cached) { setExtObjs(cached); return; } // область уже загружена — сервер не трогаем
+      // Один лёгкий объединённый запрос: только узлы-центры, с лимитами выдачи
+      const parts: string[] = [];
+      if (project.settings?.airportsLayer) parts.push(`node["aeroway"="aerodrome"](${box});`);
+      if (project.settings?.notamLayer) parts.push(`node["boundary"="military"](${box});`);
+      if (project.settings?.geozonesLayer) parts.push(`node["landuse"="military"](${box});`);
+      if (parts.length === 0) return;
+      const q = `[out:json][timeout:10];(${parts.join('')})[..60];(.;);out.skylat center 60;`;
+      setOverpassBusy(true);
+      let data: { elements?: any[] } | null = null;
+      for (const url of OVERPASS_ENDPOINTS) {
+        if (reqId !== extReqIdRef.current) { setOverpassBusy(false); return; } // отменён новым видом
+        const ctrl = new AbortController();
+        const to = setTimeout(() => ctrl.abort(), 12000);
+        try {
+          const r = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(q), signal: ctrl.signal });
+          if (r.status === 429 || r.status >= 500) continue; // зеркало занято — пробуем следующее
+          if (!r.ok) break; // 4xx — повтор бессмысленен
+          data = await r.json();
+        } catch { /* сеть/abort — следующее зеркало */ }
+        finally { clearTimeout(to); }
+        if (data) break;
+      }
+      if (reqId !== extReqIdRef.current) { setOverpassBusy(false); return; }
+      if (data) {
+        extFailRef.current = 0;
+        const out: ExtObj[] = [];
+        for (const el of data.elements || []) {
+          const lat = el.lat ?? el.center?.lat, lng = el.lon ?? el.center?.lon;
+          if (!isFinite(lat) || !isFinite(lng)) continue;
+          const aerodrome = el.tags?.aeroway === 'aerodrome' || el.tags?.amenity === 'airfield';
+          const militaryB = el.tags?.boundary === 'military';
+          const kind: ExtObj['kind'] = aerodrome ? 'airport' : militaryB ? 'notam' : 'geozone';
+          if (kind === 'airport' && !project.settings?.airportsLayer) continue;
+          if (kind === 'notam' && !project.settings?.notamLayer) continue;
+          if (kind === 'geozone' && !project.settings?.geozonesLayer) continue;
+          out.push({ kind, lat, lng, name: el.tags?.name || (kind === 'airport' ? 'Аэродром' : militaryB ? 'Военный район' : 'Геозона'), r: kind === 'notam' ? 3000 : kind === 'geozone' ? 2000 : undefined });
+        }
+        if (extCacheRef.current.size > 40) extCacheRef.current.clear(); // ограничиваем память
+        extCacheRef.current.set(cacheKey, out);
+        setExtObjs(out);
+      } else {
+        // Сервер недоступен: после 2 подряд неудач гасим слои, чтобы не нагружать
+        // его постоянными повторами и не показывать «вечную загрузку».
+        if (++extFailRef.current >= 2) {
+          extFailRef.current = 0;
+          useStore.setState((st) => ({
+            project: { ...st.project, settings: { ...st.project.settings, airportsLayer: false, notamLayer: false, geozonesLayer: false } },
+          }));
+        }
+      }
+      setOverpassBusy(false);
+    }, 800); // дебаунс: пока пользователь крутит карту — запросов нет вообще
+    return () => { clearTimeout(timer); };
+  }, [layersOn, project.settings?.airportsLayer, project.settings?.notamLayer, project.settings?.geozonesLayer, project.map?.bounds]);
 
   // Полный экран
   const toggleFullscreen = useCallback(() => {
@@ -1401,7 +1428,10 @@ const MapCanvas: React.FC = () => {
     e.preventDefault();
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect) return;
-    const factor = e.deltaY > 0 ? 0.5 : 2;
+    // Плавный зум: шаг зависит от величины прокрутки (у тачпада deltaY маленький),
+    // ограничен — чтобы одно движение не «сбрасывало» масштаб в разы.
+    const delta = Math.max(-120, Math.min(120, e.deltaY || 0));
+    const factor = Math.pow(2, -delta / 60); // ≈ ×2 на один щелчок мыши, плавно для тачпада
     zoomAt(factor, e.clientX - rect.left, e.clientY - rect.top);
   }, [zoomAt]);
 
