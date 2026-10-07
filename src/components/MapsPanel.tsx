@@ -118,7 +118,7 @@ const MapsPanel: React.FC = () => {
       if (result) {
         setSuccess(`Координаты: ${result.lat.toFixed(6)}, ${result.lng.toFixed(6)}`);
       } else {
-        setError('Адрес не найден');
+        setError(activeProvider === 'osm' ? 'Сервис геокодирования недоступен или адрес не найден. Попробуйте ещё раз.' : 'Адрес не найден');
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Ошибка геокодирования');
@@ -211,7 +211,7 @@ const MapsPanel: React.FC = () => {
         // OSM не требует загрузки API, просто загружаем карту
         geoResult = await osmGeocode(addressInput);
         if (!geoResult) {
-          setError('Адрес не найден');
+          setError('Сервис геокодирования временно недоступен или адрес не найден. Попробуйте ещё раз.');
           setLoading(false);
           return;
         }
