@@ -326,39 +326,73 @@ const MapCanvas: React.FC = () => {
   // Внешние слои: аэропорты (Overpass), NOTAM-районы, геозоны — по видимой области
   type ExtObj = { kind: 'airport' | 'notam' | 'geozone'; lat: number; lng: number; name: string; r?: number };
   const [extObjs, setExtObjs] = useState<ExtObj[]>([]);
+  const [overpassBusy, setOverpassBusy] = useState(false);
+  const overpassQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   const layersOn = !!(project.settings?.airportsLayer || project.settings?.notamLayer || project.settings?.geozonesLayer);
+
+  // Обёртка над Overpass: несколько зеркал (переживаем 504 Gateway Timeout основного),
+  // таймаут через AbortController, одна повторная попытка на другом зеркале.
+  // Запросы сериализуются через очередь — это щадит rate-limit публичных серверов Overpass.
+  const OVERPASS_ENDPOINTS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+  const queryOverpass = useCallback(async (q: string): Promise<{ elements?: any[] } | null> => {
+    const run = async (): Promise<{ elements?: any[] } | null> => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const url = OVERPASS_ENDPOINTS[attempt % OVERPASS_ENDPOINTS.length];
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 20000);
+        try {
+          const r = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(q), signal: ctrl.signal });
+          if (r.status === 429 || r.status >= 500) continue; // перегруз/таймаут зеркала — пробуем следующее
+          if (!r.ok) return null;
+          return await r.json();
+        } catch { /* сеть/abort — следующая попытка */ }
+        finally { clearTimeout(timer); }
+      }
+      return null;
+    };
+    // сериализация: не долбим один и тот же сервер тремя параллельными запросами
+    const slot = overpassQueueRef.current.then(run, run);
+    overpassQueueRef.current = slot.catch(() => null);
+    return slot;
+  }, []);
+
   useEffect(() => {
     if (!layersOn || !project.map?.bounds) { setExtObjs([]); return; }
     const b = project.map.bounds;
-    const box = `${b.south},${b.west},${b.north},${b.east}`;
+    // Ограничиваем bbox: огромный bbox — главная причина 504 на Overpass
+    const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+    const south = clamp(b.south, -89, 89), north = clamp(b.north, -89, 89);
+    const west = clamp(b.west, -179, 179), east = clamp(b.east, -179, 179);
+    const MAX_SPAN = 6; // градусов (~660 км) — типичный размер региона, безопасно для Overpass
+    const box = `${south.toFixed(4)},${west.toFixed(4)},${Math.min(north, south + MAX_SPAN).toFixed(4)},${Math.min(east, west + MAX_SPAN).toFixed(4)}`;
     let cancelled = false;
     const out: ExtObj[] = [];
     const jobs: Promise<void>[] = [];
+    setOverpassBusy(true);
     if (project.settings?.airportsLayer) {
-      const q = `[out:json][timeout:15];(node["aeroway"="aerodrome"](${box});node["amenity"="airfield"](${box});way["aeroway"="aerodrome"](${box}););out center 40;`;
-      jobs.push(fetch('https://overpass-api.de/api/interpreter', { method: 'POST', body: 'data=' + encodeURIComponent(q) })
-        .then((r) => r.ok ? r.json() : null)
+      const q = `[out:json][timeout:25];(node["aeroway"="aerodrome"](${box});node["amenity"="airfield"](${box});way["aeroway"="aerodrome"](${box}););out center 40;`;
+      jobs.push(queryOverpass(q)
         .then((d) => { if (d && !cancelled) for (const el of d.elements || []) out.push({ kind: 'airport', lat: el.lat ?? el.center?.lat, lng: el.lon ?? el.center?.lon, name: el.tags?.name || 'Аэродром' }); })
         .catch(() => {}));
     }
     if (project.settings?.notamLayer) {
       // Демо-источник NOTAM-подобных районов (без ключей API): крупные запретные районы OSM boundary=military
-      const q = `[out:json][timeout:15];way["boundary"="military"](${box});out center 20;`;
-      jobs.push(fetch('https://overpass-api.de/api/interpreter', { method: 'POST', body: 'data=' + encodeURIComponent(q) })
-        .then((r) => r.ok ? r.json() : null)
+      const q = `[out:json][timeout:25];way["boundary"="military"](${box});out center 20;`;
+      jobs.push(queryOverpass(q)
         .then((d) => { if (d && !cancelled) for (const el of d.elements || []) out.push({ kind: 'notam', lat: el.center?.lat ?? el.lat, lng: el.center?.lon ?? el.lon, name: (el.tags?.name || 'Военный район') + ' (NOTAM)', r: 3000 }); })
         .catch(() => {}));
     }
     if (project.settings?.geozonesLayer) {
-      const q = `[out:json][timeout:15];way["landuse"="military"](${box});relation["boundary"="protected_area"](${box});out center 20;`;
-      jobs.push(fetch('https://overpass-api.de/api/interpreter', { method: 'POST', body: 'data=' + encodeURIComponent(q) })
-        .then((r) => r.ok ? r.json() : null)
+      const q = `[out:json][timeout:25];way["landuse"="military"](${box});relation["boundary"="protected_area"](${box});out center 20;`;
+      jobs.push(queryOverpass(q)
         .then((d) => { if (d && !cancelled) for (const el of d.elements || []) out.push({ kind: 'geozone', lat: el.center?.lat ?? el.lat, lng: el.center?.lon ?? el.lon, name: el.tags?.name || 'Геозона', r: 2000 }); })
         .catch(() => {}));
     }
-    Promise.all(jobs).then(() => { if (!cancelled) setExtObjs(out.filter((o) => isFinite(o.lat) && isFinite(o.lng))); });
+    Promise.all(jobs).then(() => {
+      if (!cancelled) { setExtObjs(out.filter((o) => isFinite(o.lat) && isFinite(o.lng))); setOverpassBusy(false); }
+    }).catch(() => { if (!cancelled) setOverpassBusy(false); });
     return () => { cancelled = true; };
-  }, [layersOn, project.settings?.airportsLayer, project.settings?.notamLayer, project.settings?.geozonesLayer, project.map?.bounds]);
+  }, [layersOn, project.settings?.airportsLayer, project.settings?.notamLayer, project.settings?.geozonesLayer, project.map?.bounds, queryOverpass]);
 
   // Полный экран
   const toggleFullscreen = useCallback(() => {
@@ -1778,6 +1812,14 @@ const MapCanvas: React.FC = () => {
         onDoubleClick={handleDoubleClick}
         onContextMenu={handleContextMenu}
       />
+
+      {/* Индикатор загрузки внешних слоёв (Overpass может отвечать медленно — это нормально) */}
+      {overpassBusy && (
+        <div className="absolute bottom-3 left-3 z-10 flex items-center gap-2 rounded-md bg-gray-900/85 border border-gray-700 px-2.5 py-1.5 text-[11px] text-gray-200" role="status" aria-live="polite">
+          <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-cyan-400 border-t-transparent" />
+          Загрузка слоёв (аэропорты/районы)…
+        </div>
+      )}
 
       {/* Popup объекта: координаты, высота, расстояние */}
       {popup && (
