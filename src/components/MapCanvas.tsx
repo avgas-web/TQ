@@ -264,15 +264,7 @@ const MapCanvas: React.FC = () => {
   // ЕДИНАЯ инвариантная привязка вида (см. комментарий над worldPxOf):
   //   zoom = z0 + log2(scale),  worldPx = canvasHeight · 2^zoom.
   const effZ0 = vs.z0 ?? ZOOM_REF;
-  // Для РАСТРОВОЙ карты (снимок OSM/Google/Yandex) привязка задаётся размером
-  // самого растра: мир по X = map.width·2^z0 px (z0 из auto-fit). Это держит
-  // тайлы/сетку/линейку СТРОГО на пикселях снимка. Для чисто тайловой карты —
-  // стандартная инвариантная формула от высоты канваса (как Leaflet).
-  const rasterWorldX = project.map && project.map.dataUrl && project.map.width > 0
-    ? project.map.width * Math.pow(2, effZ0) : 0;
-  const worldPx = rasterWorldX > 0
-    ? Math.max(256, rasterWorldX)
-    : worldPxOf(canvasSize.height, vs.scale, effZ0);
+  const worldPx = worldPxOf(canvasSize.height, vs.scale, effZ0);
 
   // Стабильные примитивы для эффекта загрузки тайлов: сам viewState меняется на
   // каждом движении мыши — подписывать эффект на весь объект нельзя (шторм запросов).
@@ -289,32 +281,17 @@ const MapCanvas: React.FC = () => {
     const cs = canvasSizeRef.current;
     // ЕДИНАЯ привязка: zoom = z0 + log2(scale); worldPx = canvasHeight·2^zoom.
     const wp = worldPxOf(cs.height, vcur.scale, vcur.z0 ?? ZOOM_REF);
-    // Для растрового снимка — та же привязка от размера растра, что и в рендере
-    // (мир по X = map.width·2^z0): иначе загрузка тайлов считает зум не из той
-    // формулы, что отрисовка → тайлы грузятся не того зума и карта выглядит пустой.
-    const rasterWx = project.map && project.map.dataUrl && project.map.width > 0
-      ? project.map.width * Math.pow(2, vcur.z0 ?? ZOOM_REF) : 0;
-    const wpEff = rasterWx > 0 ? Math.max(256, rasterWx) : wp;
-    let zoom = Math.round(zoomAtWorldPx(wpEff));
+    let zoom = Math.round(zoomAtWorldPx(wp));
     const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[tileServer] ?? MAX_ZOOM);
     zoom = Math.max(MIN_ZOOM, Math.min(nativeMax, zoom));
     const n = Math.pow(2, zoom);
-    const tilePx = wpEff / n; // экранных px на тайл выбранного уровня
-    // Видимая область в world-пикселях текущего зума — СТРОГО та же привязка,
-    // что и в drawTiles (X: worldPx; Y: mercator-шкала растра map.height·scale).
-    const x0 = ((0 - vcur.offsetX) / wpEff) * n;
-    const x1 = ((cs.width - vcur.offsetX) / wpEff) * n;
-    let y0: number, y1: number;
-    if (rasterWx > 0 && vcur.scale > 0 && project.map && project.map.height > 0) {
-      const topMy = latToMerc(boundsRef.north);
-      const botMy = latToMerc(boundsRef.south);
-      const mercPerPx = (botMy - topMy) / (project.map.height * vcur.scale);
-      y0 = (topMy + (0 - vcur.offsetY) * mercPerPx) * n;
-      y1 = (topMy + (cs.height - vcur.offsetY) * mercPerPx) * n;
-    } else {
-      y0 = ((0 - vcur.offsetY) / wpEff) * n;
-      y1 = ((cs.height - vcur.offsetY) / wpEff) * n;
-    }
+    const tilePx = wp / n; // экранных px на тайл выбранного уровня
+    // Видимая область в world-пикселях текущего зума (строгая формула, общая со
+    // всей отрисовкой): xWorld = offsetX + lngFrac·wp, yWorld = offsetY + mercFrac·wp
+    const x0 = ((0 - vcur.offsetX) / wp) * n;
+    const x1 = ((cs.width - vcur.offsetX) / wp) * n;
+    const y0 = ((0 - vcur.offsetY) / wp) * n;
+    const y1 = ((cs.height - vcur.offsetY) / wp) * n;
     const txMin = Math.floor(x0) - 1, txMax = Math.ceil(x1) + 1;
     const tyMin = Math.floor(y0) - 1, tyMax = Math.ceil(y1) + 1;
     // Защита от шторма запросов на малых зумах: не больше ~64 тайлов за волну.
@@ -594,18 +571,9 @@ const MapCanvas: React.FC = () => {
     const key = `${map.name}|${map.bounds.north.toFixed(6)},${map.bounds.south.toFixed(6)}`;
     if (lastFittedMapRef.current === key && viewState.z0 != null) return;
     lastFittedMapRef.current = key;
-    // КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ «сбившегося масштаба»: эталон z0 НЕЛЬЗЯ жёстко ставить
-    // в 14 для растровых снимков — привязка растра к географии задаётся самим
-    // размером снимка (мир по X = map.width·2^z0), и z0 вычисляется при auto-fit.
-    // Прежний «фиксатор» перезаписывал его на 14 → тайлы уезжали относительно
-    // пикселей карты, координаты не совпадали, зум «не давал» нормального вида.
-    // Для чисто тайловой активной карты z0 = ZOOM_REF (устанавливает auto-fit).
-    // Если сохранённый вид уже имеет z0 — оставляем как есть (точное восстановление).
-    if (viewState.z0 == null) {
-      // только если z0 ещё не задан (первый запуск / сброшенный вид);
-      // для существующей карты корректный z0 установит auto-fit ниже
-      setViewState({ z0: ZOOM_REF });
-    }
+    // z0 — ЭТАЛОН привязки (14): мир = canvasHeight·2^(z0+log2 scale). Постоянен
+    // для всех карт — вид восстанавливается из persist точно, масштаб не «сбивается».
+    if (viewState.z0 !== ZOOM_REF) setViewState({ z0: ZOOM_REF });
   }, [project.map?.name, project.map?.bounds, canvasSize.height]);
 
   // Auto-fit view: при загрузке карты — вписать её; если на карте есть объекты
