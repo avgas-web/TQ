@@ -331,22 +331,32 @@ const MapCanvas: React.FC = () => {
   const layersOn = !!(project.settings?.airportsLayer || project.settings?.notamLayer || project.settings?.geozonesLayer);
 
   // Обёртка над Overpass: несколько зеркал (переживаем 504 Gateway Timeout основного),
-  // таймаут через AbortController, одна повторная попытка на другом зеркале.
+  // таймаут через AbortController, повторные попытки на разных зеркалах с паузой.
   // Запросы сериализуются через очередь — это щадит rate-limit публичных серверов Overpass.
-  const OVERPASS_ENDPOINTS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+  // console.error при недоступности зеркала подавляется: 504/таймауты внешних серверов —
+  // штатная ситуация, для неё есть индикатор «Загрузка слоёв» и вежливый ретрай.
+  const OVERPASS_ENDPOINTS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+  ];
   const queryOverpass = useCallback(async (q: string): Promise<{ elements?: any[] } | null> => {
     const run = async (): Promise<{ elements?: any[] } | null> => {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const url = OVERPASS_ENDPOINTS[attempt % OVERPASS_ENDPOINTS.length];
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 20000);
-        try {
-          const r = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(q), signal: ctrl.signal });
-          if (r.status === 429 || r.status >= 500) continue; // перегруз/таймаут зеркала — пробуем следующее
-          if (!r.ok) return null;
-          return await r.json();
-        } catch { /* сеть/abort — следующая попытка */ }
-        finally { clearTimeout(timer); }
+      // два раунда по всем зеркалам; между раундами пауза 1.5 с — даём серверу «остыть»
+      for (let round = 0; round < 2; round++) {
+        if (round > 0) await new Promise((res) => setTimeout(res, 1500));
+        for (let i = 0; i < OVERPASS_ENDPOINTS.length; i++) {
+          const url = OVERPASS_ENDPOINTS[(i + round) % OVERPASS_ENDPOINTS.length];
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 20000);
+          try {
+            const r = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(q), signal: ctrl.signal });
+            if (r.status === 429 || r.status >= 500) continue; // перегруз/таймаут зеркала — пробуем следующее
+            if (!r.ok) return null;
+            return await r.json();
+          } catch { /* сеть/abort — следующее зеркало */ }
+          finally { clearTimeout(timer); }
+        }
       }
       return null;
     };
