@@ -30,68 +30,93 @@ const App: React.FC = () => {
     // Ignore if typing in input
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 
-    // Undo/redo для рисования полигонов (Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z)
-    if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+    // Нормализуем клавишу: нижний регистр + транслит русской раскладки в физическую клавишу QWERTY
+    const k = e.key.toLowerCase();
+    const RU_TO_EN: Record<string, string> = {
+      // Ctrl+И / Ctrl+Я = Undo (физическая клавиша Z), Ctrl+Н = Redo (клавиша Y)
+      и: 'z', я: 'z', н: 'y',
+      ф: 'a', ы: 's', у: 'd', к: 'f', е: 't', г: 'u', ш: 'i', щ: 'o', з: 'p',
+      х: 'h', ж: 'j', э: 'k', м: 'l', б: 'b', ю: 'm',
+    };
+    const key = RU_TO_EN[k] ?? k;
+
+    // Undo/redo для рисования полигонов (Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z, включая русскую раскладку)
+    if ((e.ctrlKey || e.metaKey) && key === 'z') {
       e.preventDefault();
       if (e.shiftKey) redoDrawingPoint();
       else undoDrawingPoint();
       return;
     }
-    if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || e.key === 'Y')) {
+    if ((e.ctrlKey || e.metaKey) && key === 'y') {
       e.preventDefault();
       redoDrawingPoint();
       return;
     }
 
     if (e.key === 'Escape') {
+      e.preventDefault();
       clearDrawingPoints();
       setMeasurementPoints([]);
       setTool('pan');
+      return;
     }
 
     if (e.key === 'Delete' && selectedMarkerId) {
+      e.preventDefault();
       deleteMarker(selectedMarkerId);
+      return;
     }
 
-    if (e.key === '+' || e.key === '=') {
+    if (e.key === '+' || e.key === '=' || e.key === '§') {
+      e.preventDefault();
       const newScale = Math.min(50, viewState.scale * 1.2);
       setViewState({ scale: newScale });
+      return;
     }
 
-    if (e.key === '-') {
+    if (e.key === '-' || e.key === '_' || e.key === '–') {
+      e.preventDefault();
       const newScale = Math.max(0.01, viewState.scale / 1.2);
       setViewState({ scale: newScale });
+      return;
     }
 
     // Tool shortcuts
-    if (e.key === '1') setTool('pan');
-    if (e.key === '2') setTool('select');
-    if (e.key === '3') setTool('addMarker');
-    if (e.key === '4') setTool('drawRect');
-    if (e.key === '5') setTool('drawPolygon');
-    if (e.key === '6') setTool('drawCircle');
-    if (e.key === '7') setTool('measure');
+    if (['1', '2', '3', '4', '5', '6', '7'].includes(e.key)) {
+      e.preventDefault();
+      const tools = ['pan', 'select', 'addMarker', 'drawRect', 'drawPolygon', 'drawCircle', 'measure'] as const;
+      setTool(tools[Number(e.key) - 1]);
+      return;
+    }
 
-    // Grid toggle
-    if (e.key === 'g' || e.key === 'G' || e.key === 'п' || e.key === 'П') {
+    // Grid toggle: G (и русская П на той же клавише)
+    if (key === 'g') {
+      e.preventDefault();
       updateSettings({ showGrid: !project.settings?.showGrid });
+      return;
     }
 
-    // Тема: T / M (и русские е/ь)
-    if (e.key === 't' || e.key === 'T' || e.key === 'm' || e.key === 'M' || e.key === 'е' || e.key === 'м') {
+    // Тема: T / M (транслит покрывает русские Е/Ь на тех же клавишах)
+    if (key === 't' || key === 'm') {
+      e.preventDefault();
       updateSettings({ theme: project.settings?.theme === 'light' ? 'dark' : 'light' });
+      return;
     }
 
-    // Полный экран: F (и русские а)
-    if (e.key === 'f' || e.key === 'F' || e.key === 'а' || e.key === 'А') {
-      const el = document.querySelector('[data-testid="map-container"]');
+    // Полный экран: F (транслит покрывает русскую А)
+    if (key === 'f') {
+      e.preventDefault();
+      const el = document.getElementById('map-container');
       if (el && document.fullscreenElement) document.exitFullscreen().catch(() => {});
-      else if (el) (el as HTMLElement).requestFullscreen?.().catch(() => {});
+      else if (el) el.requestFullscreen?.().catch(() => {});
+      return;
     }
 
-    // Режим действий: R (и русские к/я)
-    if (e.key === 'r' || e.key === 'R' || e.key === 'к' || e.key === 'К') {
+    // Режим действий: R (транслит покрывает русскую К)
+    if (key === 'r') {
+      e.preventDefault();
       setActionMode(!actionMode);
+      return;
     }
   }, [currentTool, viewState, selectedMarkerId, setTool, setViewState,
     clearDrawingPoints, setMeasurementPoints, deleteMarker, project.settings?.showGrid,
