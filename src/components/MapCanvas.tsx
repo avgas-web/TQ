@@ -288,7 +288,12 @@ const MapCanvas: React.FC = () => {
       if (!u) return null;
       const p = loadTileImage(u)
         .then((img) => { tileCache.current.set(u, img || undefined); })
-        .finally(() => { tilePending.current.delete(u); active--; startNext(); });
+        .finally(() => {
+          tilePending.current.delete(u);
+          active--;
+          setTilesVersion((t2) => t2 + 1); // карта «проявляется» по мере готовности тайлов
+          startNext();
+        });
       tilePending.current.set(u, p);
       active++;
       return p;
