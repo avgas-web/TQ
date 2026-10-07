@@ -6,27 +6,17 @@ dist/
 build/
 out/
 
-# Deploy artifacts
-*.bundle
-
-# Logs
-*.log
-npm-debug.log*
-pnpm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
 # Env & secrets
 .env
 .env.*
 !.env.example
 
+# Logs
+*.log
+npm-debug.log*
+
 # Editor / OS
 .vscode/
 .idea/
 .DS_Store
-Thumbs.db
-
-# Cache
-.eslintcache
-.vite/
+*.local
