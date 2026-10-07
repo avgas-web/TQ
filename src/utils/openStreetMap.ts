@@ -19,67 +19,93 @@ export function initOpenStreetMap(): Promise<void> {
   });
 }
 
+// Зеркала Nominatim. Публичный nominatim.openstreetmap.org часто недоступен из ряда
+// сетей/регионов (ERR_CONNECTION_TIMED_OUT) и жёстко лимитирует запросы, поэтому
+// перебираем несколько инстансов с таймаутом и вежливым паузированием.
+const NOMINATIM_HOSTS = [
+  'https://nominatim.openstreetmap.org',
+  'https://nominatim.mapnik.us',
+  'https://nominatim.private.coffee',
+];
+
+// Простейшая локальная очередь «не чаще 1 запроса в секунду» — требование usage policy Nominatim
+let lastNominatimAt = 0;
+async function politeWait(): Promise<void> {
+  const wait = Math.max(0, lastNominatimAt + 1000 - Date.now());
+  lastNominatimAt = Date.now() + wait;
+  if (wait > 0) await new Promise((res) => setTimeout(res, wait));
+}
+
+/**
+ * Запрос к Nominatim с перебором зеркал, таймаутом и повтором.
+ * Возвращает разобранный JSON или null, если все зеркала недоступны.
+ * Ошибки внешних серверов не пишутся в console.error — это штатная ситуация,
+ * вызывающий код показывает пользователю понятное сообщение.
+ */
+async function fetchNominatimJson(path: string, params: string): Promise<any[] | any | null> {
+  for (let round = 0; round < 2; round++) {
+    for (let i = 0; i < NOMINATIM_HOSTS.length; i++) {
+      const host = NOMINATIM_HOSTS[(i + round) % NOMINATIM_HOSTS.length];
+      await politeWait();
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 12000);
+      try {
+        const response = await fetch(`${host}${path}?format=json&${params}`, {
+          signal: ctrl.signal,
+          headers: { Accept: 'application/json' },
+        });
+        if (response.status === 429 || response.status >= 500) continue; // пробуем следующее зеркало
+        if (!response.ok) return null;
+        return await response.json();
+      } catch {
+        /* сеть/таймаут — следующее зеркало */
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    // после первого раунда — короткая пауза перед повтором
+    if (round === 0) await new Promise((res) => setTimeout(res, 1000));
+  }
+  return null;
+}
+
 /**
  * Геокодирование адреса через Nominatim (OSM)
  */
 export async function osmGeocode(address: string): Promise<{ lat: number; lng: number } | null> {
-  const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}&limit=1`;
+  const data = await fetchNominatimJson('/search', `q=${encodeURIComponent(address)}&limit=1`);
 
-  try {
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'TotalQuadro-Coordinate-Marker/1.0',
-      },
-    });
-    
-    if (!response.ok) {
-      throw new Error('Ошибка геокодирования');
-    }
-    
-    const data = await response.json();
-    
-    if (data && data.length > 0) {
-      return {
-        lat: parseFloat(data[0].lat),
-        lng: parseFloat(data[0].lon),
-      };
-    }
-    
-    return null;
-  } catch (error) {
-    console.error('Ошибка геокодирования OSM:', error);
+  if (!data) {
+    console.warn('Геокодирование: сервис Nominatim временно недоступен');
     return null;
   }
+
+  if (Array.isArray(data) && data.length > 0) {
+    return {
+      lat: parseFloat(data[0].lat),
+      lng: parseFloat(data[0].lon),
+    };
+  }
+
+  return null;
 }
 
 /**
  * Обратное геокодирование через Nominatim (OSM)
  */
 export async function osmReverseGeocode(lat: number, lng: number): Promise<string | null> {
-  const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`;
+  const data = await fetchNominatimJson('/reverse', `lat=${lat}&lon=${lng}`);
 
-  try {
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'TotalQuadro-Coordinate-Marker/1.0',
-      },
-    });
-    
-    if (!response.ok) {
-      throw new Error('Ошибка обратного геокодирования');
-    }
-    
-    const data = await response.json();
-    
-    if (data && data.display_name) {
-      return data.display_name;
-    }
-    
-    return null;
-  } catch (error) {
-    console.error('Ошибка обратного геокодирования OSM:', error);
+  if (!data) {
+    console.warn('Обратное геокодирование: сервис Nominatim временно недоступен');
     return null;
   }
+
+  if (data && data.display_name) {
+    return data.display_name;
+  }
+
+  return null;
 }
 
 export type TileStyle = 'scheme' | 'satellite' | 'hybrid';
