@@ -158,6 +158,8 @@ const MapCanvas: React.FC = () => {
   const [popup, setPopup] = useState<{ x: number; y: number; title: string; lines: string[] } | null>(null);
   // Кэш тайлов подложки: url -> изображение (или undefined при ошибке)
   const tileCache = useRef<Map<string, HTMLImageElement | undefined>>(new Map());
+  // pending-загрузки тайлов: url -> промис (дедупликация — один запрос на тайл)
+  const tilePending = useRef<Map<string, Promise<void>>>(new Map());
   const [tilesVersion, setTilesVersion] = useState(0);
   // Геолокация пользователя
   const [userPos, setUserPos] = useState<{ lat: number; lng: number; acc: number } | null>(null);
@@ -270,10 +272,39 @@ const MapCanvas: React.FC = () => {
       }
     }
     if (urls.length === 0) return;
-    let cancelled = false;
-    Promise.all(urls.map((u) => loadTileImage(u).then((img) => { if (!cancelled) tileCache.current.set(u, img || undefined); })))
-      .then(() => { if (!cancelled) setTilesVersion((t2) => t2 + 1); });
-    return () => { cancelled = true; };
+    // Де дупликация: тайл, уже находящийся в загрузке (в т.ч. из ранее «отменённого»
+    // эффекта), НЕ запрашивается повторно. Прежняя логика отменяла промисы при каждом
+    // сдвиге вида, кэш почти не наполнялся и на каждое движение мыши стартовала новая
+    // волна из сотен параллельных запросов — это и была причина зависания при загрузке карты.
+    // Ограничение одновременных загрузок: браузер даёт ~6 соединений на хост,
+    // сотни тайлов в очереди без лимита = таймауты и «вечная» загрузка карты.
+    const MAX_PARALLEL = 6;
+    const toLoad = urls.filter((u) => !tilePending.current.has(u));
+    if (toLoad.length === 0) return;
+    let active = 0;
+    const queue = [...toLoad];
+    const startNext = (): Promise<void> | null => {
+      const u = queue.shift();
+      if (!u) return null;
+      const p = loadTileImage(u)
+        .then((img) => { tileCache.current.set(u, img || undefined); })
+        .finally(() => { tilePending.current.delete(u); active--; startNext(); });
+      tilePending.current.set(u, p);
+      active++;
+      return p;
+    };
+    const initial: Promise<void>[] = [];
+    for (let i = 0; i < Math.min(MAX_PARALLEL, queue.length); i++) {
+      const p = startNext();
+      if (p) initial.push(p);
+    }
+    // Дозаряжаем очередь волнами: как только пачка готова — стартуем следующую
+    const drain = (): void => {
+      while (active < MAX_PARALLEL && queue.length > 0) { const p = startNext(); if (p) initial.push(p); else break; }
+    };
+    Promise.all(initial).then(() => { drain(); }).catch(() => {});
+    setTimeout(drain, 2500); // страховка: сдвинуть очередь, если часть загрузок зависла/отменилась
+    setTilesVersion((t2) => t2 + 1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tilesEnabled, tileStyle, tileServer, offXq, offYq, zoomQ, kxq, kyq, boundsRef, mapHRef]);
 
