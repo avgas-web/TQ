@@ -1,2 +1,6 @@
-#Build artifacts
+# Build artifacts
 dist/
+node_modules/
+.env
+.DS_Store
+*.local
