@@ -1821,7 +1821,7 @@ const MapCanvas: React.FC = () => {
   const btnCls = 'w-9 h-9 flex items-center justify-center rounded-md bg-gray-800/90 hover:bg-gray-700 text-gray-100 border border-gray-600 shadow text-base select-none';
 
   return (
-    <div ref={containerRef} className="relative w-full h-full overflow-hidden bg-[#0f1729]" data-testid="map-container">
+    <div id="map-container" ref={containerRef} className="relative w-full h-full overflow-hidden bg-[#0f1729]">
       <canvas
         ref={canvasRef}
         style={{
