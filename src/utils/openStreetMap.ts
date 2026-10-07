@@ -1,5 +1,29 @@
 // Утилиты для работы с OpenStreetMap
-import { calculateBoundsFromCenter } from './googleMaps';
+import { calculateBoundsFromCenter, latToMercatorY } from './googleMaps';
+
+/** Зеркала тайлового сервера tile.openstreetmap.org (перебираются при ошибках/таймаутах) */
+const OSM_TILE_MIRRORS = [
+  'https://tile.openstreetmap.org',
+  'https://a.tile.openstreetmap.org',
+  'https://b.tile.openstreetmap.org',
+  'https://c.tile.openstreetmap.org',
+];
+
+/** Ограничение параллельных загрузок тайлов на один хост: браузер даёт ~6 соединений,
+ *  сотни запросов без лимита = таймауты и «вечная загрузка» большой карты. */
+let tileActive = 0;
+const tileWaiters: Array<() => void> = [];
+async function withTileSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (tileActive >= 4) await new Promise<void>((res) => tileWaiters.push(res));
+  tileActive++;
+  try {
+    return await fn();
+  } finally {
+    tileActive--;
+    const next = tileWaiters.shift();
+    if (next) next();
+  }
+}
 
 export interface OSMConfig {
   loaded: boolean;
@@ -157,6 +181,20 @@ export async function loadTileImage(url: string, timeoutMs = 8000): Promise<HTML
 }
 
 /**
+ * Тайл с перебором зеркал tile.openstreetmap.org (основной хост часто отдаёт
+ * 429/таймауты под нагрузкой). Для URL других провайдеров — обычная загрузка.
+ */
+export async function loadTileWithMirrors(url: string, timeoutMs = 8000): Promise<HTMLImageElement | null> {
+  const m = url.match(/^https:\/\/tile\.openstreetmap\.org\/(.+)$/);
+  if (!m) return loadTileImage(url, timeoutMs);
+  for (const host of OSM_TILE_MIRRORS) {
+    const img = await loadTileImage(host + '/' + m[1], timeoutMs);
+    if (img) return img;
+  }
+  return null;
+}
+
+/**
  * Конвертация lat/lng в тайловые координаты
  */
 export function latLngToTile(
@@ -198,86 +236,92 @@ export async function loadOSMStaticMap(
 ): Promise<{ dataUrl: string; bounds: { north: number; south: number; east: number; west: number } }> {
   console.log(`Загрузка карты OSM: сервер=${tileServer}, центр=(${center.lat}, ${center.lng}), зум=${zoom}, размер=${width}x${height}`);
   
-  // Вычисляем границы
-  const bounds = calculateOSMBoundsFromCenter(center, zoom, width, height);
-  
+  // Вычисляем границы (приблизительные — для совместимости сигнатуры)
+  void calculateOSMBoundsFromCenter;
+
+  // === ТОЧНАЯ Mercator-привязка снимка к географии (исправление «сбившегося масштаба») ===
+  // Снимок покрывает ровно окно обзора: world px на данном зуме = 256*2^z, из них
+  // по X видно width px => долготный размах симметричен центру; по Y — через Mercator.
+  const zClamped = Math.min(Math.max(Math.round(zoom), 1), 19);
+  const worldPxZ = 256 * Math.pow(2, zClamped);
+  const mercC = latToMercatorY(Math.max(-85, Math.min(85, center.lat)));
+  const halfSpanY = (height / 2) / worldPxZ;
+  const north = tileToLatLng(0, Math.max(0, Math.min(1, mercC - halfSpanY)), zClamped).lat;
+  const south = tileToLatLng(0, Math.max(0, Math.min(1, mercC + halfSpanY)), zClamped).lat;
+  const lngHalf = (width / 2 / worldPxZ) * 360;
+  const west = center.lng - lngHalf;
+  const east = center.lng + lngHalf;
+  const bounds = { north, south, east, west };
+
+  // Пиксельные границы тайловой сетки, точно соответствующие видимой области
+  const nTiles = Math.pow(2, zClamped);
+  const xMinWorld = ((west + 180) / 360) * nTiles;
+  const yMinWorld = latToMercatorY(north) * nTiles;
+
   // Создаем canvas и рисуем тайлы
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
   const ctx = canvas.getContext('2d');
-  
+
   if (!ctx) {
     throw new Error('Не удалось создать canvas');
   }
-  
+
   // Заполняем фон
   ctx.fillStyle = '#f2efe9';
   ctx.fillRect(0, 0, width, height);
-  
-  // Вычисляем центральный тайл
-  const centerTile = latLngToTile(center.lat, center.lng, zoom);
-  
-  // Вычисляем сколько тайлов нужно загрузить
+
   const tilesX = Math.ceil(width / 256) + 1;
   const tilesY = Math.ceil(height / 256) + 1;
-  
-  const startTileX = centerTile.x - Math.floor(tilesX / 2);
-  const startTileY = centerTile.y - Math.floor(tilesY / 2);
-  
-  // Загружаем и рисуем тайлы
-  const tilePromises: Promise<void>[] = [];
-  
+
+  const startTileX = Math.floor(xMinWorld);
+  const startTileY = Math.floor(yMinWorld);
+
+  // Загружаем тайлы с лимитом параллелизма (4 одновременных) и перебором зеркал
+  // tile.openstreetmap.org: раньше все тайлы стартовали одновременно без лимита —
+  // при большой карте это переполняло очередь соединений браузера, загрузка
+  // растягивалась на минуты («карта не загружается»).
+  let loadedCount = 0;
+  const drawTileAt = (img: HTMLImageElement | null, dx: number, dy: number) => {
+    const pixelX = Math.round((startTileX + dx - xMinWorld) * 256);
+    const pixelY = Math.round((startTileY + dy - yMinWorld) * 256);
+    if (img) {
+      ctx.drawImage(img, pixelX, pixelY, 256, 256);
+      loadedCount++;
+    } else {
+      ctx.fillStyle = '#cccccc';
+      ctx.fillRect(pixelX, pixelY, 256, 256);
+      ctx.strokeStyle = '#999999';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(pixelX, pixelY, 256, 256);
+    }
+  };
+
+  const jobs: Array<Promise<void>> = [];
   for (let dy = 0; dy < tilesY; dy++) {
     for (let dx = 0; dx < tilesX; dx++) {
       const tileX = startTileX + dx;
       const tileY = startTileY + dy;
-      
-      // Проверяем валидность тайла
-      if (tileX < 0 || tileY < 0 || tileX >= Math.pow(2, zoom) || tileY >= Math.pow(2, zoom)) {
-        continue;
-      }
-      
-      const tileUrl = getOSMTileUrl(zoom, tileX, tileY, tileServer);
-      
-      const promise = new Promise<void>((resolve) => {
-        const img = new Image();
-        img.crossOrigin = 'anonymous';
-        
-        img.onload = () => {
-          const pixelX = dx * 256;
-          const pixelY = dy * 256;
-          ctx.drawImage(img, pixelX, pixelY, 256, 256);
-          resolve();
-        };
-        
-        img.onerror = () => {
-          console.warn(`Не удалось загрузить тайл: ${tileUrl}`);
-          // Рисуем placeholder для неудачного тайла
-          const pixelX = dx * 256;
-          const pixelY = dy * 256;
-          ctx.fillStyle = '#cccccc';
-          ctx.fillRect(pixelX, pixelY, 256, 256);
-          ctx.strokeStyle = '#999999';
-          ctx.lineWidth = 1;
-          ctx.strokeRect(pixelX, pixelY, 256, 256);
-          resolve(); // Продолжаем даже если тайл не загрузился
-        };
-        
-        img.src = tileUrl;
-      });
-      
-      tilePromises.push(promise);
+      if (tileX < 0 || tileY < 0 || tileX >= nTiles || tileY >= nTiles) continue;
+      const base = getOSMTileUrl(zClamped, tileX, tileY, tileServer);
+      jobs.push(
+        withTileSlot(async () => {
+          const img = await loadTileWithMirrors(base);
+          drawTileAt(img, dx, dy);
+        })
+      );
     }
   }
-  
-  await Promise.all(tilePromises);
-  
-  console.log(`Загружено ${tilePromises.length} тайлов для сервера ${tileServer}`);
-  
-  // Смещаем изображение чтобы центр был в центре canvas
-  const offsetX = (width - tilesX * 256) / 2;
-  const offsetY = (height - tilesY * 256) / 2;
+  await Promise.all(jobs);
+
+  console.log(`Загружено ${loadedCount}/${jobs.length} тайлов для сервера ${tileServer}`);
+
+  // Смещение больше не нужно: тайлы нарисованы точно под окно обзора. Старый
+  // расчёт offsetX=(width-tilesX*256)/2 смещал снимок до половины тайла —
+  // из-за этого привязка координат и масштаб «съезжали».
+  const offsetX = 0;
+  const offsetY = 0;
   
   if (offsetX !== 0 || offsetY !== 0) {
     const tempCanvas = document.createElement('canvas');
