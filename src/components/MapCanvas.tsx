@@ -1348,7 +1348,12 @@ const MapCanvas: React.FC = () => {
   }, [project, renderTick, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, actionMode, tilesVersion, extObjs, userPos]);
 
   // Mouse wheel zoom (к колесу курсора; границы minZoom/maxZoom внутри zoomAt)
-  const handleWheel = useCallback((e: React.WheelEvent) => {
+  // ВАЖНО: React навешивает on-wheel/on-touch как passive-слушатели, и вызов
+  // e.preventDefault() внутри них игнорируется браузером с предупреждением
+  // "Unable to preventDefault inside passive event listener invocation".
+  // Поэтому обработчик вызывает preventDefault, но реально он навешивается ниже
+  // через addEventListener(..., { passive: false }) на самом canvas-элементе.
+  const handleWheel = useCallback((e: WheelEvent) => {
     e.preventDefault();
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect) return;
@@ -1358,7 +1363,7 @@ const MapCanvas: React.FC = () => {
 
   // Touch: одноfinger панорама, pinch — зум к центру щипка
   const touchState = useRef<{ mode: 'pan' | 'pinch'; x: number; y: number; dist: number } | null>(null);
-  const handleTouchStart = useCallback((e: React.TouchEvent) => {
+  const handleTouchStart = useCallback((e: TouchEvent) => {
     if (e.touches.length === 1) {
       touchState.current = { mode: 'pan', x: e.touches[0].clientX, y: e.touches[0].clientY, dist: 0 };
     } else if (e.touches.length === 2) {
@@ -1367,7 +1372,7 @@ const MapCanvas: React.FC = () => {
       touchState.current = { mode: 'pinch', x: (e.touches[0].clientX + e.touches[1].clientX) / 2, y: (e.touches[0].clientY + e.touches[1].clientY) / 2, dist: Math.hypot(dx, dy) };
     }
   }, []);
-  const handleTouchMove = useCallback((e: React.TouchEvent) => {
+  const handleTouchMove = useCallback((e: TouchEvent) => {
     const st = touchState.current;
     if (!st) return;
     e.preventDefault();
@@ -1391,6 +1396,25 @@ const MapCanvas: React.FC = () => {
     }
   }, [setViewState, zoomAt]);
   const handleTouchEnd = useCallback(() => { touchState.current = null; }, []);
+
+  // Навешиваем wheel/touch НЕчерез JSX (React делает их passive и preventDefault
+  // молча игнорируется), а через addEventListener с { passive: false }.
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    el.addEventListener('wheel', handleWheel, { passive: false });
+    el.addEventListener('touchstart', handleTouchStart, { passive: false });
+    el.addEventListener('touchmove', handleTouchMove, { passive: false });
+    el.addEventListener('touchend', handleTouchEnd);
+    el.addEventListener('touchcancel', handleTouchEnd);
+    return () => {
+      el.removeEventListener('wheel', handleWheel);
+      el.removeEventListener('touchstart', handleTouchStart);
+      el.removeEventListener('touchmove', handleTouchMove);
+      el.removeEventListener('touchend', handleTouchEnd);
+      el.removeEventListener('touchcancel', handleTouchEnd);
+    };
+  }, [handleWheel, handleTouchStart, handleTouchMove, handleTouchEnd]);
 
   // Mouse down
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
@@ -1743,17 +1767,16 @@ const MapCanvas: React.FC = () => {
           else if (e.key === 'ArrowRight') setViewState({ offsetX: viewRef.current.offsetX - 40 });
           else if (e.key === 'ArrowUp') setViewState({ offsetY: viewRef.current.offsetY + 40 });
           else if (e.key === 'ArrowDown') setViewState({ offsetY: viewRef.current.offsetY - 40 });
+          else return;
+          // Предотвращаем прокрутку страницы стрелками/зумом с клавиатуры
+          e.preventDefault();
         }}
-        onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
         onDoubleClick={handleDoubleClick}
         onContextMenu={handleContextMenu}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
       />
 
       {/* Popup объекта: координаты, высота, расстояние */}
