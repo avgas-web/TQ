@@ -589,7 +589,12 @@ const MapCanvas: React.FC = () => {
     if (lastInitialFitRef.current === fitKey) return; // только ОДИН раз на карту — ресайз вид не трогает
     lastInitialFitRef.current = fitKey;
     if (!map.bounds) return;
-    const z0 = startZoomForBounds(map.bounds, Math.max(1, canvasSize.height));
+    // ИНВАРИАНТНЫЙ ЭТАЛОН z0: привязка вида задаётся формулой worldPx = vh·2^zoom,
+    // zoom = ZOOM_REF + log2(scale). Он НЕ зависит от размеров окна — поэтому
+    // масштаб не «сбивается» при ресайзе/восстановлении из persist. Старый расчёт
+    // z0 = startZoomForBounds(...) менял эталон при каждом изменении высоты окна
+    // и конфликтовал с фиксатором z0=14 — из-за этого зум «залипал», а тайлы
+    // уезжали относительно объектов.
     if (mapImageRef.current) {
       // Растровая карта: вписать изображение целиком. Привязка тайлов/сетки/линейки
       // согласуется с ФАКТИЧЕСКИМ размером растра относительно bounds: scale=1 ⇔
@@ -609,7 +614,8 @@ const MapCanvas: React.FC = () => {
       const cLat = (map.bounds.north + map.bounds.south) / 2;
       const cLng = (map.bounds.east + map.bounds.west) / 2;
       const zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, 15));
-      const scale = scaleForZoom(canvasSize.width, z0, zoom);
+      const zFix = ZOOM_REF; // ЭТАЛОН для инварианта worldPx = canvasHeight·2^(zFix+log2 scale)
+      const scale = scaleForZoom(canvasSize.width, zFix, zoom);
       const lngSpan = Math.abs(map.bounds.east - map.bounds.west);
       const scrX = ((cLng - map.bounds.west) / lngSpan) * map.width * scale;
       const topM = latToMerc(map.bounds.north);
@@ -619,7 +625,7 @@ const MapCanvas: React.FC = () => {
         scale,
         offsetX: canvasSize.width / 2 - scrX,
         offsetY: canvasSize.height / 2 - cyMap * scale,
-        z0,
+        z0: zFix,
       });
     }
   }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled, mapLoaded, canvasSize.width]);
