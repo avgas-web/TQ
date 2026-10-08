@@ -402,11 +402,16 @@ const MapCanvas: React.FC = () => {
   // без него отвечает 429 («Please include a meaningful User-Agent string»), а битый
   // синтаксис запроса (см. ниже) давал HTTP 400 на всех зеркалах подряд.
   const OVERPASS_ENDPOINTS = [
-    'https://overpass-api.de/api/interpreter',
     'https://overpass.kumi.systems/api/interpreter',
     'https://overpass.private.coffee/api/interpreter',
+    'https://overpass-api.de/api/interpreter',
   ];
   const OVERPASS_UA = 'TQ-flight-planner/1.0 (web app; https://avgas-web.github.io/TQ/)';
+  // Максимальная площадь bbox (в °²), при которой шлём запрос. Больше — серверы
+  // уходят в долгий вычислительный процесс и отвечают 504, либо отрезают нас по
+  // rate-limit. При слишком крупном виде слои просто не запрашиваются до зума
+  // поближе (это безопаснее, чем «зависшая» загрузка).
+  const MAX_BBOX_AREA_DEG2 = 36; // ~6°×6°
   const extFailRef = useRef(0);        // подряд неудачных запросов
   // Кэш внешних объектов: ключ — bbox + набор слоёв; значение хранит время записи и
   // признак пустого результата. Пустые ответы НЕ кэшируются навсегда (лимит выдачи/
@@ -462,7 +467,12 @@ const MapCanvas: React.FC = () => {
       // неудач, чтобы после предыдущего автоматического отключения слоёв
       // не остаться навсегда в «заблокированном» состоянии.
       extFailRef.current = 0;
-      const q = `[out:json][timeout:15];(${parts.join('')});out center qt 60;`;
+      // Print-секция: `out center qt N` принимается не всеми сборками Overpass
+      // (зеркала отвечали 400/500 на параметр qt в union-запросах). Надёжная
+      // каноническая форма — простой `out center;` (центры ways + координаты
+      // nodes). Проверено живыми запросами к зеркалам: HTTP 200, элементы
+      // возвращаются. Объём выборки ограничивает maxBboxArea ниже.
+      const q = `[out:json][timeout:20];(${parts.join('')});out center;`;
       setOverpassBusy(true);
       let data: { elements?: any[] } | null = null;
       let lastErr = '';
@@ -470,7 +480,9 @@ const MapCanvas: React.FC = () => {
       for (const url of OVERPASS_ENDPOINTS) {
         if (reqId !== extReqIdRef.current) { setOverpassBusy(false); return; } // отменён новым видом
         const ctrl = new AbortController();
-        const to = setTimeout(() => ctrl.abort(), 20000); // timeout:15 + запас на очередь зеркала
+        // 25 с: серверный timeout:20 + запас на очередь зеркала. Прежние 12–20 с
+        // обрывали живой запрос раньше, чем сервер успевал отдать данные.
+        const to = setTimeout(() => ctrl.abort(), 25000);
         try {
           const r = await fetch(url, {
             method: 'POST',
