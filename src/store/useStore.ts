@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
+import { persist, createJSONStorage } from 'zustand/middleware';
 import { v4 as uuidv4 } from 'uuid';
 import type { Project, Marker, Restriction, Layer, Tool, ViewState, MapData, Point, CalibrationPoint, MapBounds, Route, RoutePoint } from '../types';
 import { MAX_ROUTES } from '../types';
@@ -37,6 +37,8 @@ interface AppState {
   selectedMarkerId: string | null;
   selectedRestrictionId: string | null;
   viewState: ViewState;
+  /** monotonic counter — bump on every setViewState (see selectViewForRender) */
+  viewTick: number;
   cursorPosition: Point | null;
   isDrawing: boolean;
   drawingPoints: Point[];
@@ -164,6 +166,7 @@ export const useStore = create<AppState>()(
       selectedMarkerId: null,
       selectedRestrictionId: null,
       viewState: { offsetX: 0, offsetY: 0, scale: 1 },
+      viewTick: 0,
       cursorPosition: null,
       isDrawing: false,
       drawingPoints: [],
@@ -752,6 +755,10 @@ export const useStore = create<AppState>()(
 
       setViewState: (viewState) => set((state) => ({
         viewState: { ...state.viewState, ...viewState },
+        // счётчик вида: селекторы компонентов (selectViewForRender) пересчитываются
+        // при каждом изменении вида; без него re-render мог видеть устаревший/не
+        // гидрированный viewState (краш «viewState is not defined» на проде)
+        viewTick: state.viewTick + 1,
       })),
 
       setCursorPosition: (pos) => set({ cursorPosition: pos }),
@@ -970,6 +977,13 @@ export const useStore = create<AppState>()(
     }),
     {
       name: 'totalquadro-storage',
+      version: 2,
+      // Явная JSON-гидрация из localStorage. Важно: при default storage persist
+      // записывает восстановленные поля в объект стейта через Object.assign
+      // (in-place мутация до первого notify). Если компонент успевает отрендериться
+      // в этом окне, он читает частично гидрированный viewState и падает с
+      // ReferenceError/TypeError («viewState is not defined» на проде).
+      storage: createJSONStorage(() => localStorage),
       partialize: (state) => ({
         project: {
           ...state.project,
@@ -981,6 +995,15 @@ export const useStore = create<AppState>()(
         },
         _currentMapId: state._currentMapId, // Сохраняем ID карты для восстановления
       }),
+      onRehydrateStorage: () => (state, error) => {
+        if (error) console.warn('[persist] rehydration failed:', error);
+        // Принудительный set() после гидрации: гарантирует новый ссылочный ярлык
+        // viewTick и уведомление всех подписчиков — компоненты гарантированно
+        // перерисуются уже с полностью восстановленным состоянием.
+        try {
+          useStore.setState((s) => ({ viewTick: s.viewTick + 1 }));
+        } catch { /* стор ещё не создан (первичная синхронная гидрация) — не страшно */ }
+      },
       migrate: (persistedState: any, version: number) => {
         // Миграция для старых проектов без googleMaps
         if (persistedState.project && !persistedState.project.googleMaps) {

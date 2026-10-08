@@ -172,7 +172,6 @@ const MapCanvas: React.FC = () => {
     project,
     currentTool,
     actionMode,
-    viewState,
     selectedMarkerId,
     activeRouteId,
     isDrawing,
@@ -200,8 +199,11 @@ const MapCanvas: React.FC = () => {
   // запросов тайлов на каждый mousemove -> страница «виснет»), а через лёгкую
   // zustand-подписку с requestAnimationFrame: вид читается из viewRef, canvas
   // перерисовывается не чаще одного кадра, обработчики мыши стабильны.
-  const viewRef = useRef(viewState);
-  useEffect(() => { viewRef.current = viewState; }, [viewState]);
+  // ВАЖНО: viewRef инициализируется напрямую из стора (useStore.getState()), а не
+  // из пропсов/деструктуризации — иначе при re-render до гидрации persist можно
+  // получить undefined-вид (краш «viewState is not defined» / reading 'scale').
+  const viewRef = useRef(useStore.getState().viewState);
+  useEffect(() => { viewRef.current = useStore.getState().viewState; });
   const [renderTick, setRenderTick] = useState(0);
   useEffect(() => {
     let raf = 0;
@@ -534,7 +536,7 @@ const MapCanvas: React.FC = () => {
     const map = project.map;
     if (!map?.bounds || canvasSize.height <= 0) return;
     const key = `${map.name}|${map.bounds.north.toFixed(6)},${map.bounds.south.toFixed(6)}`;
-    if (lastFittedMapRef.current === key && viewState.z0 != null) return;
+    if (lastFittedMapRef.current === key && viewRef.current.z0 != null) return;
     lastFittedMapRef.current = key;
     const z0 = startZoomForBounds(map.bounds, canvasSize.height);
     if (viewState.z0 !== z0) setViewState({ z0 });
