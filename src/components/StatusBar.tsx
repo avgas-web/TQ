@@ -1,16 +1,17 @@
 import React from 'react';
-import { useStore } from '../store/useStore';
+import { useStore, selectViewForRender } from '../store/useStore';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM } from '../utils/actionMode';
 
 
 const StatusBar: React.FC = () => {
-  const {
-    cursorPosition,
-    viewState,
-    project,
-    measurementPoints,
-  } = useStore();
+  const cursorPosition = useStore((s) => s.cursorPosition);
+  // Вид — через стабильный селектор примитивов (см. selectViewForRender):
+  // компонент не зависит от момента гидрации persist и никогда не увидит
+  // undefined-viewState (краш «viewState is not defined» на проде).
+  const view = useStore(selectViewForRender);
+  const project = useStore((s) => s.project);
+  const measurementPoints = useStore((s) => s.measurementPoints);
 
   const totalMeasurement = measurementPoints.length >= 2
     ? measurementPoints.reduce((sum, p, i) => {
@@ -74,7 +75,7 @@ const StatusBar: React.FC = () => {
           );
           // Метров на 1 экранный пиксель — из точных границ карты (WGS-84)
           const gRight = pixelToGeoFromBounds(
-            { x: project.map!.width / 2 + 1 / viewState.scale, y: project.map!.height / 2 },
+            { x: project.map!.width / 2 + 1 / (view.scale || 1), y: project.map!.height / 2 },
             project.map.bounds, project.map.width, project.map.height
           );
           const metersPerScreenPx = haversineDistanceM(gCenter, gRight);
@@ -95,7 +96,7 @@ const StatusBar: React.FC = () => {
         })()}
 
         {/* Zoom */}
-        <span>🔍 {(viewState.scale * 100).toFixed(0)}%</span>
+        <span>🔍 {((view.scale ?? 1) * 100).toFixed(0)}%</span>
 
         {/* Markers count */}
         <span>📍 {project.markers.length} точек</span>

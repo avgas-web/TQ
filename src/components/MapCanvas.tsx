@@ -215,7 +215,6 @@ const MapCanvas: React.FC = () => {
     project,
     currentTool,
     actionMode,
-    viewState,
     selectedMarkerId,
     activeRouteId,
     isDrawing,
@@ -243,8 +242,11 @@ const MapCanvas: React.FC = () => {
   // запросов тайлов на каждый mousemove -> страница «виснет»), а через лёгкую
   // zustand-подписку с requestAnimationFrame: вид читается из viewRef, canvas
   // перерисовывается не чаще одного кадра, обработчики мыши стабильны.
-  const viewRef = useRef(viewState);
-  useEffect(() => { viewRef.current = viewState; }, [viewState]);
+  // ВАЖНО: viewRef инициализируется напрямую из стора (useStore.getState()), а не
+  // из пропсов/деструктуризации — иначе при re-render до гидрации persist можно
+  // получить undefined-вид (краш «viewState is not defined» / reading 'scale').
+  const viewRef = useRef(useStore.getState().viewState);
+  useEffect(() => { viewRef.current = useStore.getState().viewState; });
   const [renderTick, setRenderTick] = useState(0);
   useEffect(() => {
     let raf = 0;
@@ -625,11 +627,11 @@ const MapCanvas: React.FC = () => {
     const map = project.map;
     if (!map?.bounds || canvasSize.height <= 0) return;
     const key = `${map.name}|${map.bounds.north.toFixed(6)},${map.bounds.south.toFixed(6)}`;
-    if (lastFittedMapRef.current === key && viewState.z0 != null) return;
+    if (lastFittedMapRef.current === key && viewRef.current.z0 != null) return;
     lastFittedMapRef.current = key;
     // z0 — ЭТАЛОН привязки (14): мир = canvasHeight·2^(z0+log2 scale). Постоянен
     // для всех карт — вид восстанавливается из persist точно, масштаб не «сбивается».
-    if (viewState.z0 !== ZOOM_REF) setViewState({ z0: ZOOM_REF });
+    if (viewRef.current.z0 !== ZOOM_REF) setViewState({ z0: ZOOM_REF });
   }, [project.map?.name, project.map?.bounds, canvasSize.height]);
 
   // Auto-fit view: при загрузке карты — вписать её; если на карте есть объекты
