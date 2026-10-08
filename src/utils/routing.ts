@@ -140,12 +140,7 @@ function segmentCircleIntersect(a: Point, b: Point, c: Point, radius: number): b
 
 /** Зоны, которые пересекает ломаная маршрутa */
 export function zonesCrossedBy(points: Point[], restrictions: Restriction[]): Restriction[] {
-  // Круг задаётся ОДНОЙ точкой + radius: старый фильтр points.length >= 2
-  // полностью исключал круговые зоны из проверки пересечений (ложно-чистые
-  // маршруты, проходящие через круг).
-  const active = restrictions.filter(
-    (r) => r.active && (r.type === 'circle' ? r.points.length >= 1 && !!r.radius : r.points.length >= 2)
-  );
+  const active = restrictions.filter((r) => r.active && r.points.length >= 2);
   if (active.length === 0 || points.length < 2) return [];
   const hitIds = new Set<string>();
   for (let i = 0; i < points.length - 1; i++) {
