@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { useStore } from '../store/useStore';
 import { osmGeocode, loadOSMStaticMap } from '../utils/openStreetMap';
 import { geoToPixelFromBounds } from '../utils/googleMaps';
@@ -27,6 +27,9 @@ const ActionModePanel: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [route, setRoute] = useState<RouteInfo | null>(null);
+  // Счётчик фоновых запросов снимка карты: защищает от гонки «старый ответ
+  // перезаписывает новый» при быстром повторном нажатии «Построить».
+  const buildSeqRef = useRef(0);
 
   const { project, loadMapWithStorage, loadActiveTileMap, addMarker, selectMarker, actionMode, setActionMode,
     addRoute, activeRouteId, setActiveRoute, deleteRoute,
@@ -214,10 +217,15 @@ const ActionModePanel: React.FC = () => {
       loadActiveTileMap(center, zoom);
       setRoute({ start, goal, distanceM, azimuth, rbfStart, rbfGoal });
 
-      // Фоновая дозагрузка снимка (не блокирует интерфейс и не отменяет активную карту)
+      // Фоновая дозагрузка снимка (не блокирует интерфейс и не отменяет активную карту).
+      // Защита от гонки: каждый запуск handleBuild увеличивает счётчик; результат
+      // применяется только если это всё ещё последний запрос (иначе быстрый двойной
+      // клик привёл бы к перезаписи новой карты снимком от старого запроса).
       if (!navigator.onLine) throw new Error('Нет сети — используется активная тайловая карта из кэша');
+      const myReqId = ++buildSeqRef.current;
       loadOSMStaticMap(center, zoom, size, size, tileServer)
         .then((mapResult) => {
+          if (myReqId !== buildSeqRef.current) return; // устаревший ответ — более свежий запрос уже в полёте
           const cur = useStore.getState().project.map;
           if (!cur || !cur.bounds) return; // карта уже заменена пользователем
           const mapData: MapData = {

@@ -30,6 +30,113 @@ function pixelToGeoStrict(p: Point, bounds: MapBounds, mapW: number, mapH: numbe
   return pixelToGeoExact(p, bounds, mapW, mapH);
 }
 
+// ─── Служебное состояние вне стейта zustand ─────────────────────────────────
+// Троттлер пакетной перестройки маршрутов. Ссылку на таймер НЕЛЬЗЯ хранить в
+// объекте стейта: запись в get() напрямую (вне set()) нарушает иммутабельность
+// zustand и теряется при HMR/ре-гидратации persist-стора — из-за этого
+// плановая перестройка маршрутов могла молча не выполняться.
+const REROUTE_THROTTLE_MS = 250;
+let rerouteTimer: number | null = null;
+
+/**
+ * Единый планировщик пакетной перестройки всех маршрутов. Идемпотентен:
+ * повторные вызовы в пределах троттл-окна схлопываются в один прогон.
+ */
+export function scheduleRerouteAll() {
+  if (rerouteTimer != null) clearTimeout(rerouteTimer);
+  rerouteTimer = window.setTimeout(() => {
+    rerouteTimer = null;
+    rerouteAllRoutesNow();
+  }, REROUTE_THROTTLE_MS);
+}
+
+/** Немедленная пакетная перестройка всех маршрутов (вызывается троттлером). */
+function rerouteAllRoutesNow() {
+  const state = useStore.getState();
+  const set = useStore.setState;
+  const map = state.project.map;
+  const routes = state.project.routes || [];
+  if (!map || routes.length === 0) return;
+  // Все активные зоны участвуют в расчёте: круг задаётся ОДНОЙ точкой + radius,
+  // старый фильтр points.length >= 2 полностью игнорировал круговые зоны.
+  const activeZones = state.project.restrictions.filter(
+    (r) => r.active && (r.type === 'circle' ? r.points.length >= 1 && !!r.radius : r.points.length >= 2)
+  );
+  const newRoutes: Route[] = [];
+  const warningsMap: Record<string, string[]> = {};
+  for (const route of routes) {
+    if (route.points.length < 2) { newRoutes.push(route); continue; }
+    // Ключевые точки берём по stable-признаку auto. Если после импорта/старых
+    // версий все точки помечены auto (ключевых < 2), принудительно считаем
+    // ключевыми первую и последнюю — иначе маршрут навсегда останется
+    // «замороженным» с авто-точками предыдущего прогона.
+    let ki: number[] = [];
+    for (let i = 0; i < route.points.length; i++) if (!route.points[i].auto) ki.push(i);
+    if (ki.length < 2) ki = [0, route.points.length - 1];
+    const pts: RoutePoint[] = [];
+    for (let k = 0; k < ki.length - 1; k++) {
+      const a = route.points[ki[k]];
+      const b = route.points[ki[k + 1]];
+      pts.push({ ...a, auto: undefined as any });
+      const path = planPathAroundZones({ x: a.x, y: a.y }, { x: b.x, y: b.y }, activeZones, map.width, map.height);
+      for (let i = 1; i < path.length - 1; i++) {
+        const px = path[i];
+        const geo = map.bounds ? pixelToGeoStrict(px, map.bounds, map.width, map.height) : { lat: NaN, lng: NaN };
+        pts.push({ x: px.x, y: px.y, lat: geo.lat, lng: geo.lng, auto: true });
+      }
+    }
+    pts.push({ ...route.points[ki[ki.length - 1]] });
+    // Кривая: сглаживание ОБХОДНОЙ ЛОМАНОЙ поверх ключевых точек.
+    // ВАЖНО: сглаживаем всегда от ключевых точек, а не от текущего массива
+    // points: раньше smooth применялся к уже сглаженному результату, и каждая
+    // перестройка умножала число точек (~×6) — экспоненциальный рост данных.
+    if (route.shape === 'curve') {
+      const base: RoutePoint[] = [];
+      for (let k = 0; k < ki.length - 1; k++) {
+        const a = route.points[ki[k]];
+        const b = route.points[ki[k + 1]];
+        base.push({ ...a, auto: undefined as any });
+        const path = planPathAroundZones({ x: a.x, y: a.y }, { x: b.x, y: b.y }, activeZones, map.width, map.height);
+        for (let i = 1; i < path.length - 1; i++) {
+          const px = path[i];
+          const geo = map.bounds ? pixelToGeoStrict(px, map.bounds, map.width, map.height) : { lat: NaN, lng: NaN };
+          base.push({ x: px.x, y: px.y, lat: geo.lat, lng: geo.lng, auto: true });
+        }
+      }
+      base.push({ ...route.points[ki[ki.length - 1]] });
+      const smooth = smoothPolyline(base.map((p) => ({ x: p.x, y: p.y })), 6);
+      const merged: RoutePoint[] = [];
+      for (const sp of smooth) {
+        const near = base.find((p) => Math.hypot(p.x - sp.x, p.y - sp.y) < 1.5);
+        if (near) { merged.push(near); continue; }
+        const geo = map.bounds ? pixelToGeoStrict(sp, map.bounds, map.width, map.height) : { lat: NaN, lng: NaN };
+        merged.push({ x: sp.x, y: sp.y, lat: geo.lat, lng: geo.lng, auto: true });
+      }
+      pts.length = 0;
+      pts.push(...merged);
+    }
+    const crossed = zonesCrossedBy(pts.map((p) => ({ x: p.x, y: p.y })), activeZones);
+    const warns = crossed.map((z) => `Пересекает зону «${z.name}»`);
+    const limitWarn = rangeLimitWarning(route, pts);
+    if (limitWarn) warns.push(limitWarn);
+    if (warns.length > 0) warningsMap[route.id] = warns;
+    newRoutes.push({ ...route, points: pts });
+  }
+  set((cur) => {
+    // Полная замена реестра предупреждений: старые записи для «очистившихся»
+    // маршрутов раньше сливались с новыми ({...cur, ...map}) и ложные
+    // предупреждения оставались навсегда.
+    const nextWarnings: Record<string, string[]> = {};
+    for (const [rid, w] of Object.entries(warningsMap)) {
+      if (w.length > 0) nextWarnings[rid] = w;
+    }
+    return {
+      routeWarnings: nextWarnings,
+      project: { ...cur.project, routes: newRoutes, updatedAt: new Date().toISOString() },
+    };
+  });
+}
+
 interface AppState {
   project: Project;
   currentTool: Tool;
@@ -392,67 +499,18 @@ export const useStore = create<AppState>()(
         // ТРОТТЛИНГ: пакетная перестройка ВСЕХ маршрутов — дорогая операция
         // (обход зон для каждого). Без троттлинга каждое движение мыши / зум
         // вызывали полный пересчёт -> вкладка «виснет» намертво.
-        const s = get() as any;
-        if (s.__rerouteTimer) { clearTimeout(s.__rerouteTimer); }
-        s.__rerouteTimer = setTimeout(() => {
-          (get() as any).__rerouteTimer = null;
-          (get() as any).__rerouteAllRoutesNow?.();
-        }, 250);
+        // ВАЖНО: ссылка таймера хранится В МОДУЛЬНОЙ ЗАМЫКАНИИ, а не в объекте
+        // стейта. Запись напрямую в стейт через (get() as any) нарушала
+        // иммутабельность zustand и терялась при HMR/ре-гидратации — из-за
+        // этого пакетная перестройка могла молча не выполняться.
+        if (rerouteTimer != null) clearTimeout(rerouteTimer);
+        rerouteTimer = window.setTimeout(() => {
+          rerouteTimer = null;
+          rerouteAllRoutesNow();
+        }, REROUTE_THROTTLE_MS);
       },
 
-      __rerouteAllRoutesNow: () => {
-        const state = get();
-        const map = state.project.map;
-        const routes = state.project.routes || [];
-        if (!map || routes.length === 0) return;
-        // Быстрая пакетовая перестройка: все маршруты за один set() вместо N штук
-        const keyBy = state.project.restrictions.filter((r) => r.active && r.points.length >= 2);
-        const newRoutes: Route[] = [];
-        const warningsMap: Record<string, string[]> = {};
-        for (const route of routes) {
-          if (route.points.length < 2) { newRoutes.push(route); continue; }
-          const ki: number[] = [];
-          for (let i = 0; i < route.points.length; i++) if (!route.points[i].auto) ki.push(i);
-          if (ki.length < 2) { newRoutes.push(route); continue; }
-          const pts: RoutePoint[] = [];
-          for (let k = 0; k < ki.length - 1; k++) {
-            const a = route.points[ki[k]];
-            const b = route.points[ki[k + 1]];
-            pts.push({ ...a, auto: undefined as any });
-            const path = planPathAroundZones({ x: a.x, y: a.y }, { x: b.x, y: b.y }, keyBy, map.width, map.height);
-            for (let i = 1; i < path.length - 1; i++) {
-              const px = path[i];
-              const geo = map.bounds ? pixelToGeoStrict(px, map.bounds, map.width, map.height) : { lat: NaN, lng: NaN };
-              pts.push({ x: px.x, y: px.y, lat: geo.lat, lng: geo.lng, auto: true });
-            }
-          }
-          pts.push({ ...route.points[ki[ki.length - 1]] });
-          // Кривая: сглаживание обходной ломаной (ключевые точки сохраняются)
-          if (route.shape === 'curve') {
-            const smooth = smoothPolyline(pts.map((p) => ({ x: p.x, y: p.y })), 6);
-            const merged: RoutePoint[] = [];
-            for (const sp of smooth) {
-              const near = pts.find((p) => Math.hypot(p.x - sp.x, p.y - sp.y) < 1.5);
-              if (near) { merged.push(near); continue; }
-              const geo = map.bounds ? pixelToGeoStrict(sp, map.bounds, map.width, map.height) : { lat: NaN, lng: NaN };
-              merged.push({ x: sp.x, y: sp.y, lat: geo.lat, lng: geo.lng, auto: true });
-            }
-            pts.length = 0;
-            pts.push(...merged);
-          }
-          const crossed = zonesCrossedBy(pts.map((p) => ({ x: p.x, y: p.y })), keyBy);
-          const warns = crossed.map((z) => `Пересекает зону «${z.name}»`);
-          const limitWarn = rangeLimitWarning(route, pts);
-          if (limitWarn) warns.push(limitWarn);
-          if (warns.length > 0) warningsMap[route.id] = warns;
-          else delete warningsMap[route.id];
-          newRoutes.push({ ...route, points: pts });
-        }
-        set((cur) => ({
-          routeWarnings: { ...cur.routeWarnings, ...warningsMap },
-          project: { ...cur.project, routes: newRoutes, updatedAt: new Date().toISOString() },
-        }));
-      },
+      __rerouteAllRoutesNow: () => rerouteAllRoutesNow(),
 
       refreshAllRoutesAfterMapChange: () => {
         const state = get();
@@ -673,7 +731,9 @@ export const useStore = create<AppState>()(
             updatedAt: new Date().toISOString(),
           },
         }));
-        get().rerouteAllRoutes(); // зоны изменились — маршруты перестраиваются автоматически
+        // Перестройку выполняет единственный троттлинговый подписчик на
+        // изменения restrictions (MapCanvas). Синхронный вызов отсюда создавал
+        // двойной запуск пакетной перестройки на каждое изменение зон.
       },
 
       deleteRestriction: (id) => {
@@ -686,7 +746,7 @@ export const useStore = create<AppState>()(
           activeRestrictionId: state.activeRestrictionId === id ? null : state.activeRestrictionId,
           selectedRestrictionId: state.selectedRestrictionId === id ? null : state.selectedRestrictionId,
         }));
-        get().rerouteAllRoutes();
+        // reroute — через троттлинговый подписчик на restrictions (см. MapCanvas)
       },
 
       selectRestriction: (id) => set({ selectedRestrictionId: id, selectedMarkerId: null }),
@@ -703,6 +763,9 @@ export const useStore = create<AppState>()(
             updatedAt: new Date().toISOString(),
           },
         }));
+        // set-active меняет набор активных зон → маршруты должны перестроиться.
+        // Вызов через единый троттлер; дубль от подписчика на restrictions
+        // безвреден — планировщик схлопывает повторные вызовы в один прогон.
         get().rerouteAllRoutes();
       },
 

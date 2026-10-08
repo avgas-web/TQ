@@ -155,11 +155,17 @@ const App: React.FC = () => {
     restoreMap();
   }, []);
 
-  // Initialize OpenStreetMap on app load (doesn't require API key)
+  // Initialize OpenStreetMap on app load (doesn't require API key).
+  // НЕ включаем OSM безусловно: toggleOpenStreetMap(true) на каждом старте
+  // перезаписывал сохранённый выбор пользователя (persist openStreetMap.enabled).
+  // Инициализация конфигурации выполняется, а состояние берётся из стора.
   useEffect(() => {
     const initOSM = async () => {
       await initOpenStreetMap();
-      useStore.getState().toggleOpenStreetMap(true);
+      const st = useStore.getState();
+      if (!st.project.openStreetMap.enabled) {
+        st.toggleOpenStreetMap(true);
+      }
     };
     initOSM();
   }, []);

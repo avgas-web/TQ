@@ -1,5 +1,5 @@
 // Утилиты экспорта/импорта
-import type { Marker, Project } from '../types';
+import type { Marker, Project, Route, Restriction } from '../types';
 import { pixelToGeoFromBounds } from './googleMaps';
 
 /**
@@ -131,18 +131,104 @@ export function exportProject(project: Project): string {
 }
 
 /**
- * Импорт проекта из JSON
+ * Импорт проекта из JSON.
+ * Валидация структуры: файл может быть повреждён или содержать объекты
+ * без обязательных полей (points, числовые координаты и т.п.), что иначе
+ * приводит к крахам в planPathAroundZones / fitViewToData / делению на ноль.
+ * Некорректные элементы отбрасываются, недостающие секции дополняются
+ * значениями по умолчанию. Возвращает null только если это явно не проект.
  */
 export function importProject(json: string): Project | null {
+  let data: any;
   try {
-    const data = JSON.parse(json);
-    if (data.version && data.projectName) {
-      return data as Project;
-    }
-    return null;
+    data = JSON.parse(json);
   } catch {
     return null;
   }
+  if (!data || typeof data !== 'object') return null;
+  if (typeof data.version !== 'string' && typeof data.projectName !== 'string') return null;
+
+  const num = (v: unknown, d: number) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
+  const str = (v: unknown, d: string) => (typeof v === 'string' ? v : d);
+  const arr = <T>(v: unknown): T[] => (Array.isArray(v) ? v : []);
+
+  // Карта: принимаем только с валидными размерами и dataUrl, иначе — null
+  let map: Project['map'] = null;
+  if (data.map && typeof data.map === 'object' && typeof data.map.dataUrl === 'string' &&
+      num(data.map.width, 0) > 0 && num(data.map.height, 0) > 0) {
+    map = data.map;
+  }
+
+  const markers: Marker[] = arr<any>(data.markers)
+    .filter((m) => m && typeof m === 'object')
+    .map((m, i) => ({
+      ...m,
+      id: str(m.id, `m-${Date.now()}-${i}`),
+      name: str(m.name, `Точка ${i + 1}`),
+      x: num(m.x, 0),
+      y: num(m.y, 0),
+    }));
+
+  const routes: Route[] = arr<any>(data.routes)
+    .filter((r) => r && typeof r === 'object' && Array.isArray(r.points))
+    .map((r, i) => ({
+      ...r,
+      id: str(r.id, `r-${Date.now()}-${i}`),
+      points: r.points.filter((p: any) => p && typeof p === 'object' &&
+        Number.isFinite(p.lat) && Number.isFinite(p.lng)),
+    }))
+    .filter((r) => r.points.length >= 2);
+
+  const restrictions: Restriction[] = arr<any>(data.restrictions)
+    .filter((z) => z && typeof z === 'object' && Array.isArray(z.points))
+    .map((z, i) => ({
+      ...z,
+      id: str(z.id, `z-${Date.now()}-${i}`),
+      points: z.points.filter((p: any) => p && typeof p === 'object' &&
+        Number.isFinite(p.x) && Number.isFinite(p.y)),
+    }))
+    .filter((z) => z.points.length >= 1);
+
+  return {
+    version: str(data.version, '1.0'),
+    projectName: str(data.projectName, 'Импортированный проект'),
+    createdAt: str(data.createdAt, new Date().toISOString()),
+    updatedAt: str(data.updatedAt, new Date().toISOString()),
+    map,
+    calibration: {
+      enabled: !!(data.calibration && data.calibration.enabled === true),
+      points: arr(data.calibration?.points),
+    },
+    restrictions,
+    markers,
+    routes,
+    importLists: data.importLists && typeof data.importLists === 'object' ? data.importLists : undefined,
+    layers: arr(data.layers),
+    settings: {
+      showGrid: !!(data.settings && data.settings.showGrid),
+      gridSize: num(data.settings?.gridSize, 100),
+      showCoordinates: !!(data.settings?.showCoordinates),
+      theme: data.settings?.theme === 'light' ? 'light' : 'dark',
+      tileStyle: ['scheme', 'satellite', 'hybrid'].includes(data.settings?.tileStyle) ? data.settings.tileStyle : undefined,
+      tilesEnabled: data.settings?.tilesEnabled,
+      airportsLayer: data.settings?.airportsLayer,
+      geozonesLayer: data.settings?.geozonesLayer,
+      notamLayer: data.settings?.notamLayer,
+    },
+    googleMaps: {
+      apiKey: str(data.googleMaps?.apiKey, ''),
+      enabled: !!(data.googleMaps && data.googleMaps.enabled),
+    },
+    yandexMaps: {
+      apiKey: str(data.yandexMaps?.apiKey, ''),
+      enabled: !!(data.yandexMaps && data.yandexMaps.enabled),
+    },
+    openStreetMap: {
+      enabled: !!(data.openStreetMap && data.openStreetMap.enabled),
+      tileServer: ['osm', 'opentopomap', 'carto'].includes(data.openStreetMap?.tileServer)
+        ? data.openStreetMap.tileServer : 'osm',
+    },
+  };
 }
 
 /**
