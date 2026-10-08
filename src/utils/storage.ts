@@ -105,6 +105,13 @@ export function initMapDatabase(): Promise<IDBDatabase> {
       reject(new Error('Не удалось открыть IndexedDB'));
     };
     
+    // onblocked: другая вкладка держит старую версию БД —
+    // событие отличается от onerror (отказ хранилища). Раньше не
+    // обрабатывалось, и Promise висел вечно; теперь — явная ошибка.
+    request.onblocked = () => {
+      reject(new Error('IndexedDB заблокирована другой открытой вкладкой — закройте её и повторите'));
+    };
+    
     request.onsuccess = () => {
       resolve(request.result);
     };
