@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { useStore } from '../store/useStore';
 import { loadGoogleMapsApi, geocodeAddress, loadStaticMap, isGoogleMapsLoaded } from '../utils/googleMaps';
 import { loadYandexMapsApi, yandexGeocode, loadYandexStaticMap, isYandexMapsLoaded } from '../utils/yandexMaps';
@@ -19,6 +19,9 @@ const MapsPanel: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
+  // Счётчик фоновых снимков: результат применяется только если это всё ещё
+  // последний запрос (защита от гонки при быстром двойном нажатии)
+  const loadSeqRef = useRef(0);
 
   const {
     project,
@@ -28,6 +31,7 @@ const MapsPanel: React.FC = () => {
     toggleYandexMaps,
     setOSMTileServer,
     loadMapWithStorage,
+    loadActiveTileMap,
     setMapBounds,
   } = useStore();
 
@@ -215,7 +219,11 @@ const MapsPanel: React.FC = () => {
           source: 'yandex',
         });
       } else if (activeProvider === 'osm') {
-        // OSM не требует загрузки API, просто загружаем карту
+        // ПРОСТАЯ ЗАГРУЗКА KAK НА OPENSTREETMAP.ORG: вместо «фотографии»-стоп-кадра
+        // (сотни тайлов в один большой PNG — медленно и с потерей чёткости при зуме)
+        // создаётся АКТИВНАЯ тайловая карта: подложка грузится тайлами динамически,
+        // непрерывно масштабируется колесом от z3 до z19+ и жёстко привязана к
+        // координатам единой Web Mercator-формулой (worldPx = 256·2^z).
         const geoRes = await osmGeocode(addressInput);
         geoResult = geoRes.point;
         if (!geoResult) {
@@ -224,22 +232,34 @@ const MapsPanel: React.FC = () => {
           return;
         }
 
-        mapResult = await loadOSMStaticMap(
-          geoResult,
-          zoom,
-          width,
-          height,
-          osmTileServer
-        );
+        loadActiveTileMap(geoResult, zoom);
 
-        await loadMapWithStorage({
-          name: `OpenStreetMap - ${addressInput}`,
-          width,
-          height,
-          dataUrl: mapResult.dataUrl,
-          bounds: mapResult.bounds,
-          source: 'osm',
-        });
+        // Фоновая дозагрузка снимка как fallback-растра (не блокирует интерфейс):
+        // применяется только если это всё ещё последний запрос (защита от гонки)
+        // и карта не заменена пользователем. При офлайне шаг просто пропускается.
+        const myReqId = ++loadSeqRef.current;
+        if (navigator.onLine) {
+          loadOSMStaticMap(geoResult, zoom, width, height, osmTileServer)
+            .then((res) => {
+              if (myReqId !== loadSeqRef.current) return; // более свежий запрос уже в полёте
+              const cur = useStore.getState().project.map;
+              if (!cur || !cur.bounds || cur.source !== 'osm') return; // карта заменена
+              void loadMapWithStorage({
+                name: `OpenStreetMap - ${addressInput}`,
+                width,
+                height,
+                dataUrl: res.dataUrl,
+                bounds: res.bounds,
+                source: 'osm',
+              });
+            })
+            .catch(() => { /* активная тайловая карта уже работает — снимок опционален */ });
+        }
+
+        // Привязка уже установлена loadActiveTileMap (точная Mercator); setMapBounds
+        // здесь не нужен — иначе стёр бы bounds до прихода фонового снимка.
+        setSuccess('Карта открыта (как на openstreetmap.org): доступен зум и панорама, привязка к координатам строгая.');
+        return;
       }
 
       // mapResult может остаться undefined, если activeProvider не совпал ни с
