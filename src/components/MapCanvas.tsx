@@ -707,9 +707,12 @@ const MapCanvas: React.FC = () => {
     const tilesActive = !!project.settings?.tilesEnabled && !!project.map?.bounds;
     const map = project.map;
     if (!map || !mapLoaded || canvasSize.width <= 0) return;
+    // Ключ = карта + ЦЕЛЕВОЙ ЗУМ загрузки (store.setMapZoom). Старый ключ не
+    // содержал zoom → повторная загрузка той же точки с другим масштабом молча
+    // оставляла вид на прежнем зуме («зум из панели не применялся»).
     const boundsKey = map.bounds ? `${map.bounds.north},${map.bounds.south}` : 'nobounds';
-    const fitKey = `${map.dataUrl ? 'img' : 'tiles'}|${boundsKey}`;
-    if (lastInitialFitRef.current === fitKey) return; // только ОДИН раз на карту — ресайз вид не трогает
+    const fitKey = `${map.dataUrl ? 'img' : 'tiles'}|${boundsKey}|${useStore.getState().mapZoom ?? ''}`;
+    if (lastInitialFitRef.current === fitKey) return; // только ОДИН раз на карту+зум — ресайз вид не трогает
     lastInitialFitRef.current = fitKey;
     if (!map.bounds) return;
     // ИНВАРИАНТНЫЙ ЭТАЛОН z0: привязка вида задаётся формулой worldPx = vh·2^zoom,
@@ -739,13 +742,16 @@ const MapCanvas: React.FC = () => {
       // произвольного z15: пользователь задал zoom → на нём карта и открывается.
       const cLat = (map.bounds.north + map.bounds.south) / 2;
       const cLng = (map.bounds.east + map.bounds.west) / 2;
-      // Целевой зум восстанавливаем из Mercator-геометрии самого растрового
-      // «виртуального» растра loadActiveTileMap: он построен так, что высота
-      // мира на уровне z равна map.height по Y. Это даёт точный zoom загрузки
-      // без догадок и независим от размеров окна.
+      // Целевой зум берём ПРЯМО из стора (loadActiveTileMap записывает setMapZoom
+      // ровно тем значением, что пользователь выставил в панели). Mercator-оценка
+      // по height/mercSpanY служила лишь fallback: при малых высотах растра она
+      // округлялась вниз и карта открывалась не на заданном масштабе.
+      const requestedZoom = useStore.getState().mapZoom;
       const mercSpanY = latToMerc(map.bounds.south) - latToMerc(map.bounds.north);
       const zoomFromRaster = Math.log2(Math.max(map.height / Math.max(mercSpanY, 1e-12), 256) / 256);
-      const zoom = clampZoom(Number.isFinite(zoomFromRaster) ? zoomFromRaster : 15);
+      const zoom = clampZoom(Number.isFinite(requestedZoom) && requestedZoom! >= MIN_ZOOM
+        ? requestedZoom!
+        : (Number.isFinite(zoomFromRaster) ? zoomFromRaster : 15));
       const zFix = ZOOM_REF; // ЭТАЛОН для инварианта worldPx = canvasHeight·2^(zFix+log2 scale)
       const worldPx = canvasSize.height * Math.pow(2, zoom); // мир в экранных px на этом зуме
       const fx = (cLng + 180) / 360;  // mercator-доля мира по X для центра bounds
