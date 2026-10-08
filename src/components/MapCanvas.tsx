@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
-import { useStore } from '../store/useStore';
+import { useStore, scheduleRerouteAll } from '../store/useStore';
 import { isPointInActiveRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
@@ -556,10 +556,14 @@ const MapCanvas: React.FC = () => {
   // (viewRef и rAF-подписка объявлены выше — дублирующий блок удалён.)
 
   // Троттлинговый подписчик: зоны ограничений изменились -> маршруты автоматически
-  // перестраиваются (обход зон). rerouteAllRoutes внутри — с троттлингом 250 мс.
+  // перестраиваются (обход зон). Вызывается единый модульный планировщик scheduleRerouteAll —
+  // троттлинг 250 мс и отмена предыдущего таймера гарантируются в одном месте.
+  // ВАЖНО: НЕ вызывать s.rerouteAllRoutes() здесь — стор сам инициирует перестройку
+  // после updateRestriction/deleteRestriction/setActiveRestriction; двойной вызов
+  // порождал две гонки троттлеров на одну операцию изменения зон.
   useEffect(() => {
     const unsub = useStore.subscribe((s, prev) => {
-      if (s.project.restrictions !== prev.project.restrictions) s.rerouteAllRoutes();
+      if (s.project.restrictions !== prev.project.restrictions) scheduleRerouteAll();
     });
     return unsub;
   }, []);
