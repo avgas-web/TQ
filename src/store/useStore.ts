@@ -1220,10 +1220,15 @@ export const useStore = create<AppState>()(
             tilesEnabled: true,
             tileStyle: 'scheme',
           };
-        } else if (persistedState.project?.settings && persistedState.project.settings.tilesEnabled === undefined) {
+        } else if (persistedState.project?.settings) {
           // существующие проекты: включаем активную тайловую карту по умолчанию
-          persistedState.project.settings.tilesEnabled = true;
-          persistedState.project.settings.tileStyle = persistedState.project.settings.tileStyle || 'scheme';
+          if (persistedState.project.settings.tilesEnabled === undefined) persistedState.project.settings.tilesEnabled = true;
+          // Режимы «спутник/гибрид» и внешние Overpass-слои удалены из приложения:
+          // нормализуем сохранённые настройки к стандартной схеме.
+          persistedState.project.settings.tileStyle = 'scheme';
+          delete (persistedState.project.settings as any).airportsLayer;
+          delete (persistedState.project.settings as any).geozonesLayer;
+          delete (persistedState.project.settings as any).notamLayer;
         }
         // Миграция для старых проектов без маршрутов
         if (persistedState.project && !Array.isArray(persistedState.project.routes)) {

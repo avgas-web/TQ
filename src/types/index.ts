@@ -82,12 +82,9 @@ export interface Project {
     gridSize: number;
     showCoordinates: boolean;
     theme: 'dark' | 'light';
-    // Стили тайловой подложки (включаются поверх загруженной карты, не заменяя её)
-    tileStyle?: 'scheme' | 'satellite' | 'hybrid';
+    // Стиль тайловой подложки: только стандартная схема OSM (режимы удалены из приложения)
+    tileStyle?: 'scheme';
     tilesEnabled?: boolean;
-    airportsLayer?: boolean;   // слой аэропортов (Overpass/OSM)
-    geozonesLayer?: boolean;   // слой геозон (NoFly Zones)
-    notamLayer?: boolean;      // слой NOTAM-уведомлений
   };
   googleMaps: {
     apiKey: string;
