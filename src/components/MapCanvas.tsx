@@ -673,7 +673,16 @@ const MapCanvas: React.FC = () => {
     for (const r of project.routes || []) if (r.visible !== false) for (const p of r.points) pts.push({ x: p.x, y: p.y });
     for (const m of project.markers) pts.push({ x: m.x, y: m.y });
     if (pts.length < 2) return;
-    const key = `${map.dataUrl}|${pts.length}`;
+    // Ключ — ТОЛЬКО набор объектов (mapId + упорядоченные id маршрутов/маркеров),
+    // но не их количество и не dataUrl. Старый ключ `${dataUrl}|${pts.length}`
+    // менялся при каждом добавлении/удалении точки → вид самовольно перемасштабивался
+    // под все объекты, откатывая ручной зум пользователя (редактирование маршрутов
+    // становилось невозможным). Смена карты определяется по mapId (стабилен между
+    // загрузками), а не по dataUrl (меняется при каждой перезагрузке одного bbox).
+    const fitKeyParts: string[] = [String(map.mapId || '')];
+    for (const r of project.routes || []) fitKeyParts.push(`R:${r.id}`);
+    for (const m of project.markers) fitKeyParts.push(`M:${m.id}`);
+    const key = fitKeyParts.join('|');
     if (lastFitKeyRef.current === key) return;
     lastFitKeyRef.current = key;
     const fit = fitViewToData(map.width, map.height, map.bounds, pts, canvasSize.width, canvasSize.height);
