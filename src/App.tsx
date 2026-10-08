@@ -10,8 +10,6 @@ const App: React.FC = () => {
   const {
     currentTool,
     setTool,
-    viewState,
-    setViewState,
     clearDrawingPoints,
     setMeasurementPoints,
     project,
@@ -53,6 +51,11 @@ const App: React.FC = () => {
       return;
     }
 
+    // Ctrl/Meta+буквы — браузерные связки (Ctrl+T новая вкладка, Ctrl+O открыть файл,
+    // Ctrl+S сохранить и т.п.): не перехватываем их транслитерацией русской раскладки.
+    // (кроме разобранных выше Ctrl+Z / Ctrl+Y)
+    if (e.ctrlKey || e.metaKey) return;
+
     if (e.key === 'Escape') {
       e.preventDefault();
       clearDrawingPoints();
@@ -67,17 +70,20 @@ const App: React.FC = () => {
       return;
     }
 
+    // Зум с клавиатуры — через единый обработчик канваса (zoomAt): фиксация на центре
+    // окна + ограничение в тех же границах minZoom..maxNativeZoom, что и у колеса мыши.
+    // Раньше здесь были жёсткие Math.min(50)/Math.max(0.01) без привязки к зум-шкале
+    // тайловой карты — лимиты расходились с канвасом, а центр «прыгал» из-за смены
+    // scale без корректировки offset.
     if (e.key === '+' || e.key === '=' || e.key === '§') {
       e.preventDefault();
-      const newScale = Math.min(50, viewState.scale * 1.2);
-      setViewState({ scale: newScale });
+      window.dispatchEvent(new CustomEvent('tq:zoom', { detail: 1.2 }));
       return;
     }
 
     if (e.key === '-' || e.key === '_' || e.key === '–') {
       e.preventDefault();
-      const newScale = Math.max(0.01, viewState.scale / 1.2);
-      setViewState({ scale: newScale });
+      window.dispatchEvent(new CustomEvent('tq:zoom', { detail: 1 / 1.2 }));
       return;
     }
 
@@ -124,7 +130,7 @@ const App: React.FC = () => {
         return;
       }
     }
-  }, [currentTool, viewState, selectedMarkerId, setTool, setViewState,
+  }, [currentTool, selectedMarkerId, setTool,
     clearDrawingPoints, setMeasurementPoints, deleteMarker, project.settings?.showGrid,
     project.settings?.theme, updateSettings, actionMode, setActionMode,
     undoDrawingPoint, redoDrawingPoint]);

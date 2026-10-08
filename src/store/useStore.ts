@@ -56,7 +56,7 @@ export function invalidateZoneCache() {
 }
 
 /** Активные «проходимые внутри» зоны в нормализованном виде (сброс при изменении зон). */
-function getActiveZonesCached(restrictions: Restriction[]): Restriction[] {
+export function getActiveZonesCached(restrictions: Restriction[]): Restriction[] {
   if (zoneCacheKey && zoneCacheKey.ver === zonesVersion && zoneCacheKey.n === restrictions.length) {
     return zoneCacheList!;
   }

@@ -1,9 +1,9 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
-import { useStore, scheduleRerouteAll } from '../store/useStore';
+import { useStore, scheduleRerouteAll, getActiveZonesCached } from '../store/useStore';
 import { isPointInActiveRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
-import { analyzeRoute, pixelToGeoExact, routeLengthM } from '../utils/routing';
+import { pixelToGeoExact, routeLengthM, zonesCrossedBy } from '../utils/routing';
 import { getOSMTileUrl, loadTileImage } from '../utils/openStreetMap';
 import type { Point, Route, RoutePoint } from '../types';
 
@@ -577,8 +577,19 @@ const MapCanvas: React.FC = () => {
     const unsub = useStore.subscribe((s, prev) => {
       if (s.project.restrictions !== prev.project.restrictions) scheduleRerouteAll();
     });
-    return unsub;
-  }, []);
+    // Клавиатурный зум из App.tsx: событие tq:zoom принимает factor и масштабирует
+    // вид вокруг центра канваса через тот же zoomAt, что и колесо мыши
+    // (единые границы minZoom..maxNativeZoom, центр не «прыгает»).
+    const onZoomEvent = (e: Event) => {
+      const factor = (e as CustomEvent<number>).detail;
+      if (typeof factor === 'number' && isFinite(factor) && factor > 0) zoomAt(factor);
+    };
+    window.addEventListener('tq:zoom', onZoomEvent);
+    return () => {
+      unsub();
+      window.removeEventListener('tq:zoom', onZoomEvent);
+    };
+  }, [zoomAt]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -1388,10 +1399,20 @@ const MapCanvas: React.FC = () => {
         const color = route.color || ROUTE_PALETTE[ri % ROUTE_PALETTE.length];
         const isActive = route.id === activeRouteId;
 
-        // Предупреждения о пересечении зон ограничений
+        // Предупреждения о пересечении зон ограничений.
+        // П.7: НЕ вызываем analyzeRoute на каждый кадр — он пересчитывает
+        // haversine-длины всех сегментов (O(N)) только ради crossedZones.
+        // Активные зоны берутся из кэша (инвалидируется при изменении зон),
+        // проверка отрезок↔зона выполняется сразу на пиксельных точках.
         let crossed: { name: string }[] = [];
         try {
-          crossed = analyzeRoute(route, project.restrictions).crossedZones;
+          const activeZonesForDraw = getActiveZonesCached(project.restrictions);
+          if (activeZonesForDraw.length > 0) {
+            crossed = zonesCrossedBy(
+              route.points.map((p) => ({ x: p.x, y: p.y })),
+              activeZonesForDraw
+            );
+          }
         } catch { /* зоны могут быть невалидными — не роняем отрисовку */ }
 
         // Ограничение по дальности (max/min) — нарушение помечаем красным
