@@ -16,6 +16,13 @@ let googleMapsConfig: GoogleMapsConfig = {
  */
 export function loadGoogleMapsApi(apiKey: string): Promise<void> {
   return new Promise((resolve, reject) => {
+    // СМЕНА КЛЮЧА: если API уже загружен с ДРУГИМ ключом, старый скрипт
+    // (window.google.maps) привязан к прежнему ключу — повторная загрузка
+    // молча использовала бы его. Сбрасываем флаг и помечаем необходимость
+    // перезагрузки; без этого смена ключа в настройках ничего бы не меняла.
+    if (googleMapsConfig.loaded && googleMapsConfig.apiKey !== apiKey) {
+      googleMapsConfig.loaded = false;
+    }
     if (googleMapsConfig.loaded) {
       resolve();
       return;
@@ -28,13 +35,21 @@ export function loadGoogleMapsApi(apiKey: string): Promise<void> {
 
     googleMapsConfig.apiKey = apiKey;
 
-    // Проверяем, не загружен ли уже скрипт
-    if (document.querySelector(`script[src*="maps.googleapis.com"]`)) {
-      if (window.google && window.google.maps) {
+    // Проверяем, не загружен ли уже скрипт С ЭТИМ ЖЕ ключом.
+    // Раньше проверка была по подстрке домена — скрипт со СТАРЫМ ключом
+    // считался «уже загруженным», и новый ключ никогда не применялся.
+    const existing = document.querySelector<HTMLScriptElement>(
+      `script[src*="maps.googleapis.com/maps/api/js"]`);
+    if (existing) {
+      if (existing.src.includes(`key=${apiKey}`) && window.google && window.google.maps) {
         googleMapsConfig.loaded = true;
         resolve();
         return;
       }
+      // другой ключ или недогруженный/ошибочный скрипт — удаляем и грузим заново,
+      // иначе ветка ниже зависла бы навсегда (REJECTED-PROMISE RETRY).
+      existing.remove();
+      delete (window as any).google;
     }
 
     const script = document.createElement('script');
@@ -47,11 +62,15 @@ export function loadGoogleMapsApi(apiKey: string): Promise<void> {
         googleMapsConfig.loaded = true;
         resolve();
       } else {
-        reject(new Error('Google Maps API не загружен'));
+        // убираем следы неудачной загрузки — повторный вызов получит шанс
+        // загрузиться заново, а не упасть на «вечном» промежуточном состоянии
+        script.remove();
+        reject(new Error('Google Maps API не загружен (ключ отклонён или ответ повреждён)'));
       }
     };
 
     script.onerror = () => {
+      script.remove();
       reject(new Error('Ошибка загрузки Google Maps API'));
     };
 

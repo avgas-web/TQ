@@ -50,6 +50,20 @@ export function cleanupLocalStorage(): void {
 }
 
 /**
+ * Пользовательское уведомление об ошибке сохранения (UX-слой).
+ * console.error сам по себе невидим пользователю — при переполнении хранилища
+ * данные терялись молча. Dispatch собственного события; компоненты могут
+ * подписаться на него для показа тоста. detail содержит только текст (строку).
+ */
+export function notifyStorageError(message: string): void {
+  try {
+    window.dispatchEvent(new CustomEvent('tq:storage-error', { detail: message }));
+  } catch {
+    /* окружение без DOM — тихо пропускаем */
+  }
+}
+
+/**
  * Безопасное сохранение в localStorage с обработкой ошибок
  */
 export function safeSetItem(key: string, value: string): boolean {
@@ -69,11 +83,13 @@ export function safeSetItem(key: string, value: string): boolean {
         return true;
       } catch (retryError) {
         console.error('Не удалось сохранить даже после очистки:', retryError);
+        notifyStorageError('Хранилище браузера переполнено — последние изменения НЕ сохранены. Очистите старые карты или экспортируйте проект в файл.');
         return false;
       }
     }
     
     console.error('Ошибка сохранения в localStorage:', error);
+    notifyStorageError('Не удалось сохранить данные в локальное хранилище браузера.');
     return false;
   }
 }
@@ -87,6 +103,13 @@ export function initMapDatabase(): Promise<IDBDatabase> {
     
     request.onerror = () => {
       reject(new Error('Не удалось открыть IndexedDB'));
+    };
+    
+    // onblocked: другая вкладка держит старую версию БД —
+    // событие отличается от onerror (отказ хранилища). Раньше не
+    // обрабатывалось, и Promise висел вечно; теперь — явная ошибка.
+    request.onblocked = () => {
+      reject(new Error('IndexedDB заблокирована другой открытой вкладкой — закройте её и повторите'));
     };
     
     request.onsuccess = () => {

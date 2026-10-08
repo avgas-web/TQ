@@ -6,12 +6,40 @@ import StatusBar from './components/StatusBar';
 import { useStore } from './store/useStore';
 import { initOpenStreetMap } from './utils/openStreetMap';
 
+
+/**
+ * Тост-уведомление об ошибках хранилища (quota-exceeded и т.п.).
+ * storage.ts диспатчит window-событие 'tq:storage-error' — молчаливая потеря
+ * данных при переполнении localStorage теперь видна пользователю.
+ */
+const StorageToast: React.FC = () => {
+  const [message, setMessage] = useState<string | null>(null);
+  useEffect(() => {
+    const onError = (e: Event) => {
+      const detail = (e as CustomEvent<string>).detail;
+      if (typeof detail === 'string' && detail) {
+        setMessage(detail);
+        window.setTimeout(() => setMessage(null), 6000);
+      }
+    };
+    window.addEventListener('tq:storage-error', onError);
+    return () => window.removeEventListener('tq:storage-error', onError);
+  }, []);
+  if (!message) return null;
+  return (
+    <div
+      role="alert"
+      className="fixed top-12 left-1/2 -translate-x-1/2 z-[9999] max-w-md px-4 py-2 rounded-lg border border-red-500 bg-red-600/95 text-white text-xs shadow-lg pointer-events-none"
+    >
+      ⚠️ {message}
+    </div>
+  );
+};
+
 const App: React.FC = () => {
   const {
     currentTool,
     setTool,
-    viewState,
-    setViewState,
     clearDrawingPoints,
     setMeasurementPoints,
     project,
@@ -53,6 +81,11 @@ const App: React.FC = () => {
       return;
     }
 
+    // Ctrl/Meta+буквы — браузерные связки (Ctrl+T новая вкладка, Ctrl+O открыть файл,
+    // Ctrl+S сохранить и т.п.): не перехватываем их транслитерацией русской раскладки.
+    // (кроме разобранных выше Ctrl+Z / Ctrl+Y)
+    if (e.ctrlKey || e.metaKey) return;
+
     if (e.key === 'Escape') {
       e.preventDefault();
       clearDrawingPoints();
@@ -67,17 +100,20 @@ const App: React.FC = () => {
       return;
     }
 
+    // Зум с клавиатуры — через единый обработчик канваса (zoomAt): фиксация на центре
+    // окна + ограничение в тех же границах minZoom..maxNativeZoom, что и у колеса мыши.
+    // Раньше здесь были жёсткие Math.min(50)/Math.max(0.01) без привязки к зум-шкале
+    // тайловой карты — лимиты расходились с канвасом, а центр «прыгал» из-за смены
+    // scale без корректировки offset.
     if (e.key === '+' || e.key === '=' || e.key === '§') {
       e.preventDefault();
-      const newScale = Math.min(50, viewState.scale * 1.2);
-      setViewState({ scale: newScale });
+      window.dispatchEvent(new CustomEvent('tq:zoom', { detail: 1.2 }));
       return;
     }
 
     if (e.key === '-' || e.key === '_' || e.key === '–') {
       e.preventDefault();
-      const newScale = Math.max(0.01, viewState.scale / 1.2);
-      setViewState({ scale: newScale });
+      window.dispatchEvent(new CustomEvent('tq:zoom', { detail: 1 / 1.2 }));
       return;
     }
 
@@ -89,36 +125,42 @@ const App: React.FC = () => {
       return;
     }
 
-    // Grid toggle: G (и русская П на той же клавише)
-    if (key === 'g') {
-      e.preventDefault();
-      updateSettings({ showGrid: !project.settings?.showGrid });
-      return;
-    }
+    // Одиночные горячие клавиши срабатывают ТОЛЬКО без Ctrl/Meta/Alt.
+    // Раньше транслитерация перехватывала связки: Ctrl+T (новая вкладка),
+    // Alt+F (меню браузера), Ctrl+S и т.п. — браузерные комбинации не должны
+    // подменять действия приложения.
+    if (!(e.ctrlKey || e.metaKey || e.altKey)) {
+      // Grid toggle: G (и русская П на той же клавише)
+      if (key === 'g') {
+        e.preventDefault();
+        updateSettings({ showGrid: !project.settings?.showGrid });
+        return;
+      }
 
-    // Тема: T / M (транслит покрывает русские Е/Ь на тех же клавишах)
-    if (key === 't' || key === 'm') {
-      e.preventDefault();
-      updateSettings({ theme: project.settings?.theme === 'light' ? 'dark' : 'light' });
-      return;
-    }
+      // Тема: T / M (транслит покрывает русские Е/Ь на тех же клавишах)
+      if (key === 't' || key === 'm') {
+        e.preventDefault();
+        updateSettings({ theme: project.settings?.theme === 'light' ? 'dark' : 'light' });
+        return;
+      }
 
-    // Полный экран: F (транслит покрывает русскую А)
-    if (key === 'f') {
-      e.preventDefault();
-      const el = document.getElementById('map-container');
-      if (el && document.fullscreenElement) document.exitFullscreen().catch(() => {});
-      else if (el) el.requestFullscreen?.().catch(() => {});
-      return;
-    }
+      // Полный экран: F (транслит покрывает русскую А)
+      if (key === 'f') {
+        e.preventDefault();
+        const el = document.getElementById('map-container');
+        if (el && document.fullscreenElement) document.exitFullscreen().catch(() => {});
+        else if (el) el.requestFullscreen?.().catch(() => {});
+        return;
+      }
 
-    // Режим действий: R (транслит покрывает русскую К)
-    if (key === 'r') {
-      e.preventDefault();
-      setActionMode(!actionMode);
-      return;
+      // Режим действий: R (транслит покрывает русскую К)
+      if (key === 'r') {
+        e.preventDefault();
+        setActionMode(!actionMode);
+        return;
+      }
     }
-  }, [currentTool, viewState, selectedMarkerId, setTool, setViewState,
+  }, [currentTool, selectedMarkerId, setTool,
     clearDrawingPoints, setMeasurementPoints, deleteMarker, project.settings?.showGrid,
     project.settings?.theme, updateSettings, actionMode, setActionMode,
     undoDrawingPoint, redoDrawingPoint]);
@@ -155,11 +197,17 @@ const App: React.FC = () => {
     restoreMap();
   }, []);
 
-  // Initialize OpenStreetMap on app load (doesn't require API key)
+  // Initialize OpenStreetMap on app load (doesn't require API key).
+  // НЕ включаем OSM безусловно: toggleOpenStreetMap(true) на каждом старте
+  // перезаписывал сохранённый выбор пользователя (persist openStreetMap.enabled).
+  // Инициализация конфигурации выполняется, а состояние берётся из стора.
   useEffect(() => {
     const initOSM = async () => {
       await initOpenStreetMap();
-      useStore.getState().toggleOpenStreetMap(true);
+      const st = useStore.getState();
+      if (!st.project.openStreetMap.enabled) {
+        st.toggleOpenStreetMap(true);
+      }
     };
     initOSM();
   }, []);
@@ -254,6 +302,8 @@ const App: React.FC = () => {
 
       {/* Status bar */}
       <StatusBar />
+
+      <StorageToast />
     </div>
   );
 };

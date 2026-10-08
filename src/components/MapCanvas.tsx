@@ -1,9 +1,9 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
-import { useStore } from '../store/useStore';
+import { useStore, scheduleRerouteAll, getActiveZonesCached } from '../store/useStore';
 import { isPointInActiveRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
-import { analyzeRoute, pixelToGeoExact, routeLengthM } from '../utils/routing';
+import { pixelToGeoExact, routeLengthM, zonesCrossedBy } from '../utils/routing';
 import { getOSMTileUrl, loadTileImage } from '../utils/openStreetMap';
 import type { Point, Route, RoutePoint } from '../types';
 
@@ -195,10 +195,16 @@ const MapCanvas: React.FC = () => {
   const [popup, setPopup] = useState<{ x: number; y: number; title: string; lines: string[] } | null>(null);
   // Кэш тайлов подложки: url -> изображение (или undefined при ошибке)
   const tileCache = useRef<Map<string, HTMLImageElement | undefined>>(new Map());
+  // LRU-размер кэша тайлов: Map сохраняет порядок вставки — при переполнении
+  // удаляем самые старые записи, иначе при длительной работе накапливаются
+  // тысячи HTMLImageElement (утечка памяти).
+  const TILE_CACHE_MAX = 1500;
   // Очередь щадящей загрузки тайлов: один общий список + счётчик активных загрузок
   const tileQueueRef = useRef<string[]>([]);
   const activeTilesRef = useRef(0);
   const tileDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Троттлинг обновления координат курсора в сторе (см. handleMouseMove)
+  const lastCursorUpdateRef = useRef(0);
   // pending-загрузки тайлов: url -> промис (дедупликация — один запрос на тайл)
   const tilePending = useRef<Map<string, Promise<void>>>(new Map());
   const [tilesVersion, setTilesVersion] = useState(0);
@@ -333,7 +339,13 @@ const MapCanvas: React.FC = () => {
         if (tilePending.current.has(u) || tileCache.current.has(u)) continue;
         activeTilesRef.current++;
         const p = loadTileImage(u, 10000) // таймаут: зависший тайл не блокирует очередь
-          .then((img) => { tileCache.current.set(u, img || undefined); })
+          .then((img) => {
+            tileCache.current.set(u, img || undefined);
+            if (tileCache.current.size > TILE_CACHE_MAX) {
+              const firstKey = tileCache.current.keys().next().value as string | undefined;
+              if (firstKey !== undefined) tileCache.current.delete(firstKey);
+            }
+          })
           .finally(() => {
             tilePending.current.delete(u);
             activeTilesRef.current--;
@@ -380,6 +392,8 @@ const MapCanvas: React.FC = () => {
   type ExtObj = { kind: 'airport' | 'notam' | 'geozone'; lat: number; lng: number; name: string; r?: number };
   const [extObjs, setExtObjs] = useState<ExtObj[]>([]);
   const [overpassBusy, setOverpassBusy] = useState(false);
+  // Предупреждение о недоступности Overpass (показывается вместо «тихого» выключения слоёв)
+  const [extNotice, setExtNotice] = useState<string | null>(null);
   const layersOn = !!(project.settings?.airportsLayer || project.settings?.notamLayer || project.settings?.geozonesLayer);
 
   const OVERPASS_ENDPOINTS = [
@@ -388,7 +402,11 @@ const MapCanvas: React.FC = () => {
     'https://overpass.private.coffee/api/interpreter',
   ];
   const extFailRef = useRef(0);        // подряд неудачных запросов
-  const extCacheRef = useRef<Map<string, ExtObj[]>>(new Map());
+  // Кэш внешних объектов: ключ — bbox + набор слоёв; значение хранит время записи и
+  // признак пустого результата. Пустые ответы НЕ кэшируются навсегда (лимит выдачи/
+  // временнаяEmpty-область не должна блокировать повторную загрузку области).
+  const extCacheRef = useRef<Map<string, { objs: ExtObj[]; at: number }>>(new Map());
+  const EXT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 минут
   const extReqIdRef = useRef(0);       // id последнего актуального запроса (отмена устаревших)
 
   useEffect(() => {
@@ -408,7 +426,12 @@ const MapCanvas: React.FC = () => {
     const timer = setTimeout(async () => {
       if (reqId !== extReqIdRef.current) return; // устаревший запрос — не запускаем
       const cached = extCacheRef.current.get(cacheKey);
-      if (cached) { setExtObjs(cached); return; } // область уже загружена — сервер не трогаем
+      // Пустые результаты кэшируются только на короткое время, чтобы не «замораживать»
+      // область навсегда при лимите выдачи или временной пустоте ответа.
+      if (cached && (cached.objs.length > 0 || Date.now() - cached.at < EXT_CACHE_TTL_MS)) {
+        setExtObjs(cached.objs);
+        return;
+      } // область уже загружена — сервер не трогаем
       // Один лёгкий объединённый запрос: только узлы-центры, с лимитами выдачи
       const parts: string[] = [];
       if (project.settings?.airportsLayer) parts.push(`node["aeroway"="aerodrome"](${box});`);
@@ -418,17 +441,32 @@ const MapCanvas: React.FC = () => {
       const q = `[out:json][timeout:10];(${parts.join('')})[..60];(.;);out.skylat center 60;`;
       setOverpassBusy(true);
       let data: { elements?: any[] } | null = null;
+      let lastErr = '';
       for (const url of OVERPASS_ENDPOINTS) {
         if (reqId !== extReqIdRef.current) { setOverpassBusy(false); return; } // отменён новым видом
         const ctrl = new AbortController();
         const to = setTimeout(() => ctrl.abort(), 12000);
         try {
-          const r = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(q), signal: ctrl.signal });
-          if (r.status === 429 || r.status >= 500) continue; // зеркало занято — пробуем следующее
-          if (!r.ok) break; // 4xx — повтор бессмысленен
-          data = await r.json();
-        } catch { /* сеть/abort — следующее зеркало */ }
-        finally { clearTimeout(to); }
+          const r = await fetch(url, {
+            method: 'POST',
+            // Many Overpass mirrors reject bare bodies without this content type (HTTP 400)
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'data=' + encodeURIComponent(q),
+            signal: ctrl.signal,
+          });
+          if (r.status === 429 || r.status >= 500) { lastErr = `HTTP ${r.status}`; continue; } // зеркало занято — пробуем следующее
+          if (!r.ok) { lastErr = `HTTP ${r.status}`; break; } // 4xx — повтор бессмысленен
+          // Parse into a local first: an abort during .json() must not be treated as
+          // "mirror busy" when the response itself was fine.
+          const parsed = await r.json();
+          if (reqId !== extReqIdRef.current) { clearTimeout(to); setOverpassBusy(false); return; }
+          data = parsed;
+          lastErr = '';
+        } catch (e) {
+          lastErr = e instanceof Error && e.name === 'AbortError' ? 'timeout' : 'network';
+        } finally {
+          clearTimeout(to);
+        }
         if (data) break;
       }
       if (reqId !== extReqIdRef.current) { setOverpassBusy(false); return; }
@@ -447,16 +485,19 @@ const MapCanvas: React.FC = () => {
           out.push({ kind, lat, lng, name: el.tags?.name || (kind === 'airport' ? 'Аэродром' : militaryB ? 'Военный район' : 'Геозона'), r: kind === 'notam' ? 3000 : kind === 'geozone' ? 2000 : undefined });
         }
         if (extCacheRef.current.size > 40) extCacheRef.current.clear(); // ограничиваем память
-        extCacheRef.current.set(cacheKey, out);
+        extCacheRef.current.set(cacheKey, { objs: out, at: Date.now() });
         setExtObjs(out);
+        setExtNotice(null);
       } else {
         // Сервер недоступен: после 2 подряд неудач гасим слои, чтобы не нагружать
         // его постоянными повторами и не показывать «вечную загрузку».
+        // Пользователь получает понятное сообщение о причине (HTTP-код/timeout/network).
         if (++extFailRef.current >= 2) {
           extFailRef.current = 0;
           useStore.setState((st) => ({
             project: { ...st.project, settings: { ...st.project.settings, airportsLayer: false, notamLayer: false, geozonesLayer: false } },
           }));
+          setExtNotice(`Внешние слои отключены: Overpass недоступен (${lastErr || 'ошибка сети'}). Повторите позже.`);
         }
       }
       setOverpassBusy(false);
@@ -527,13 +568,28 @@ const MapCanvas: React.FC = () => {
   // (viewRef и rAF-подписка объявлены выше — дублирующий блок удалён.)
 
   // Троттлинговый подписчик: зоны ограничений изменились -> маршруты автоматически
-  // перестраиваются (обход зон). rerouteAllRoutes внутри — с троттлингом 250 мс.
+  // перестраиваются (обход зон). Вызывается единый модульный планировщик scheduleRerouteAll —
+  // троттлинг 250 мс и отмена предыдущего таймера гарантируются в одном месте.
+  // ВАЖНО: НЕ вызывать s.rerouteAllRoutes() здесь — стор сам инициирует перестройку
+  // после updateRestriction/deleteRestriction/setActiveRestriction; двойной вызов
+  // порождал две гонки троттлеров на одну операцию изменения зон.
   useEffect(() => {
     const unsub = useStore.subscribe((s, prev) => {
-      if (s.project.restrictions !== prev.project.restrictions) s.rerouteAllRoutes();
+      if (s.project.restrictions !== prev.project.restrictions) scheduleRerouteAll();
     });
-    return unsub;
-  }, []);
+    // Клавиатурный зум из App.tsx: событие tq:zoom принимает factor и масштабирует
+    // вид вокруг центра канваса через тот же zoomAt, что и колесо мыши
+    // (единые границы minZoom..maxNativeZoom, центр не «прыгает»).
+    const onZoomEvent = (e: Event) => {
+      const factor = (e as CustomEvent<number>).detail;
+      if (typeof factor === 'number' && isFinite(factor) && factor > 0) zoomAt(factor);
+    };
+    window.addEventListener('tq:zoom', onZoomEvent);
+    return () => {
+      unsub();
+      window.removeEventListener('tq:zoom', onZoomEvent);
+    };
+  }, [zoomAt]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -640,7 +696,16 @@ const MapCanvas: React.FC = () => {
     for (const r of project.routes || []) if (r.visible !== false) for (const p of r.points) pts.push({ x: p.x, y: p.y });
     for (const m of project.markers) pts.push({ x: m.x, y: m.y });
     if (pts.length < 2) return;
-    const key = `${map.dataUrl}|${pts.length}`;
+    // Ключ — ТОЛЬКО набор объектов (mapId + упорядоченные id маршрутов/маркеров),
+    // но не их количество и не dataUrl. Старый ключ `${dataUrl}|${pts.length}`
+    // менялся при каждом добавлении/удалении точки → вид самовольно перемасштабивался
+    // под все объекты, откатывая ручной зум пользователя (редактирование маршрутов
+    // становилось невозможным). Смена карты определяется по mapId (стабилен между
+    // загрузками), а не по dataUrl (меняется при каждой перезагрузке одного bbox).
+    const fitKeyParts: string[] = [String(map.mapId || '')];
+    for (const r of project.routes || []) fitKeyParts.push(`R:${r.id}`);
+    for (const m of project.markers) fitKeyParts.push(`M:${m.id}`);
+    const key = fitKeyParts.join('|');
     if (lastFitKeyRef.current === key) return;
     lastFitKeyRef.current = key;
     const fit = fitViewToData(map.width, map.height, map.bounds, pts, canvasSize.width, canvasSize.height);
@@ -1334,10 +1399,20 @@ const MapCanvas: React.FC = () => {
         const color = route.color || ROUTE_PALETTE[ri % ROUTE_PALETTE.length];
         const isActive = route.id === activeRouteId;
 
-        // Предупреждения о пересечении зон ограничений
+        // Предупреждения о пересечении зон ограничений.
+        // П.7: НЕ вызываем analyzeRoute на каждый кадр — он пересчитывает
+        // haversine-длины всех сегментов (O(N)) только ради crossedZones.
+        // Активные зоны берутся из кэша (инвалидируется при изменении зон),
+        // проверка отрезок↔зона выполняется сразу на пиксельных точках.
         let crossed: { name: string }[] = [];
         try {
-          crossed = analyzeRoute(route, project.restrictions).crossedZones;
+          const activeZonesForDraw = getActiveZonesCached(project.restrictions);
+          if (activeZonesForDraw.length > 0) {
+            crossed = zonesCrossedBy(
+              route.points.map((p) => ({ x: p.x, y: p.y })),
+              activeZonesForDraw
+            );
+          }
         } catch { /* зоны могут быть невалидными — не роняем отрисовку */ }
 
         // Ограничение по дальности (max/min) — нарушение помечаем красным
@@ -1615,8 +1690,22 @@ const MapCanvas: React.FC = () => {
         const start = (project.routes || []).find((r) => r.id === activeRouteId)?.points[0]
           || project.markers.find((m) => (m.type as any) === 'start');
         if (start) {
-          const d = distanceBetween({ x: clickedMarker.x, y: clickedMarker.y }, { x: (start as any).x, y: (start as any).y });
-          lines.push(`До старта: ${d >= 1000 ? (d / 1000).toFixed(2) + ' км' : Math.round(d) + ' м'}`);
+          // Расстояние в МЕТРАХ через haversine по гео-координатам. Старый код
+          // считал distanceBetween() по пикселям и подписывал результат «м/км» —
+          // единицы измерения были перепутаны (пиксель ≠ метр).
+          const gStart = project.map?.bounds
+            ? pixelToGeoExact({ x: (start as any).x, y: (start as any).y }, project.map.bounds, project.map.width, project.map.height)
+            : null;
+          if (gStart && isFinite(gStart.lat) && isFinite(geo.lat)) {
+            const R = 6371000;
+            const toRad = (v: number) => (v * Math.PI) / 180;
+            const dLat = toRad(gStart.lat - geo.lat);
+            const dLng = toRad(gStart.lng - geo.lng);
+            const a = Math.sin(dLat / 2) ** 2 +
+              Math.cos(toRad(gStart.lat)) * Math.cos(toRad(geo.lat)) * Math.sin(dLng / 2) ** 2;
+            const d = 2 * R * Math.asin(Math.sqrt(a));
+            lines.push(`До старта: ${d >= 1000 ? (d / 1000).toFixed(2) + ' км' : Math.round(d) + ' м'}`);
+          }
         }
         setPopup({ x: screenX, y: screenY, title: clickedMarker.name || 'Маркер', lines });
       } else {
@@ -1735,7 +1824,14 @@ const MapCanvas: React.FC = () => {
     const screenX = e.clientX - rect.left;
     const screenY = e.clientY - rect.top;
     const mapPoint = screenToMap(screenX, screenY);
-    setCursorPosition(mapPoint);
+    // Троттлинг курсора: set() в сторе на каждый mousemove вызывал ре-рендер
+    // всех подписанных компонентов (StatusBar) — десятки раз в секунду.
+    // Обновляем не чаще ~10 Гц; drag/pan ниже работают без троттлинга.
+    const nowMs = performance.now();
+    if (nowMs - lastCursorUpdateRef.current >= 100) {
+      lastCursorUpdateRef.current = nowMs;
+      setCursorPosition(mapPoint);
+    }
 
     if (isPanningRef.current) {
       const dx = e.clientX - panStartRef.current.x;
@@ -1900,6 +1996,14 @@ const MapCanvas: React.FC = () => {
         <div className="absolute bottom-3 left-3 z-10 flex items-center gap-2 rounded-md bg-gray-900/85 border border-gray-700 px-2.5 py-1.5 text-[11px] text-gray-200" role="status" aria-live="polite">
           <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-cyan-400 border-t-transparent" />
           Загрузка слоёв (аэропорты/районы)…
+        </div>
+      )}
+
+      {/* Предупреждение о недоступности Overpass: слои отключены не молча, а с причиной */}
+      {extNotice && !overpassBusy && (
+        <div className="absolute bottom-3 left-3 z-10 flex items-center gap-2 rounded-md bg-amber-900/90 border border-amber-600 px-2.5 py-1.5 text-[11px] text-amber-100 max-w-xs" role="alert">
+          <span>{extNotice}</span>
+          <button className="ml-1 underline" onClick={() => setExtNotice(null)} aria-label="Скрыть предупреждение">×</button>
         </div>
       )}
 
