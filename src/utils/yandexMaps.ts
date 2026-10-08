@@ -49,11 +49,19 @@ export function loadYandexMapsApi(apiKey: string): Promise<void> {
           resolve();
         });
       } else {
+        // REJECTED-PROMISE RETRY: при отказе убираем следы неудачной загрузки,
+        // чтобы повторный вызов мог начать заново, а не мгновенно падать на
+        // том же кэшированном rejection (раньше все ретраисы были невозможны).
+        script.remove();
         reject(new Error('Yandex Maps API не загружен'));
       }
     };
 
     script.onerror = () => {
+      // Скрипт не дошёл (сеть/блокатор) — удаляем его из DOM, иначе ветка
+      // document.querySelector('script[src*=...]') ниже решит, что API уже
+      // «в процессе загрузки», и все последующие попытки зависнут навсегда.
+      script.remove();
       reject(new Error('Ошибка загрузки Yandex Maps API'));
     };
 
