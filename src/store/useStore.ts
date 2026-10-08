@@ -76,9 +76,26 @@ export function scheduleRerouteAll() {
   if (rerouteTimer != null) clearTimeout(rerouteTimer);
   rerouteTimer = window.setTimeout(() => {
     rerouteTimer = null;
+    // Защита от самоподдерживающегося каскада: пакетная перестройка делает set()
+    // с новым массивом routes; если подписчики снова планируют scheduleRerouteAll,
+    // цепочка прогонов без пользовательского действия растёт бесконечно и
+    // блокирует поток (React error #185 «Maximum update depth exceeded»).
+    // Счётчик сбрасывается в публичной обёртке rerouteAllRoutes (пользовательское
+    // действие) — лимит касается только автогенерируемой цепочки.
+    if (++rerouteChainCount > MAX_REROUTE_CHAIN) {
+      console.warn('[reroute] цепочка авто-перестроек превысила лимит — остановлено.');
+      return;
+    }
     rerouteAllRoutesNow();
   }, REROUTE_THROTTLE_MS);
 }
+
+/**
+ * Лимит подряд идущих авто-перестроек маршрутов без пользовательского
+ * действия (см. защиту от каскада в scheduleRerouteAll).
+ */
+let rerouteChainCount = 0;
+const MAX_REROUTE_CHAIN = 20;
 
 /** Немедленная пакетная перестройка всех маршрутов (вызывается троттлером). */
 function rerouteAllRoutesNow() {
@@ -92,6 +109,11 @@ function rerouteAllRoutesNow() {
   const activeZones = getActiveZonesCached(state.project.restrictions);
   const newRoutes: Route[] = [];
   const warningsMap: Record<string, string[]> = {};
+  // Фиксированная точка отсчёта updatedAt на весь прогон: set() с новым
+  // Date() каждый раз делает project «изменившимся» — это подпитывало
+  // каскад перестроек (React #185). Если маршруты не поменялись, и updatedAt
+  // остаётся прежним.
+  let changed = false;
   for (const route of routes) {
     if (route.points.length < 2) { newRoutes.push(route); continue; }
     // Ключевые точки берём по stable-признаку auto. Если после импорта/старых
@@ -148,7 +170,18 @@ function rerouteAllRoutesNow() {
     const limitWarn = rangeLimitWarning(route, pts);
     if (limitWarn) warns.push(limitWarn);
     if (warns.length > 0) warningsMap[route.id] = warns;
-    newRoutes.push({ ...route, points: pts });
+    // Идемпотентность: если геометрия маршрута не изменилась (те же точки,
+    // тот же порядок), сохраняем ПРЕЖНИЙ объект route — без нового set()
+    // каскад перестроек затухает сам (см. защиту от React #185).
+    if (pts.length === route.points.length && pts.every((p, i) => {
+      const q = route.points[i];
+      return p.x === q.x && p.y === q.y && p.auto === q.auto;
+    })) {
+      newRoutes.push(route);
+    } else {
+      changed = true;
+      newRoutes.push({ ...route, points: pts });
+    }
   }
   set((cur) => {
     // Полная замена реестра предупреждений: старые записи для «очистившихся»
@@ -158,9 +191,15 @@ function rerouteAllRoutesNow() {
     for (const [rid, w] of Object.entries(warningsMap)) {
       if (w.length > 0) nextWarnings[rid] = w;
     }
+    const sameWarnings =
+      Object.keys(nextWarnings).length === Object.keys(cur.routeWarnings).length &&
+      Object.keys(nextWarnings).every((k) => cur.routeWarnings[k]?.join('\n') === nextWarnings[k].join('\n'));
+    // Ничего не изменилось — не пишем в стор вообще (не трогаем updatedAt/ссылки):
+    // это обрывает любые попытки каскадной перестройки на корню.
+    if (!changed && sameWarnings && cur.project.routes === routes) return {};
     return {
-      routeWarnings: nextWarnings,
-      project: { ...cur.project, routes: newRoutes, updatedAt: new Date().toISOString() },
+      routeWarnings: sameWarnings ? cur.routeWarnings : nextWarnings,
+      project: { ...cur.project, routes: changed ? newRoutes : routes, updatedAt: changed ? new Date().toISOString() : cur.project.updatedAt },
     };
   });
 }
@@ -178,8 +217,20 @@ function rerouteAllRoutesNow() {
  * возвращает актуальный вид.
  */
 export function selectViewForRender(s: AppState): ViewState {
-  return { scale: s.viewState.scale, offsetX: s.viewState.offsetX, offsetY: s.viewState.offsetY, z0: s.viewState.z0 };
+  // viewTick в ключе: подписка пересчитывается при каждом изменении вида.
+  // Примитивные поля (scale/offsetX/...) сравниваются Object.is — возвращаем
+  // ту же ссылку, если вид не менялся; иначе — новый объект. Без tick в
+  // ключе селектор бы молча «зависал» на старом значении; с новым объектом
+  // на каждый emit стора — infinite re-render loop (React error #185).
+  const v = s.viewState;
+  const t = s.viewTick;
+  const last = lastViewSel;
+  if (last && last.t === t && last.v === v) return last.out;
+  const out: ViewState = { scale: v.scale, offsetX: v.offsetX, offsetY: v.offsetY, z0: v.z0 };
+  lastViewSel = { t, v, out };
+  return out;
 }
+let lastViewSel: { t: number; v: AppState['viewState']; out: ViewState } | null = null;
 
 interface AppState {
   project: Project;
@@ -563,6 +614,10 @@ export const useStore = create<AppState>()(
       },
 
       rerouteAllRoutes: () => {
+        // Пользовательское действие (изменение зон/карты через API стора) —
+        // обнуляем счётчик авто-цепочки, лимит в scheduleRerouteAll касается
+        // только самогенерируемых каскадов.
+        rerouteChainCount = 0;
         // ТРОТТЛИНГ: пакетная перестройка ВСЕХ маршрутов — дорогая операция
         // (обход зон для каждого). Без троттлинга каждое движение мыши / зум
         // вызывали полный пересчёт -> вкладка «виснет» намертво.
