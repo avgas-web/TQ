@@ -127,7 +127,14 @@ ${placemarks}
  * Экспорт всего проекта в JSON
  */
 export function exportProject(project: Project): string {
-  return JSON.stringify(project, null, 2);
+  // Секьюрити: API-ключи не должны покидать устройство вместе с файлом проекта —
+  // экспорт передаётся другим людям, а ключ в .tqproj = утечка платного квотного доступа.
+  const redacted: Project = {
+    ...project,
+    googleMaps: project.googleMaps ? { ...project.googleMaps, apiKey: '' } : project.googleMaps,
+    yandexMaps: project.yandexMaps ? { ...project.yandexMaps, apiKey: '' } : project.yandexMaps,
+  };
+  return JSON.stringify(redacted, null, 2);
 }
 
 /**

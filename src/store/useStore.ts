@@ -1010,6 +1010,10 @@ export const useStore = create<AppState>()(
               map: cur.project.map ? { ...cur.project.map, dataUrl } : cur.project.map,
             },
           }));
+          // Пиксели маршрутов были рассчитаны по старому/пустому растру — после
+          // восстановления изображения пересчитываем их из lat/lng, иначе точки
+          // маршрутов остаются «привязанными» к несуществующим пикселям.
+          get().refreshAllRoutesAfterMapChange();
         }
       },
     }),

@@ -142,12 +142,15 @@ const MapsPanel: React.FC = () => {
     setSuccess('');
 
     try {
-      const width = parseInt(widthInput) || 2048;
-      const height = parseInt(heightInput) || 2048;
-      const zoom = parseInt(zoomInput) || 15;
+      // Валидация размеров: без лимитов Google Static Maps вернёт ошибку размера,
+      // Яндекс — 400, а OSM-конструктор соберёт тысячи тайлов (память/canvas-лимиты).
+      const clampSize = (v: number, d: number) => Math.min(4096, Math.max(256, Number.isFinite(v) ? v : d));
+      const width = clampSize(parseInt(widthInput), 2048);
+      const height = clampSize(parseInt(heightInput), 2048);
+      const zoom = Math.min(21, Math.max(1, parseInt(zoomInput) || 15));
 
       let geoResult: { lat: number; lng: number } | null = null;
-      let mapResult: { dataUrl: string; bounds: any };
+      let mapResult: { dataUrl: string; bounds: any } | undefined;
 
       if (activeProvider === 'google') {
         if (!isGoogleMapsLoaded()) {
@@ -239,9 +242,14 @@ const MapsPanel: React.FC = () => {
         });
       }
 
-      if (mapResult!) {
+      // mapResult может остаться undefined, если activeProvider не совпал ни с
+      // одной веткой (например 'local') — сообщаем об этом вместо тихого «успеха»
+      // с non-null assertion.
+      if (mapResult) {
         setMapBounds(mapResult.bounds);
         setSuccess('Карта успешно загружена!');
+      } else {
+        setError(`Провайдер «${activeProvider}» не поддерживает загрузку статической карты`);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Ошибка загрузки карты');
