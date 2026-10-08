@@ -94,7 +94,12 @@ async function fetchNominatimJson(path: string, params: string): Promise<any[] |
 }
 
 /**
- * Геокодирование адреса через Nominatim (OSM)
+ * Запрос к Nominatim с перебором зеркал, таймаутом и повтором.
+ * Возвращает [данные, kind] где kind='ok'|'not_found'|'network'|'http' —
+ * вызывающий код различает «сервис недоступен», «адрес не найден» и HTTP-ошибку.
+ * Поддерживает внешний AbortController для отмены (уход пользователя, новый запрос).
+ * Ошибки внешних серверов не пишутся в console.error — это штатная ситуация,
+ * вызывающий код показывает пользователю понятное сообщение.
  */
 export async function osmGeocode(address: string): Promise<{ lat: number; lng: number } | null> {
   const data = await fetchNominatimJson('/search', `q=${encodeURIComponent(address)}&limit=1`);
@@ -115,7 +120,8 @@ export async function osmGeocode(address: string): Promise<{ lat: number; lng: n
 }
 
 /**
- * Обратное геокодирование через Nominatim (OSM)
+ * Геокодирование адреса через Nominatim (OSM).
+ * Возвращает различимый статус, чтобы UI не смешивал «не найдено» и «сервис недоступен».
  */
 export async function osmReverseGeocode(lat: number, lng: number): Promise<string | null> {
   const data = await fetchNominatimJson('/reverse', `lat=${lat}&lon=${lng}`);

@@ -6,12 +6,40 @@ import StatusBar from './components/StatusBar';
 import { useStore } from './store/useStore';
 import { initOpenStreetMap } from './utils/openStreetMap';
 
+
+/**
+ * Тост-уведомление об ошибках хранилища (quota-exceeded и т.п.).
+ * storage.ts диспатчит window-событие 'tq:storage-error' — молчаливая потеря
+ * данных при переполнении localStorage теперь видна пользователю.
+ */
+const StorageToast: React.FC = () => {
+  const [message, setMessage] = useState<string | null>(null);
+  useEffect(() => {
+    const onError = (e: Event) => {
+      const detail = (e as CustomEvent<string>).detail;
+      if (typeof detail === 'string' && detail) {
+        setMessage(detail);
+        window.setTimeout(() => setMessage(null), 6000);
+      }
+    };
+    window.addEventListener('tq:storage-error', onError);
+    return () => window.removeEventListener('tq:storage-error', onError);
+  }, []);
+  if (!message) return null;
+  return (
+    <div
+      role="alert"
+      className="fixed top-12 left-1/2 -translate-x-1/2 z-[9999] max-w-md px-4 py-2 rounded-lg border border-red-500 bg-red-600/95 text-white text-xs shadow-lg pointer-events-none"
+    >
+      ⚠️ {message}
+    </div>
+  );
+};
+
 const App: React.FC = () => {
   const {
     currentTool,
     setTool,
-    viewState,
-    setViewState,
     clearDrawingPoints,
     setMeasurementPoints,
     project,
@@ -155,11 +183,17 @@ const App: React.FC = () => {
     restoreMap();
   }, []);
 
-  // Initialize OpenStreetMap on app load (doesn't require API key)
+  // Initialize OpenStreetMap on app load (doesn't require API key).
+  // НЕ включаем OSM безусловно: toggleOpenStreetMap(true) на каждом старте
+  // перезаписывал сохранённый выбор пользователя (persist openStreetMap.enabled).
+  // Инициализация конфигурации выполняется, а состояние берётся из стора.
   useEffect(() => {
     const initOSM = async () => {
       await initOpenStreetMap();
-      useStore.getState().toggleOpenStreetMap(true);
+      const st = useStore.getState();
+      if (!st.project.openStreetMap.enabled) {
+        st.toggleOpenStreetMap(true);
+      }
     };
     initOSM();
   }, []);
@@ -254,6 +288,8 @@ const App: React.FC = () => {
 
       {/* Status bar */}
       <StatusBar />
+
+      <StorageToast />
     </div>
   );
 };

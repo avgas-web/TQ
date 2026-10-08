@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
-import { useStore } from '../store/useStore';
+import { useStore, scheduleRerouteAll, getActiveZonesCached } from '../store/useStore';
 import { isPointInActiveRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
@@ -1693,7 +1693,14 @@ const MapCanvas: React.FC = () => {
     const screenX = e.clientX - rect.left;
     const screenY = e.clientY - rect.top;
     const mapPoint = screenToMap(screenX, screenY);
-    setCursorPosition(mapPoint);
+    // Троттлинг курсора: set() в сторе на каждый mousemove вызывал ре-рендер
+    // всех подписанных компонентов (StatusBar) — десятки раз в секунду.
+    // Обновляем не чаще ~10 Гц; drag/pan ниже работают без троттлинга.
+    const nowMs = performance.now();
+    if (nowMs - lastCursorUpdateRef.current >= 100) {
+      lastCursorUpdateRef.current = nowMs;
+      setCursorPosition(mapPoint);
+    }
 
     if (isPanningRef.current) {
       const dx = e.clientX - panStartRef.current.x;

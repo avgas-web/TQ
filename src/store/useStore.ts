@@ -616,7 +616,9 @@ export const useStore = create<AppState>()(
 
       selectMarker: (id) => set({ selectedMarkerId: id, selectedRestrictionId: null }),
 
-      addRestriction: (restrictionData) => set((state) => {
+      addRestriction: (restrictionData) => {
+        invalidateZoneCache();
+        return set((state) => {
         const id = uuidv4();
         const restriction: Restriction = {
           id,
@@ -637,6 +639,19 @@ export const useStore = create<AppState>()(
             updatedAt: new Date().toISOString(),
           },
           activeRestrictionId: restriction.id,
+        };
+        });
+      },
+
+      // undo/redo для рисования полигонов (и любых точек рисования)
+      undoDrawingPoint: () => set((state) => {
+        if (state.drawingPoints.length === 0) return {};
+        const removed = state.drawingPoints[state.drawingPoints.length - 1];
+        const pts = state.drawingPoints.slice(0, -1);
+        return {
+          drawingPoints: pts,
+          isDrawing: pts.length > 0 && state.isDrawing,
+          redoDrawingStack: [...state.redoDrawingStack, removed],
         };
       }),
 
@@ -756,12 +771,15 @@ export const useStore = create<AppState>()(
 
       setFilterType: (type) => set({ filterType: type }),
 
-      importProject: (project) => set({
-        project,
-        selectedMarkerId: null,
-        selectedRestrictionId: null,
-        viewState: { offsetX: 0, offsetY: 0, scale: 1 },
-      }),
+      importProject: (project) => {
+        invalidateZoneCache(); // набор зон заменён целиком — кэш недействителен
+        return set({
+          project,
+          selectedMarkerId: null,
+          selectedRestrictionId: null,
+          viewState: { offsetX: 0, offsetY: 0, scale: 1 },
+        });
+      },
 
       exportProject: () => get().project,
 
