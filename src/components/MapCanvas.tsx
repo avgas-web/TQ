@@ -272,7 +272,8 @@ const MapCanvas: React.FC = () => {
   // ===== Тайловая подложка: карта активна, а НЕ статичная фотография =====
   // Кэш тайлов, дозагрузка при изменении вида; maxNativeZoom — выше не растягиваем.
   const tilesEnabled = !!project.settings?.tilesEnabled && !!project.map?.bounds;
-  const tileStyle = project.settings?.tileStyle || 'scheme';
+  // Только стандартная схема OSM (режимы «спутник/гибрид» удалены из приложения)
+  const tileStyle: 'scheme' = 'scheme';
   const tileServer = (project.openStreetMap?.tileServer as any) || 'osm';
   // ЕДИНАЯ инвариантная привязка вида (см. комментарий над worldPxOf):
   //   zoom = z0 + log2(scale),  worldPx = canvasHeight · 2^zoom.
@@ -391,186 +392,6 @@ const MapCanvas: React.FC = () => {
     );
   }, []);
 
-  // Внешние слои: аэропорты (Overpass), NOTAM-районы, геозоны — по видимой области.
-  // МАКСИМАЛЬНО ПРОСТАЯ щадящая схема (минимальная нагрузка на OSM/Overpass):
-  // - ОДИН объединённый запрос вместо трёх (сервер делает один проход по данным);
-  // - только точечные объекты (.is_center) — без way/relation-полигонов, это в
-  //   разы дешевле для сервера и не вызывает 504 Gateway Timeout;
-  // - маленький bbox (≤3°) и лимит выдачи (≤60 объектов);
-  // - кэш результата: повторный запрос той же области (с округлением до ~30 км)
-  //   не уходит на сервер вообще;
-  // - дебаунс 800 мс + отмена устаревших ответов: при панорамировании/зуме
-  //   запросы не плодятся, грузится только финальная область;
-  // - автоматическое отключение слоёв после 2 подряд неудач: карта продолжает
-  //   работать, бесконечные ретраи перегруженному серверу не шлются (повторно
-  //   включаются переключателями слоёв).
-  type ExtObj = { kind: 'airport' | 'notam' | 'geozone'; lat: number; lng: number; name: string; r?: number };
-  const [extObjs, setExtObjs] = useState<ExtObj[]>([]);
-  const [overpassBusy, setOverpassBusy] = useState(false);
-  // Предупреждение о недоступности Overpass (показывается вместо «тихого» выключения слоёв)
-  const [extNotice, setExtNotice] = useState<string | null>(null);
-  const layersOn = !!(project.settings?.airportsLayer || project.settings?.notamLayer || project.settings?.geozonesLayer);
-
-  // Зеркала Overpass. ВАЖНО: зеркало overpass-api.de требует значимый User-Agent —
-  // без него отвечает 429 («Please include a meaningful User-Agent string»), а битый
-  // синтаксис запроса (см. ниже) давал HTTP 400 на всех зеркалах подряд.
-  const OVERPASS_ENDPOINTS = [
-    'https://overpass.kumi.systems/api/interpreter',
-    'https://overpass.private.coffee/api/interpreter',
-    'https://overpass-api.de/api/interpreter',
-  ];
-  const OVERPASS_UA = 'TQ-flight-planner/1.0 (web app; https://avgas-web.github.io/TQ/)';
-  // Максимальная площадь bbox (в °²), при которой шлём запрос. Больше — серверы
-  // уходят в долгий вычислительный процесс и отвечают 504, либо отрезают нас по
-  // rate-limit. При слишком крупном виде слои просто не запрашиваются до зума
-  // поближе (это безопаснее, чем «зависшая» загрузка).
-  const MAX_BBOX_AREA_DEG2 = 36; // ~6°×6°
-  const extFailRef = useRef(0);        // подряд неудачных запросов
-  // Кэш внешних объектов: ключ — bbox + набор слоёв; значение хранит время записи и
-  // признак пустого результата. Пустые ответы НЕ кэшируются навсегда (лимит выдачи/
-  // временнаяEmpty-область не должна блокировать повторную загрузку области).
-  const extCacheRef = useRef<Map<string, { objs: ExtObj[]; at: number }>>(new Map());
-  const EXT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 минут
-  const extReqIdRef = useRef(0);       // id последнего актуального запроса (отмена устаревших)
-
-  useEffect(() => {
-    if (!layersOn || !project.map?.bounds) { setExtObjs([]); return; }
-    const b = project.map.bounds;
-    const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
-    const south = clamp(b.south, -89, 89), north = clamp(b.north, -89, 89);
-    const west = clamp(b.west, -179, 179), east = clamp(b.east, -179, 179);
-    const MAX_SPAN = 3; // градусов (~330 км) — маленький bbox: быстрый и безопасный запрос
-    const s = south.toFixed(2), w = west.toFixed(2);
-    const n2 = Math.min(north, south + MAX_SPAN).toFixed(2);
-    const e2 = Math.min(east, west + MAX_SPAN).toFixed(2);
-    const box = `${s},${w},${n2},${e2}`;
-    const cacheKey = `${box}|${project.settings?.airportsLayer ? 'a' : ''}${project.settings?.notamLayer ? 'n' : ''}${project.settings?.geozonesLayer ? 'g' : ''}`;
-
-    const reqId = ++extReqIdRef.current;
-    const timer = setTimeout(async () => {
-      if (reqId !== extReqIdRef.current) return; // устаревший запрос — не запускаем
-      const cached = extCacheRef.current.get(cacheKey);
-      // Пустые результаты кэшируются только на короткое время, чтобы не «замораживать»
-      // область навсегда при лимите выдачи или временной пустоте ответа.
-      if (cached && (cached.objs.length > 0 || Date.now() - cached.at < EXT_CACHE_TTL_MS)) {
-        setExtObjs(cached.objs);
-        return;
-      } // область уже загружена — сервер не трогаем
-      // Один лёгкий объединённый запрос по включённым слоям.
-      // ИСПРАВЛЕНИЕ 400 Bad Request: прежний шаблон был синтаксически битым —
-      //   `(node[...](box);)[..60];(.;);out.skylat center 60;`
-      // Overpass не принимает union-фильтр `[..]` и рекурсивный блок `(.;)` вне
-      // union, а `out.skylat` — несуществующий параметр print (зеркала отвечали
-      // 400 «Invalid parameter for print»). Корректная форма: union statements
-      // внутри `( ... );` и печать `out center qt N` (центры ways + координаты
-      // nodes; для узлов identical с body). Аэродромы в OSM почти всегда ways —
-      // только узельный поиск их не находил, поэтому добавлены way-секции.
-      const parts: string[] = [];
-      if (project.settings?.airportsLayer) {
-        parts.push(`node["aeroway"="aerodrome"](${box});`, `way["aeroway"="aerodrome"](${box});`);
-      }
-      if (project.settings?.notamLayer) {
-        parts.push(`node["boundary"="military"](${box});`, `way["boundary"="military"](${box});`);
-      }
-      if (project.settings?.geozonesLayer) {
-        parts.push(`node["landuse"="military"](${box});`, `way["landuse"="military"](${box});`);
-      }
-      if (parts.length === 0) return;
-      // Пользователь явно включил хотя бы один слой — сбрасываем счётчик
-      // неудач, чтобы после предыдущего автоматического отключения слоёв
-      // не остаться навсегда в «заблокированном» состоянии.
-      extFailRef.current = 0;
-      // Print-секция: `out center qt N` принимается не всеми сборками Overpass
-      // (зеркала отвечали 400/500 на параметр qt в union-запросах). Надёжная
-      // каноническая форма — простой `out center;` (центры ways + координаты
-      // nodes). Проверено живыми запросами к зеркалам: HTTP 200, элементы
-      // возвращаются. Объём выборки ограничивает maxBboxArea ниже.
-      const q = `[out:json][timeout:20];(${parts.join('')});out center;`;
-      setOverpassBusy(true);
-      let data: { elements?: any[] } | null = null;
-      let lastErr = '';
-      let parseError = false; // 4xx синтаксиса — повтор на других зеркалах бессмысленен
-      for (const url of OVERPASS_ENDPOINTS) {
-        if (reqId !== extReqIdRef.current) { setOverpassBusy(false); return; } // отменён новым видом
-        const ctrl = new AbortController();
-        // 25 с: серверный timeout:20 + запас на очередь зеркала. Прежние 12–20 с
-        // обрывали живой запрос раньше, чем сервер успевал отдать данные.
-        const to = setTimeout(() => ctrl.abort(), 25000);
-        try {
-          const r = await fetch(url, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/x-www-form-urlencoded',
-              // overpass-api.de шлёт 429 без осмысленного User-Agent (политика OSM)
-              'User-Agent': OVERPASS_UA,
-            },
-            body: 'data=' + encodeURIComponent(q),
-            signal: ctrl.signal,
-          });
-          if (r.status === 429 || r.status >= 500) { lastErr = `HTTP ${r.status}`; continue; } // зеркало занято/лежит — пробуем следующее
-          if (!r.ok) {
-            // 4xx: различаем «битый запрос» (все зеркала дадут то же) и прочие 4xx
-            lastErr = `HTTP ${r.status}`;
-            parseError = r.status === 400;
-            break;
-          }
-          // Parse into a local first: an abort during .json() must not be treated as
-          // "mirror busy" when the response itself was fine.
-          const parsed = await r.json();
-          if (reqId !== extReqIdRef.current) { clearTimeout(to); setOverpassBusy(false); return; }
-          data = parsed;
-          lastErr = '';
-        } catch (e) {
-          lastErr = e instanceof Error && e.name === 'AbortError' ? 'timeout' : 'network';
-        } finally {
-          clearTimeout(to);
-        }
-        if (data) break;
-      }
-      if (reqId !== extReqIdRef.current) { setOverpassBusy(false); return; }
-      if (data) {
-        extFailRef.current = 0;
-        const out: ExtObj[] = [];
-        for (const el of data.elements || []) {
-          const lat = el.lat ?? el.center?.lat, lng = el.lon ?? el.center?.lon;
-          if (!isFinite(lat) || !isFinite(lng)) continue;
-          const aerodrome = el.tags?.aeroway === 'aerodrome' || el.tags?.amenity === 'airfield';
-          const militaryB = el.tags?.boundary === 'military';
-          const kind: ExtObj['kind'] = aerodrome ? 'airport' : militaryB ? 'notam' : 'geozone';
-          if (kind === 'airport' && !project.settings?.airportsLayer) continue;
-          if (kind === 'notam' && !project.settings?.notamLayer) continue;
-          if (kind === 'geozone' && !project.settings?.geozonesLayer) continue;
-          out.push({ kind, lat, lng, name: el.tags?.name || (kind === 'airport' ? 'Аэродром' : militaryB ? 'Военный район' : 'Геозона'), r: kind === 'notam' ? 3000 : kind === 'geozone' ? 2000 : undefined });
-        }
-        if (extCacheRef.current.size > 40) extCacheRef.current.clear(); // ограничиваем память
-        extCacheRef.current.set(cacheKey, { objs: out, at: Date.now() });
-        setExtObjs(out);
-        setExtNotice(null);
-      } else {
-        // Ошибка сети/сервера. 400 (битый синтаксис запроса) — НЕТРИГгеряющее
-        // автовключение состояние событие: слои не гасим, показываем предупреждение,
-        // иначе локальная ошибка кода выглядела бы как «Overpass недоступен».
-        if (parseError) {
-          setExtNotice(`Overpass отклонил запрос (${lastErr || 'HTTP 400'}): вероятно, временная проблема сервера. Слои остались включены, попробуйте обновить вид карты.`);
-        } else if (++extFailRef.current >= 2 && layersOn) {
-          // Сервер недоступен: ПОСЛЕ ДВУХ подряд неудач гасим слои ОДИН РАЗ.
-          // Важно: extFailRef НЕ сбрасывается в 0 после отключения — иначе
-          // выключение слоёв пересобирает этот эффект, тот снова стреляет
-          // запросом, снова копит 2 неудачи, снова setState... — бесконечный
-          // каскад обновлений (React error #185). Повтор включается только
-          // осознанным включением слоя пользователем (см. resetExtFailBelow).
-          useStore.setState((st) => ({
-            project: { ...st.project, settings: { ...st.project.settings, airportsLayer: false, notamLayer: false, geozonesLayer: false } },
-          }));
-          setExtNotice(`Внешние слои отключены: Overpass недоступен (${lastErr || 'ошибка сети'}). Включите слой заново, когда сервер заработает.`);
-        } else {
-          setExtNotice(`Загрузка внешних слоёв не удалась (${lastErr || 'ошибка сети'}) — это нормально для перегруженного зеркала; повторится при следующем изменении вида.`);
-        }
-      }
-      setOverpassBusy(false);
-    }, 800); // дебаунс: пока пользователь крутит карту — запросов нет вообще
-    return () => { clearTimeout(timer); };
-  }, [layersOn, project.settings?.airportsLayer, project.settings?.notamLayer, project.settings?.geozonesLayer, project.map?.bounds]);
 
   // Полный экран
   const toggleFullscreen = useCallback(() => {
@@ -872,7 +693,7 @@ const MapCanvas: React.FC = () => {
       const tilePx = worldPx / n; // экранных px на тайл ВЫБРАННОГО уровня (при отрисовке масштабируется)
       void map;
       const server = (project.openStreetMap?.tileServer as any) || 'osm';
-      const style = project.settings?.tileStyle || 'scheme';
+      const style: 'scheme' = 'scheme';
       // Границы видимой области — из той же привязки, что и позиции тайлов (без обратной
       // конвертации через широту: floor() по mercator-долям напрямую, точность не теряется)
       const fx0 = (0 - vs.offsetX) / worldPx;          // доля мира [0..1] левого края экрана
@@ -940,13 +761,13 @@ const MapCanvas: React.FC = () => {
       drawGrid(ctx);
     }
 
-    // Внешние слои: аэропорты / NOTAM / геозоны + позиция пользователя (гео-привязка строгая)
-    drawExternalLayers(ctx);
+    // Позиция пользователя (геолокация) — гео-привязка строгая
+    drawUserPosition(ctx);
 
     // Масштабная линейка + плашка масштаба — всегда поверх всего
     drawScaleOverlay(ctx);
 
-    function drawExternalLayers(g: CanvasRenderingContext2D) {
+    function drawUserPosition(g: CanvasRenderingContext2D) {
       const map = project.map;
       if (!map?.bounds) return;
       const b = map.bounds;
@@ -957,33 +778,6 @@ const MapCanvas: React.FC = () => {
         return { x: mx * vs.scale + vs.offsetX, y: my * vs.scale + vs.offsetY };
       };
       g.save();
-      for (const o of extObjs) {
-        const p = toScreen(o.lat, o.lng);
-        if (p.x < -50 || p.y < -50 || p.x > canvasSize.width + 50 || p.y > canvasSize.height + 50) continue;
-        // радиус зоны в экранных px (для notam/geozone)
-        if (o.r && (o.kind === 'notam' || o.kind === 'geozone')) {
-          const mppLoc = metersPerPixelFromWorld(worldPx, o.lat);
-          const rpx = Math.min(3000, o.r / Math.max(mppLoc, 1e-6));
-          g.beginPath();
-          g.arc(p.x, p.y, rpx, 0, Math.PI * 2);
-          g.fillStyle = o.kind === 'notam' ? 'rgba(245,158,11,0.10)' : 'rgba(239,68,68,0.10)';
-          g.fill();
-          g.strokeStyle = o.kind === 'notam' ? 'rgba(245,158,11,0.6)' : 'rgba(239,68,68,0.6)';
-          g.setLineDash([6, 4]);
-          g.lineWidth = 1.5;
-          g.stroke();
-          g.setLineDash([]);
-        }
-        // маркер объекта
-        g.font = 'bold 14px sans-serif';
-        g.textAlign = 'center';
-        g.fillStyle = o.kind === 'airport' ? '#34d399' : o.kind === 'notam' ? '#fbbf24' : '#f87171';
-        g.fillText(o.kind === 'airport' ? '✈' : o.kind === 'notam' ? '⚠' : '⛔', p.x, p.y + 5);
-        g.font = '10px sans-serif';
-        g.fillStyle = 'rgba(226,232,240,0.9)';
-        const nm = o.name.length > 24 ? o.name.slice(0, 23) + '…' : o.name;
-        g.fillText(nm, p.x, p.y + 18);
-      }
       // позиция пользователя (геолокация)
       if (userPos) {
         const p = toScreen(userPos.lat, userPos.lng);
@@ -1603,7 +1397,7 @@ const MapCanvas: React.FC = () => {
       ctx.restore();
     }
 
-  }, [project, renderTick, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, actionMode, tilesVersion, extObjs, userPos]);
+  }, [project, renderTick, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, actionMode, tilesVersion, userPos]);
 
   // Mouse wheel zoom (к колесу курсора; границы minZoom/maxZoom внутри zoomAt)
   // ВАЖНО: React навешивает on-wheel/on-touch как passive-слушатели, и вызов
@@ -2064,22 +1858,6 @@ const MapCanvas: React.FC = () => {
         onContextMenu={handleContextMenu}
       />
 
-      {/* Индикатор загрузки внешних слоёв (Overpass может отвечать медленно — это нормально) */}
-      {overpassBusy && (
-        <div className="absolute bottom-3 left-3 z-10 flex items-center gap-2 rounded-md bg-gray-900/85 border border-gray-700 px-2.5 py-1.5 text-[11px] text-gray-200" role="status" aria-live="polite">
-          <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-cyan-400 border-t-transparent" />
-          Загрузка слоёв (аэропорты/районы)…
-        </div>
-      )}
-
-      {/* Предупреждение о недоступности Overpass: слои отключены не молча, а с причиной */}
-      {extNotice && !overpassBusy && (
-        <div className="absolute bottom-3 left-3 z-10 flex items-center gap-2 rounded-md bg-amber-900/90 border border-amber-600 px-2.5 py-1.5 text-[11px] text-amber-100 max-w-xs" role="alert">
-          <span>{extNotice}</span>
-          <button className="ml-1 underline" onClick={() => setExtNotice(null)} aria-label="Скрыть предупреждение">×</button>
-        </div>
-      )}
-
       {/* Popup объекта: координаты, высота, расстояние */}
       {popup && (
         <div
@@ -2107,38 +1885,6 @@ const MapCanvas: React.FC = () => {
           aria-label="Тайловая подложка" title="Активная тайловая карта (T)"
           onClick={() => updateSettings({ tilesEnabled: !project.settings?.tilesEnabled })}
         >▦</button>
-        {/* Слои: схема / спутник / гибрид */}
-        <div className="flex flex-col gap-1 mt-1" role="group" aria-label="Слои карты">
-          {(['scheme', 'satellite', 'hybrid'] as const).map((st) => (
-            <button
-              key={st}
-              className={`h-7 px-1.5 rounded-md text-[10px] font-semibold ${btnCls} !w-auto ${(project.settings?.tileStyle || 'scheme') === st ? 'bg-cyan-700/80 ring-1 ring-cyan-300' : ''}`}
-              aria-pressed={(project.settings?.tileStyle || 'scheme') === st}
-              title={st === 'scheme' ? 'Схема' : st === 'satellite' ? 'Спутник' : 'Гибрид'}
-              onClick={() => updateSettings({ tileStyle: st, tilesEnabled: true })}
-            >
-              {st === 'scheme' ? 'СХЕМА' : st === 'satellite' ? 'СПУТ' : 'ГИБР'}
-            </button>
-          ))}
-          <button
-            className={`h-7 px-1.5 rounded-md text-[10px] font-semibold ${btnCls} !w-auto ${project.settings?.airportsLayer ? 'bg-emerald-700/80 ring-1 ring-emerald-300' : ''}`}
-            aria-pressed={!!project.settings?.airportsLayer}
-            title="Аэропорты (Overpass API)"
-            onClick={() => updateSettings({ airportsLayer: !project.settings?.airportsLayer })}
-          >✈ АЭРО</button>
-          <button
-            className={`h-7 px-1.5 rounded-md text-[10px] font-semibold ${btnCls} !w-auto ${project.settings?.geozonesLayer ? 'bg-red-700/80 ring-1 ring-red-300' : ''}`}
-            aria-pressed={!!project.settings?.geozonesLayer}
-            title="Геозоны / No-Fly зоны"
-            onClick={() => updateSettings({ geozonesLayer: !project.settings?.geozonesLayer })}
-          >⛔ ГЕО</button>
-          <button
-            className={`h-7 px-1.5 rounded-md text-[10px] font-semibold ${btnCls} !w-auto ${project.settings?.notamLayer ? 'bg-amber-700/80 ring-1 ring-amber-300' : ''}`}
-            aria-pressed={!!project.settings?.notamLayer}
-            title="NOTAM-уведомления"
-            onClick={() => updateSettings({ notamLayer: !project.settings?.notamLayer })}
-          >! NOTAM</button>
-        </div>
       </div>
     </div>
   );
