@@ -317,8 +317,6 @@ interface AppState {
   loadMapWithStorage: (mapData: MapData) => Promise<void>;
   /** Активная тайловая карта без снимка: центр (lat/lng) + зум 10..19 */
   loadActiveTileMap: (center: { lat: number; lng: number }, zoom: number) => void;
-  /** Целевой зум последней загрузки активной карты (эталон для стартового вида) */
-  mapZoom: number | null;
   restoreMapFromStorage: () => Promise<void>;
 }
 
@@ -371,7 +369,6 @@ export const useStore = create<AppState>()(
       selectedRestrictionId: null,
       viewState: { offsetX: 0, offsetY: 0, scale: 1 },
       viewTick: 0,
-      mapZoom: null,
       cursorPosition: null,
       isDrawing: false,
       drawingPoints: [],
@@ -1106,9 +1103,6 @@ export const useStore = create<AppState>()(
        */
       loadActiveTileMap: (center, zoom) => {
         const z = Math.max(MIN_MAP_ZOOM_FLOOR, Math.min(19, Math.round(zoom)));
-        // Сохраняем целевой зум ДО установки карты: эффект стартового вида в
-        // MapCanvas читает его и открывает карту ровно на этом масштабе.
-        set({ mapZoom: z });
         const worldPx = 256 * Math.pow(2, z);
         const b = calculateBoundsFromCenter(center, z, worldPx, worldPx);
         const mapW = Math.round(worldPx * ((b.east - b.west) / 360));
@@ -1177,7 +1171,6 @@ export const useStore = create<AppState>()(
           } : null,
         },
         _currentMapId: state._currentMapId, // Сохраняем ID карты для восстановления
-        mapZoom: state.mapZoom, // целевой зум активной карты — эталон стартового вида после перезагрузки
       }),
       onRehydrateStorage: () => (state, error) => {
         if (error) console.warn('[persist] rehydration failed:', error);

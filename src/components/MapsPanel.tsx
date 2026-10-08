@@ -2,7 +2,7 @@ import React, { useState, useRef } from 'react';
 import { useStore } from '../store/useStore';
 import { loadGoogleMapsApi, geocodeAddress, loadStaticMap, isGoogleMapsLoaded } from '../utils/googleMaps';
 import { loadYandexMapsApi, yandexGeocode, loadYandexStaticMap, isYandexMapsLoaded } from '../utils/yandexMaps';
-import { osmGeocode } from '../utils/openStreetMap';
+import { osmGeocode, loadOSMStaticMap } from '../utils/openStreetMap';
 import type { MapProvider } from '../types';
 
 const MapsPanel: React.FC = () => {
@@ -234,11 +234,30 @@ const MapsPanel: React.FC = () => {
 
         loadActiveTileMap(geoResult, zoom);
 
-        // УПРОЩЕНИЕ: фоновый статический снимок больше НЕ загружается. Он
-        // перезаписывал виртуальную карту пиксельным растром (loadMapWithStorage),
-        // из-за чего вид мог сбрасываться, а загрузка тянула десятки тайлов в
-        // один PNG. Активная тайловая карта самодостаточна: подложка грузится
-        // тайлами динамически, привязка к координатам — единая Mercator-формула.
+        // Фоновая дозагрузка снимка как fallback-растра (не блокирует интерфейс):
+        // применяется только если это всё ещё последний запрос (защита от гонки)
+        // и карта не заменена пользователем. При офлайне шаг просто пропускается.
+        const myReqId = ++loadSeqRef.current;
+        if (navigator.onLine) {
+          loadOSMStaticMap(geoResult, zoom, width, height, osmTileServer)
+            .then((res) => {
+              if (myReqId !== loadSeqRef.current) return; // более свежий запрос уже в полёте
+              const cur = useStore.getState().project.map;
+              if (!cur || !cur.bounds || cur.source !== 'osm') return; // карта заменена
+              void loadMapWithStorage({
+                name: `OpenStreetMap - ${addressInput}`,
+                width,
+                height,
+                dataUrl: res.dataUrl,
+                bounds: res.bounds,
+                source: 'osm',
+              });
+            })
+            .catch(() => { /* активная тайловая карта уже работает — снимок опционален */ });
+        }
+
+        // Привязка уже установлена loadActiveTileMap (точная Mercator); setMapBounds
+        // здесь не нужен — иначе стёр бы bounds до прихода фонового снимка.
         setSuccess('Карта открыта (как на openstreetmap.org): доступен зум и панорама, привязка к координатам строгая.');
         return;
       }
