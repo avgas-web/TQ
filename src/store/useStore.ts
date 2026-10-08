@@ -38,6 +38,36 @@ function pixelToGeoStrict(p: Point, bounds: MapBounds, mapW: number, mapH: numbe
 const REROUTE_THROTTLE_MS = 250;
 let rerouteTimer: number | null = null;
 
+// Кэш «грязевых» предикатов для planPathAroundZones. Сегмент прям тогда, когда
+// он не задевает буферную полосу НИ ОДНОЙ активной зоны — это проверяется
+// дешёвым тестом отрезок↔зона (zonesCrossedBy) без построения препятствий.
+// buildObstacles+segmentBlocked+граф видимости выполняются только для сегментов,
+// реально задетых зонами. Кэш сбрасывается при любом изменении restrictions
+// (см. setRestrictions/updateRestriction/deleteRestriction/setActiveRestriction).
+let zoneCacheKey: { ver: number; n: number } | null = null;
+let zoneCacheList: Restriction[] | null = null;
+let zonesVersion = 0;
+
+/** Инвалидация кэша зон (вызывать при любом изменении project.restrictions). */
+export function invalidateZoneCache() {
+  zonesVersion++;
+  zoneCacheKey = null;
+  zoneCacheList = null;
+}
+
+/** Активные «проходимые внутри» зоны в нормализованном виде (сброс при изменении зон). */
+function getActiveZonesCached(restrictions: Restriction[]): Restriction[] {
+  if (zoneCacheKey && zoneCacheKey.ver === zonesVersion && zoneCacheKey.n === restrictions.length) {
+    return zoneCacheList!;
+  }
+  const list = restrictions.filter(
+    (r) => r.active && (r.type === 'circle' ? r.points.length >= 1 && !!r.radius : r.points.length >= 2)
+  );
+  zoneCacheKey = { ver: zonesVersion, n: restrictions.length };
+  zoneCacheList = list;
+  return list;
+}
+
 /**
  * Единый планировщик пакетной перестройки всех маршрутов. Идемпотентен:
  * повторные вызовы в пределах троттл-окна схлопываются в один прогон.
@@ -59,9 +89,7 @@ function rerouteAllRoutesNow() {
   if (!map || routes.length === 0) return;
   // Все активные зоны участвуют в расчёте: круг задаётся ОДНОЙ точкой + radius,
   // старый фильтр points.length >= 2 полностью игнорировал круговые зоны.
-  const activeZones = state.project.restrictions.filter(
-    (r) => r.active && (r.type === 'circle' ? r.points.length >= 1 && !!r.radius : r.points.length >= 2)
-  );
+  const activeZones = getActiveZonesCached(state.project.restrictions);
   const newRoutes: Route[] = [];
   const warningsMap: Record<string, string[]> = {};
   for (const route of routes) {
@@ -445,6 +473,13 @@ export const useStore = create<AppState>()(
         const map = state.project.map;
         const route = (state.project.routes || []).find((r) => r.id === id);
         if (!map || !route || route.points.length < 2) return;
+        // Активные зоны — из кэша (сбрасывается при изменении restrictions).
+        // planPathAroundZones раньше получал ВСЕ restrictions и на КАЖДЫЙ
+        // сегмент перестраивал препятствия (buildObstacles) — O(N×зон) на
+        // каждый клик/движение точки. Плюс быстрый «грязевой» тест: если
+        // отрезок не задевает ни одну активную зону, обходной движок вообще
+        // не вызывается.
+        const activeZones = getActiveZonesCached(state.project.restrictions);
         // Пользовательские точки (ключевые): пересчитываем обходные сегменты между соседними ключевыми.
         const keyIdx: number[] = [];
         for (let i = 0; i < route.points.length; i++) {
@@ -456,7 +491,12 @@ export const useStore = create<AppState>()(
           const a = route.points[keyIdx[k]];
           const b = route.points[keyIdx[k + 1]];
           newPts.push({ ...a, auto: undefined as any });
-          const path = planPathAroundZones({ x: a.x, y: a.y }, { x: b.x, y: b.y }, state.project.restrictions, map.width, map.height);
+          let path: Point[];
+          if (activeZones.length === 0 || zonesCrossedBy([a, b], activeZones).length === 0) {
+            path = [a, b]; // сегмент чист — дешёвый путь без построения препятствий
+          } else {
+            path = planPathAroundZones({ x: a.x, y: a.y }, { x: b.x, y: b.y }, activeZones, map.width, map.height);
+          }
           for (let i = 1; i < path.length - 1; i++) {
             const px = path[i];
             const geo = map.bounds ? pixelToGeoStrict(px, map.bounds, map.width, map.height) : { lat: NaN, lng: NaN };
@@ -479,20 +519,28 @@ export const useStore = create<AppState>()(
           newPts.length = 0;
           newPts.push(...merged);
         }
-        // Предупреждения о зонах, через которые всё же проходит маршрут
-        const crossed = zonesCrossedBy(newPts.map((p) => ({ x: p.x, y: p.y })), state.project.restrictions);
+        // Предупреждения о зонах, через которые всё же проходит маршрут.
+        // ВАЖНО: набор предупреждений ПОЛНОСТЬЮ заменяется для маршрута
+        // (пустой массив удаляет запись), иначе «застывшие» ложные
+        // предупреждения оставались бы навсегда после обхода зоны.
+        const crossed = zonesCrossedBy(newPts.map((p) => ({ x: p.x, y: p.y })), activeZones);
         const warnings = crossed.map((z) => `Пересекает зону «${z.name}»`);
         // Проверка ограничения по дальности
         const limitWarn = rangeLimitWarning(route, newPts);
         if (limitWarn) warnings.push(limitWarn);
-        set((cur) => ({
-          routeWarnings: { ...cur.routeWarnings, [id]: warnings },
-          project: {
-            ...cur.project,
-            routes: (cur.project.routes || []).map((r) => (r.id === id ? { ...r, points: newPts } : r)),
-            updatedAt: new Date().toISOString(),
-          },
-        }));
+        set((cur) => {
+          const rw = { ...cur.routeWarnings };
+          if (warnings.length > 0) rw[id] = warnings;
+          else delete rw[id];
+          return {
+            routeWarnings: rw,
+            project: {
+              ...cur.project,
+              routes: (cur.project.routes || []).map((r) => (r.id === id ? { ...r, points: newPts } : r)),
+              updatedAt: new Date().toISOString(),
+            },
+          };
+        });
       },
 
       rerouteAllRoutes: () => {
@@ -674,7 +722,9 @@ export const useStore = create<AppState>()(
 
       selectMarker: (id) => set({ selectedMarkerId: id, selectedRestrictionId: null }),
 
-      addRestriction: (restrictionData) => set((state) => {
+      addRestriction: (restrictionData) => {
+        invalidateZoneCache();
+        return set((state) => {
         const id = uuidv4();
         const restriction: Restriction = {
           id,
@@ -696,7 +746,8 @@ export const useStore = create<AppState>()(
           },
           activeRestrictionId: restriction.id,
         };
-      }),
+        });
+      },
 
       // undo/redo для рисования полигонов (и любых точек рисования)
       undoDrawingPoint: () => set((state) => {
@@ -722,6 +773,7 @@ export const useStore = create<AppState>()(
       }),
 
       updateRestriction: (id, updates) => {
+        invalidateZoneCache(); // геометрия/флаг зоны изменились — кэш активных зон недействителен
         set((state) => ({
           project: {
             ...state.project,
@@ -737,6 +789,7 @@ export const useStore = create<AppState>()(
       },
 
       deleteRestriction: (id) => {
+        invalidateZoneCache();
         set((state) => ({
           project: {
             ...state.project,
@@ -752,6 +805,7 @@ export const useStore = create<AppState>()(
       selectRestriction: (id) => set({ selectedRestrictionId: id, selectedMarkerId: null }),
 
       setActiveRestriction: (id) => {
+        invalidateZoneCache();
         set((state) => ({
           activeRestrictionId: id,
           project: {
@@ -764,9 +818,9 @@ export const useStore = create<AppState>()(
           },
         }));
         // set-active меняет набор активных зон → маршруты должны перестроиться.
-        // Вызов через единый троттлер; дубль от подписчика на restrictions
-        // безвреден — планировщик схлопывает повторные вызовы в один прогон.
-        get().rerouteAllRoutes();
+        // Перестройку выполняет ЕДИНСТВЕННЫЙ троттлинговый подписчик на изменения
+        // restrictions (MapCanvas). Синхронный вызов отсюда создавал двойной
+        // запуск пакетной перестройки (п.2) и обходил схему «одного владельца».
       },
 
       addLayer: (name) => set((state) => {
@@ -819,12 +873,15 @@ export const useStore = create<AppState>()(
 
       setFilterType: (type) => set({ filterType: type }),
 
-      importProject: (project) => set({
-        project,
-        selectedMarkerId: null,
-        selectedRestrictionId: null,
-        viewState: { offsetX: 0, offsetY: 0, scale: 1 },
-      }),
+      importProject: (project) => {
+        invalidateZoneCache(); // набор зон заменён целиком — кэш недействителен
+        return set({
+          project,
+          selectedMarkerId: null,
+          selectedRestrictionId: null,
+          viewState: { offsetX: 0, offsetY: 0, scale: 1 },
+        });
+      },
 
       exportProject: () => get().project,
 

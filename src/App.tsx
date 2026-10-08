@@ -89,34 +89,40 @@ const App: React.FC = () => {
       return;
     }
 
-    // Grid toggle: G (и русская П на той же клавише)
-    if (key === 'g') {
-      e.preventDefault();
-      updateSettings({ showGrid: !project.settings?.showGrid });
-      return;
-    }
+    // Одиночные горячие клавиши срабатывают ТОЛЬКО без Ctrl/Meta/Alt.
+    // Раньше транслитерация перехватывала связки: Ctrl+T (новая вкладка),
+    // Alt+F (меню браузера), Ctrl+S и т.п. — браузерные комбинации не должны
+    // подменять действия приложения.
+    if (!(e.ctrlKey || e.metaKey || e.altKey)) {
+      // Grid toggle: G (и русская П на той же клавише)
+      if (key === 'g') {
+        e.preventDefault();
+        updateSettings({ showGrid: !project.settings?.showGrid });
+        return;
+      }
 
-    // Тема: T / M (транслит покрывает русские Е/Ь на тех же клавишах)
-    if (key === 't' || key === 'm') {
-      e.preventDefault();
-      updateSettings({ theme: project.settings?.theme === 'light' ? 'dark' : 'light' });
-      return;
-    }
+      // Тема: T / M (транслит покрывает русские Е/Ь на тех же клавишах)
+      if (key === 't' || key === 'm') {
+        e.preventDefault();
+        updateSettings({ theme: project.settings?.theme === 'light' ? 'dark' : 'light' });
+        return;
+      }
 
-    // Полный экран: F (транслит покрывает русскую А)
-    if (key === 'f') {
-      e.preventDefault();
-      const el = document.getElementById('map-container');
-      if (el && document.fullscreenElement) document.exitFullscreen().catch(() => {});
-      else if (el) el.requestFullscreen?.().catch(() => {});
-      return;
-    }
+      // Полный экран: F (транслит покрывает русскую А)
+      if (key === 'f') {
+        e.preventDefault();
+        const el = document.getElementById('map-container');
+        if (el && document.fullscreenElement) document.exitFullscreen().catch(() => {});
+        else if (el) el.requestFullscreen?.().catch(() => {});
+        return;
+      }
 
-    // Режим действий: R (транслит покрывает русскую К)
-    if (key === 'r') {
-      e.preventDefault();
-      setActionMode(!actionMode);
-      return;
+      // Режим действий: R (транслит покрывает русскую К)
+      if (key === 'r') {
+        e.preventDefault();
+        setActionMode(!actionMode);
+        return;
+      }
     }
   }, [currentTool, viewState, selectedMarkerId, setTool, setViewState,
     clearDrawingPoints, setMeasurementPoints, deleteMarker, project.settings?.showGrid,
