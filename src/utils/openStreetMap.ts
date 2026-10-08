@@ -52,46 +52,19 @@ const NOMINATIM_HOSTS = [
   'https://nominatim.private.coffee',
 ];
 
-// Простейшая локальная очередь «не чаще 1 запроса в секунду» — требование usage policy Nominatim
+// Локальная очередь «не чаще 1 запроса в секунду» — требование usage policy Nominatim.
+// Резервирование момента выполнения синхронно (до await) исключает «шторм» из
+// одновременно стартовавших запросов при пакетном геокодировании списков.
 let lastNominatimAt = 0;
-async function politeWait(): Promise<void> {
-  const wait = Math.max(0, lastNominatimAt + 1000 - Date.now());
-  lastNominatimAt = Date.now() + wait;
-  if (wait > 0) await new Promise((res) => setTimeout(res, wait));
+function reserveNominatimSlot(): Promise<void> {
+  const now = Date.now();
+  const when = Math.max(now, lastNominatimAt + 1000);
+  lastNominatimAt = when;
+  const wait = when - now;
+  return wait > 0 ? new Promise((res) => setTimeout(res, wait)) : Promise.resolve();
 }
 
-/**
- * Запрос к Nominatim с перебором зеркал, таймаутом и повтором.
- * Возвращает разобранный JSON или null, если все зеркала недоступны.
- * Ошибки внешних серверов не пишутся в console.error — это штатная ситуация,
- * вызывающий код показывает пользователю понятное сообщение.
- */
-async function fetchNominatimJson(path: string, params: string): Promise<any[] | any | null> {
-  for (let round = 0; round < 2; round++) {
-    for (let i = 0; i < NOMINATIM_HOSTS.length; i++) {
-      const host = NOMINATIM_HOSTS[(i + round) % NOMINATIM_HOSTS.length];
-      await politeWait();
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 12000);
-      try {
-        const response = await fetch(`${host}${path}?format=json&${params}`, {
-          signal: ctrl.signal,
-          headers: { Accept: 'application/json' },
-        });
-        if (response.status === 429 || response.status >= 500) continue; // пробуем следующее зеркало
-        if (!response.ok) return null;
-        return await response.json();
-      } catch {
-        /* сеть/таймаут — следующее зеркало */
-      } finally {
-        clearTimeout(timer);
-      }
-    }
-    // после первого раунда — короткая пауза перед повтором
-    if (round === 0) await new Promise((res) => setTimeout(res, 1000));
-  }
-  return null;
-}
+export type NominatimErrorKind = 'network' | 'http';
 
 /**
  * Запрос к Nominatim с перебором зеркал, таймаутом и повтором.
@@ -101,40 +74,78 @@ async function fetchNominatimJson(path: string, params: string): Promise<any[] |
  * Ошибки внешних серверов не пишутся в console.error — это штатная ситуация,
  * вызывающий код показывает пользователю понятное сообщение.
  */
-export async function osmGeocode(address: string): Promise<{ lat: number; lng: number } | null> {
-  const data = await fetchNominatimJson('/search', `q=${encodeURIComponent(address)}&limit=1`);
-
-  if (!data) {
-    console.warn('Геокодирование: сервис Nominatim временно недоступен');
-    return null;
+async function fetchNominatimJson(
+  path: string,
+  params: string,
+  outerSignal?: AbortSignal,
+): Promise<{ data: any[] | any | null; kind: 'ok' | 'not_found' | NominatimErrorKind }> {
+  let sawHttpError = false;
+  for (let round = 0; round < 2; round++) {
+    for (let i = 0; i < NOMINATIM_HOSTS.length; i++) {
+      if (outerSignal?.aborted) return { data: null, kind: 'network' };
+      const host = NOMINATIM_HOSTS[(i + round) % NOMINATIM_HOSTS.length];
+      await reserveNominatimSlot();
+      if (outerSignal?.aborted) return { data: null, kind: 'network' };
+      const ctrl = new AbortController();
+      const abortOuter = () => ctrl.abort();
+      outerSignal?.addEventListener('abort', abortOuter);
+      const timer = setTimeout(() => ctrl.abort(), 12000);
+      try {
+        const response = await fetch(`${host}${path}?format=json&${params}`, {
+          signal: ctrl.signal,
+          headers: { Accept: 'application/json' },
+        });
+        if (response.status === 429 || response.status >= 500) {
+          sawHttpError = true;
+          continue; // пробуем следующее зеркало
+        }
+        if (!response.ok) return { data: null, kind: 'http' };
+        const json = await response.json();
+        return { data: json, kind: Array.isArray(json) && json.length === 0 ? 'not_found' : 'ok' };
+      } catch {
+        /* сеть/таймаут/отмена — следующее зеркало */
+      } finally {
+        clearTimeout(timer);
+        outerSignal?.removeEventListener('abort', abortOuter);
+      }
+    }
+    // после первого раунда — короткая пауза перед повтором
+    if (round === 0) await new Promise((res) => setTimeout(res, 1000));
   }
+  return { data: null, kind: sawHttpError ? 'http' : 'network' };
+}
 
-  if (Array.isArray(data) && data.length > 0) {
-    return {
-      lat: parseFloat(data[0].lat),
-      lng: parseFloat(data[0].lon),
-    };
-  }
-
-  return null;
+export interface OsmGeocodeResult {
+  point: { lat: number; lng: number } | null;
+  /** 'ok' — успех; 'not_found' — адрес не найден; 'network'/'http' — сервисная ошибка */
+  kind: 'ok' | 'not_found' | NominatimErrorKind;
 }
 
 /**
  * Геокодирование адреса через Nominatim (OSM).
  * Возвращает различимый статус, чтобы UI не смешивал «не найдено» и «сервис недоступен».
  */
-export async function osmReverseGeocode(lat: number, lng: number): Promise<string | null> {
-  const data = await fetchNominatimJson('/reverse', `lat=${lat}&lon=${lng}`);
+export async function osmGeocode(address: string, signal?: AbortSignal): Promise<OsmGeocodeResult> {
+  const { data, kind } = await fetchNominatimJson(
+    '/search',
+    `q=${encodeURIComponent(address)}&limit=1`,
+    signal,
+  );
+  if (kind !== 'ok') return { point: null, kind };
+  const first = Array.isArray(data) ? data[0] : null;
+  const lat = first ? parseFloat(first.lat) : NaN;
+  const lng = first ? parseFloat(first.lon) : NaN;
+  if (!isFinite(lat) || !isFinite(lng)) return { point: null, kind: 'not_found' };
+  return { point: { lat, lng }, kind: 'ok' };
+}
 
-  if (!data) {
-    console.warn('Обратное геокодирование: сервис Nominatim временно недоступен');
-    return null;
-  }
-
-  if (data && data.display_name) {
-    return data.display_name;
-  }
-
+/**
+ * Обратное геокодирование через Nominatim (OSM)
+ */
+export async function osmReverseGeocode(lat: number, lng: number, signal?: AbortSignal): Promise<string | null> {
+  const { data, kind } = await fetchNominatimJson('/reverse', `lat=${lat}&lon=${lng}`, signal);
+  if (kind !== 'ok') return null;
+  if (data && typeof data.display_name === 'string') return data.display_name;
   return null;
 }
 
