@@ -757,14 +757,17 @@ const MapCanvas: React.FC = () => {
     // Draw routes (маршруты режима действий: редактирование, обход зон, предупреждения)
     drawRoutes(ctx);
 
-    // Draw map border
-    ctx.save();
-    ctx.translate(vs.offsetX, vs.offsetY);
-    ctx.scale(vs.scale, vs.scale);
-    ctx.strokeStyle = 'rgba(100, 200, 255, 0.3)';
-    ctx.lineWidth = 2 / vs.scale;
-    ctx.strokeRect(0, 0, project.map.width, project.map.height);
-    ctx.restore();
+    // Draw map border: у активной тайловой карты «виртуальный растр» покрывает
+    // всю mercator-площадку — рамка границы не нужна (подложка бесконечна, как на osm.org)
+    if (!(!!project.settings?.tilesEnabled && !!project.map?.bounds)) {
+      ctx.save();
+      ctx.translate(vs.offsetX, vs.offsetY);
+      ctx.scale(vs.scale, vs.scale);
+      ctx.strokeStyle = 'rgba(100, 200, 255, 0.3)';
+      ctx.lineWidth = 2 / vs.scale;
+      ctx.strokeRect(0, 0, project.map.width, project.map.height);
+      ctx.restore();
+    }
 
     // Сетка поверх карты (чтобы линии и подписи НЕ тонули в подложке тайлов)
     if (project.settings?.showGrid) {
