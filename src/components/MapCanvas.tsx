@@ -305,25 +305,44 @@ const MapCanvas: React.FC = () => {
     if (!el) return;
     const v = viewRef.current;
     const cs = canvasSizeRef.current;
-    const tilesOn = !!useStore.getState().project.settings?.tilesEnabled &&
-      !!useStore.getState().project.map?.bounds;
-    if (!tilesOn || cs.height <= 0) { el.style.display = 'none'; return; }
+    const st = useStore.getState();
+    const mapBounds = st.project.map?.bounds;
+    const tilesOn = !!st.project.settings?.tilesEnabled && !!mapBounds;
+    if (!tilesOn || !mapBounds || cs.height <= 0) { el.style.display = 'none'; return; }
     const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
     const zoom = clampZoom(zoomAtWorldPx(wp));
-    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[(useStore.getState().project.openStreetMap?.tileServer as any) || 'osm'] ?? MAX_ZOOM);
+    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[(st.project.openStreetMap?.tileServer as any) || 'osm'] ?? MAX_ZOOM);
     const level = Math.max(MIN_ZOOM, Math.min(nativeMax, Math.round(zoom)));
     const n = Math.pow(2, level);
-    // CSS-px на тайл: world-пиксели ВЫБРАННОГО уровня / 2^level (уровень может быть
-    // ограничен nativeMax при зуме за пределы нативных тайлов сервера)
-    const tileCss = (cs.height * Math.pow(2, level)) / n;
+    // ── СТРОГАЯ привязка DOM-слоя к инварианту вида ───────────────────────────
+    // ИСПРАВЛЕНИЕ «карта грузится, но не видна»: раньше transform слоя был
+    // translate(offsetX, offsetY)·scale(tileCss/256), т.е. тайл (0,0) всегда
+    // попадал в точку offsets вида — а это world-пиксель нуля ТОГО зума, из
+    // которого взяты offsets (стартовый z карты). После любого зума/панорамы
+    // слой уезжал на десятки тысяч пикселей за экран (transform вида
+    // translate(-1.57e7px, -1.24e7px)) — подложка формально «грузилась», но
+    // была полностью невидима. Теперь позиция выводится из единой формулы
+    // экрана: screen = rasterPx·sPerPx + offset (то же affine-преобразование,
+    // что использует канвас для объектов; см. geoToRaster/toScreen ниже).
+    const map = st.project.map!;
+    const lngSpan = Math.abs(mapBounds.east - mapBounds.west);
+    const mercSpanY = Math.max(1e-12, latToMerc(mapBounds.south) - latToMerc(mapBounds.north));
+    // Экранных px на один пиксель растра карты (привязка строго через bounds):
+    const sPerPxX = (wp * (lngSpan / 360)) / Math.max(1, map.width);
+    const sPerPxY = (wp * mercSpanY) / Math.max(1, map.height);
+    // CSS-размер одного тайла на экране (2^(zoom-level) — плавный непрерывный зум)
+    const tileCss = wp / n;
+    // Позиция тайла (0,0) = растровый пиксель (westFrac·map.width, northFrac·map.height),
+    // где westFrac/northFrac — mercator-доля мира левого-верхнего угла bounds.
+    const westFrac = (mapBounds.west + 180) / 360;
+    const northFrac = latToMerc(mapBounds.north);
+    const baseX = westFrac * map.width * sPerPxX + v.offsetX;
+    const baseY = northFrac * map.height * sPerPxY + v.offsetY;
     el.style.display = '';
     el.style.width = `${cs.width}px`;
     el.style.height = `${cs.height}px`;
-    void wp;
-    // Единый transform для всех детей: origin (0,0), сдвиг на offset, масштаб
-    // относительно мира уровня level (origin смещён так, чтобы tx=ty=0 попал в offsetX/Y).
     el.style.transformOrigin = '0 0';
-    el.style.transform = `translate(${v.offsetX}px, ${v.offsetY}px) scale(${tileCss / 256})`;
+    el.style.transform = `translate(${baseX}px, ${baseY}px) scale(${tileCss / 256})`;
   }, []);
   // Обновляем ссылку для rAF-подписчика на viewState (см. useEffect выше)
   useEffect(() => { tileLayerPositionRef.current = positionTileLayer; }, [positionTileLayer]);
