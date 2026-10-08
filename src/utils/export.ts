@@ -245,16 +245,47 @@ export function importFromCSV(csv: string): Partial<Marker>[] {
   const lines = csv.split('\n').filter(l => l.trim());
   if (lines.length < 2) return [];
 
+  // RFC-совместимый разбор разделителя ';' с кавычками: имена/комментарии,
+  // содержащие ';' или кавычки, раньше ломали колонки (сдвиг полей).
+  const parseLine = (line: string): string[] => {
+    const out: string[] = [];
+    let cur = '';
+    let inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (inQ) {
+        if (ch === '"') {
+          if (line[i + 1] === '"') { cur += '"'; i++; }
+          else inQ = false;
+        } else cur += ch;
+      } else if (ch === '"') inQ = true;
+      else if (ch === ';') { out.push(cur); cur = ''; }
+      else cur += ch;
+    }
+    out.push(cur);
+    return out;
+  };
+
+  // Число с проверкой: нечисловые значения -> null (ранее parseFloat давал NaN,
+  // который молча попадал в данные маркеров).
+  const numOrNull = (v: string | undefined): number | null => {
+    if (v === undefined || v.trim() === '') return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+
   const markers: Partial<Marker>[] = [];
   for (let i = 1; i < lines.length; i++) {
-    const parts = lines[i].split(';');
+    const parts = parseLine(lines[i]);
     if (parts.length >= 4) {
+      const x = numOrNull(parts[2]);
+      const y = numOrNull(parts[3]);
       markers.push({
         name: parts[1] || `Точка ${i}`,
-        x: parseFloat(parts[2]) || 0,
-        y: parseFloat(parts[3]) || 0,
-        lat: parts[4] ? parseFloat(parts[4]) : null,
-        lon: parts[5] ? parseFloat(parts[5]) : null,
+        x: x ?? 0,
+        y: y ?? 0,
+        lat: numOrNull(parts[4]),
+        lon: numOrNull(parts[5]),
         type: parts[6] || 'default',
         comment: parts[7] || '',
       });

@@ -1657,8 +1657,22 @@ const MapCanvas: React.FC = () => {
         const start = (project.routes || []).find((r) => r.id === activeRouteId)?.points[0]
           || project.markers.find((m) => (m.type as any) === 'start');
         if (start) {
-          const d = distanceBetween({ x: clickedMarker.x, y: clickedMarker.y }, { x: (start as any).x, y: (start as any).y });
-          lines.push(`До старта: ${d >= 1000 ? (d / 1000).toFixed(2) + ' км' : Math.round(d) + ' м'}`);
+          // Расстояние в МЕТРАХ через haversine по гео-координатам. Старый код
+          // считал distanceBetween() по пикселям и подписывал результат «м/км» —
+          // единицы измерения были перепутаны (пиксель ≠ метр).
+          const gStart = project.map?.bounds
+            ? pixelToGeoExact({ x: (start as any).x, y: (start as any).y }, project.map.bounds, project.map.width, project.map.height)
+            : null;
+          if (gStart && isFinite(gStart.lat) && isFinite(geo.lat)) {
+            const R = 6371000;
+            const toRad = (v: number) => (v * Math.PI) / 180;
+            const dLat = toRad(gStart.lat - geo.lat);
+            const dLng = toRad(gStart.lng - geo.lng);
+            const a = Math.sin(dLat / 2) ** 2 +
+              Math.cos(toRad(gStart.lat)) * Math.cos(toRad(geo.lat)) * Math.sin(dLng / 2) ** 2;
+            const d = 2 * R * Math.asin(Math.sqrt(a));
+            lines.push(`До старта: ${d >= 1000 ? (d / 1000).toFixed(2) + ' км' : Math.round(d) + ' м'}`);
+          }
         }
         setPopup({ x: screenX, y: screenY, title: clickedMarker.name || 'Маркер', lines });
       } else {
