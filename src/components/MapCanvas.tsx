@@ -203,6 +203,8 @@ const MapCanvas: React.FC = () => {
   const tileQueueRef = useRef<string[]>([]);
   const activeTilesRef = useRef(0);
   const tileDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Троттлинг обновления координат курсора в сторе (см. handleMouseMove)
+  const lastCursorUpdateRef = useRef(0);
   // pending-загрузки тайлов: url -> промис (дедупликация — один запрос на тайл)
   const tilePending = useRef<Map<string, Promise<void>>>(new Map());
   const [tilesVersion, setTilesVersion] = useState(0);
@@ -1801,7 +1803,14 @@ const MapCanvas: React.FC = () => {
     const screenX = e.clientX - rect.left;
     const screenY = e.clientY - rect.top;
     const mapPoint = screenToMap(screenX, screenY);
-    setCursorPosition(mapPoint);
+    // Троттлинг курсора: set() в сторе на каждый mousemove вызывал ре-рендер
+    // всех подписанных компонентов (StatusBar) — десятки раз в секунду.
+    // Обновляем не чаще ~10 Гц; drag/pan ниже работают без троттлинга.
+    const nowMs = performance.now();
+    if (nowMs - lastCursorUpdateRef.current >= 100) {
+      lastCursorUpdateRef.current = nowMs;
+      setCursorPosition(mapPoint);
+    }
 
     if (isPanningRef.current) {
       const dx = e.clientX - panStartRef.current.x;
