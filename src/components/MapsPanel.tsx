@@ -234,27 +234,10 @@ const MapsPanel: React.FC = () => {
 
         loadActiveTileMap(geoResult, zoom);
 
-        // Фоновая дозагрузка снимка как fallback-растра (не блокирует интерфейс):
-        // применяется только если это всё ещё последний запрос (защита от гонки)
-        // и карта не заменена пользователем. При офлайне шаг просто пропускается.
-        const myReqId = ++loadSeqRef.current;
-        if (navigator.onLine) {
-          loadOSMStaticMap(geoResult, zoom, width, height, osmTileServer)
-            .then((res) => {
-              if (myReqId !== loadSeqRef.current) return; // более свежий запрос уже в полёте
-              const cur = useStore.getState().project.map;
-              if (!cur || !cur.bounds || cur.source !== 'osm') return; // карта заменена
-              void loadMapWithStorage({
-                name: `OpenStreetMap - ${addressInput}`,
-                width,
-                height,
-                dataUrl: res.dataUrl,
-                bounds: res.bounds,
-                source: 'osm',
-              });
-            })
-            .catch(() => { /* активная тайловая карта уже работает — снимок опционален */ });
-        }
+        // Снимок-подложка для OSM НЕ загружается: активная тайловая карта уже
+        // является основной подложкой (как на openstreetmap.org). Фоновый big-PNG
+        // ранее перезаписывал виртуальный растр и сбивал вид при каждом открытии —
+        // именно это делало карту «невидимой» после панорамирования/зума.
 
         // Привязка уже установлена loadActiveTileMap (точная Mercator); setMapBounds
         // здесь не нужен — иначе стёр бы bounds до прихода фонового снимка.

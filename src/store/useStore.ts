@@ -4,7 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 import type { Project, Marker, Restriction, Layer, Tool, ViewState, MapData, Point, CalibrationPoint, MapBounds, Route, RoutePoint } from '../types';
 import { MAX_ROUTES } from '../types';
 import { saveMapToIndexedDB, loadMapFromIndexedDB, deleteMapFromIndexedDB } from '../utils/storage';
-import { geoToPixelFromBounds, calculateBoundsFromCenter, latToMercatorY } from '../utils/googleMaps';
+import { geoToPixelFromBounds, calculateBoundsFromCenter, latToMercatorY, mercatorYToLat } from '../utils/googleMaps';
 import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, smoothPolyline, routeLengthM } from '../utils/routing';
 import type { RouteShape, RangeLimitMode, ImportPoint, ImportLists } from '../types';
 
@@ -1103,16 +1103,28 @@ export const useStore = create<AppState>()(
        */
       loadActiveTileMap: (center, zoom) => {
         const z = Math.max(MIN_MAP_ZOOM_FLOOR, Math.min(19, Math.round(zoom)));
+        // ── Эталонная привязка «как на openstreetmap.org» ─────────────────────
+        // Виртуальный растр строится по FULL-меркаторовой сетке уровня z:
+        //   width = height = 256·2^z, pixel(x,y) ⇔ tile(x/256, y/256).
+        // Bounds — ровно видимое окно этого растра вокруг центра. Благодаря этому
+        // ЛЮБОЙ пиксель карты (маршруты, зоны, маркеры, клик, попапы) имеет
+        // однозначную географическую привязку даже после панорамирования ЗА
+        // пределы начального окна — объекты больше не «уезжают» от подложки.
         const worldPx = 256 * Math.pow(2, z);
-        const b = calculateBoundsFromCenter(center, z, worldPx, worldPx);
-        const mapW = Math.round(worldPx * ((b.east - b.west) / 360));
-        const topY = latToMercatorY(b.north);
-        const botY = latToMercatorY(b.south);
-        const mapH = Math.max(1, Math.round(worldPx * (botY - topY)));
+        const fx = (center.lng + 180) / 360;               // mercator-доля мира по X
+        const fy = latToMercatorY(center.lat);              // mercator-доля мира по Y
+        const x0 = fx * worldPx - worldPx / 2;              // левый край окна (world px)
+        const y0 = fy * worldPx - worldPx / 2;              // верхний край окна (world px)
+        const b: MapBounds = {
+          west: ((x0 / worldPx) * 360) - 180,
+          east: (((x0 + worldPx) / worldPx) * 360) - 180,
+          north: mercatorYToLat(y0 / worldPx),
+          south: mercatorYToLat((y0 + worldPx) / worldPx),
+        };
         const mapData: MapData = {
           name: `Активная карта: ${center.lat.toFixed(5)}, ${center.lng.toFixed(5)} (z${z})`,
-          width: mapW,
-          height: mapH,
+          width: worldPx,   // full-меркаторов мир уровня z — строгая привязка координат
+          height: worldPx,
           dataUrl: '', // без фотографии — подложка грузится тайлами динамически
           bounds: b,
           source: 'osm',
