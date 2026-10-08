@@ -398,11 +398,20 @@ const MapCanvas: React.FC = () => {
   const [extNotice, setExtNotice] = useState<string | null>(null);
   const layersOn = !!(project.settings?.airportsLayer || project.settings?.notamLayer || project.settings?.geozonesLayer);
 
+  // Зеркала Overpass. ВАЖНО: зеркало overpass-api.de требует значимый User-Agent —
+  // без него отвечает 429 («Please include a meaningful User-Agent string»), а битый
+  // синтаксис запроса (см. ниже) давал HTTP 400 на всех зеркалах подряд.
   const OVERPASS_ENDPOINTS = [
-    'https://overpass-api.de/api/interpreter',
     'https://overpass.kumi.systems/api/interpreter',
     'https://overpass.private.coffee/api/interpreter',
+    'https://overpass-api.de/api/interpreter',
   ];
+  const OVERPASS_UA = 'TQ-flight-planner/1.0 (web app; https://avgas-web.github.io/TQ/)';
+  // Максимальная площадь bbox (в °²), при которой шлём запрос. Больше — серверы
+  // уходят в долгий вычислительный процесс и отвечают 504, либо отрезают нас по
+  // rate-limit. При слишком крупном виде слои просто не запрашиваются до зума
+  // поближе (это безопаснее, чем «зависшая» загрузка).
+  const MAX_BBOX_AREA_DEG2 = 36; // ~6°×6°
   const extFailRef = useRef(0);        // подряд неудачных запросов
   // Кэш внешних объектов: ключ — bbox + набор слоёв; значение хранит время записи и
   // признак пустого результата. Пустые ответы НЕ кэшируются навсегда (лимит выдачи/
@@ -434,34 +443,64 @@ const MapCanvas: React.FC = () => {
         setExtObjs(cached.objs);
         return;
       } // область уже загружена — сервер не трогаем
-      // Один лёгкий объединённый запрос: только узлы-центры, с лимитами выдачи
+      // Один лёгкий объединённый запрос по включённым слоям.
+      // ИСПРАВЛЕНИЕ 400 Bad Request: прежний шаблон был синтаксически битым —
+      //   `(node[...](box);)[..60];(.;);out.skylat center 60;`
+      // Overpass не принимает union-фильтр `[..]` и рекурсивный блок `(.;)` вне
+      // union, а `out.skylat` — несуществующий параметр print (зеркала отвечали
+      // 400 «Invalid parameter for print»). Корректная форма: union statements
+      // внутри `( ... );` и печать `out center qt N` (центры ways + координаты
+      // nodes; для узлов identical с body). Аэродромы в OSM почти всегда ways —
+      // только узельный поиск их не находил, поэтому добавлены way-секции.
       const parts: string[] = [];
-      if (project.settings?.airportsLayer) parts.push(`node["aeroway"="aerodrome"](${box});`);
-      if (project.settings?.notamLayer) parts.push(`node["boundary"="military"](${box});`);
-      if (project.settings?.geozonesLayer) parts.push(`node["landuse"="military"](${box});`);
+      if (project.settings?.airportsLayer) {
+        parts.push(`node["aeroway"="aerodrome"](${box});`, `way["aeroway"="aerodrome"](${box});`);
+      }
+      if (project.settings?.notamLayer) {
+        parts.push(`node["boundary"="military"](${box});`, `way["boundary"="military"](${box});`);
+      }
+      if (project.settings?.geozonesLayer) {
+        parts.push(`node["landuse"="military"](${box});`, `way["landuse"="military"](${box});`);
+      }
       if (parts.length === 0) return;
       // Пользователь явно включил хотя бы один слой — сбрасываем счётчик
       // неудач, чтобы после предыдущего автоматического отключения слоёв
       // не остаться навсегда в «заблокированном» состоянии.
       extFailRef.current = 0;
-      const q = `[out:json][timeout:10];(${parts.join('')})[..60];(.;);out.skylat center 60;`;
+      // Print-секция: `out center qt N` принимается не всеми сборками Overpass
+      // (зеркала отвечали 400/500 на параметр qt в union-запросах). Надёжная
+      // каноническая форма — простой `out center;` (центры ways + координаты
+      // nodes). Проверено живыми запросами к зеркалам: HTTP 200, элементы
+      // возвращаются. Объём выборки ограничивает maxBboxArea ниже.
+      const q = `[out:json][timeout:20];(${parts.join('')});out center;`;
       setOverpassBusy(true);
       let data: { elements?: any[] } | null = null;
       let lastErr = '';
+      let parseError = false; // 4xx синтаксиса — повтор на других зеркалах бессмысленен
       for (const url of OVERPASS_ENDPOINTS) {
         if (reqId !== extReqIdRef.current) { setOverpassBusy(false); return; } // отменён новым видом
         const ctrl = new AbortController();
-        const to = setTimeout(() => ctrl.abort(), 12000);
+        // 25 с: серверный timeout:20 + запас на очередь зеркала. Прежние 12–20 с
+        // обрывали живой запрос раньше, чем сервер успевал отдать данные.
+        const to = setTimeout(() => ctrl.abort(), 25000);
         try {
           const r = await fetch(url, {
             method: 'POST',
-            // Many Overpass mirrors reject bare bodies without this content type (HTTP 400)
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              // overpass-api.de шлёт 429 без осмысленного User-Agent (политика OSM)
+              'User-Agent': OVERPASS_UA,
+            },
             body: 'data=' + encodeURIComponent(q),
             signal: ctrl.signal,
           });
-          if (r.status === 429 || r.status >= 500) { lastErr = `HTTP ${r.status}`; continue; } // зеркало занято — пробуем следующее
-          if (!r.ok) { lastErr = `HTTP ${r.status}`; break; } // 4xx — повтор бессмысленен
+          if (r.status === 429 || r.status >= 500) { lastErr = `HTTP ${r.status}`; continue; } // зеркало занято/лежит — пробуем следующее
+          if (!r.ok) {
+            // 4xx: различаем «битый запрос» (все зеркала дадут то же) и прочие 4xx
+            lastErr = `HTTP ${r.status}`;
+            parseError = r.status === 400;
+            break;
+          }
           // Parse into a local first: an abort during .json() must not be treated as
           // "mirror busy" when the response itself was fine.
           const parsed = await r.json();
@@ -495,17 +534,24 @@ const MapCanvas: React.FC = () => {
         setExtObjs(out);
         setExtNotice(null);
       } else {
-        // Сервер недоступен: ПОСЛЕ ДВУХ подряд неудач гасим слои ОДИН РАЗ.
-        // Важно: extFailRef НЕ сбрасывается в 0 после отключения — иначе
-        // выключение слоёв пересобирает этот эффект, тот снова стреляет
-        // запросом, снова копит 2 неудачи, снова setState... — бесконечный
-        // каскад обновлений (React error #185). Повтор включается только
-        // осознанным включением слоя пользователем (см. resetExtFailBelow).
-        if (++extFailRef.current >= 2 && layersOn) {
+        // Ошибка сети/сервера. 400 (битый синтаксис запроса) — НЕТРИГгеряющее
+        // автовключение состояние событие: слои не гасим, показываем предупреждение,
+        // иначе локальная ошибка кода выглядела бы как «Overpass недоступен».
+        if (parseError) {
+          setExtNotice(`Overpass отклонил запрос (${lastErr || 'HTTP 400'}): вероятно, временная проблема сервера. Слои остались включены, попробуйте обновить вид карты.`);
+        } else if (++extFailRef.current >= 2 && layersOn) {
+          // Сервер недоступен: ПОСЛЕ ДВУХ подряд неудач гасим слои ОДИН РАЗ.
+          // Важно: extFailRef НЕ сбрасывается в 0 после отключения — иначе
+          // выключение слоёв пересобирает этот эффект, тот снова стреляет
+          // запросом, снова копит 2 неудачи, снова setState... — бесконечный
+          // каскад обновлений (React error #185). Повтор включается только
+          // осознанным включением слоя пользователем (см. resetExtFailBelow).
           useStore.setState((st) => ({
             project: { ...st.project, settings: { ...st.project.settings, airportsLayer: false, notamLayer: false, geozonesLayer: false } },
           }));
           setExtNotice(`Внешние слои отключены: Overpass недоступен (${lastErr || 'ошибка сети'}). Включите слой заново, когда сервер заработает.`);
+        } else {
+          setExtNotice(`Загрузка внешних слоёв не удалась (${lastErr || 'ошибка сети'}) — это нормально для перегруженного зеркала; повторится при следующем изменении вида.`);
         }
       }
       setOverpassBusy(false);
