@@ -18,6 +18,10 @@ const ROUTE_PALETTE = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#
 
 /** Нативный max zoom тайловых серверов (выше НЕ поднимаемся — нет данных, только растяжение) */
 const NATIVE_MAX_BY_SERVER: Record<string, number> = { osm: 19, carto: 18, opentopomap: 17 };
+// Параметры аккуратной очереди загрузки тайлов (как на openstreetmap.org):
+// максимум параллельных загрузок и дебаунс новых волн во время жеста.
+const MAX_PARALLEL = 6;
+const TILE_DEBOUNCE_MS = 150;
 
 /**
  * ЕДИНАЯ инвариантная привязка вида «экран ↔ география» (Web Mercator EPSG:3857).
@@ -145,17 +149,6 @@ function clampZoom(z: number): number {
   return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
 }
 
-/**
- * Приоритет тайла в очереди загрузки: расстояние от его индексов до центра
- * экрана в тайлах текущего уровня (URL вида .../{z}/{x}/{y}.png или .../z/x/y.png).
- */
-function tileDistFrom(url: string, cxw: number, cyw: number): number {
-  const m = url.match(/\/(\d+)\/(\d+)(?:\.png)?$/);
-  if (!m) return 0;
-  const tx = parseInt(m[2], 10), ty = parseInt(m[3], 10);
-  return Math.hypot(tx + 0.5 - cxw, ty + 0.5 - cyw);
-}
-
 /** Подпись «1 см на экране = N м» при текущем масштабе (96 css px = 2.54 см) */
 function rulerScaleText(mpp: number): string {
   const m1cm = mpp * (2.54 / 96) * 100; // метров в 1 см экрана
@@ -200,6 +193,14 @@ const MapCanvas: React.FC = () => {
   const [popup, setPopup] = useState<{ x: number; y: number; title: string; lines: string[] } | null>(null);
   // Кэш тайлов подложки: url -> изображение (или undefined при ошибке)
   const tileCache = useRef<Map<string, HTMLImageElement | undefined>>(new Map());
+  // DOM-слой подложки OSM (как на openstreetmap.org): настоящие <img>-тайлы в
+  // <div>-обёртке ПОД canvas. Canvas рисует поверх них маршруты, зоны, маркеры и
+  // прочие объекты по той же Mercator-привязке — привязка строгая и общая.
+  const tileLayerRef = useRef<HTMLDivElement>(null);
+  const tileElsRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  // Актуальная ссылка на функцию позиционирования DOM-слоя тайлов — вызывается
+  // из rAF-подписчика на viewState (объявлена ниже через useCallback).
+  const tileLayerPositionRef = useRef<() => void>(() => {});
   // LRU-размер кэша тайлов: Map сохраняет порядок вставки — при переполнении
   // удаляем самые старые записи, иначе при длительной работе накапливаются
   // тысячи HTMLImageElement (утечка памяти).
@@ -258,6 +259,11 @@ const MapCanvas: React.FC = () => {
     const unsub = useStore.subscribe((s) => {
       if (s.viewState === viewRef.current) return;
       viewRef.current = s.viewState;
+      // Подложка OSM — DOM-слой: его позиция обновляется напрямую без
+      // React-рендера (как на openstreetmap.org). Функция объявлена ниже через
+      // useCallback — берём актуальную ссылку из ref, чтобы не создавать
+      // цикл зависимостей и не терять вызов при HMR.
+      tileLayerPositionRef.current?.();
       if (raf) return; // уже запланировано — не плодим рендеры (троттлинг до 1/кадр)
       raf = requestAnimationFrame(() => { raf = 0; setRenderTick((t) => t + 1); });
     });
@@ -283,104 +289,157 @@ const MapCanvas: React.FC = () => {
   // уровня round(zoom), но рисуются в масштабе 2^(zoom-level) — плавное
   // масштабирование без «прыжков» между уровнями.
   const contZoom = clampZoom(zoomAtWorldPx(worldPx));
-  const tileLevelQ = Math.round(contZoom);
 
-  // Стабильные примитивы для эффекта загрузки тайлов: сам viewState меняется на
-  // каждом движении мыши — подписывать эффект на весь объект нельзя (шторм запросов).
-  const offXq = Math.round(vs.offsetX / 24);
-  const offYq = Math.round(vs.offsetY / 24);
-  const zoomQ = tileLevelQ;
-  const kxq = Math.round(canvasSize.width / 96);
-  const kyq = Math.round(canvasSize.height / 96);
+
   const boundsRef = project.map?.bounds;
 
-  useEffect(() => {
-    if (!tilesEnabled || !boundsRef) return;
-    const vcur = viewRef.current; // актуальный вид (не из рендер-замыкания — эффект читает ref)
+  // ─── DOM-слой подложки OSM («как на openstreetmap.org») ────────────────────
+  // Подложка — настоящие <img>-тайлы внутри абсолютно спозиционированного div
+  // ПОД canvas. Позиция слоя обновляется напрямую через transform в rAF
+  // (без React-рендера и без перерисовки тысяч тайлов на канвасе). Объекты
+  // (маршруты, зоны, маркеры) рисуются canvas-слоем поверх по ТОЙ ЖЕ формуле
+  // привязки worldPx = offsetY + lngFrac·worldPx — поэтому они жёстко
+  // «приклеены» к географическим координатам подложки.
+  const positionTileLayer = useCallback(() => {
+    const el = tileLayerRef.current;
+    if (!el) return;
+    const v = viewRef.current;
     const cs = canvasSizeRef.current;
-    // ЕДИНАЯ привязка: zoom = z0 + log2(scale); worldPx = canvasHeight·2^zoom.
-    const wpView = worldPxOf(cs.height, vcur.scale, vcur.z0 ?? ZOOM_REF);
-    const zoom = Math.round(clampZoom(zoomAtWorldPx(wpView))); // уровень тайлов = round(непрерывного зума)
-    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[tileServer] ?? MAX_ZOOM);
-    const zClamped = Math.max(MIN_ZOOM, Math.min(nativeMax, zoom));
-    const n = Math.pow(2, zClamped);
-    // World-пиксели ВЫБРАННОГО уровня тайлов: xWorld = offsetX + lngFrac·wpz
-    const wpz = cs.height * Math.pow(2, zClamped);
-    const x0 = ((0 - vcur.offsetX) / wpz) * n;
-    const x1 = ((cs.width - vcur.offsetX) / wpz) * n;
-    const y0 = ((0 - vcur.offsetY) / wpz) * n;
-    const y1 = ((cs.height - vcur.offsetY) / wpz) * n;
-    const txMin = Math.floor(x0), txMax = Math.floor(x1);
-    const tyMin = Math.floor(y0), tyMax = Math.floor(y1);
+    const tilesOn = !!useStore.getState().project.settings?.tilesEnabled &&
+      !!useStore.getState().project.map?.bounds;
+    if (!tilesOn || cs.height <= 0) { el.style.display = 'none'; return; }
+    const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
+    const zoom = clampZoom(zoomAtWorldPx(wp));
+    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[(useStore.getState().project.openStreetMap?.tileServer as any) || 'osm'] ?? MAX_ZOOM);
+    const level = Math.max(MIN_ZOOM, Math.min(nativeMax, Math.round(zoom)));
+    const n = Math.pow(2, level);
+    // CSS-px на тайл: world-пиксели ВЫБРАННОГО уровня / 2^level (уровень может быть
+    // ограничен nativeMax при зуме за пределы нативных тайлов сервера)
+    const tileCss = (cs.height * Math.pow(2, level)) / n;
+    el.style.display = '';
+    el.style.width = `${cs.width}px`;
+    el.style.height = `${cs.height}px`;
+    void wp;
+    // Единый transform для всех детей: origin (0,0), сдвиг на offset, масштаб
+    // относительно мира уровня level (origin смещён так, чтобы tx=ty=0 попал в offsetX/Y).
+    el.style.transformOrigin = '0 0';
+    el.style.transform = `translate(${v.offsetX}px, ${v.offsetY}px) scale(${tileCss / 256})`;
+  }, []);
+  // Обновляем ссылку для rAF-подписчика на viewState (см. useEffect выше)
+  useEffect(() => { tileLayerPositionRef.current = positionTileLayer; }, [positionTileLayer]);
+
+  /** Синхронизация набора <img> в DOM-слое с видимой областью текущего вида.
+   *  Загрузка — аккуратной очередью (дедупликация pending, лимит параллельных,
+   *  приоритет тайлов от центра экрана, дебаунс во время жеста), как на osm.org. */
+  const syncTileDom = useCallback(() => {
+    const el = tileLayerRef.current;
+    if (!el) return;
+    const st = useStore.getState();
+    const mapBounds = st.project.map?.bounds;
+    const tilesOn = !!st.project.settings?.tilesEnabled && !!mapBounds;
+    if (!tilesOn || !mapBounds) {
+      for (const img of tileElsRef.current.values()) img.remove();
+      tileElsRef.current.clear();
+      return;
+    }
+    const v = viewRef.current;
+    const cs = canvasSizeRef.current;
+    if (cs.height <= 0) return;
+    const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
+    const zoom = clampZoom(zoomAtWorldPx(wp));
+    const server = (st.project.openStreetMap?.tileServer as any) || 'osm';
+    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[server] ?? MAX_ZOOM);
+    const level = Math.max(MIN_ZOOM, Math.min(nativeMax, Math.round(zoom)));
+    const n = Math.pow(2, level);
+    // World-пиксели ВЫБРАННОГО уровня: та же формула привязки, что у объектов
+    const wpz = cs.height * Math.pow(2, level);
+    const fx0 = (0 - v.offsetX) / wpz, fx1 = (cs.width - v.offsetX) / wpz;
+    const fy0 = (0 - v.offsetY) / wpz, fy1 = (cs.height - v.offsetY) / wpz;
+    const txMin = Math.floor(fx0), txMax = Math.floor(fx1);
+    const tyMin = Math.floor(Math.max(0, fy0)), tyMax = Math.floor(Math.min(n - 1, fy1));
+    const keep = new Set<string>();
     const urls: string[] = [];
-    let budget = 512; // видимая область ≈ (w/256+2)×(h/256+2) тайлов; лимит — только против аномалий
+    let budget = 900; // защита от аномальных видов
     for (let tx = txMin; tx <= txMax && budget > 0; tx++) {
       for (let ty = tyMin; ty <= tyMax && budget > 0; ty++) {
         if (tx < 0 || ty < 0 || tx >= n || ty >= n) continue;
         budget--;
-        const url = getOSMTileUrl(zClamped, tx, ty, tileServer, tileStyle);
-        if (!tileCache.current.has(url)) urls.push(url);
+        const url = getOSMTileUrl(level, tx, ty, server, 'scheme');
+        keep.add(url);
+        if (tileElsRef.current.has(url)) continue;
+        const img = document.createElement('img');
+        img.alt = '';
+        img.decoding = 'async';
+        img.draggable = false;
+        img.style.position = 'absolute';
+        // Слой масштабируется scale(tileCss/256), поэтому дети позиционируются в
+        // координатах «мировых пикселей уровня»: x = tx·256, y = ty·256.
+        img.style.left = `${tx * 256}px`;
+        img.style.top = `${ty * 256}px`;
+        img.style.width = '256px';
+        img.style.height = '256px';
+        // Позиция известна сразу — запоминаем её на элементе для очереди загрузки
+        (img as any).__tilePos = true;
+        el.appendChild(img);
+        tileElsRef.current.set(url, img);
+        if (!tilePending.current.has(url) && !tileCache.current.has(url)) urls.push(url);
       }
     }
-    if (urls.length === 0) return;
-    // УПРОЩЁННАЯ щадящая загрузка тайлов (минимальная нагрузка на OSM-серверы):
-    // 1) Дедупликация: тайл, уже в работе (pending или в кэше), никогда не
-    //    запрашивается повторно — ни одно движение мыши не создаёт лишнего трафика.
-    // 2) При быстро сменяющемся виде (зум/перетаскивание) новые волны НЕ стартуют
-    //    немедленно: они откладываются дебаунсом на 400 мс. В итоге во время жеста
-    //    к серверу не уходит НИ одного запроса — загружается только финальный вид.
-    //    Это устраняет и шторм запросов, и «зависание» при загрузке большой карты.
-    // 3) Жёсткий лимит: максимум 3 одновременные загрузки (браузер даёт ~6
-    //    соединений на хост; половина оставляется свободной, чтобы UI-запросы
-    //    — geocoding/маршруты — не ждали своей очереди за сотнями тайлов).
-    // 4) Загруженные тайлы остаются в кэше навсегда: повторный визит в область
-    //    не порождает обращений к серверу вообще.
-    const MAX_PARALLEL = 6; // как на openstreetmap.org: a/b/c-поддомены × HTTP/2 — быстрая первая загрузка
-    const DEBOUNCE_MS = 150;
-    const toLoad = urls.filter((u) => !tilePending.current.has(u) && !tileCache.current.has(u));
-    if (toLoad.length === 0) return;
-    // Приоритет ближних к центру экрана тайлов — карта «проявляется» из центра,
-    // как на osm.org, а не серыми квадратами до ожидания всей очереди.
-    const cxw = ((canvasSize.width / 2 - viewRef.current.offsetX) / Math.max(1, worldPx)) * Math.pow(2, zoomQ);
-    const cyw = ((canvasSize.height / 2 - viewRef.current.offsetY) / Math.max(1, worldPx)) * Math.pow(2, zoomQ);
-    toLoad.sort((a, b) => {
-      const da = tileDistFrom(a, cxw, cyw), db = tileDistFrom(b, cxw, cyw);
-      return da - db;
-    });
-    // Аккуратная очередь: дополняем существующую, не плодя параллельных воркеров
-    for (const u of toLoad) tileQueueRef.current.push(u);
-    const pump = (): void => {
-      while (activeTilesRef.current < MAX_PARALLEL && tileQueueRef.current.length > 0) {
-        const u = tileQueueRef.current.shift()!;
-        if (tilePending.current.has(u) || tileCache.current.has(u)) continue;
-        activeTilesRef.current++;
-        const p = loadTileImage(u, 10000) // таймаут: зависший тайл не блокирует очередь
-          .then((img) => {
-            tileCache.current.set(u, img || undefined);
-            if (tileCache.current.size > TILE_CACHE_MAX) {
-              const firstKey = tileCache.current.keys().next().value as string | undefined;
-              if (firstKey !== undefined) tileCache.current.delete(firstKey);
-            }
-          })
-          .finally(() => {
-            tilePending.current.delete(u);
-            activeTilesRef.current--;
-            setTilesVersion((t2) => t2 + 1); // карта «проявляется» по мере готовности тайлов
-            pump();
-          });
-        tilePending.current.set(u, p);
-      }
-      // Если очередь опустела, но pending ещё есть — дождёмся и продолжим сами
-      // (каждый .finally вызывает pump), отдельный планировщик не нужен.
-    };
-    if (tileDebounceRef.current) clearTimeout(tileDebounceRef.current);
-    // Если в данный момент ничего не грузится — стартуем сразу (первая загрузка
-    // карты не должна ждать лишних 400 мс); иначе — ждём окончания жеста.
-    const idle = activeTilesRef.current === 0 && tilePending.current.size === 0;
-    tileDebounceRef.current = setTimeout(pump, idle ? 0 : DEBOUNCE_MS);
-    setTilesVersion((t2) => t2 + 1);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tilesEnabled, tileStyle, tileServer, offXq, offYq, zoomQ, kxq, kyq, boundsRef]);
+    // Удаляем тайлы вне видимой области (экономим DOM и память)
+    for (const [url, img] of tileElsRef.current) {
+      if (!keep.has(url)) { img.remove(); tileElsRef.current.delete(url); }
+    }
+    positionTileLayer();
+
+    // ── Очередь загрузки недостающих <img> ──
+    if (urls.length > 0) {
+      // Приоритет ближних к центру экрана — карта «проявляется» из центра, как на osm.org
+      const cxw = (cs.width / 2 - v.offsetX) / wpz, cyw = (cs.height / 2 - v.offsetY) / wpz;
+      const distOf = (u: string): number => {
+        const img = tileElsRef.current.get(u);
+        if (!img) return 0;
+        const x = parseFloat(img.style.left) / 256, y = parseFloat(img.style.top) / 256;
+        return (x - cxw) ** 2 + (y - cyw) ** 2;
+      };
+      urls.sort((a, b) => distOf(a) - distOf(b));
+      for (const u of urls) tileQueueRef.current.push(u);
+      const pump = (): void => {
+        while (activeTilesRef.current < MAX_PARALLEL && tileQueueRef.current.length > 0) {
+          const u = tileQueueRef.current.shift()!;
+          const imgEl = tileElsRef.current.get(u);
+          // Тайл больше не виден (ушёл с экрана) или уже загружен — пропускаем без запроса
+          if (!imgEl || tilePending.current.has(u) || tileCache.current.has(u)) continue;
+          activeTilesRef.current++;
+          const p = loadTileImage(u, 10000) // таймаут: зависший тайл не блокирует очередь
+            .then((loaded) => {
+              tileCache.current.set(u, loaded || undefined);
+              if (tileCache.current.size > TILE_CACHE_MAX) {
+                const firstKey = tileCache.current.keys().next().value as string | undefined;
+                if (firstKey !== undefined) tileCache.current.delete(firstKey);
+              }
+              if (loaded && tileElsRef.current.get(u) === imgEl) imgEl.src = u;
+            })
+            .finally(() => {
+              tilePending.current.delete(u);
+              activeTilesRef.current--;
+              setTilesVersion((t2) => t2 + 1);
+              pump();
+            });
+          tilePending.current.set(u, p);
+        }
+      };
+      if (tileDebounceRef.current) clearTimeout(tileDebounceRef.current);
+      // Первая загрузка (покой) — старт немедленно; во время жеста — дебаунс,
+      // чтобы быстро сменяемый вид не плодил лишних запросов к серверу.
+      const idle = activeTilesRef.current === 0 && tilePending.current.size === 0;
+      tileDebounceRef.current = setTimeout(pump, idle ? 0 : TILE_DEBOUNCE_MS);
+    }
+  }, [positionTileLayer]);
+
+  // Пересинхронизация DOM-слоя при смене вида (rAF-троттлинг), карты и настроек
+  useEffect(() => {
+    syncTileDom();
+  }, [renderTick, tilesEnabled, tileServer, project.map?.bounds, canvasSize, syncTileDom]);
 
   // Геолокация пользователя (по требованию — кнопка 📍)
   const locateUser = useCallback(() => {
@@ -638,12 +697,18 @@ const MapCanvas: React.FC = () => {
       centerLatRef = mercToLat(topM + ((botM - topM) / project.map.height) * Math.max(0, Math.min(project.map.height, cyMapPx)));
     }
 
-    // Clear
-    ctx.fillStyle = '#0f1729';
-    ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
+    // Clear: при активной подложке OSM canvas ПРОЗРАЧЕН — сквозь него виден
+    // DOM-слой тайлов (подложка как на openstreetmap.org), а объекты рисуются
+    // поверх. Без подложки — классический непрозрачный фон + растр fallback.
+    const tilesActiveNow = !!project.settings?.tilesEnabled && !!project.map?.bounds;
+    if (tilesActiveNow) {
+      ctx.clearRect(0, 0, canvasSize.width, canvasSize.height);
+    } else {
+      ctx.fillStyle = '#0f1729';
+      ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
+    }
 
-    const tilesOnNow = !!project.settings?.tilesEnabled && !!project.map?.bounds;
-    if (!project.map || (!mapImageRef.current && !tilesOnNow)) {
+    if (!project.map || (!mapImageRef.current && !tilesActiveNow)) {
       // No map - draw placeholder (fallback-состояние без тайловой подложки)
       ctx.fillStyle = '#1a2744';
       ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
@@ -657,11 +722,10 @@ const MapCanvas: React.FC = () => {
       return;
     }
 
-    // Draw map: тайловая подложка (активная карта) или загруженный растр как fallback-картинка
-    const tilesOn = tilesOnNow;
-    if (tilesOn && project.map?.bounds) {
-      drawTiles(ctx);
-    } else if (mapImageRef.current) {
+    // Draw map: подложка OSM — DOM-слой (см. syncTileDom), canvas прозрачен и
+    // рисует поверх неё ТОЛЬКО объекты. Растровая карта (Google/Yandex/local) —
+    // рисуется на canvas, когда тайловая подложка выключена.
+    if (!tilesActiveNow && mapImageRef.current) {
       ctx.save();
       ctx.translate(vs.offsetX, vs.offsetY);
       ctx.scale(vs.scale, vs.scale);
@@ -669,62 +733,8 @@ const MapCanvas: React.FC = () => {
       // при уменьшении — сглаженная. Canvas физически рендерится в dpr-разрешении.
       ctx.imageSmoothingEnabled = vs.scale < 1;
       if (ctx.imageSmoothingEnabled) (ctx as any).imageSmoothingQuality = 'high';
-      ctx.drawImage(mapImageRef.current, 0, 0, project.map.width, project.map.height);
+      ctx.drawImage(mapImageRef.current, 0, 0, project.map!.width, project.map!.height);
       ctx.restore();
-    }
-
-    function drawTiles(g: CanvasRenderingContext2D) {
-      // Строгая Mercator-привязка тайлов к карте проекта: тот же bounds и та же формула,
-      // что используют маркеры/маршруты → привязка координат соблюдается автоматически.
-      const map = project.map!;
-      const bounds = map.bounds!;
-      const topM = latToMerc(bounds.north);
-      const botM = latToMerc(bounds.south);
-      // НЕПРЕРЫВНЫЙ зум как на openstreetmap.org: уровень тайлов = round(непрерывного
-      // zoom), но рисуем их в масштабе 2^(zoom-level) — плавное масштабирование без
-      // «прыжков» между целыми уровнями. Всё через ЕДИНУЮ инвариантную привязку
-      // worldPx = canvasHeight·2^zoom (X и Y — одна формула, расхождений нет).
-      // world-привязка (см. комментарий выше): X и Y — одна формула worldPx,
-      // mercator-доли растра map.width×map.height покрывают bounds карты.
-      const nativeMaxT = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[(project.openStreetMap?.tileServer as any) || 'osm'] ?? MAX_ZOOM);
-      const zoom = Math.max(MIN_ZOOM, Math.min(nativeMaxT, clampZoom(zoomAtWorldPx(worldPx))));
-      const level = Math.round(zoom);
-      const n = Math.pow(2, level);
-      const tilePx = worldPx / n; // экранных px на тайл ВЫБРАННОГО уровня (при отрисовке масштабируется)
-      void map;
-      const server = (project.openStreetMap?.tileServer as any) || 'osm';
-      const style: 'scheme' = 'scheme';
-      // Границы видимой области — из той же привязки, что и позиции тайлов (без обратной
-      // конвертации через широту: floor() по mercator-долям напрямую, точность не теряется)
-      const fx0 = (0 - vs.offsetX) / worldPx;          // доля мира [0..1] левого края экрана
-      const fx1 = (canvasSize.width - vs.offsetX) / worldPx;
-      const fy0 = (0 - vs.offsetY) / worldPx;
-      const fy1 = (canvasSize.height - vs.offsetY) / worldPx;
-      const txMin = Math.floor(fx0 * n), txMax = Math.floor(fx1 * n);
-      const tyMin = Math.floor(Math.max(0, fy0 * n)), tyMax = Math.floor(Math.min(n - 1, fy1 * n));
-      g.save();
-      g.fillStyle = '#1a2744';
-      for (let tx = txMin; tx <= txMax; tx++) {
-        for (let ty = tyMin; ty <= tyMax; ty++) {
-          if (tx < 0 || ty < 0 || tx >= n || ty >= n) continue;
-          // позиция левого верхнего угла тайла: worldFrac·worldPx + offset — ровно та же
-          // формула, что у объектов (строго централизованная привязка координат)
-          const scrXTile = vs.offsetX + (tx / n) * worldPx;
-          const scrY = vs.offsetY + (ty / n) * worldPx;
-          const url = getOSMTileUrl(level, tx, ty, server, style);
-          const img = tileCache.current.get(url);
-          if (img) {
-            // Плавный субпиксельный размер: tilePx уже учитывает несоответствие
-            // непрерывного zoom целому уровню (2^(zoom-level) ≠ 1) — карта
-            // масштабируется непрерывно, как на osm.org.
-            g.drawImage(img, scrXTile, scrY, tilePx + 0.5, tilePx + 0.5);
-          } else if (img === undefined) {
-            g.fillRect(scrXTile, scrY, tilePx, tilePx);
-          }
-        }
-      }
-      void topM; void botM; void bounds;
-      g.restore();
     }
 
     // Draw restrictions
@@ -1827,6 +1837,15 @@ const MapCanvas: React.FC = () => {
 
   return (
     <div id="map-container" ref={containerRef} className="relative w-full h-full overflow-hidden bg-[#0f1729]">
+      {/* Подложка OSM: DOM-слой настоящих <img>-тайлов (как на openstreetmap.org),
+          positioned под canvas. Позиция/набор тайлов обновляются напрямую через
+          transform/syncTileDom без React-рендера; pointer-events отключены — все
+          события мыши принимает canvas поверх. */}
+      <div
+        ref={tileLayerRef}
+        aria-hidden="true"
+        style={{ position: 'absolute', top: 0, left: 0, overflow: 'hidden', transformOrigin: '0 0', pointerEvents: 'none', zIndex: 0 }}
+      />
       <canvas
         ref={canvasRef}
         style={{
@@ -1834,6 +1853,7 @@ const MapCanvas: React.FC = () => {
           height: `${canvasSize.height}px`,
           cursor: cursorStyle,
           touchAction: 'none',
+          zIndex: 1,
         }}
         className="absolute inset-0"
         role="application"
