@@ -73,11 +73,13 @@ const ActionModePanel: React.FC = () => {
     return out;
   };
 
-  /** Геокодинг названия через OSM Nominatim */
+  /** Геокодинг названия через OSM Nominatim.
+   *  Интервал ≥1 с между запросами обеспечивается очередью внутри osmGeocode —
+   *  здесь достаточно последовательного await без дополнительных задержек. */
   const geocodePlace = async (placeName: string): Promise<{ lat: number; lng: number } | null> => {
     try {
-      const geo = await osmGeocode(placeName);
-      return geo && isValidGeo(geo) ? geo : null;
+      const res = await osmGeocode(placeName);
+      return res.point && isValidGeo(res.point) ? res.point : null;
     } catch {
       return null;
     }
@@ -183,9 +185,10 @@ const ActionModePanel: React.FC = () => {
     if (!text) throw new Error('Пустой ввод');
     const direct = parseCoordinatesString(text);
     if (direct) return direct;
-    const geo = await osmGeocode(text);
-    if (geo && isValidGeo(geo)) return geo;
-    throw new Error(`Не удалось определить координаты: «${text}»`);
+    const res = await osmGeocode(text);
+    if (res.point && isValidGeo(res.point)) return res.point;
+    if (res.kind === 'not_found') throw new Error(`Адрес не найден: «${text}»`);
+    throw new Error(`Сервис геокодирования недоступен (попробуйте позже): «${text}»`);
   };
 
   const handleBuild = async () => {

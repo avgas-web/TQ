@@ -380,6 +380,8 @@ const MapCanvas: React.FC = () => {
   type ExtObj = { kind: 'airport' | 'notam' | 'geozone'; lat: number; lng: number; name: string; r?: number };
   const [extObjs, setExtObjs] = useState<ExtObj[]>([]);
   const [overpassBusy, setOverpassBusy] = useState(false);
+  // Предупреждение о недоступности Overpass (показывается вместо «тихого» выключения слоёв)
+  const [extNotice, setExtNotice] = useState<string | null>(null);
   const layersOn = !!(project.settings?.airportsLayer || project.settings?.notamLayer || project.settings?.geozonesLayer);
 
   const OVERPASS_ENDPOINTS = [
@@ -388,7 +390,11 @@ const MapCanvas: React.FC = () => {
     'https://overpass.private.coffee/api/interpreter',
   ];
   const extFailRef = useRef(0);        // подряд неудачных запросов
-  const extCacheRef = useRef<Map<string, ExtObj[]>>(new Map());
+  // Кэш внешних объектов: ключ — bbox + набор слоёв; значение хранит время записи и
+  // признак пустого результата. Пустые ответы НЕ кэшируются навсегда (лимит выдачи/
+  // временнаяEmpty-область не должна блокировать повторную загрузку области).
+  const extCacheRef = useRef<Map<string, { objs: ExtObj[]; at: number }>>(new Map());
+  const EXT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 минут
   const extReqIdRef = useRef(0);       // id последнего актуального запроса (отмена устаревших)
 
   useEffect(() => {
@@ -408,7 +414,12 @@ const MapCanvas: React.FC = () => {
     const timer = setTimeout(async () => {
       if (reqId !== extReqIdRef.current) return; // устаревший запрос — не запускаем
       const cached = extCacheRef.current.get(cacheKey);
-      if (cached) { setExtObjs(cached); return; } // область уже загружена — сервер не трогаем
+      // Пустые результаты кэшируются только на короткое время, чтобы не «замораживать»
+      // область навсегда при лимите выдачи или временной пустоте ответа.
+      if (cached && (cached.objs.length > 0 || Date.now() - cached.at < EXT_CACHE_TTL_MS)) {
+        setExtObjs(cached.objs);
+        return;
+      } // область уже загружена — сервер не трогаем
       // Один лёгкий объединённый запрос: только узлы-центры, с лимитами выдачи
       const parts: string[] = [];
       if (project.settings?.airportsLayer) parts.push(`node["aeroway"="aerodrome"](${box});`);
@@ -418,17 +429,32 @@ const MapCanvas: React.FC = () => {
       const q = `[out:json][timeout:10];(${parts.join('')})[..60];(.;);out.skylat center 60;`;
       setOverpassBusy(true);
       let data: { elements?: any[] } | null = null;
+      let lastErr = '';
       for (const url of OVERPASS_ENDPOINTS) {
         if (reqId !== extReqIdRef.current) { setOverpassBusy(false); return; } // отменён новым видом
         const ctrl = new AbortController();
         const to = setTimeout(() => ctrl.abort(), 12000);
         try {
-          const r = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(q), signal: ctrl.signal });
-          if (r.status === 429 || r.status >= 500) continue; // зеркало занято — пробуем следующее
-          if (!r.ok) break; // 4xx — повтор бессмысленен
-          data = await r.json();
-        } catch { /* сеть/abort — следующее зеркало */ }
-        finally { clearTimeout(to); }
+          const r = await fetch(url, {
+            method: 'POST',
+            // Many Overpass mirrors reject bare bodies without this content type (HTTP 400)
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'data=' + encodeURIComponent(q),
+            signal: ctrl.signal,
+          });
+          if (r.status === 429 || r.status >= 500) { lastErr = `HTTP ${r.status}`; continue; } // зеркало занято — пробуем следующее
+          if (!r.ok) { lastErr = `HTTP ${r.status}`; break; } // 4xx — повтор бессмысленен
+          // Parse into a local first: an abort during .json() must not be treated as
+          // "mirror busy" when the response itself was fine.
+          const parsed = await r.json();
+          if (reqId !== extReqIdRef.current) { clearTimeout(to); setOverpassBusy(false); return; }
+          data = parsed;
+          lastErr = '';
+        } catch (e) {
+          lastErr = e instanceof Error && e.name === 'AbortError' ? 'timeout' : 'network';
+        } finally {
+          clearTimeout(to);
+        }
         if (data) break;
       }
       if (reqId !== extReqIdRef.current) { setOverpassBusy(false); return; }
@@ -447,16 +473,19 @@ const MapCanvas: React.FC = () => {
           out.push({ kind, lat, lng, name: el.tags?.name || (kind === 'airport' ? 'Аэродром' : militaryB ? 'Военный район' : 'Геозона'), r: kind === 'notam' ? 3000 : kind === 'geozone' ? 2000 : undefined });
         }
         if (extCacheRef.current.size > 40) extCacheRef.current.clear(); // ограничиваем память
-        extCacheRef.current.set(cacheKey, out);
+        extCacheRef.current.set(cacheKey, { objs: out, at: Date.now() });
         setExtObjs(out);
+        setExtNotice(null);
       } else {
         // Сервер недоступен: после 2 подряд неудач гасим слои, чтобы не нагружать
         // его постоянными повторами и не показывать «вечную загрузку».
+        // Пользователь получает понятное сообщение о причине (HTTP-код/timeout/network).
         if (++extFailRef.current >= 2) {
           extFailRef.current = 0;
           useStore.setState((st) => ({
             project: { ...st.project, settings: { ...st.project.settings, airportsLayer: false, notamLayer: false, geozonesLayer: false } },
           }));
+          setExtNotice(`Внешние слои отключены: Overpass недоступен (${lastErr || 'ошибка сети'}). Повторите позже.`);
         }
       }
       setOverpassBusy(false);
@@ -1900,6 +1929,14 @@ const MapCanvas: React.FC = () => {
         <div className="absolute bottom-3 left-3 z-10 flex items-center gap-2 rounded-md bg-gray-900/85 border border-gray-700 px-2.5 py-1.5 text-[11px] text-gray-200" role="status" aria-live="polite">
           <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-cyan-400 border-t-transparent" />
           Загрузка слоёв (аэропорты/районы)…
+        </div>
+      )}
+
+      {/* Предупреждение о недоступности Overpass: слои отключены не молча, а с причиной */}
+      {extNotice && !overpassBusy && (
+        <div className="absolute bottom-3 left-3 z-10 flex items-center gap-2 rounded-md bg-amber-900/90 border border-amber-600 px-2.5 py-1.5 text-[11px] text-amber-100 max-w-xs" role="alert">
+          <span>{extNotice}</span>
+          <button className="ml-1 underline" onClick={() => setExtNotice(null)} aria-label="Скрыть предупреждение">×</button>
         </div>
       )}
 
