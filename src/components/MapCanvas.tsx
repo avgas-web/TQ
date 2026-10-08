@@ -440,6 +440,10 @@ const MapCanvas: React.FC = () => {
       if (project.settings?.notamLayer) parts.push(`node["boundary"="military"](${box});`);
       if (project.settings?.geozonesLayer) parts.push(`node["landuse"="military"](${box});`);
       if (parts.length === 0) return;
+      // Пользователь явно включил хотя бы один слой — сбрасываем счётчик
+      // неудач, чтобы после предыдущего автоматического отключения слоёв
+      // не остаться навсегда в «заблокированном» состоянии.
+      extFailRef.current = 0;
       const q = `[out:json][timeout:10];(${parts.join('')})[..60];(.;);out.skylat center 60;`;
       setOverpassBusy(true);
       let data: { elements?: any[] } | null = null;
@@ -491,15 +495,17 @@ const MapCanvas: React.FC = () => {
         setExtObjs(out);
         setExtNotice(null);
       } else {
-        // Сервер недоступен: после 2 подряд неудач гасим слои, чтобы не нагружать
-        // его постоянными повторами и не показывать «вечную загрузку».
-        // Пользователь получает понятное сообщение о причине (HTTP-код/timeout/network).
-        if (++extFailRef.current >= 2) {
-          extFailRef.current = 0;
+        // Сервер недоступен: ПОСЛЕ ДВУХ подряд неудач гасим слои ОДИН РАЗ.
+        // Важно: extFailRef НЕ сбрасывается в 0 после отключения — иначе
+        // выключение слоёв пересобирает этот эффект, тот снова стреляет
+        // запросом, снова копит 2 неудачи, снова setState... — бесконечный
+        // каскад обновлений (React error #185). Повтор включается только
+        // осознанным включением слоя пользователем (см. resetExtFailBelow).
+        if (++extFailRef.current >= 2 && layersOn) {
           useStore.setState((st) => ({
             project: { ...st.project, settings: { ...st.project.settings, airportsLayer: false, notamLayer: false, geozonesLayer: false } },
           }));
-          setExtNotice(`Внешние слои отключены: Overpass недоступен (${lastErr || 'ошибка сети'}). Повторите позже.`);
+          setExtNotice(`Внешние слои отключены: Overpass недоступен (${lastErr || 'ошибка сети'}). Включите слой заново, когда сервер заработает.`);
         }
       }
       setOverpassBusy(false);
