@@ -195,6 +195,10 @@ const MapCanvas: React.FC = () => {
   const [popup, setPopup] = useState<{ x: number; y: number; title: string; lines: string[] } | null>(null);
   // Кэш тайлов подложки: url -> изображение (или undefined при ошибке)
   const tileCache = useRef<Map<string, HTMLImageElement | undefined>>(new Map());
+  // LRU-размер кэша тайлов: Map сохраняет порядок вставки — при переполнении
+  // удаляем самые старые записи, иначе при длительной работе накапливаются
+  // тысячи HTMLImageElement (утечка памяти).
+  const TILE_CACHE_MAX = 1500;
   // Очередь щадящей загрузки тайлов: один общий список + счётчик активных загрузок
   const tileQueueRef = useRef<string[]>([]);
   const activeTilesRef = useRef(0);
@@ -333,7 +337,13 @@ const MapCanvas: React.FC = () => {
         if (tilePending.current.has(u) || tileCache.current.has(u)) continue;
         activeTilesRef.current++;
         const p = loadTileImage(u, 10000) // таймаут: зависший тайл не блокирует очередь
-          .then((img) => { tileCache.current.set(u, img || undefined); })
+          .then((img) => {
+            tileCache.current.set(u, img || undefined);
+            if (tileCache.current.size > TILE_CACHE_MAX) {
+              const firstKey = tileCache.current.keys().next().value as string | undefined;
+              if (firstKey !== undefined) tileCache.current.delete(firstKey);
+            }
+          })
           .finally(() => {
             tilePending.current.delete(u);
             activeTilesRef.current--;
