@@ -613,14 +613,25 @@ const MapCanvas: React.FC = () => {
     if (!map.bounds) return;
     // ИНВАРИАНТНЫЙ ЭТАЛОН z0: привязка вида задаётся формулой worldPx = vh·2^zoom,
     // zoom = ZOOM_REF + log2(scale). Он НЕ зависит от размеров окна — поэтому
-    // масштаб не «сбивается» при ресайзе/восстановлении из persist. Старый расчёт
-    // z0 = startZoomForBounds(...) менял эталон при каждом изменении высоты окна
-    // и конфликтовал с фиксатором z0=14 — из-за этого зум «залипал», а тайлы
-    // уезжали относительно объектов.
-    if (mapImageRef.current) {
-      // Растровая карта: вписать изображение целиком. Привязка тайлов/сетки/линейки
-      // согласуется с ФАКТИЧЕСКИМ размером растра относительно bounds: scale=1 ⇔
-      // мир по X = map.width·2^z0 экранных px ⇒ z0 = log2(worldPxNeeded/(256·fitScale)).
+    // масштаб не «сбивается» при ресайзе/восстановлении из persist.
+    // ── КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ «карта загружается с ошибкой / не грузится» ──────
+    // Старый код вычислял целевой зум из ГЕОМЕТРИИ РАСТРА
+    // (zoom = log2(map.height / mercSpanY(bounds) / 256)). Для активной тайловой
+    // карты loadActiveTileMap строит виртуальный растр = ПОЛНЫЙ мир уровня z
+    // (height = 256·2^z), но bounds хранит окно обзора пользователя (например
+    // область Москвы на z12: mercSpanY ≈ 0.002). Подстановка давала
+    // zoom = log2(256·2^12 / 0.002 / 256) ≈ 23.7 → кламп к MAX_ZOOM=19 и камера
+    // улетала в космос: тайлы запрашивались на z19 в радиусе тысяч экранов,
+    // очередь не успевала — «карта не загружается». Теперь:
+    //  • зум берётся ПРЯМО из размера bounds (стандартная формула fit-to-bounds,
+    //    та же, что zoomToFitBounds) — корректен для любой пары растр/bounds;
+    //  • центр — географический центр bounds;
+    //  • эталон z0 = ZOOM_REF постоянен.
+    if (mapImageRef.current && !tilesActive) {
+      // Растровая карта (Google/Yandex/локальный снимок): вписать изображение
+      // целиком. Привязка тайлов/сетки/линейки согласуется с ФАКТИЧЕСКИМ размером
+      // растра относительно bounds: scale=1 ⇔ мир по X = map.width·2^z0 px ⇒
+      // z0 = log2(worldPxNeeded/(256·fitScale)).
       const lngSpan = Math.abs(map.bounds.east - map.bounds.west);
       const worldPxNeeded = (canvasSize.width * 360) / Math.max(lngSpan, 1e-9);
       const fitScale = Math.min(canvasSize.width / map.width, canvasSize.height / map.height) * 0.9;
@@ -632,23 +643,56 @@ const MapCanvas: React.FC = () => {
         z0: zFit,
       });
     } else if (tilesActive) {
-      // Только тайловая подложка (активная карта, как на openstreetmap.org):
-      // стартовый вид = ровно ТОТ зум, что указан при загрузке (диапазон масштаба
-      // соблюдается жёстко), центр — географический центр bounds. Никакого
-      // произвольного z15: пользователь задал zoom → на нём карта и открывается.
-      const cLat = (map.bounds.north + map.bounds.south) / 2;
-      const cLng = (map.bounds.east + map.bounds.west) / 2;
-      // Целевой зум восстанавливаем из Mercator-геометрии самого растрового
-      // «виртуального» растра loadActiveTileMap: он построен так, что высота
-      // мира на уровне z равна map.height по Y. Это даёт точный zoom загрузки
-      // без догадок и независим от размеров окна.
-      const mercSpanY = latToMerc(map.bounds.south) - latToMerc(map.bounds.north);
-      const zoomFromRaster = Math.log2(Math.max(map.height / Math.max(mercSpanY, 1e-12), 256) / 256);
-      const zoom = clampZoom(Number.isFinite(zoomFromRaster) ? zoomFromRaster : 15);
+      // Тайловая подложка (активная карта, как на openstreetmap.org).
+      // ── КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ «карта загружается с ошибкой» (fit-to-bounds) ──
+      // Старый расчёт брал ГЕОМЕТРИЮ РАСТРА: растр = полный мир уровня z
+      // (height = 256·2^z), а bounds = узкое окно пользователя → формула
+      // zoom = log2(map.height / mercSpanY(bounds)) давала ~23.7 → кламп к 19:
+      // камера улетала в космос, тайлы не успевали, «карта не загружалась».
+      // Теперь стартовый вид считается ПРЯМО из пары «виртуальный растр ⇔
+      // bounds» loadActiveTileMap: пиксели растра привязаны к bounds линейно
+      // (pixel ⇔ доля bounds), поэтому масштаб, при котором весь растр вписан
+      // в экран, — это ровно тот зум z, что был запрошен при загрузке
+      // (worldPx = 256·2^z). Центр — географический центр bounds (или центр
+      // растра, если bounds шире окна). Никакой зависимости от размеров окна,
+      // никакого «полёта в космоса»: строгая привязка к координатам при любом
+      // масштабе и панораме.
+      const b = map.bounds;
+      const topM = latToMerc(b.north);
+      const botM = latToMerc(b.south);
+      const leftFx = (b.west + 180) / 360;
+      const rightFx = (b.east + 180) / 360;
+      // Размер bounds в нормализованных меркатор-долях мира
+      const spanFx = Math.max(1e-12, rightFx - leftFx);
+      const spanFy = Math.max(1e-12, botM - topM);
+      // Растр loadActiveTileMap привязан к bounds линейно (pixel ⇔ доля bounds),
+      // поэтому «весь растр в окне» ⇔ весь bounds в окне. Базовый зум, при
+      // котором bounds целиком вписывается в экран:
+      //   spanFx·256·2^zb ≤ canvasW и spanFy·256·2^zb ≤ canvasH
+      const zb = Math.min(
+        Math.log2(canvasSize.width / (256 * spanFx)),
+        Math.log2(canvasSize.height / (256 * spanFy)),
+      );
+      // Если ВЕСЬ виртуальный растр (map.width×map.height px уровня z) влезает
+      // в экран — открываемся ровно на запрошенном при загрузке зуме z
+      // (worldPx = 256·2^z): это заявленный диапазон масштаба без догадок.
+      // Иначе (bounds больше экрана) — fit-to-bounds: базовый зум растр-геометрии.
+      const rasterWorldPx = (map.width / spanFx + map.height / spanFy) / 2; // ≈ 256·2^z
+      const rasterFitsScreen = map.width <= canvasSize.width && map.height <= canvasSize.height;
+      let zoom: number;
+      if (rasterFitsScreen && rasterWorldPx >= 256 * Math.pow(2, zb)) {
+        zoom = Math.log2(rasterWorldPx / 256); // ровно z загрузки
+      } else {
+        zoom = zb; // подогнать область bounds под экран
+      }
+      zoom = clampZoom(zoom);
       const zFix = ZOOM_REF; // ЭТАЛОН для инварианта worldPx = canvasHeight·2^(zFix+log2 scale)
       const worldPx = canvasSize.height * Math.pow(2, zoom); // мир в экранных px на этом зуме
-      const fx = (cLng + 180) / 360;  // mercator-доля мира по X для центра bounds
-      const fy = latToMerc(cLat);     // mercator-доля мира по Y
+      // Центр вида — географическая середина bounds (ровно center при обычной
+      // загрузке; при клампе bounds к краям мира центр может смещаться — берём
+      // середину фактических bounds, чтобы не уходить в пустоту).
+      const fx = leftFx + spanFx / 2;
+      const fy = topM + spanFy / 2;
       setViewState({
         scale: worldPx / (canvasSize.height * Math.pow(2, zFix)), // ⇔ zoom = zFix + log2(scale)
         offsetX: canvasSize.width / 2 - fx * worldPx,
