@@ -3,9 +3,11 @@ import { useStore, scheduleRerouteAll, getActiveZonesCached } from '../store/use
 import { isPointInActiveRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
-import { pixelToGeoExact, routeLengthM, zonesCrossedBy } from '../utils/routing';
+import { pixelToGeoExact, geoToPixelExact, routeLengthM, zonesCrossedBy } from '../utils/routing';
 import { getOSMTileUrl, loadTileImage } from '../utils/openStreetMap';
-import type { Point, Route, RoutePoint } from '../types';
+import MiniMapPanel, { MiniOverlayLine, MiniOverlayPoint } from './MiniMapPanel';
+import { zoomForGroundMpp, GROUND_MPP_1CM_2KM } from '../utils/pannelli';
+import type { Point, Route, RoutePoint, MapBounds } from '../types';
 
 /** Границы зума тайловой карты: minZoom 3 (вся страна/регион), maxZoom 19 (уровни OSM).
  *  Раньше нижняя граница была z10 — поэтому «большая карта» (страна/область) не
@@ -469,6 +471,148 @@ const MapCanvas: React.FC = () => {
       { enableHighAccuracy: true, timeout: 10000 }
     );
   }, []);
+
+  // ─── Режим «три окна карты»: СТАРТ / ВЕСЬ МАРШРУТ / ЦЕЛЬ ──────────────────
+  // Каждое окно — отдельная автономная карта со строгой Mercator-привязкой и
+  // полным зумом/панорамой. Стартовая панель открывается крупно в масштабе
+  // 1 см = 2 км; цель — так же; «весь маршрут» — fit по всем точкам маршрутов.
+  // Рой дронов: у всех дронов один старт; общая цель ИЛИ индивидуальные цели
+  // (переключатель «Общая цель для всего роя»).
+  const [tripleMode, setTripleMode] = useState(false);
+  const [droneCount, setDroneCount] = useState(4);
+  const [sharedGoal, setSharedGoal] = useState(true);
+  const [activeUav, setActiveUav] = useState(0);
+  const [startGeo, setStartGeo] = useState<{ lat: number; lng: number } | null>(null);
+  const [goalGeo, setGoalGeo] = useState<{ lat: number; lng: number } | null>(null);
+  const [pickWhat, setPickWhat] = useState<'none' | 'start' | 'goal'>('none');
+  const pickWhatRef = useRef(pickWhat);
+  useEffect(() => { pickWhatRef.current = pickWhat; }, [pickWhat]);
+
+  // Перенос гео-объектов проекта (маршруты/маркеры/зоны) в виртуальный растр
+  // новой активной карты при включении режима — иначе объекты останутся в
+  // пикселях старого растра и будут вне bounds («карты пустые»).
+  const remapProjectToRaster = useCallback(() => {
+    const st = useStore.getState();
+    const map = st.project.map;
+    if (!map?.bounds || map.width <= 0 || map.height <= 0) return;
+    const b = map.bounds;
+    const routes = (st.project.routes || []).map((r) => ({
+      ...r,
+      points: r.points.map((p) => ({ ...p, ...geoToPixelExact(p.lat, p.lng, b, map.width, map.height) })),
+    }));
+    const markers = st.project.markers.map((m) =>
+      m.lat != null && m.lon != null ? { ...m, ...geoToPixelExact(m.lat, m.lon, b, map.width, map.height) } : m);
+    const restrictions = st.project.restrictions.map((r) => {
+      if (r.points.length === 0) return r;
+      const geoPts = r.points.map((p) => pixelToGeoExact(p, b, map.width, map.height));
+      const pts = geoPts.map((g) => geoToPixelExact(g.lat, g.lng, b, map.width, map.height));
+      let radius = r.radius;
+      if (r.type === 'circle' && r.radius) {
+        const cLat = geoPts[0].lat;
+        const dM = r.radius * metersPerPixelFromWorld(256 * Math.pow(2, ZOOM_REF + 10), cLat); // приблизительный перенос в метрах
+        const edge = { lat: cLat + dM / 111320, lng: geoPts[0].lng };
+        const pe = geoToPixelExact(edge.lat, edge.lng, b, map.width, map.height);
+        radius = Math.hypot(pe.x - pts[0].x, pe.y - pts[0].y);
+      }
+      return { ...r, points: pts, radius };
+    });
+    useStore.setState((cur) => ({
+      project: { ...cur.project, routes, markers, restrictions },
+    }));
+  }, []);
+
+  const enableTripleMode = useCallback((on: boolean) => {
+    setTripleMode(on);
+    if (!on) { setPickWhat('none'); return; }
+    const st = useStore.getState();
+    const tilesOn = !!st.project.settings?.tilesEnabled && !!st.project.map?.bounds;
+    if (!tilesOn) {
+      // нет активной тайловой карты — создать под текущий центр вида
+      const cs = canvasSizeRef.current;
+      const v = viewRef.current;
+      const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
+      const latC = mercToLat((cs.height / 2 - v.offsetY) / wp);
+      const lngC = ((cs.width / 2 - v.offsetX) / wp) * 360 - 180;
+      const zNow = clampZoom(zoomAtWorldPx(wp));
+      st.loadActiveTileMap({ lat: latC, lng: lngC }, Math.round(Math.min(12, zNow)));
+      remapProjectToRaster();
+    }
+  }, [remapProjectToRaster]);
+
+  // Клик по карте с активным выбором точки (Старт/Цель) — раньше других обработчиков
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const onClick = (e: MouseEvent) => {
+      const what = pickWhatRef.current;
+      if (what === 'none') return;
+      const st = useStore.getState();
+      const map = st.project.map;
+      if (!map?.bounds || map.width <= 0 || map.height <= 0) return;
+      const r = canvas.getBoundingClientRect();
+      const v = viewRef.current;
+      const mx = (e.clientX - r.left - v.offsetX) / v.scale;
+      const my = (e.clientY - r.top - v.offsetY) / v.scale;
+      const g = pixelToGeoExact({ x: mx, y: my }, map.bounds, map.width, map.height);
+      if (what === 'start') setStartGeo(g); else setGoalGeo(g);
+      setPickWhat('none');
+    };
+    canvas.addEventListener('click', onClick, true); // capture: выполняемся до основной обработки кликов
+    return () => canvas.removeEventListener('click', onClick, true);
+  }, []);
+
+  // Гео-данные проекта (из пикселей текущего виртуального растра) — источник
+  // точек для панелей «весь маршрут» и целей дронов
+  const tripleRoutes = React.useMemo(() => {
+    if (!tripleMode) return [] as { id: string; name: string; color: string; geo: { lat: number; lng: number }[] }[];
+    const map = project.map;
+    if (!map?.bounds || map.width <= 0 || map.height <= 0) return [];
+    return (project.routes || [])
+      .filter((r) => r.visible !== false && r.points.length >= 2)
+      .map((r) => ({
+        id: r.id, name: r.name, color: r.color || '#22d3ee',
+        geo: r.points.map((p) => pixelToGeoExact({ x: p.x, y: p.y }, map.bounds!, map.width, map.height)),
+      }));
+  }, [tripleMode, project.routes, project.map]);
+
+  const tripleAllGeoPts = React.useMemo(() => {
+    const out: { lat: number; lng: number }[] = [];
+    for (const r of tripleRoutes) out.push(...r.geo);
+    if (startGeo) out.push(startGeo);
+    if (goalGeo) out.push(goalGeo);
+    return out;
+  }, [tripleRoutes, startGeo, goalGeo]);
+
+  // Масштаб стартовой/целевой панелей: 1 см = 2 км при высоте панели ~230 px
+  const panelZoomFor2km = (lat: number): number =>
+    clampZoom(zoomForGroundMpp(GROUND_MPP_1CM_2KM, lat));
+
+  // Экспорт PNG высокого разрешения: композитинг трёх панелей + легенда
+  const exportTriplePng = useCallback(async () => {
+    const panels = Array.from(document.querySelectorAll<HTMLCanvasElement>('#triple-map-row canvas'));
+    if (panels.length < 3) return;
+    const S = 2; // надбавка разрешения: 2× от css-размера (высокая детализация)
+    const W = panels[0].clientWidth * S, H = panels[0].clientHeight * S;
+    const out = document.createElement('canvas');
+    out.width = W * 3 + 40; out.height = H + 90;
+    const ctx = out.getContext('2d');
+    if (!ctx) return;
+    ctx.fillStyle = '#0f1729'; ctx.fillRect(0, 0, out.width, out.height);
+    const titles = ['СТАРТ (1 см = 2 км)', 'ВЕСЬ МАРШРУТ', 'ЦЕЛЬ (1 см = 2 км)'];
+    panels.forEach((pc, i) => {
+      const x = 10 + i * (W + 10);
+      ctx.drawImage(pc, x, 40, W, H);
+      ctx.fillStyle = '#7dd3fc'; ctx.font = `bold ${Math.round(13 * S / 2)}px sans-serif`;
+      ctx.fillText(titles[i] || '', x + 4, 24);
+    });
+    ctx.fillStyle = '#94a3b8'; ctx.font = `${Math.round(11 * S / 2)}px sans-serif`;
+    const leg = `Рой: ${droneCount} БПЛА · ${sharedGoal ? 'общая цель' : `${Math.min(droneCount, Math.max(1, tripleRoutes.length))} индив. цели`} · Старт: ${startGeo ? `${startGeo.lat.toFixed(5)}, ${startGeo.lng.toFixed(5)}` : 'не выбран'} · Цель: ${goalGeo ? `${goalGeo.lat.toFixed(5)}, ${goalGeo.lng.toFixed(5)}` : 'не выбрана'}`;
+    ctx.fillText(leg, 10, out.height - 12);
+    const a = document.createElement('a');
+    a.download = `route-maps-${Date.now()}.png`;
+    a.href = out.toDataURL('image/png');
+    a.click();
+  }, [droneCount, sharedGoal, startGeo, goalGeo, tripleRoutes]);
 
 
   // Полный экран
@@ -1549,6 +1693,9 @@ const MapCanvas: React.FC = () => {
 
   // Mouse down
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    // Режим выбора точки старт/цель: основной канвас не редактируется — клик
+    // перехватывается capture-обработчиком (см. pickWhat выше); остальное глушим.
+    if (pickWhatRef.current !== 'none') return;
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect) return;
 
@@ -1901,6 +2048,35 @@ const MapCanvas: React.FC = () => {
 
   const btnCls = 'w-9 h-9 flex items-center justify-center rounded-md bg-gray-800/90 hover:bg-gray-700 text-gray-100 border border-gray-600 shadow text-base select-none';
 
+  // ─── Данные для трёх окон карты ─────────────────────────────────────────────
+  const uavColors = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#fb923c', '#38bdf8', '#e879f9'];
+  const goalForUav = (i: number): { lat: number; lng: number } | null => {
+    if (sharedGoal) return goalGeo;
+    const r = tripleRoutes[i];
+    if (r && r.geo.length > 0) return r.geo[r.geo.length - 1];
+    return goalGeo;
+  };
+  const startCenter = startGeo || tripleAllGeoPts[0] || (project.map?.bounds
+    ? { lat: (project.map.bounds.north + project.map.bounds.south) / 2, lng: (project.map.bounds.west + project.map.bounds.east) / 2 }
+    : { lat: 55.75, lng: 37.62 });
+  const goalCenter = goalForUav(activeUav) || goalGeo || startCenter;
+  const routeLineGeo = tripleRoutes.length > 0
+    ? (activeUav < tripleRoutes.length ? tripleRoutes[activeUav].geo : tripleRoutes.flatMap((r) => r.geo))
+    : [];
+  const linesOut: MiniOverlayLine[] = [
+    ...tripleRoutes.map((r) => ({ pts: r.geo, color: r.color, width: 2 })),
+    ...(startGeo && goalGeo ? [{ pts: [startGeo, goalGeo], color: '#facc15', width: 2, dashed: true }] : []),
+  ];
+  const pointsOut: MiniOverlayPoint[] = [
+    ...(startGeo ? [{ lat: startGeo.lat, lng: startGeo.lng, label: 'СТАРТ', color: '#4ade80' }] : []),
+    ...(goalGeo ? [{ lat: goalGeo.lat, lng: goalGeo.lng, label: sharedGoal ? 'ЦЕЛЬ (общая)' : 'ЦЕЛЬ (выбранная)', color: '#f87171' }] : []),
+    ...(!sharedGoal ? tripleRoutes.slice(0, droneCount).map((r, i) => {
+      const g = r.geo[r.geo.length - 1];
+      return g ? { lat: g.lat, lng: g.lng, label: `Дрон ${i + 1}`, color: uavColors[i % uavColors.length] } : null;
+    }).filter(Boolean) as MiniOverlayPoint[] : []),
+  ];
+  const panelH = 260;
+
   return (
     <div id="map-container" ref={containerRef} className="relative w-full h-full overflow-hidden bg-[#0f1729]">
       {/* Подложка OSM: DOM-слой настоящих <img>-тайлов (как на openstreetmap.org),
@@ -1971,7 +2147,77 @@ const MapCanvas: React.FC = () => {
           aria-label="Тайловая подложка" title="Активная тайловая карта (T)"
           onClick={() => updateSettings({ tilesEnabled: !project.settings?.tilesEnabled })}
         >▦</button>
+        <button
+          className={`${btnCls} ${tripleMode ? 'ring-1 ring-emerald-400 bg-emerald-900/60' : ''}`}
+          aria-label="Три окна карты" title="Три окна карты: старт / весь маршрут / цель"
+          onClick={() => enableTripleMode(!tripleMode)}
+        >🗺</button>
       </div>
+
+      {/* ─── Три отдельных окна карты: СТАРТ / ВЕСЬ МАРШРУТ / ЦЕЛЬ ─────────── */}
+      {tripleMode && (
+        <div id="triple-map-row" className="absolute left-2 right-2 bottom-8 z-30 rounded-xl border border-cyan-700/60 bg-gray-900/95 shadow-2xl p-2">
+          <div className="flex flex-wrap items-center gap-2 mb-2 text-xs">
+            <span className="font-bold text-cyan-300">Карта миссии роя</span>
+            <button
+              className={`px-2 py-0.5 rounded border text-white ${pickWhat === 'start' ? 'bg-emerald-700 border-emerald-400' : 'bg-gray-800 border-gray-600 hover:bg-gray-700'}`}
+              onClick={() => setPickWhat(pickWhat === 'start' ? 'none' : 'start')}
+              title="Кликните по основной карте, чтобы выбрать точку старта"
+            >🟢 Выбрать старт{pickWhat === 'start' ? ' — кликните по карте…' : ''}</button>
+            <button
+              className={`px-2 py-0.5 rounded border text-white ${pickWhat === 'goal' ? 'bg-red-700 border-red-400' : 'bg-gray-800 border-gray-600 hover:bg-gray-700'}`}
+              onClick={() => setPickWhat(pickWhat === 'goal' ? 'none' : 'goal')}
+              title="Кликните по основной карте, чтобы выбрать цель"
+            >🔴 Выбрать цель{pickWhat === 'goal' ? ' — кликните по карте…' : ''}</button>
+            <label className="flex items-center gap-1 text-gray-300">Дронов:
+              <input type="number" min={1} max={8} value={droneCount}
+                onChange={(e) => setDroneCount(Math.max(1, Math.min(8, Number(e.target.value) || 1)))}
+                className="w-12 px-1 bg-gray-800 border border-gray-600 rounded text-white" />
+            </label>
+            <label className="flex items-center gap-1 text-gray-300 cursor-pointer">
+              <input type="checkbox" checked={sharedGoal} onChange={(e) => setSharedGoal(e.target.checked)} />
+              Общая цель для всего роя
+            </label>
+            {!sharedGoal && tripleRoutes.length > 0 && (
+              <select
+                value={Math.min(activeUav, tripleRoutes.length - 1)}
+                onChange={(e) => setActiveUav(Number(e.target.value))}
+                className="px-1 py-0.5 bg-gray-800 border border-gray-600 rounded text-white"
+                title="Выбрать дрон (его маршрут и цель — в окне «Цель»)"
+              >
+                {tripleRoutes.slice(0, droneCount).map((r, i) => (
+                  <option key={r.id} value={i}>Дрон {i + 1}: {r.name}</option>
+                ))}
+              </select>
+            )}
+            <div className="flex-1" />
+            <button className="px-2 py-0.5 rounded bg-cyan-800 hover:bg-cyan-700 border border-cyan-600 text-white" onClick={exportTriplePng} title="PNG высокого разрешения: три карты в одном файле">💾 PNG</button>
+            <button className="px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 border border-gray-600 text-white" onClick={() => enableTripleMode(false)}>✕ Закрыть</button>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+            <MiniMapPanel
+              title="СТАРТ (масштаб 1 см = 2 км)" icon="🟢"
+              center={startCenter} zoom={panelZoomFor2km(startCenter.lat)}
+              points={pointsOut.filter((p) => p.label === 'СТАРТ')}
+              lines={linesOut} height={panelH}
+            />
+            <MiniMapPanel
+              title="ВЕСЬ МАРШРУТ (высокая детализация)" icon="🧭"
+              center={startCenter} zoom={10}
+              fitPoints={tripleAllGeoPts.length > 0 ? tripleAllGeoPts : undefined}
+              points={pointsOut} lines={linesOut} height={panelH}
+            />
+            <MiniMapPanel
+              title={sharedGoal ? 'ЦЕЛЬ — общая для роя (1 см = 2 км)' : `ЦЕЛЬ дрона ${Math.min(activeUav + 1, droneCount)} (1 см = 2 км)`}
+              icon="🔴"
+              center={goalCenter} zoom={panelZoomFor2km(goalCenter.lat)}
+              points={pointsOut.filter((p) => p.label !== 'СТАРТ')}
+              lines={[...(routeLineGeo.length > 1 ? [{ pts: routeLineGeo, color: '#facc15', width: 2 }] : []), ...linesOut]}
+              height={panelH}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 };
