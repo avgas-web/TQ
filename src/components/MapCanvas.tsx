@@ -472,13 +472,15 @@ const MapCanvas: React.FC = () => {
     );
   }, []);
 
-  // ─── Режим «три окна карты»: СТАРТ / ВЕСЬ МАРШРУТ / ЦЕЛЬ ──────────────────
-  // Каждое окно — отдельная автономная карта со строгой Mercator-привязкой и
-  // полным зумом/панорамой. Стартовая панель открывается крупно в масштабе
-  // 1 см = 2 км; цель — так же; «весь маршрут» — fit по всем точкам маршрутов.
-  // Рой дронов: у всех дронов один старт; общая цель ИЛИ индивидуальные цели
-  // (переключатель «Общая цель для всего роя»).
-  const [tripleMode, setTripleMode] = useState(false);
+  // ─── ЕДИНСТВЕННЫЙ режим карты: три окна СТАРТ / МАРШРУТ / ЦЕЛЬ ──────────────
+  // Приложение всегда работает в режиме трёх окон: МАРШРУТ занимает место
+  // большой карты (верх), СТАРТ и ЦЕЛЬ — внизу. Каждое окно — автономная карта
+  // со строгой Mercator-привязкой, полным зумом/панорамой, редактированием
+  // (точки старта/цели, маршрут, зоны ограничений) и удалением объектов кликом.
+  // Все функции доступны ВО ВСЕХ ТРЁХ ОКНАХ. После ЗАПУСКА миссия передаётся
+  // в дроны, и кнопка «🆕 Новая миссия» очищает данные для следующего полёта.
+  // Рой дронов: у всех дронов один старт; общая цель ИЛИ индивидуальные цели.
+  const tripleMode = true;
   const [droneCount, setDroneCount] = useState(4);
   const [sharedGoal, setSharedGoal] = useState(true);
   const [activeUav, setActiveUav] = useState(0);
@@ -487,6 +489,10 @@ const MapCanvas: React.FC = () => {
   const [pickWhat, setPickWhat] = useState<'none' | 'start' | 'goal'>('none');
   const pickWhatRef = useRef(pickWhat);
   useEffect(() => { pickWhatRef.current = pickWhat; }, [pickWhat]);
+  // Автозапуск мастера: как только данные этапа заданы — этап утверждается сам,
+  // фокус автоматически переходит к следующему окну (редактирование доступно и
+  // вручную через кнопки этапов / перенос окна наверх).
+  const autoApproveTimerRef = useRef<number | null>(null);
 
   const uavColors = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#fb923c', '#38bdf8', '#e879f9'];
   // Гео-данные проекта (из пикселей текущего виртуального растра) — источник
@@ -535,10 +541,15 @@ const MapCanvas: React.FC = () => {
   }, [tripleStep, approvedSteps]);
 
   const focusPanelIdx = tripleStep === 3 ? -1 : tripleStep;
+  // Зона ограничения, поставленная «на любой карте» (в т.ч. неактивной), ждёт
+  // утверждения этапа ЦЕЛЬ — рисуем её-кандидата во всех окнах с id для удаления.
+  const pendingZoneMini = pendingZone
+    ? [{ id: 'pendingZone', pts: [] as { lat: number; lng: number }[], radiusM: pendingZone.radiusM, centerGeo: pendingZone.center, color: '#fb923c' }]
+    : [];
   const canApproveStep = (st: TripleStep): boolean => {
     if (st === 0) return !!startGeo;
     if (st === 1) return (draftRoutePts?.length ?? 0) >= 2 || tripleRoutes.length > 0;
-    if (st === 2) return !!goalGeo || !sharedGoal;
+    if (st === 2) return (!!goalGeo || !sharedGoal) && !pendingZone; // зона должна быть утверждена или удалена кликом
     return false;
   };
 
@@ -578,6 +589,28 @@ const MapCanvas: React.FC = () => {
     else setTripleStep(3);
   }, [tripleStep, draftRoutePts, mapBounds, project.map, tripleRoutes, activeUav, addRoute, pendingZone]);
 
+  // ─── Авто-утверждение этапов: данные заданы → этап утверждается сам, фокус
+  // переходит к следующему окну. При этом любое окно остаётся редактируемым:
+  // клик по окну / кнопка этапа возвращает фокус и снимает утверждение шага.
+  useEffect(() => {
+    if (launchState !== 'idle') return;
+    if (tripleStep > 2 || approvedSteps[tripleStep]) return;
+    if (!canApproveStep(tripleStep as 0 | 1 | 2)) return;
+    if (autoApproveTimerRef.current) window.clearTimeout(autoApproveTimerRef.current);
+    autoApproveTimerRef.current = window.setTimeout(() => approveTripleStep(), 700);
+    return () => { if (autoApproveTimerRef.current) window.clearTimeout(autoApproveTimerRef.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tripleStep, approvedSteps, startGeo, goalGeo, draftRoutePts, tripleRoutes.length, launchState]);
+
+  // Снятие утверждения при возврате к этапу (перенос окна наверх в режиме правки)
+  const reopenStepForEdit = useCallback((idx: number) => {
+    setTripleStep((cur) => {
+      if (cur === 3 && idx <= 2) setApprovedSteps((a) => [a[0], a[1], idx > 2 ? a[2] : false]);
+      else if (idx < cur) setApprovedSteps((a) => { const n = [...a]; for (let i = idx; i < 3; i++) n[i] = false; return n; });
+      return idx as TripleStep;
+    });
+  }, []);
+
   const backTripleStep = useCallback(() => {
     setDraftRoutePts(null); setPendingZone(null); setEditTool('point');
     if (tripleStep === 3) { setTripleStep(2); setApprovedSteps((a) => [a[0], a[1], false]); }
@@ -587,18 +620,28 @@ const MapCanvas: React.FC = () => {
     }
   }, [tripleStep]);
 
-  // Клик по карте активной панели: добавление точек маршрута / зон-ограничений
-  const handlePanelMapClick = useCallback((geo: { lat: number; lng: number }) => {
-    if (tripleStep === 1) {
-      setDraftRoutePts((prev) => [...(prev || []), geo]);
-    } else if (tripleStep === 2 && editTool === 'zone') {
-      setPendingZone({ center: geo, radiusM: 2000 }); // 1 см карты = 2 км ⇒ радиус круга 2 км
-    } else if (tripleStep === 0) {
+  // Клик по карте ПАНЕЛИ: все функции доступны во всех трёх окнах одновременно —
+  // стартовое окно ставит/переносит старт, целевое — цель/зоны, маршрутное — путевые точки.
+  const handlePanelMapClick = useCallback((geo: { lat: number; lng: number; panelIdx?: number }) => {
+    if (launchStateRef.current !== 'idle') return;
+    const panelIdx = geo.panelIdx ?? tripleStepRef.current;
+    if (panelIdx === 0) {
       setStartGeo(geo);
-    } else if (tripleStep === 2 && editTool === 'point') {
-      setGoalGeo(geo);
+    } else if (panelIdx === 1) {
+      setDraftRoutePts((prev) => [...(prev || []), { lat: geo.lat, lng: geo.lng }]);
+      reopenStepForEdit(1);
+    } else if (panelIdx === 2) {
+      if (editToolRef.current === 'zone') setPendingZone({ center: { lat: geo.lat, lng: geo.lng }, radiusM: 2000 }); // 1 см карты = 2 км ⇒ радиус круга 2 км
+      else setGoalGeo({ lat: geo.lat, lng: geo.lng });
     }
-  }, [tripleStep, editTool]);
+  }, [reopenStepForEdit]);
+
+  const editToolRef = useRef(editTool);
+  useEffect(() => { editToolRef.current = editTool; }, [editTool]);
+  const tripleStepRef = useRef(tripleStep);
+  useEffect(() => { tripleStepRef.current = tripleStep; }, [tripleStep]);
+  const launchStateRef = useRef(launchState);
+  useEffect(() => { launchStateRef.current = launchState; }, [launchState]);
 
   // Изначальный порядок нижней строки: СТАРТ слева, ЦЕЛЬ справа; МАРШРУТ — сверху.
   const panelOrderState = useState<number[]>([0, 2]);
@@ -606,9 +649,10 @@ const MapCanvas: React.FC = () => {
   // «Перенести наверх»: idx 1 (маршрут) всегда занимает место большой карты;
   // для старт/цель — меняет их местами в нижней строке и делает активным этапом.
   const bringPanelOnTop = (idx: number) => {
-    if (idx === 1) { setTripleStep(1); return; }
+    if (launchState !== 'idle') return;
+    if (idx === 1) { reopenStepForEdit(1); return; }
     setPanelOrder((o) => [idx, ...o.filter((x) => x !== idx)]);
-    setTripleStep(idx as TripleStep);
+    reopenStepForEdit(idx);
   };
 
   // ─── Удаление введённых точек/объектов кликом по ✛ на активной карте ───────
@@ -642,7 +686,7 @@ const MapCanvas: React.FC = () => {
 
   // «ЗАПУСК»: загрузка данных миссии в дроны (имитация телеметрической загрузки)
   const launchMission = useCallback(async () => {
-    if (tripleStep !== 3 || launchState !== 'idle') return;
+    if (launchState !== 'idle') return;
     setLaunchState('uploading');
     const st = useStore.getState();
     const mission = {
@@ -673,7 +717,22 @@ const MapCanvas: React.FC = () => {
     } catch {
       setLaunchState('idle');
     }
-  }, [tripleStep, launchState, startGeo, goalGeo, sharedGoal, droneCount, mapBounds, canvasSize, tripleRoutes]);
+  }, [launchState, startGeo, goalGeo, sharedGoal, droneCount, mapBounds, canvasSize, tripleRoutes]);
+
+  // Готовность миссии к запуску: все данные утверждены (шаг 3) либо заданы вручную
+  const missionReady = !!startGeo && ((draftRoutePts?.length ?? 0) >= 2 || tripleRoutes.length > 0) && (!!goalGeo || !sharedGoal);
+  const canLaunch = tripleStep === 3 || missionReady;
+
+  // «НОВАЯ МИССИЯ»: после ЗАПУСКА очищаем данные — можно начинать следующий полёт.
+  const newMission = useCallback(() => {
+    if (launchState !== 'done') return;
+    setStartGeo(null); setGoalGeo(null); setDraftRoutePts([]); setPendingZone(null);
+    setApprovedSteps([false, false, false]); setTripleStep(0); setLaunchState('idle');
+    setEditTool('point'); setActiveUav(0);
+    // маршруты предыдущей миссии удаляем из проекта (зоны-ограничения остаются)
+    useStore.setState((cur) => ({ project: { ...cur.project, routes: [] } }));
+    setPopup({ x: canvasSize.width / 2 - 160, y: 60, title: '🆕 Новая миссия', lines: ['Данные предыдущего полёта очищены.', 'Окно «Старт» активно — кликните по карте, чтобы задать точку старта.'] });
+  }, [launchState, canvasSize]);
 
   // Перенос гео-объектов проекта (маршруты/маркеры/зоны) в виртуальный растр
   // новой активной карты при включении режима — иначе объекты останутся в
@@ -708,13 +767,15 @@ const MapCanvas: React.FC = () => {
     }));
   }, []);
 
-  const enableTripleMode = useCallback((on: boolean) => {
-    setTripleMode(on);
-    if (!on) { setPickWhat('none'); return; }
+  // Инициализация тайловой карты при старте приложения (режим трёх окон всегда включён):
+  // если активной тайловой карты нет — создаём под текущий центр вида.
+  const remapDoneRef = useRef(false);
+  useEffect(() => {
+    if (remapDoneRef.current) return;
+    remapDoneRef.current = true;
     const st = useStore.getState();
     const tilesOn = !!st.project.settings?.tilesEnabled && !!st.project.map?.bounds;
     if (!tilesOn) {
-      // нет активной тайловой карты — создать под текущий центр вида
       const cs = canvasSizeRef.current;
       const v = viewRef.current;
       const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
@@ -722,8 +783,8 @@ const MapCanvas: React.FC = () => {
       const lngC = ((cs.width / 2 - v.offsetX) / wp) * 360 - 180;
       const zNow = clampZoom(zoomAtWorldPx(wp));
       st.loadActiveTileMap({ lat: latC, lng: lngC }, Math.round(Math.min(12, zNow)));
-      remapProjectToRaster();
     }
+    remapProjectToRaster();
   }, [remapProjectToRaster]);
 
   // Клик по карте с активным выбором точки (Старт/Цель) — раньше других обработчиков
@@ -2192,7 +2253,6 @@ const MapCanvas: React.FC = () => {
   }, [currentTool]);
 
   // Управление видом: зум/геолокация/полный экран + переключатели слоёв
-  const updateSettings = useStore((s) => s.updateSettings);
   const setViewStateForZoom10k = useCallback(() => {
     // Целевой масштаб 1:10 000 (1 см ≈ 100 м): подбираем scale из Mercator-привязки
     const map = project.map;
@@ -2226,9 +2286,13 @@ const MapCanvas: React.FC = () => {
     if (r && r.geo.length > 0) return r.geo[r.geo.length - 1];
     return goalGeo;
   };
-  const startCenter = startGeo || tripleAllGeoPts[0] || (project.map?.bounds
-    ? { lat: (project.map.bounds.north + project.map.bounds.south) / 2, lng: (project.map.bounds.west + project.map.bounds.east) / 2 }
-    : { lat: 55.75, lng: 37.62 });
+  // ─── Изначальная фокусировка всех окон карты — Санкт-Петербург ──────────────
+  const SPB_GEO = { lat: 59.9398, lng: 30.3146 };
+  // Пока пользователь не ввёл свои точки — все окна сфокусированы на СПб;
+  // после ввода старт/цель следуют за данными автоматически (animateTo).
+  const spbPanelCenter: { lat: number; lng: number } | null = (!startGeo && !goalGeo && tripleAllGeoPts.length === 0) ? SPB_GEO : null;
+
+  const startCenter = startGeo || tripleAllGeoPts[0] || SPB_GEO;
   const goalCenter = goalForUav(activeUav) || goalGeo || startCenter;
   const routeLineGeo = tripleRoutes.length > 0
     ? (activeUav < tripleRoutes.length ? tripleRoutes[activeUav].geo : tripleRoutes.flatMap((r) => r.geo))
@@ -2246,12 +2310,6 @@ const MapCanvas: React.FC = () => {
     }).filter(Boolean) as MiniOverlayPoint[] : []),
   ];
   const panelH = 260;
-
-  // ─── Изначальная фокусировка всех окон карты — Санкт-Петербург ──────────────
-  const SPB_GEO = { lat: 59.9398, lng: 30.3146 };
-  // Пока пользователь не ввёл свои точки — все окна сфокусированы на СПб;
-  // после ввода старт/цель следуют за данными автоматически (animateTo).
-  const spbPanelCenter = !startGeo && !goalGeo && tripleAllGeoPts.length === 0 ? SPB_GEO : null;
 
   return (
     <div id="map-container" ref={containerRef} className="relative w-full h-full overflow-hidden bg-[#0f1729]">
@@ -2318,16 +2376,6 @@ const MapCanvas: React.FC = () => {
         <button className={btnCls} aria-label="Масштаб 1 к 10000" title="Целевой масштаб 1:10 000 (1 см ≈ 100 м)" onClick={setViewStateForZoom10k}>⌖</button>
         <button className={btnCls} aria-label="Геолокация" title="Моё местоположение" onClick={locateUser}>📍</button>
         <button className={btnCls} aria-label="Полный экран" title="Полный экран (F)" onClick={toggleFullscreen}>⛶</button>
-        <button
-          className={`${btnCls} ${project.settings?.tilesEnabled ? 'ring-1 ring-cyan-400' : ''}`}
-          aria-label="Тайловая подложка" title="Активная тайловая карта (T)"
-          onClick={() => updateSettings({ tilesEnabled: !project.settings?.tilesEnabled })}
-        >▦</button>
-        <button
-          className={`${btnCls} ${tripleMode ? 'ring-1 ring-emerald-400 bg-emerald-900/60' : ''}`}
-          aria-label="Три окна карты" title="Три окна карты: старт / весь маршрут / цель"
-          onClick={() => enableTripleMode(!tripleMode)}
-        >🗺</button>
       </div>
 
       {/* ─── Три отдельных окна карты + пошаговый мастер: СТАРТ → МАРШРУТ → ЦЕЛЬ → ЗАПУСК ─── */}
@@ -2355,12 +2403,16 @@ const MapCanvas: React.FC = () => {
           { idx: 2, title: sharedGoal ? 'ЦЕЛЬ — общая для роя (1 см = 2 км)' : `ЦЕЛЬ дрона ${Math.min(activeUav + 1, droneCount)} (1 см = 2 км)`, icon: '🔴' },
         ] as const;
         const panelPropsFor = (idx: number): React.ComponentProps<typeof MiniMapPanel> => {
-          // общие пропсы панелей: фокус, редактирование, удаление кликом
+          // общие пропсы панелей: фокус, редактирование, удаление кликом —
+          // ОДИНАКОВО во всех трёх окнах (редактировать можно любое окно сразу)
           const base: Partial<React.ComponentProps<typeof MiniMapPanel>> = {
             focused: tripleStep === idx,
+            panelIdx: idx,
             onFocus: () => { if (launchState === 'idle') bringPanelOnTop(idx); },
+            onMapClick: handlePanelMapClick,
             onPointClick: handlePanelPointDelete,
             onZoneClick: handlePanelZoneDelete,
+            zones: [...zoneGeoList, ...pendingZoneMini],
           };
           if (idx === 0) return {
             ...base,
@@ -2393,11 +2445,7 @@ const MapCanvas: React.FC = () => {
         <>
         {/* ВЕРХ: окно «МАРШРУТ» вместо большой карты */}
         <div id="triple-route-top" className="absolute inset-0 z-30">
-          <MiniMapPanel
-            {...panelPropsFor(1)}
-            onMapClick={tripleStep === 1 ? handlePanelMapClick : undefined}
-            zones={tripleStep === 1 ? zoneGeoList : []}
-          />
+          <MiniMapPanel {...panelPropsFor(1)} />
         </div>
         {/* НИЗ: окна «СТАРТ» и «ЦЕЛЬ» + панель мастера */}
         <div id="triple-map-row" className="absolute left-2 right-2 bottom-2 z-40 rounded-xl border border-cyan-700/60 bg-gray-900/95 shadow-2xl p-2">
@@ -2446,15 +2494,12 @@ const MapCanvas: React.FC = () => {
             )}
             <div className="flex-1" />
             <button className="px-2 py-0.5 rounded bg-cyan-800 hover:bg-cyan-700 border border-cyan-600 text-white" onClick={exportTriplePng} title="PNG высокого разрешения: три карты в одном файле">💾 PNG</button>
-            <button className="px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 border border-gray-600 text-white" onClick={() => enableTripleMode(false)}>✕ Закрыть</button>
           </div>
           <div className="grid grid-cols-2 gap-2">
             {bottomOrder.map((idx) => (
               <MiniMapPanel
                 key={idx}
                 {...panelPropsFor(idx)}
-                onMapClick={tripleStep === idx ? handlePanelMapClick : undefined}
-                zones={tripleStep === idx ? [...zoneGeoList, ...(pendingZone && idx === 2 ? [{ id: 'pendingZone', pts: [], radiusM: pendingZone.radiusM, centerGeo: pendingZone.center, color: '#fb923c' }] : [])] : []}
               />
             ))}
           </div>
@@ -2472,19 +2517,27 @@ const MapCanvas: React.FC = () => {
                 onClick={approveTripleStep}
                 title={canApproveStep(tripleStep as 0 | 1 | 2) ? 'Утвердить изменения этого этапа и перейти к следующему' : 'Сначала задайте данные этапа кликами по сфокусированной карте'}
               >✓ Утвердить и далее</button>
-            ) : (
+            ) : canLaunch ? (
               <button
                 className={`px-4 py-1 rounded font-bold border text-white transition-all ${launchState === 'done' ? 'bg-emerald-600 border-emerald-400 cursor-default' : launchState === 'uploading' ? 'bg-amber-700 border-amber-500 animate-pulse cursor-wait' : 'bg-red-700 hover:bg-red-600 border-red-400 shadow-[0_0_14px_rgba(239,68,68,0.5)]'}`}
                 onClick={launchMission}
                 disabled={launchState !== 'idle'}
                 title="Все данные миссии утверждены — загрузить полётные задания в дроны"
               >{launchState === 'uploading' ? '⏳ Загрузка в дроны…' : launchState === 'done' ? '✅ Задания загружены' : '🚀 ЗАПУСК'}</button>
+            ) : null}
+            {launchState === 'done' && (
+              <button
+                className="px-4 py-1 rounded font-bold border text-white bg-cyan-700 hover:bg-cyan-600 border-cyan-400 shadow-[0_0_14px_rgba(34,211,238,0.45)]"
+                onClick={newMission}
+                title="Очистить данные предыдущего полёта и начать новую миссию"
+              >🆕 Новая миссия</button>
             )}
             <span className="text-gray-400">
               {tripleStep === 0 && 'Кликните по подсвеченной карте «Старт», чтобы выбрать точку старта.'}
               {tripleStep === 1 && 'Кликами по карте «Маршрут» добавляйте путевые точки; перетащите карту/зум для обзора.'}
               {tripleStep === 2 && 'На карте «Цель»: ставьте цель (🎯) и ограничения зон (⛔).'}
               {tripleStep === 3 && 'Проверьте карты и нажмите «ЗАПУСК» — задания уйдут в рой.'}
+              {launchState === 'done' && ' ✅ Задания загружены в дроны. Нажмите «Новая миссия», чтобы начать следующий полёт.'}
             </span>
           </div>
         </div>
