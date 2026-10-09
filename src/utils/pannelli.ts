@@ -98,18 +98,18 @@ export function screenPxToGeo(x: number, y: number, vb: PanelViewBox, canvasW: n
   return mercFracToGeo(vb.fx + (x - canvasW / 2) / vb.wpx, vb.fy + (y - canvasH / 2) / vb.hpx);
 }
 
-/** Непрерывный зум вокруг точки канваса (колесо мыши) */
+/** Непрерывный зум вокруг точки канваса (колесо мыши).
+ *  Инвариант: гео-точка под курсором остаётся под курсором после смены зума. */
 export function zoomPanelAt(v: PanelView, factor: number, cx: number, cy: number, canvasW: number, canvasH: number, minZoom: number, maxZoom: number): PanelView {
   const vb = viewBox(v, canvasW, canvasH);
-  const g = screenPxToGeo(cx, cy, vb, canvasW, canvasH);
+  // какая доля мира смещена от центра к курсору (в mercator-долях)
+  const dFx = (cx - canvasW / 2) / vb.wpx;
+  const dFy = (cy - canvasH / 2) / vb.hpx;
   const zoom = Math.max(minZoom, Math.min(maxZoom, v.zoom + Math.log2(Math.max(factor, 1e-6))));
-  const ng = geoToMercFrac(g.lat, g.lng);
-  const nv = { zoom, fx: v.fx, fy: v.fy };
-  const nvb = viewBox(nv, canvasW, canvasH);
-  // фиксируем точку под курсором: после смены зума скорректируем центр
-  const after = geoToScreenPx(g.lat, g.lng, nvb, canvasW, canvasH);
-  const shift = screenPxToGeo(cx - (after.x - canvasW / 2), cy - (after.y - canvasH / 2), nvb, canvasW, canvasH);
-  return { zoom, fx: geoToMercFrac(shift.lat, shift.lng).fx, fy: geoToMercFrac(shift.lat, shift.lng).fy };
+  const nvb = viewBox({ ...v, zoom }, canvasW, canvasH);
+  // новый центр: fx_new = fx_geo(курсор) − dF_new, где dF_new = dF·wpx_old/wpx_new
+  const scale = vb.wpx / nvb.wpx;
+  return { zoom, fx: v.fx + dFx * (1 - scale), fy: v.fy + dFy * (1 - scale) };
 }
 
 /** Панорама перетаскиванием: delta px экрана -> новый центр вида */
