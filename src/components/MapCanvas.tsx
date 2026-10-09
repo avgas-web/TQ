@@ -488,6 +488,161 @@ const MapCanvas: React.FC = () => {
   const pickWhatRef = useRef(pickWhat);
   useEffect(() => { pickWhatRef.current = pickWhat; }, [pickWhat]);
 
+  const uavColors = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#fb923c', '#38bdf8', '#e879f9'];
+  // Гео-данные проекта (из пикселей текущего виртуального растра) — источник
+  // точек для панелей «весь маршрут» и целей дронов
+  const tripleRoutes = React.useMemo(() => {
+    if (!tripleMode) return [] as { id: string; name: string; color: string; geo: { lat: number; lng: number }[] }[];
+    const map = project.map;
+    if (!map?.bounds || map.width <= 0 || map.height <= 0) return [];
+    return (project.routes || [])
+      .filter((r) => r.visible !== false && r.points.length >= 2)
+      .map((r) => ({
+        id: r.id, name: r.name, color: r.color || '#22d3ee',
+        geo: r.points.map((p) => pixelToGeoExact({ x: p.x, y: p.y }, map.bounds!, map.width, map.height)),
+      }));
+  }, [tripleMode, project.routes, project.map]);
+
+  const tripleAllGeoPts = React.useMemo(() => {
+    const out: { lat: number; lng: number }[] = [];
+    for (const r of tripleRoutes) out.push(...r.geo);
+    if (startGeo) out.push(startGeo);
+    if (goalGeo) out.push(goalGeo);
+    return out;
+  }, [tripleRoutes, startGeo, goalGeo]);
+
+  // ─── Пошаговый мастер: старт → маршрут → цель → ЗАПУСК ──────────────────────
+  // step: 0 = выбор старта (панель СТАРТ сфокусирована), 1 = редактирование
+  // маршрута (панель ВЕСЬ МАРШРУТ), 2 = выбор цели (панель ЦЕЛЬ),
+  // 3 = всё утверждено — активна кнопка «🚀 ЗАПУСК».
+  type TripleStep = 0 | 1 | 2 | 3;
+  const [tripleStep, setTripleStep] = useState<TripleStep>(0);
+  const [approvedSteps, setApprovedSteps] = useState<boolean[]>([false, false, false]);
+  const [launchState, setLaunchState] = useState<'idle' | 'uploading' | 'done'>('idle');
+  const [draftRoutePts, setDraftRoutePts] = useState<{ lat: number; lng: number }[] | null>(null);
+  const [editTool, setEditTool] = useState<'point' | 'zone'>('point');
+  const [pendingZone, setPendingZone] = useState<{ center: { lat: number; lng: number }; radiusM: number } | null>(null);
+  const addRoute = useStore((s) => s.addRoute);
+  const mapBounds = project.map?.bounds;
+
+  // Черновик маршрута из реальных маршрутов проекта при входе в шаг 1
+  useEffect(() => {
+    if (tripleStep === 1 && draftRoutePts === null) {
+      const r = tripleRoutes[Math.min(activeUav, Math.max(0, tripleRoutes.length - 1))];
+      setDraftRoutePts(r ? r.geo : (startGeo && goalGeo ? [startGeo, goalGeo] : []));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tripleStep, approvedSteps]);
+
+  const focusPanelIdx = tripleStep === 3 ? -1 : tripleStep;
+  const canApproveStep = (st: TripleStep): boolean => {
+    if (st === 0) return !!startGeo;
+    if (st === 1) return (draftRoutePts?.length ?? 0) >= 2 || tripleRoutes.length > 0;
+    if (st === 2) return !!goalGeo || !sharedGoal;
+    return false;
+  };
+
+  const approveTripleStep = useCallback(() => {
+    if (tripleStep === 1 && draftRoutePts && draftRoutePts.length >= 2 && mapBounds && project.map) {
+      // зафиксировать отредактированный маршрут в проект (пиксели — из точной гео-привязки)
+      const pts: RoutePoint[] = draftRoutePts.map((g) => ({ ...geoToPixelExact(g.lat, g.lng, mapBounds, project.map!.width, project.map!.height), lat: g.lat, lng: g.lng }));
+      const existing = tripleRoutes[Math.min(activeUav, tripleRoutes.length - 1)];
+      if (existing) {
+        useStore.setState((cur) => ({
+          project: {
+            ...cur.project,
+            routes: (cur.project.routes || []).map((r) => (r.id === existing.id ? { ...r, points: pts } : r)),
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+      } else {
+        addRoute(pts, `Маршрут дрона ${activeUav + 1}`, uavColors[activeUav % uavColors.length]);
+      }
+    }
+    if (tripleStep === 2 && pendingZone && mapBounds && project.map) {
+      // последняя неподтверждённая зона шага цели — добавить как ограничение.
+      // radius хранится в пикселях z14-мира основного канваса (worldPx=canvasH·2^14):
+      const worldPxZ14 = Math.max(256, canvasSizeRef.current.height * Math.pow(2, ZOOM_REF));
+      const mppZ14 = metersPerPixelFromWorld(worldPxZ14, pendingZone.center.lat);
+      const c = geoToPixelExact(pendingZone.center.lat, pendingZone.center.lng, mapBounds, project.map!.width, project.map!.height);
+      useStore.getState().addRestriction({
+        type: 'circle', points: [c], radius: pendingZone.radiusM / Math.max(mppZ14, 1e-9),
+        color: '#ff000080', active: true,
+      });
+      setPendingZone(null);
+    }
+    setApprovedSteps((a) => { const n = [...a]; n[tripleStep] = true; return n; });
+    setDraftRoutePts(null);
+    setEditTool('point');
+    if (tripleStep < 2) setTripleStep((tripleStep + 1) as TripleStep);
+    else setTripleStep(3);
+  }, [tripleStep, draftRoutePts, mapBounds, project.map, tripleRoutes, activeUav, addRoute, pendingZone]);
+
+  const backTripleStep = useCallback(() => {
+    setDraftRoutePts(null); setPendingZone(null); setEditTool('point');
+    if (tripleStep === 3) { setTripleStep(2); setApprovedSteps((a) => [a[0], a[1], false]); }
+    else if (tripleStep > 0) {
+      setTripleStep((tripleStep - 1) as TripleStep);
+      setApprovedSteps((a) => { const n = [...a]; n[tripleStep - 1] = false; n[tripleStep] = false; return n; });
+    }
+  }, [tripleStep]);
+
+  // Клик по карте активной панели: добавление точек маршрута / зон-ограничений
+  const handlePanelMapClick = useCallback((geo: { lat: number; lng: number }) => {
+    if (tripleStep === 1) {
+      setDraftRoutePts((prev) => [...(prev || []), geo]);
+    } else if (tripleStep === 2 && editTool === 'zone') {
+      setPendingZone({ center: geo, radiusM: 2000 }); // 1 см карты = 2 км ⇒ радиус круга 2 км
+    } else if (tripleStep === 0) {
+      setStartGeo(geo);
+    } else if (tripleStep === 2 && editTool === 'point') {
+      setGoalGeo(geo);
+    }
+  }, [tripleStep, editTool]);
+
+  // Перенос вида панели на новую точку (кнопка «⬆ наверх» меняет порядок панелей)
+  const panelOrderState = useState<number[]>([0, 1, 2]);
+  const [panelOrder, setPanelOrder] = panelOrderState;
+  const bringPanelOnTop = (idx: number) => {
+    setPanelOrder((o) => [idx, ...o.filter((x) => x !== idx)]);
+    if (idx < 3) setTripleStep(idx as TripleStep);
+  };
+
+  // «ЗАПУСК»: загрузка данных миссии в дроны (имитация телеметрической загрузки)
+  const launchMission = useCallback(async () => {
+    if (tripleStep !== 3 || launchState !== 'idle') return;
+    setLaunchState('uploading');
+    const st = useStore.getState();
+    const mission = {
+      start: startGeo, goal: goalGeo, sharedGoal, droneCount,
+      routes: (st.project.routes || []).filter((r) => r.visible !== false).map((r) => ({
+        id: r.id, name: r.name,
+        waypoints: r.points.map((p) => ({ lat: p.lat, lng: p.lng })),
+      })),
+      zones: st.project.restrictions.filter((z) => z.active).map((z) => ({
+        id: z.id, name: z.name, type: z.type,
+        geoPoints: mapBounds && st.project.map ? z.points.map((pt) => {
+          const g = pixelToGeoExact(pt, mapBounds, st.project.map!.width, st.project.map!.height);
+          return { lat: g.lat, lng: g.lng };
+        }) : [],
+      })),
+      createdAt: new Date().toISOString(),
+    };
+    try {
+      await new Promise((res) => setTimeout(res, 1200)); // имитация последовательной загрузки полётных заданий в рой
+      localStorage.setItem(`mission-launch-${Date.now()}`, JSON.stringify(mission));
+      setLaunchState('done');
+      setPopup({ x: canvasSize.width / 2 - 160, y: 60, title: '🚀 ЗАПУСК выполнен', lines: [
+        `Полётные задания загружены в ${droneCount} БПЛА`,
+        `Старт: ${startGeo ? `${startGeo.lat.toFixed(5)}, ${startGeo.lng.toFixed(5)}` : '—'}`,
+        `Цель: ${sharedGoal ? (goalGeo ? `${goalGeo.lat.toFixed(5)}, ${goalGeo.lng.toFixed(5)} (общая)` : '—') : `${Math.min(droneCount, tripleRoutes.length)} индив. целей`}`,
+        `Маршрутов: ${mission.routes.length} · Активных зон: ${mission.zones.length}`,
+      ] });
+    } catch {
+      setLaunchState('idle');
+    }
+  }, [tripleStep, launchState, startGeo, goalGeo, sharedGoal, droneCount, mapBounds, canvasSize, tripleRoutes]);
+
   // Перенос гео-объектов проекта (маршруты/маркеры/зоны) в виртуальный растр
   // новой активной карты при включении режима — иначе объекты останутся в
   // пикселях старого растра и будут вне bounds («карты пустые»).
@@ -561,27 +716,6 @@ const MapCanvas: React.FC = () => {
     return () => canvas.removeEventListener('click', onClick, true);
   }, []);
 
-  // Гео-данные проекта (из пикселей текущего виртуального растра) — источник
-  // точек для панелей «весь маршрут» и целей дронов
-  const tripleRoutes = React.useMemo(() => {
-    if (!tripleMode) return [] as { id: string; name: string; color: string; geo: { lat: number; lng: number }[] }[];
-    const map = project.map;
-    if (!map?.bounds || map.width <= 0 || map.height <= 0) return [];
-    return (project.routes || [])
-      .filter((r) => r.visible !== false && r.points.length >= 2)
-      .map((r) => ({
-        id: r.id, name: r.name, color: r.color || '#22d3ee',
-        geo: r.points.map((p) => pixelToGeoExact({ x: p.x, y: p.y }, map.bounds!, map.width, map.height)),
-      }));
-  }, [tripleMode, project.routes, project.map]);
-
-  const tripleAllGeoPts = React.useMemo(() => {
-    const out: { lat: number; lng: number }[] = [];
-    for (const r of tripleRoutes) out.push(...r.geo);
-    if (startGeo) out.push(startGeo);
-    if (goalGeo) out.push(goalGeo);
-    return out;
-  }, [tripleRoutes, startGeo, goalGeo]);
 
   // Масштаб стартовой/целевой панелей: 1 см = 2 км при высоте панели ~230 px
   const panelZoomFor2km = (lat: number): number =>
@@ -2049,7 +2183,6 @@ const MapCanvas: React.FC = () => {
   const btnCls = 'w-9 h-9 flex items-center justify-center rounded-md bg-gray-800/90 hover:bg-gray-700 text-gray-100 border border-gray-600 shadow text-base select-none';
 
   // ─── Данные для трёх окон карты ─────────────────────────────────────────────
-  const uavColors = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#fb923c', '#38bdf8', '#e879f9'];
   const goalForUav = (i: number): { lat: number; lng: number } | null => {
     if (sharedGoal) return goalGeo;
     const r = tripleRoutes[i];
@@ -2154,28 +2287,82 @@ const MapCanvas: React.FC = () => {
         >🗺</button>
       </div>
 
-      {/* ─── Три отдельных окна карты: СТАРТ / ВЕСЬ МАРШРУТ / ЦЕЛЬ ─────────── */}
-      {tripleMode && (
+      {/* ─── Три отдельных окна карты + пошаговый мастер: СТАРТ → МАРШРУТ → ЦЕЛЬ → ЗАПУСК ─── */}
+      {tripleMode && (() => {
+        // гео-зоны проекта (для отрисовки ограничений на активной панели)
+        const zoneGeoList = (() => {
+          const map = project.map;
+          if (!map?.bounds || map.width <= 0 || map.height <= 0) return [] as { pts: { lat: number; lng: number }[]; color?: string; radiusM?: number; centerGeo?: { lat: number; lng: number } }[];
+          const worldPxZ14 = Math.max(256, canvasSizeRef.current.height * Math.pow(2, ZOOM_REF));
+          return (project.restrictions || []).filter((z) => z.active !== false && z.points.length > 0).map((z) => {
+            const geoPts = z.points.map((p) => pixelToGeoExact(p, map.bounds!, map.width, map.height));
+            if (z.type === 'circle' && z.radius) {
+              const mppZ14 = metersPerPixelFromWorld(worldPxZ14, geoPts[0].lat);
+              return { pts: [] as { lat: number; lng: number }[], color: '#f87171', radiusM: z.radius * mppZ14, centerGeo: geoPts[0] };
+            }
+            return { pts: geoPts, color: '#f87171' };
+          });
+        })();
+        const draftLine: MiniOverlayLine[] = draftRoutePts && draftRoutePts.length >= 2
+          ? [{ pts: draftRoutePts, color: '#34d399', width: 3 }] : [];
+        const draftPoints: MiniOverlayPoint[] = (draftRoutePts || []).map((g, i) => ({ lat: g.lat, lng: g.lng, label: `${i + 1}`, color: '#34d399' }));
+        const stepDefs = [
+          { idx: 0, title: 'СТАРТ (масштаб 1 см = 2 км)', icon: '🟢' },
+          { idx: 1, title: 'ВЕСЬ МАРШРУТ (высокая детализация)', icon: '🧭' },
+          { idx: 2, title: sharedGoal ? 'ЦЕЛЬ — общая для роя (1 см = 2 км)' : `ЦЕЛЬ дрона ${Math.min(activeUav + 1, droneCount)} (1 см = 2 км)`, icon: '🔴' },
+        ] as const;
+        const panelPropsFor = (idx: number): React.ComponentProps<typeof MiniMapPanel> => {
+          if (idx === 0) return {
+            title: stepDefs[0].title, icon: '🟢',
+            center: startCenter, zoom: panelZoomFor2km(startCenter.lat),
+            points: pointsOut.filter((p) => p.label === 'СТАРТ'), lines: linesOut, height: panelH,
+          };
+          if (idx === 1) return {
+            title: stepDefs[1].title, icon: '🧭',
+            center: startCenter, zoom: 10,
+            fitPoints: tripleAllGeoPts.length > 0 ? tripleAllGeoPts : undefined,
+            points: [...pointsOut, ...draftPoints], lines: [...linesOut, ...draftLine], height: panelH,
+          };
+          return {
+            title: stepDefs[2].title, icon: '🔴',
+            center: goalCenter, zoom: panelZoomFor2km(goalCenter.lat),
+            points: pointsOut.filter((p) => p.label !== 'СТАРТ'),
+            lines: [...(routeLineGeo.length > 1 ? [{ pts: routeLineGeo, color: '#facc15', width: 2 }] : []), ...linesOut],
+            height: panelH,
+          };
+        };
+        const stepHint = ['① Утвердите точку старта', '② Утвердите маршрут', '③ Утвердите цель', '✔ Все этапы утверждены — можно запускать'][tripleStep];
+        return (
         <div id="triple-map-row" className="absolute left-2 right-2 bottom-8 z-30 rounded-xl border border-cyan-700/60 bg-gray-900/95 shadow-2xl p-2">
           <div className="flex flex-wrap items-center gap-2 mb-2 text-xs">
             <span className="font-bold text-cyan-300">Карта миссии роя</span>
-            <button
-              className={`px-2 py-0.5 rounded border text-white ${pickWhat === 'start' ? 'bg-emerald-700 border-emerald-400' : 'bg-gray-800 border-gray-600 hover:bg-gray-700'}`}
-              onClick={() => setPickWhat(pickWhat === 'start' ? 'none' : 'start')}
-              title="Кликните по основной карте, чтобы выбрать точку старта"
-            >🟢 Выбрать старт{pickWhat === 'start' ? ' — кликните по карте…' : ''}</button>
-            <button
-              className={`px-2 py-0.5 rounded border text-white ${pickWhat === 'goal' ? 'bg-red-700 border-red-400' : 'bg-gray-800 border-gray-600 hover:bg-gray-700'}`}
-              onClick={() => setPickWhat(pickWhat === 'goal' ? 'none' : 'goal')}
-              title="Кликните по основной карте, чтобы выбрать цель"
-            >🔴 Выбрать цель{pickWhat === 'goal' ? ' — кликните по карте…' : ''}</button>
+            {/* Индикатор шагов мастера */}
+            <div className="flex items-center gap-1" aria-label="Этапы подготовки миссии">
+              {['Старт', 'Маршрут', 'Цель'].map((lbl, i) => (
+                <button key={lbl}
+                  onClick={() => { if (launchState === 'idle') bringPanelOnTop(i); }}
+                  className={`px-2 py-0.5 rounded border ${approvedSteps[i] ? 'bg-emerald-900/70 border-emerald-500 text-emerald-200' : tripleStep === i ? 'bg-cyan-800 border-cyan-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-400 hover:bg-gray-700'}`}
+                  title={`Перенести карту «${lbl}» наверх и редактировать`}
+                >{approvedSteps[i] ? '✓' : `${i + 1}.`} {lbl}</button>
+              ))}
+              <span className="text-gray-400 ml-1">{stepHint}</span>
+            </div>
+            {/* Инструменты редактирования активного шага */}
+            {tripleStep === 2 && (
+              <div className="flex items-center gap-1">
+                <button className={`px-2 py-0.5 rounded border ${editTool === 'point' ? 'bg-red-800 border-red-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'}`}
+                  onClick={() => setEditTool('point')} title="Клик по карте цели — поставить/перенести цель">🎯 Цель</button>
+                <button className={`px-2 py-0.5 rounded border ${editTool === 'zone' ? 'bg-orange-800 border-orange-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'}`}
+                  onClick={() => setEditTool('zone')} title="Клик по карте — добавить круговую зону ограничения (r = 2 км)">⛔ Зона 2 км</button>
+              </div>
+            )}
             <label className="flex items-center gap-1 text-gray-300">Дронов:
-              <input type="number" min={1} max={8} value={droneCount}
+              <input type="number" min={1} max={8} value={droneCount} disabled={launchState !== 'idle'}
                 onChange={(e) => setDroneCount(Math.max(1, Math.min(8, Number(e.target.value) || 1)))}
                 className="w-12 px-1 bg-gray-800 border border-gray-600 rounded text-white" />
             </label>
             <label className="flex items-center gap-1 text-gray-300 cursor-pointer">
-              <input type="checkbox" checked={sharedGoal} onChange={(e) => setSharedGoal(e.target.checked)} />
+              <input type="checkbox" checked={sharedGoal} disabled={launchState !== 'idle'} onChange={(e) => setSharedGoal(e.target.checked)} />
               Общая цель для всего роя
             </label>
             {!sharedGoal && tripleRoutes.length > 0 && (
@@ -2195,29 +2382,49 @@ const MapCanvas: React.FC = () => {
             <button className="px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 border border-gray-600 text-white" onClick={() => enableTripleMode(false)}>✕ Закрыть</button>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-            <MiniMapPanel
-              title="СТАРТ (масштаб 1 см = 2 км)" icon="🟢"
-              center={startCenter} zoom={panelZoomFor2km(startCenter.lat)}
-              points={pointsOut.filter((p) => p.label === 'СТАРТ')}
-              lines={linesOut} height={panelH}
-            />
-            <MiniMapPanel
-              title="ВЕСЬ МАРШРУТ (высокая детализация)" icon="🧭"
-              center={startCenter} zoom={10}
-              fitPoints={tripleAllGeoPts.length > 0 ? tripleAllGeoPts : undefined}
-              points={pointsOut} lines={linesOut} height={panelH}
-            />
-            <MiniMapPanel
-              title={sharedGoal ? 'ЦЕЛЬ — общая для роя (1 см = 2 км)' : `ЦЕЛЬ дрона ${Math.min(activeUav + 1, droneCount)} (1 см = 2 км)`}
-              icon="🔴"
-              center={goalCenter} zoom={panelZoomFor2km(goalCenter.lat)}
-              points={pointsOut.filter((p) => p.label !== 'СТАРТ')}
-              lines={[...(routeLineGeo.length > 1 ? [{ pts: routeLineGeo, color: '#facc15', width: 2 }] : []), ...linesOut]}
-              height={panelH}
-            />
+            {panelOrder.map((idx) => (
+              <MiniMapPanel
+                key={idx}
+                {...panelPropsFor(idx)}
+                focused={tripleStep === idx}
+                onFocus={() => { if (launchState === 'idle') bringPanelOnTop(idx); }}
+                onMapClick={tripleStep === idx ? handlePanelMapClick : undefined}
+                zones={tripleStep === idx ? [...zoneGeoList, ...(pendingZone ? [{ pts: [], radiusM: pendingZone.radiusM, centerGeo: pendingZone.center, color: '#fb923c' }] : [])] : []}
+              />
+            ))}
+          </div>
+          {/* Нижняя панель мастера: назад / утвердить / ЗАПУСК */}
+          <div className="flex items-center gap-2 mt-2 text-xs">
+            <button
+              className="px-3 py-1 rounded bg-gray-800 hover:bg-gray-700 border border-gray-600 text-gray-200 disabled:opacity-40"
+              disabled={tripleStep === 0 || launchState !== 'idle'}
+              onClick={backTripleStep}
+            >← Назад</button>
+            {tripleStep < 3 ? (
+              <button
+                className="px-3 py-1 rounded font-semibold bg-emerald-700 hover:bg-emerald-600 border border-emerald-500 text-white disabled:opacity-40 disabled:cursor-not-allowed"
+                disabled={!canApproveStep(tripleStep as 0 | 1 | 2)}
+                onClick={approveTripleStep}
+                title={canApproveStep(tripleStep as 0 | 1 | 2) ? 'Утвердить изменения этого этапа и перейти к следующему' : 'Сначала задайте данные этапа кликами по сфокусированной карте'}
+              >✓ Утвердить и далее</button>
+            ) : (
+              <button
+                className={`px-4 py-1 rounded font-bold border text-white transition-all ${launchState === 'done' ? 'bg-emerald-600 border-emerald-400 cursor-default' : launchState === 'uploading' ? 'bg-amber-700 border-amber-500 animate-pulse cursor-wait' : 'bg-red-700 hover:bg-red-600 border-red-400 shadow-[0_0_14px_rgba(239,68,68,0.5)]'}`}
+                onClick={launchMission}
+                disabled={launchState !== 'idle'}
+                title="Все данные миссии утверждены — загрузить полётные задания в дроны"
+              >{launchState === 'uploading' ? '⏳ Загрузка в дроны…' : launchState === 'done' ? '✅ Задания загружены' : '🚀 ЗАПУСК'}</button>
+            )}
+            <span className="text-gray-400">
+              {tripleStep === 0 && 'Кликните по подсвеченной карте «Старт», чтобы выбрать точку старта.'}
+              {tripleStep === 1 && 'Кликами по карте «Маршрут» добавляйте путевые точки; перетащите карту/зум для обзора.'}
+              {tripleStep === 2 && 'На карте «Цель»: ставьте цель (🎯) и ограничения зон (⛔).'}
+              {tripleStep === 3 && 'Проверьте карты и нажмите «ЗАПУСК» — задания уйдут в рой.'}
+            </span>
           </div>
         </div>
-      )}
+        );
+      })()}
     </div>
   );
 };

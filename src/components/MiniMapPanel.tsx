@@ -29,6 +29,26 @@ interface MiniMapPanelProps {
   lines?: MiniOverlayLine[];
   height?: number | string;
   onReady?: () => void;
+  /** Режим «фокус»: панель активна для редактирования (принимает клики) */
+  focused?: boolean;
+  /** Вызывается при фокусировке панели (клик по неактивной панели) */
+  onFocus?: () => void;
+  /** Клик по карте панели → гео-координаты (для добавления точек маршрута и т.п.) */
+  onMapClick?: (geo: { lat: number; lng: number }) => void;
+  /** Ограничения/зоны, привязанные к этой панели (рисуются поверх тайлов).
+   *  radiusM — радиус круга в метрах; pts — полигон по гео-точкам. */
+  zones?: { pts: { lat: number; lng: number }[]; color?: string; radiusM?: number; centerGeo?: { lat: number; lng: number } }[];
+}
+
+/** Обратное преобразование экран→гео для панели (нужно для кликов редактирования).
+ *  Совпадает с screenPxToGeo из pannelli.ts (центр канваса как точка отсчёта). */
+export function screenPxToGeoPanel(vb: { fx: number; fy: number; wpx: number }, sx: number, sy: number, canvasW: number, canvasH: number): { lat: number; lng: number } {
+  const fx = vb.fx + (sx - canvasW / 2) / vb.wpx;
+  const fy = vb.fy + (sy - canvasH / 2) / vb.wpx;
+  const lng = fx * 360 - 180;
+  const nn = Math.PI - 2 * Math.PI * fy;
+  const lat = (180 / Math.PI) * Math.atan(0.5 * (Math.exp(nn) - Math.exp(-nn)));
+  return { lat, lng };
 }
 
 /** Общий LRU-кэш изображений тайлов для ВСЕХ мини-панелей (экономит трафик OSM) */
@@ -48,6 +68,7 @@ function cacheTile(url: string, img: HTMLImageElement | null): void {
 const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   title, icon, center, zoom = 11, fitPoints, minZoom = 3, maxZoom = 19,
   points = [], lines = [], height = 260, onReady,
+  focused = false, onFocus, onMapClick, zones = [],
 }) => {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -159,6 +180,31 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       ctx.restore();
     }
 
+    // Зоны ограничений (для панели в режиме редактирования).
+    // radiusM — радиус в МЕТРАХ (передаётся вызывающим кодом), рисуется точно
+    // через масштаб панели (м/пиксель с учётом широты).
+    for (const zn of zones) {
+      ctx.save();
+      ctx.strokeStyle = zn.color || 'rgba(248,113,113,0.9)';
+      ctx.fillStyle = 'rgba(248,113,113,0.13)';
+      ctx.lineWidth = 1.5;
+      if (zn.radiusM && zn.centerGeo) {
+        const c = geoToScreenPx(zn.centerGeo.lat, zn.centerGeo.lng, vb, w, h);
+        const mppPanel = metersPerPixel(v.zoom, mercLatOf(v));
+        const rScreen = zn.radiusM / Math.max(mppPanel, 1e-9);
+        ctx.beginPath(); ctx.arc(c.x, c.y, Math.min(rScreen, 4000), 0, Math.PI * 2);
+        ctx.fill(); ctx.stroke();
+      } else if (zn.pts.length >= 2) {
+        ctx.beginPath();
+        zn.pts.forEach((p, i) => {
+          const s = geoToScreenPx(p.lat, p.lng, vb, w, h);
+          if (i === 0) ctx.moveTo(s.x, s.y); else ctx.lineTo(s.x, s.y);
+        });
+        ctx.closePath(); ctx.fill(); ctx.stroke();
+      }
+      ctx.restore();
+    }
+
     // Точки (старт/цели дронов)
     for (const pt of points) {
       const s = geoToScreenPx(pt.lat, pt.lng, vb, w, h);
@@ -198,7 +244,7 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     ctx.strokeStyle = '#7dd3fc'; ctx.lineWidth = 1.5;
     ctx.beginPath(); ctx.moveTo(w - barPx - 10, h - 14); ctx.lineTo(w - 10, h - 14); ctx.stroke();
     ctx.restore();
-  }, [lines, points, minZoom, maxZoom, bump]);
+  }, [lines, points, zones, minZoom, maxZoom, bump]);
 
   function mercLatOf(v: PanelView): number {
     const nn = Math.PI - 2 * Math.PI * v.fy;
@@ -208,7 +254,13 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   // Перерисовка на каждый тик/ресайз
   useEffect(() => { drawAll(); }, [drawAll, size, tickRef.current]);
 
-  // Управление: wheel (не-passive!), touch, кнопки зума
+  // Управление: wheel (не-passive!), touch, кнопки зума + клики редактирования
+  const focusedRef = useRef(focused);
+  useEffect(() => { focusedRef.current = focused; }, [focused]);
+  const onMapClickRef = useRef(onMapClick);
+  useEffect(() => { onMapClickRef.current = onMapClick; }, [onMapClick]);
+  const onFocusRef = useRef(onFocus);
+  useEffect(() => { onFocusRef.current = onFocus; }, [onFocus]);
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -219,16 +271,32 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       viewRef.current = zoomPanelAt(viewRef.current, e.deltaY < 0 ? 1.25 : 1 / 1.25, e.clientX - r.left, e.clientY - r.top, sizeRef.current.w, sizeRef.current.h, minZoom, maxZoom);
       bump();
     };
-    let drag: { x: number; y: number } | null = null;
-    const onDown = (e: PointerEvent) => { drag = { x: e.clientX, y: e.clientY }; canvas.setPointerCapture?.(e.pointerId); };
+    let drag: { x: number; y: number; moved: boolean } | null = null;
+    const onDown = (e: PointerEvent) => { drag = { x: e.clientX, y: e.clientY, moved: false }; canvas.setPointerCapture?.(e.pointerId); };
     const onMove = (e: PointerEvent) => {
       if (!drag) return;
       const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
-      drag = { x: e.clientX, y: e.clientY };
+      if (Math.abs(dx) + Math.abs(dy) > 2) drag.moved = true;
+      drag = { x: e.clientX, y: e.clientY, moved: drag.moved };
       viewRef.current = panPanelBy(viewRef.current, dx, dy, sizeRef.current.w, sizeRef.current.h);
       bump();
     };
-    const onUp = () => { drag = null; };
+    const onUp = (e: PointerEvent) => {
+      const wasDrag = drag?.moved;
+      drag = null;
+      if (wasDrag) return;
+      // Клик (без перетаскивания): неактивная панель — фокусируется;
+      // активная в режиме редактирования — передаёт гео-точку вызывающему коду.
+      const r = rectOf();
+      const sx = e.clientX - r.left, sy = e.clientY - r.top;
+      if (sx < 0 || sy < 0 || sx > r.width || sy > r.height) return;
+      if (!focusedRef.current) { onFocusRef.current?.(); return; }
+      if (onMapClickRef.current) {
+        const { w, h } = sizeRef.current;
+        const vb = viewBox(viewRef.current, w, h);
+        onMapClickRef.current(screenPxToGeoPanel(vb, sx, sy, w, h));
+      }
+    };
     canvas.addEventListener('wheel', onWheel, { passive: false });
     canvas.addEventListener('pointerdown', onDown);
     canvas.addEventListener('pointermove', onMove);
@@ -262,16 +330,20 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
 
   const btn = 'w-7 h-7 flex items-center justify-center rounded bg-gray-800/90 hover:bg-gray-700 text-gray-100 border border-gray-600 text-sm select-none';
   return (
-    <div className="rounded-lg border border-gray-700 bg-gray-900 overflow-hidden" style={{ height }}>
+    <div
+      className={`rounded-lg overflow-hidden ${focused ? 'border-2 border-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.35)]' : 'border border-gray-700'}`}
+      style={{ height }}
+    >
       <div className="flex items-center gap-2 px-2 py-1 border-b border-gray-700 bg-gray-800/60">
         <span className="text-xs font-bold text-cyan-300">{icon} {title}</span>
+        {focused && <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-800/80 text-emerald-100 border border-emerald-500 animate-pulse">✏️ редактируется — клик по карте добавляет точку</span>}
         <div className="flex-1" />
         <button className={btn} title="Приблизить" onClick={() => zoomBy(1.5)}>＋</button>
         <button className={btn} title="Отдалить" onClick={() => zoomBy(1 / 1.5)}>－</button>
         <button className={btn} title="Вписать объект / сбросить вид" onClick={recenter}>⌂</button>
       </div>
       <div ref={wrapRef} className="relative w-full" style={{ height: `calc(100% - 30px)` }}>
-        <canvas ref={canvasRef} style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none', cursor: 'grab' }} aria-label={`Карта: ${title}`} />
+        <canvas ref={canvasRef} style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none', cursor: focused && onMapClick ? 'crosshair' : 'grab' }} aria-label={`Карта: ${title}`} />
       </div>
     </div>
   );
