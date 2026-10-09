@@ -34,7 +34,9 @@ interface MiniMapPanelProps {
   /** Вызывается при фокусировке панели (клик по неактивной панели) */
   onFocus?: () => void;
   /** Клик по карте панели → гео-координаты (для добавления точек маршрута и т.п.) */
-  onMapClick?: (geo: { lat: number; lng: number }) => void;
+  onMapClick?: (geo: { lat: number; lng: number; panelIdx?: number }) => void;
+  /** Индекс панели (0 старт / 1 маршрут / 2 цель) — для маршрутизации кликов */
+  panelIdx?: number;
   /** Ограничения/зоны, привязанные к этой панели (рисуются поверх тайлов).
    *  radiusM — радиус круга в метрах; pts — полигон по гео-точкам. */
   zones?: MiniZone[];
@@ -77,7 +79,7 @@ function cacheTile(url: string, img: HTMLImageElement | null): void {
 const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   title, icon, center, zoom = 11, fitPoints, minZoom = 3, maxZoom = 20,
   points = [], lines = [], height = 260, onReady,
-  focused = false, onFocus, onMapClick, zones = [], onPointClick, onZoneClick,
+  focused = false, onFocus, onMapClick, panelIdx = -1, zones = [], onPointClick, onZoneClick,
 }) => {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -355,6 +357,8 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   useEffect(() => { focusedRef.current = focused; }, [focused]);
   const onMapClickRef = useRef(onMapClick);
   useEffect(() => { onMapClickRef.current = onMapClick; }, [onMapClick]);
+  const panelIdxRef = useRef(panelIdx);
+  useEffect(() => { panelIdxRef.current = panelIdx; }, [panelIdx]);
   const onFocusRef = useRef(onFocus);
   useEffect(() => { onFocusRef.current = onFocus; }, [onFocus]);
   const onPointClickRef = useRef(onPointClick);
@@ -387,13 +391,13 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       const wasDrag = drag?.moved;
       drag = null;
       if (wasDrag) return;
-      // Клик (без перетаскивания): неактивная панель — фокусируется;
-      // активная в режиме редактирования — передаёт гео-точку вызывающему коду.
+      // Клик (без перетаскивания): любой панели разрешено редактирование —
+      // фокус + удаление/добавление объектов работают во ВСЕХ окнах сразу.
       const r = rectOf();
       const sx = e.clientX - r.left, sy = e.clientY - r.top;
       if (sx < 0 || sy < 0 || sx > r.width || sy > r.height) return;
-      if (!focusedRef.current) { onFocusRef.current?.(); return; }
-      // Приоритет: клик ТОЧНО по точке/объекту или зоне на активной карте = УДАЛИТЬ её
+      onFocusRef.current?.();
+      // Приоритет: клик ТОЧНО по точке/объекту или зоне на карте = УДАЛИТЬ её
       const { w, h } = sizeRef.current;
       const vb = viewBox(viewRef.current, w, h);
       const sc = { x: sx * (w / Math.max(1, r.width)), y: sy * (h / Math.max(1, r.height)) };
@@ -402,7 +406,9 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       const hitZn = [...hitsRef.current.zoneHits].reverse().find((z) => z.id && ((z.x - sc.x) ** 2 + (z.y - sc.y) ** 2 <= Math.min(z.r, 60) ** 2));
       if (hitZn?.id) { onZoneClickRef.current?.(hitZn.id); return; }
       if (onMapClickRef.current) {
-        onMapClickRef.current(screenPxToGeoPanel(vb, sc.x, sc.y, w, h));
+        const geo = screenPxToGeoPanel(vb, sc.x, sc.y, w, h);
+        const idx = panelIdxRef.current;
+        onMapClickRef.current(idx >= 0 ? ({ ...geo, panelIdx: idx } as typeof geo) : geo);
       }
     };
     canvas.addEventListener('wheel', onWheel, { passive: false });
