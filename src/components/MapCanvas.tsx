@@ -608,6 +608,35 @@ const MapCanvas: React.FC = () => {
     if (idx < 3) setTripleStep(idx as TripleStep);
   };
 
+  // ─── Удаление введённых точек/объектов кликом по ✛ на активной карте ───────
+  // id форматы: 'triple:start' | 'triple:goal' | 'draft:N' | 'zone:<restrictionId>' |
+  //             'pendingZone' | 'drone-goal:<routeId>'
+  const handlePanelPointDelete = useCallback((id: string) => {
+    if (id === 'triple:start') { setStartGeo(null); return; }
+    if (id === 'triple:goal') { setGoalGeo(null); return; }
+    if (id === 'pendingZone') { setPendingZone(null); return; }
+    if (id.startsWith('draft:')) {
+      const i = Number(id.slice(6));
+      setDraftRoutePts((prev) => (prev ? prev.filter((_, j) => j !== i) : prev));
+      return;
+    }
+    if (id.startsWith('zone:')) {
+      useStore.getState().deleteRestriction(id.slice(5));
+      return;
+    }
+    if (id.startsWith('drone-goal:')) {
+      // удаление цели дрона = удаление последней путевой точки его маршрута
+      const rid = id.slice('drone-goal:'.length);
+      const st = useStore.getState();
+      const r = (st.project.routes || []).find((rr) => rr.id === rid);
+      if (r && r.points.length > 0) st.removeRoutePoint(rid, r.points.length - 1);
+    }
+  }, []);
+  const handlePanelZoneDelete = useCallback((id: string) => {
+    if (id === 'pendingZone') { setPendingZone(null); return; }
+    useStore.getState().deleteRestriction(id);
+  }, []);
+
   // «ЗАПУСК»: загрузка данных миссии в дроны (имитация телеметрической загрузки)
   const launchMission = useCallback(async () => {
     if (tripleStep !== 3 || launchState !== 'idle') return;
@@ -2201,11 +2230,11 @@ const MapCanvas: React.FC = () => {
     ...(startGeo && goalGeo ? [{ pts: [startGeo, goalGeo], color: '#facc15', width: 2, dashed: true }] : []),
   ];
   const pointsOut: MiniOverlayPoint[] = [
-    ...(startGeo ? [{ lat: startGeo.lat, lng: startGeo.lng, label: 'СТАРТ', color: '#4ade80' }] : []),
-    ...(goalGeo ? [{ lat: goalGeo.lat, lng: goalGeo.lng, label: sharedGoal ? 'ЦЕЛЬ (общая)' : 'ЦЕЛЬ (выбранная)', color: '#f87171' }] : []),
+    ...(startGeo ? [{ id: 'triple:start', lat: startGeo.lat, lng: startGeo.lng, label: 'СТАРТ', color: '#4ade80' }] : []),
+    ...(goalGeo ? [{ id: 'triple:goal', lat: goalGeo.lat, lng: goalGeo.lng, label: sharedGoal ? 'ЦЕЛЬ (общая)' : 'ЦЕЛЬ (выбранная)', color: '#f87171' }] : []),
     ...(!sharedGoal ? tripleRoutes.slice(0, droneCount).map((r, i) => {
       const g = r.geo[r.geo.length - 1];
-      return g ? { lat: g.lat, lng: g.lng, label: `Дрон ${i + 1}`, color: uavColors[i % uavColors.length] } : null;
+      return g ? { id: `drone-goal:${r.id}`, lat: g.lat, lng: g.lng, label: `Дрон ${i + 1}`, color: uavColors[i % uavColors.length] } : null;
     }).filter(Boolean) as MiniOverlayPoint[] : []),
   ];
   const panelH = 260;
@@ -2298,32 +2327,42 @@ const MapCanvas: React.FC = () => {
             const geoPts = z.points.map((p) => pixelToGeoExact(p, map.bounds!, map.width, map.height));
             if (z.type === 'circle' && z.radius) {
               const mppZ14 = metersPerPixelFromWorld(worldPxZ14, geoPts[0].lat);
-              return { pts: [] as { lat: number; lng: number }[], color: '#f87171', radiusM: z.radius * mppZ14, centerGeo: geoPts[0] };
+              return { id: `zone:${z.id}`, pts: [] as { lat: number; lng: number }[], color: '#f87171', radiusM: z.radius * mppZ14, centerGeo: geoPts[0] };
             }
-            return { pts: geoPts, color: '#f87171' };
+            return { id: `zone:${z.id}`, pts: geoPts, color: '#f87171' };
           });
         })();
         const draftLine: MiniOverlayLine[] = draftRoutePts && draftRoutePts.length >= 2
           ? [{ pts: draftRoutePts, color: '#34d399', width: 3 }] : [];
-        const draftPoints: MiniOverlayPoint[] = (draftRoutePts || []).map((g, i) => ({ lat: g.lat, lng: g.lng, label: `${i + 1}`, color: '#34d399' }));
+        const draftPoints: MiniOverlayPoint[] = (draftRoutePts || []).map((g, i) => ({ id: `draft:${i}`, lat: g.lat, lng: g.lng, label: `${i + 1}`, color: '#34d399' }));
         const stepDefs = [
           { idx: 0, title: 'СТАРТ (масштаб 1 см = 2 км)', icon: '🟢' },
           { idx: 1, title: 'ВЕСЬ МАРШРУТ (высокая детализация)', icon: '🧭' },
           { idx: 2, title: sharedGoal ? 'ЦЕЛЬ — общая для роя (1 см = 2 км)' : `ЦЕЛЬ дрона ${Math.min(activeUav + 1, droneCount)} (1 см = 2 км)`, icon: '🔴' },
         ] as const;
         const panelPropsFor = (idx: number): React.ComponentProps<typeof MiniMapPanel> => {
+          // общие пропсы панелей: фокус, редактирование, удаление кликом
+          const base: Partial<React.ComponentProps<typeof MiniMapPanel>> = {
+            focused: tripleStep === idx,
+            onFocus: () => { if (launchState === 'idle') bringPanelOnTop(idx); },
+            onPointClick: handlePanelPointDelete,
+            onZoneClick: handlePanelZoneDelete,
+          };
           if (idx === 0) return {
+            ...base,
             title: stepDefs[0].title, icon: '🟢',
             center: startCenter, zoom: panelZoomFor2km(startCenter.lat),
             points: pointsOut.filter((p) => p.label === 'СТАРТ'), lines: linesOut, height: panelH,
           };
           if (idx === 1) return {
+            ...base,
             title: stepDefs[1].title, icon: '🧭',
             center: startCenter, zoom: 10,
             fitPoints: tripleAllGeoPts.length > 0 ? tripleAllGeoPts : undefined,
             points: [...pointsOut, ...draftPoints], lines: [...linesOut, ...draftLine], height: panelH,
           };
           return {
+            ...base,
             title: stepDefs[2].title, icon: '🔴',
             center: goalCenter, zoom: panelZoomFor2km(goalCenter.lat),
             points: pointsOut.filter((p) => p.label !== 'СТАРТ'),
@@ -2389,7 +2428,7 @@ const MapCanvas: React.FC = () => {
                 focused={tripleStep === idx}
                 onFocus={() => { if (launchState === 'idle') bringPanelOnTop(idx); }}
                 onMapClick={tripleStep === idx ? handlePanelMapClick : undefined}
-                zones={tripleStep === idx ? [...zoneGeoList, ...(pendingZone ? [{ pts: [], radiusM: pendingZone.radiusM, centerGeo: pendingZone.center, color: '#fb923c' }] : [])] : []}
+                zones={tripleStep === idx ? [...zoneGeoList, ...(pendingZone && idx === 2 ? [{ id: 'pendingZone', pts: [], radiusM: pendingZone.radiusM, centerGeo: pendingZone.center, color: '#fb923c' }] : [])] : []}
               />
             ))}
           </div>
