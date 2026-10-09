@@ -8,8 +8,6 @@ import { geoToPixelFromBounds, calculateBoundsFromCenter, latToMercatorY, mercat
 import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, smoothPolyline, routeLengthM } from '../utils/routing';
 import type { RouteShape, RangeLimitMode, ImportPoint, ImportLists } from '../types';
 
-const MIN_MAP_ZOOM_FLOOR = 6;
-
 const ROUTE_COLORS = ['#00d0ff', '#ff9500', '#a78bfa', '#34d399', '#f472b6', '#facc15', '#fb7185', '#60a5fa'];
 
 /** Предупреждение о нарушении ограничения маршрута по дальности */
@@ -1102,32 +1100,53 @@ export const useStore = create<AppState>()(
        * а подложка масштабировалась интерактивно до 1 см ≈ 100 м и ближе.
        */
       loadActiveTileMap: (center, zoom) => {
-        const z = Math.max(MIN_MAP_ZOOM_FLOOR, Math.min(19, Math.round(zoom)));
-        // ── Эталонная привязка «как на openstreetmap.org» ─────────────────────
-        // КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ («карта грузится, но не видна»): раньше bounds
-        // строились как ОДНО ОКНО размером 256·2^z вокруг центра, а виртуальный
-        // раст — как ПОЛНЫЙ меркаторов мир уровня z (width = height = 256·2^z).
-        // Из-за этого bounds покрывали весь мир (west ≈ −142°, east > 180°,
-        // north ≈ 88°), а auto-fit при открытии считал из них зум ≈ 23 и уводил
-        // камеру в космос: тайловый слой получал transform вроде
-        // translate(-1.57e7px, -1.24e7px) — подложка «загружалась», но была
-        // полностью вне экрана. Теперь это согласованная пара:
-        //   растр = полный мир уровня z (256·2^z), pixel(x,y) ⇔ tile(x/256, y/256);
-        //   bounds = РОВНО тот же полный мир (−180..180, ±merc-пределы).
-        // Привязка пикселей растра к географии становится тождественной
-        // (pixel ⇔ tile), любой пиксель карты имеет однозначную гео-привязку
-        // при любом панорамировании, а стартовый вид = запрошенный зум z.
+        // Зум активная карта принимает БЕЗ нижней клампы: MIN_MAP_ZOOM_FLOOR (=6)
+        // ограничивал только растровые снимки; тайловая подложка корректно работает
+        // от z3 (вся страна) — раньше «большая карта» не отдалялась дальше региона.
+        const z = Math.max(3, Math.min(19, Math.round(zoom)));
+        // ── СОГЛАСОВАННАЯ ПАРА «виртуальный растр + bounds» ───────────────────
+        // История ошибок: (1) bounds = одно окно вокруг центра, а виртуальный
+        // раст = ПОЛНЫЙ мир уровня z → auto-fit по геометрии растра давал зум ≈ 23,
+        // камера улетала в космос, тайлы не успевали («карта не загружается»);
+        // (2) bounds = ВЕСЬ мир при полном мире-растре → любое панорамирование
+        // совмещало окно с целым земным шаром — масштаб сбивался, объекты
+        // разъезжались относительно тайлов;
+        // (3) гигантский буфер ±10240 px (80×80 тайлов) при крошечных централь-
+        // ных bounds → fit-to-bounds всегда открывался на ~z7 вместо заказанного
+        // z12/z18 («карта загружается с ошибкой»: масштаб не соответствует
+        // запросу, а 6400 тайлов на весь буфер забивали очередь загрузки).
+        // Теперь это ОДНА согласованная область обзора РОВНО на заказанный зум:
+        //   worldPx = 256·2^z — мир в пикселях уровня z;
+        //   bounds  = видимое окно: по ширине ≈ canvasWidth px уровня z
+        //             (по умолчанию 1280 px = 5 тайлов), по высоте — симметрично
+        //             в меркатор-долях (квадратное окно ⇔ ровно z при типичном
+        //             окне ~800–1080 px по высоте);
+        //   растр   = те же размеры в px уровня z (pixel ⇔ tile·256 тождественно).
+        // MapCanvas откроет вид ровно на z (bounds вписаны в экран), центр =
+        // center. Панорамирование за пределы bounds безопасно: тайловый слой
+        // рисуется от бесконечной меркатор-сетки worldPx, а не от bounds.
         const worldPx = 256 * Math.pow(2, z);
+        // Ширина окна обзора в пикселях уровня z (≈ ширина канваса приложения;
+        // меньшие значения делают стартовый зум крупнее запроса, большие — мелче).
+        const viewWpx = 1280;
+        const halfWpx = Math.min(viewWpx / 2, worldPx / 2);
+        const halfHpx = Math.min(viewWpx / 2, worldPx / 2); // квадратное окно ⇔ стартовый зум = ровно z
+        const fx = (center.lng + 180) / 360;            // mercator-доля мира по X
+        const fy = Math.min(0.9999, Math.max(0.0001, latToMercatorY(center.lat))); // доля по Y
+        const spanFx = Math.min(1, (halfWpx * 2) / worldPx); // ширина окна (доля мира)
+        const wLeft = Math.min(Math.max(0, fx - halfWpx / worldPx), 1 - spanFx);
+        const hTop = Math.max(0, fy - halfHpx / worldPx);
+        const hBot = Math.min(1, fy + halfHpx / worldPx);
         const b: MapBounds = {
-          west: -180,
-          east: 180,
-          north: mercatorYToLat(0),
-          south: mercatorYToLat(1),
+          west: wLeft * 360 - 180,
+          east: (wLeft + spanFx) * 360 - 180,
+          north: mercatorYToLat(hTop),
+          south: mercatorYToLat(hBot),
         };
         const mapData: MapData = {
           name: `Активная карта: ${center.lat.toFixed(5)}, ${center.lng.toFixed(5)} (z${z})`,
-          width: worldPx,   // full-меркаторов мир уровня z — строгая привязка координат
-          height: worldPx,
+          width: Math.max(256, Math.round(spanFx * worldPx)),    // px растра ⇔ bounds по X
+          height: Math.max(256, Math.round((hBot - hTop) * worldPx)), // px растра ⇔ bounds по Y
           dataUrl: '', // без фотографии — подложка грузится тайлами динамически
           bounds: b,
           source: 'osm',
