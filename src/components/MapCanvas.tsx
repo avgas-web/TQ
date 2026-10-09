@@ -3,9 +3,9 @@ import { useStore, scheduleRerouteAll, getActiveZonesCached } from '../store/use
 import { isPointInActiveRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
-import { pixelToGeoExact, geoToPixelExact, routeLengthM, zonesCrossedBy } from '../utils/routing';
+import { pixelToGeoExact, geoToPixelExact, routeLengthM, zonesCrossedBy, planPathAroundZones } from '../utils/routing';
 import { getOSMTileUrl, loadTileImage } from '../utils/openStreetMap';
-import MiniMapPanel, { MiniOverlayLine, MiniOverlayPoint } from './MiniMapPanel';
+import MiniMapPanel, { MiniOverlayLine, MiniOverlayPoint, type MiniZone } from './MiniMapPanel';
 import { zoomForGroundMpp, GROUND_MPP_1CM_2KM } from '../utils/pannelli';
 import type { Point, Route, RoutePoint, MapBounds } from '../types';
 
@@ -222,7 +222,6 @@ const MapCanvas: React.FC = () => {
   const {
     project,
     currentTool,
-    actionMode,
     selectedMarkerId,
     activeRouteId,
     isDrawing,
@@ -627,12 +626,21 @@ const MapCanvas: React.FC = () => {
     const panelIdx = geo.panelIdx ?? tripleStepRef.current;
     if (panelIdx === 0) {
       setStartGeo(geo);
+      reopenStepForEdit(0);
     } else if (panelIdx === 1) {
       setDraftRoutePts((prev) => [...(prev || []), { lat: geo.lat, lng: geo.lng }]);
       reopenStepForEdit(1);
     } else if (panelIdx === 2) {
-      if (editToolRef.current === 'zone') setPendingZone({ center: { lat: geo.lat, lng: geo.lng }, radiusM: 2000 }); // 1 см карты = 2 км ⇒ радиус круга 2 км
-      else setGoalGeo({ lat: geo.lat, lng: geo.lng });
+      // Инструменты доступны ВО ВСЕХ окнах: если зона ставится не на окне ЦЕЛЬ —
+      // сначала переносим окно ЦЕЛЬ наверх (фокус), затем ставим зону там.
+      // Иначе pendingZone меняет центр панели цели и «сбивает» фокус другой карты.
+      if (editToolRef.current === 'zone') {
+        if (tripleStepRef.current !== 2) reopenStepForEdit(2);
+        setPendingZone({ center: { lat: geo.lat, lng: geo.lng }, radiusM: 2000 }); // 1 см карты = 2 км ⇒ радиус круга 2 км
+      } else {
+        setGoalGeo({ lat: geo.lat, lng: geo.lng });
+        reopenStepForEdit(2);
+      }
     }
   }, [reopenStepForEdit]);
 
@@ -643,17 +651,20 @@ const MapCanvas: React.FC = () => {
   const launchStateRef = useRef(launchState);
   useEffect(() => { launchStateRef.current = launchState; }, [launchState]);
 
-  // Изначальный порядок нижней строки: СТАРТ слева, ЦЕЛЬ справа; МАРШРУТ — сверху.
-  const panelOrderState = useState<number[]>([0, 2]);
-  const [panelOrder, setPanelOrder] = panelOrderState;
-  // «Перенести наверх»: idx 1 (маршрут) всегда занимает место большой карты;
-  // для старт/цель — меняет их местами в нижней строке и делает активным этапом.
-  const bringPanelOnTop = (idx: number) => {
-    if (launchState !== 'idle') return;
-    if (idx === 1) { reopenStepForEdit(1); return; }
-    setPanelOrder((o) => [idx, ...o.filter((x) => x !== idx)]);
+  // Смена вкладок из бокового меню: активная карта ВСЕГДА сверху (на месте
+  // большой карты). Кнопки этапов работают как вкладки: клик по окну или по
+  // кнопке этапа переносит это окно наверх, его предыдущее место занимает то,
+  // что было сверху (циклическая ротация стека [верх, низ-лево, низ-право]).
+  const [panelStack, setPanelStack] = useState<number[]>([1, 0, 2]);
+  const panelStackRef = useRef(panelStack);
+  useEffect(() => { panelStackRef.current = panelStack; }, [panelStack]);
+  const topPanelIdx = panelStack[0];
+  const bottomPanels = panelStack.slice(1);
+  const focusAndRaisePanel = useCallback((idx: number) => {
+    if (launchStateRef.current !== 'idle') return;
     reopenStepForEdit(idx);
-  };
+    setPanelStack((s) => (s[0] === idx ? s : [idx, s[1], s[2]]));
+  }, [reopenStepForEdit]);
 
   // ─── Удаление введённых точек/объектов кликом по ✛ на активной карте ───────
   // id форматы: 'triple:start' | 'triple:goal' | 'draft:N' | 'zone:<restrictionId>' |
@@ -1188,12 +1199,7 @@ const MapCanvas: React.FC = () => {
     // Draw current drawing
     drawCurrentDrawing(ctx);
 
-    // Draw action-mode route (СТАРТ → ЦЕЛЬ) in real geographic coordinates
-    if (actionMode) {
-      drawActionRoute(ctx);
-    }
-
-    // Draw routes (маршруты режима действий: редактирование, обход зон, предупреждения)
+    // Draw routes (маршруты миссии: редактирование, автообход зон, предупреждения)
     drawRoutes(ctx);
 
     // Draw map border: у активной тайловой карты «виртуальный растр» покрывает
@@ -1644,59 +1650,7 @@ const MapCanvas: React.FC = () => {
       ctx.restore();
     }
 
-    function drawActionRoute(ctx: CanvasRenderingContext2D) {
-      if (!project.map?.bounds) return;
-      const start = project.markers.find(m => m.name === 'СТАРТ' && m.lat != null && m.lon != null);
-      const goal = project.markers.find(m => m.name === 'ЦЕЛЬ' && m.lat != null && m.lon != null);
-      if (!start || !goal) return;
-
-      ctx.save();
-      ctx.translate(vs.offsetX, vs.offsetY);
-      ctx.scale(vs.scale, vs.scale);
-
-      const geoStart = { lat: start.lat as number, lng: start.lon as number };
-      const geoGoal = { lat: goal.lat as number, lng: goal.lon as number };
-      const distM = haversineDistanceM(geoStart, geoGoal);
-      const az = bearingDeg(geoStart, geoGoal);
-
-      // Line start->goal
-      ctx.strokeStyle = '#ff9500';
-      ctx.lineWidth = 3 / vs.scale;
-      ctx.setLineDash([10 / vs.scale, 6 / vs.scale]);
-      ctx.beginPath();
-      ctx.moveTo(start.x, start.y);
-      ctx.lineTo(goal.x, goal.y);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      // Arrow at goal
-      const ang = Math.atan2(goal.y - start.y, goal.x - start.x);
-      const ah = 14 / vs.scale;
-      ctx.fillStyle = '#ff9500';
-      ctx.beginPath();
-      ctx.moveTo(goal.x, goal.y);
-      ctx.lineTo(goal.x - ah * Math.cos(ang - 0.4), goal.y - ah * Math.sin(ang - 0.4));
-      ctx.lineTo(goal.x - ah * Math.cos(ang + 0.4), goal.y - ah * Math.sin(ang + 0.4));
-      ctx.closePath();
-      ctx.fill();
-
-      // Labels with real geo data
-      const fs = Math.max(11, 13 / vs.scale);
-      ctx.font = `bold ${fs}px sans-serif`;
-      ctx.textAlign = 'left';
-      const midX = (start.x + goal.x) / 2;
-      const midY = (start.y + goal.y) / 2;
-      const label = `${distM >= 1000 ? (distM / 1000).toFixed(2) + ' км' : Math.round(distM) + ' м'} | Азимут ${az.toFixed(0)}°`;
-      const tw = ctx.measureText(label).width;
-      ctx.fillStyle = 'rgba(0,0,0,0.75)';
-      ctx.fillRect(midX - tw / 2 - 4 / vs.scale, midY - fs - 4 / vs.scale, tw + 8 / vs.scale, fs + 8 / vs.scale);
-      ctx.fillStyle = '#ffcc66';
-      ctx.fillText(label, midX - tw / 2, midY - 4 / vs.scale);
-
-      ctx.restore();
-    }
-
-    // ─── Маршруты режима действий ────────────────────────────────────────────
+    // ─── Маршруты миссии (три окна карты) ────────────────────────────────────
     // Все точки маршрутов хранятся в WGS-84; пиксельные координаты (x, y)
     // пересчитаны из bounds при загрузке — привязка строго географическая.
     function drawRoutes(ctx: CanvasRenderingContext2D) {
@@ -1849,7 +1803,7 @@ const MapCanvas: React.FC = () => {
       ctx.restore();
     }
 
-  }, [project, renderTick, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, actionMode, tilesVersion, userPos]);
+  }, [project, renderTick, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, tilesVersion, userPos]);
 
   // Mouse wheel zoom (к колесу курсора; границы minZoom/maxZoom внутри zoomAt)
   // ВАЖНО: React навешивает on-wheel/on-touch как passive-слушатели, и вызов
@@ -2092,9 +2046,9 @@ const MapCanvas: React.FC = () => {
       return;
     }
 
-    // Режим действий: клик по карте добавляет/вставляет точку в активный маршрут
+    // Клик по карте добавляет/вставляет точку в активный маршрут
     // (рядом с существующей точкой — перемещаем её, на линии — вставляем в середину)
-    if (actionMode && e.button === 0 && project.map) {
+    if (e.button === 0 && project.map) {
       const active = (project.routes || []).find((r) => r.id === activeRouteId && r.visible);
       if (active) {
         appendRoutePoint(active.id, mapPoint);
@@ -2104,7 +2058,7 @@ const MapCanvas: React.FC = () => {
       }
       return;
     }
-  }, [currentTool, actionMode, project, isDrawing, drawingPoints, measurementPoints,
+  }, [currentTool, project, isDrawing, drawingPoints, measurementPoints,
     screenToMap, addMarker, selectMarker, addDrawingPoint, addRestriction,
     clearDrawingPoints, setDrawing, setMeasurementPoints,
     activeRouteId, appendRoutePoint, setActiveRoute]);
@@ -2202,7 +2156,7 @@ const MapCanvas: React.FC = () => {
       setMeasurementPoints([]);
     }
     // Двойной клик по точке активного маршрута — удалить её (маршрут перестроится)
-    if ((currentTool === 'select' || actionMode) && activeRouteId && project.map) {
+    if (currentTool === 'select' && activeRouteId && project.map) {
       const rect = canvasRef.current?.getBoundingClientRect();
       if (!rect) return;
       const mp = screenToMap(e.clientX - rect.left, e.clientY - rect.top);
@@ -2221,7 +2175,7 @@ const MapCanvas: React.FC = () => {
         }
       }
     }
-  }, [currentTool, actionMode, drawingPoints, addRestriction, clearDrawingPoints, setMeasurementPoints,
+  }, [currentTool, drawingPoints, addRestriction, clearDrawingPoints, setMeasurementPoints,
     activeRouteId, project.map, project.routes, screenToMap, removeRoutePoint]);
 
   // Right click - cancel drawing
@@ -2359,8 +2313,6 @@ const MapCanvas: React.FC = () => {
         <div
           className="absolute z-20 max-w-[260px] rounded-lg bg-gray-900/95 border border-cyan-500/50 text-gray-100 text-xs shadow-xl p-2 pointer-events-auto"
           style={{ left: Math.min(popup.x + 12, canvasSize.width - 270), top: Math.min(popup.y + 12, canvasSize.height - 120) }}
-          role="dialog"
-          aria-label="Информация об объекте"
           onClick={() => setPopup(null)}
         >
           <div className="font-bold text-cyan-300 mb-1">{popup.title}</div>
@@ -2408,7 +2360,7 @@ const MapCanvas: React.FC = () => {
           const base: Partial<React.ComponentProps<typeof MiniMapPanel>> = {
             focused: tripleStep === idx,
             panelIdx: idx,
-            onFocus: () => { if (launchState === 'idle') bringPanelOnTop(idx); },
+            onFocus: () => { focusAndRaisePanel(idx); },
             onMapClick: handlePanelMapClick,
             onPointClick: handlePanelPointDelete,
             onZoneClick: handlePanelZoneDelete,
@@ -2418,7 +2370,7 @@ const MapCanvas: React.FC = () => {
             ...base,
             title: stepDefs[0].title, icon: '🟢',
             center: spbPanelCenter || startCenter, zoom: panelZoomFor2km((spbPanelCenter || startCenter).lat),
-            points: pointsOut.filter((p) => p.label === 'СТАРТ'), lines: linesOut, height: panelH,
+            points: pointsOut.filter((p) => p.label === 'СТАРТ'), lines: linesOut, height: '100%',
           };
           if (idx === 1) return {
             ...base,
@@ -2434,43 +2386,40 @@ const MapCanvas: React.FC = () => {
             center: spbPanelCenter || goalCenter, zoom: panelZoomFor2km((spbPanelCenter || goalCenter).lat),
             points: pointsOut.filter((p) => p.label !== 'СТАРТ'),
             lines: [...(routeLineGeo.length > 1 ? [{ pts: routeLineGeo, color: '#facc15', width: 2 }] : []), ...linesOut],
-            height: panelH,
+            height: '100%',
           };
         };
         const stepHint = ['① Утвердите точку старта', '② Утвердите маршрут', '③ Утвердите цель', '✔ Все этапы утверждены — можно запускать'][tripleStep];
-        // Компоновка «три карты»: МАРШРУТ занимает место большой карты (верх),
-        // СТАРТ и ЦЕЛЬ — внизу. Порядок в строке снизу = panelOrder без idx 1.
-        const bottomOrder = panelOrder;
+        // Компоновка «три карты»: АКТИВНАЯ карта всегда сверху (на месте большой
+        // карты) — смена как вкладками; остальные две — внизу.
         return (
         <>
-        {/* ВЕРХ: окно «МАРШРУТ» вместо большой карты */}
+        {/* ВЕРХ: активная карта (вкладка) вместо большой карты */}
         <div id="triple-route-top" className="absolute inset-0 z-30">
-          <MiniMapPanel {...panelPropsFor(1)} />
+          <MiniMapPanel key={`top-${topPanelIdx}`} {...panelPropsFor(topPanelIdx)} />
         </div>
-        {/* НИЗ: окна «СТАРТ» и «ЦЕЛЬ» + панель мастера */}
+        {/* НИЗ: две неактивные карты + панель мастера */}
         <div id="triple-map-row" className="absolute left-2 right-2 bottom-2 z-40 rounded-xl border border-cyan-700/60 bg-gray-900/95 shadow-2xl p-2">
           <div className="flex flex-wrap items-center gap-2 mb-2 text-xs">
             <span className="font-bold text-cyan-300">Карта миссии роя</span>
-            {/* Индикатор шагов мастера */}
-            <div className="flex items-center gap-1" aria-label="Этапы подготовки миссии">
+            {/* Вкладки карт: активная всегда наверху */}
+            <div className="flex items-center gap-1" role="tablist" aria-label="Карты миссии">
               {['Старт', 'Маршрут', 'Цель'].map((lbl, i) => (
-                <button key={lbl}
-                  onClick={() => { if (launchState === 'idle') bringPanelOnTop(i); }}
+                <button key={lbl} role="tab" aria-selected={topPanelIdx === i}
+                  onClick={() => { focusAndRaisePanel(i); }}
                   className={`px-2 py-0.5 rounded border ${approvedSteps[i] ? 'bg-emerald-900/70 border-emerald-500 text-emerald-200' : tripleStep === i ? 'bg-cyan-800 border-cyan-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-400 hover:bg-gray-700'}`}
                   title={`Перенести карту «${lbl}» наверх и редактировать`}
                 >{approvedSteps[i] ? '✓' : `${i + 1}.`} {lbl}</button>
               ))}
               <span className="text-gray-400 ml-1">{stepHint}</span>
             </div>
-            {/* Инструменты редактирования активного шага */}
-            {tripleStep === 2 && (
-              <div className="flex items-center gap-1">
-                <button className={`px-2 py-0.5 rounded border ${editTool === 'point' ? 'bg-red-800 border-red-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'}`}
-                  onClick={() => setEditTool('point')} title="Клик по карте цели — поставить/перенести цель">🎯 Цель</button>
-                <button className={`px-2 py-0.5 rounded border ${editTool === 'zone' ? 'bg-orange-800 border-orange-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'}`}
-                  onClick={() => setEditTool('zone')} title="Клик по карте — добавить круговую зону ограничения (r = 2 км)">⛔ Зона 2 км</button>
-              </div>
-            )}
+            {/* Инструменты редактирования: доступны на любом этапе и в любом окне */}
+            <div className="flex items-center gap-1">
+              <button className={`px-2 py-0.5 rounded border ${editTool === 'point' ? 'bg-red-800 border-red-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'}`}
+                onClick={() => setEditTool('point')} title="Клик по карте — поставить/перенести цель">🎯 Цель</button>
+              <button className={`px-2 py-0.5 rounded border ${editTool === 'zone' ? 'bg-orange-800 border-orange-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'}`}
+                onClick={() => { setEditTool('zone'); focusAndRaisePanel(2); }} title="Клик по карте — добавить круговую зону ограничения (r = 2 км); окно ЦЕЛЬ переносится наверх">⛔ Зона 2 км</button>
+            </div>
             <label className="flex items-center gap-1 text-gray-300">Дронов:
               <input type="number" min={1} max={8} value={droneCount} disabled={launchState !== 'idle'}
                 onChange={(e) => setDroneCount(Math.max(1, Math.min(8, Number(e.target.value) || 1)))}
@@ -2495,10 +2444,10 @@ const MapCanvas: React.FC = () => {
             <div className="flex-1" />
             <button className="px-2 py-0.5 rounded bg-cyan-800 hover:bg-cyan-700 border border-cyan-600 text-white" onClick={exportTriplePng} title="PNG высокого разрешения: три карты в одном файле">💾 PNG</button>
           </div>
-          <div className="grid grid-cols-2 gap-2">
-            {bottomOrder.map((idx) => (
+          <div className="grid grid-cols-2 gap-2" style={{ height: 260 }}>
+            {bottomPanels.map((idx) => (
               <MiniMapPanel
-                key={idx}
+                key={`bot-${idx}`}
                 {...panelPropsFor(idx)}
               />
             ))}
