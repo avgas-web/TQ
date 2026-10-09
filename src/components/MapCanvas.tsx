@@ -600,12 +600,15 @@ const MapCanvas: React.FC = () => {
     }
   }, [tripleStep, editTool]);
 
-  // Перенос вида панели на новую точку (кнопка «⬆ наверх» меняет порядок панелей)
-  const panelOrderState = useState<number[]>([0, 1, 2]);
+  // Изначальный порядок нижней строки: СТАРТ слева, ЦЕЛЬ справа; МАРШРУТ — сверху.
+  const panelOrderState = useState<number[]>([0, 2]);
   const [panelOrder, setPanelOrder] = panelOrderState;
+  // «Перенести наверх»: idx 1 (маршрут) всегда занимает место большой карты;
+  // для старт/цель — меняет их местами в нижней строке и делает активным этапом.
   const bringPanelOnTop = (idx: number) => {
+    if (idx === 1) { setTripleStep(1); return; }
     setPanelOrder((o) => [idx, ...o.filter((x) => x !== idx)]);
-    if (idx < 3) setTripleStep(idx as TripleStep);
+    setTripleStep(idx as TripleStep);
   };
 
   // ─── Удаление введённых точек/объектов кликом по ✛ на активной карте ───────
@@ -752,10 +755,15 @@ const MapCanvas: React.FC = () => {
 
   // Экспорт PNG высокого разрешения: композитинг трёх панелей + легенда
   const exportTriplePng = useCallback(async () => {
-    const panels = Array.from(document.querySelectorAll<HTMLCanvasElement>('#triple-map-row canvas'));
+    // панели теперь в двух контейнерах: маршрут — сверху (вместо большой карты),
+    // старт/цель — в нижней строке
+    const routePanel = document.querySelector<HTMLCanvasElement>('#triple-route-top canvas');
+    const bottomPanels = Array.from(document.querySelectorAll<HTMLCanvasElement>('#triple-map-row canvas'));
+    const panels = [bottomPanels[0], routePanel, bottomPanels[1]].filter(Boolean) as HTMLCanvasElement[];
     if (panels.length < 3) return;
     const S = 2; // надбавка разрешения: 2× от css-размера (высокая детализация)
-    const W = panels[0].clientWidth * S, H = panels[0].clientHeight * S;
+    const W = Math.max(...panels.map((p) => p.clientWidth)) * S;
+    const H = Math.max(...panels.map((p) => p.clientHeight)) * S;
     const out = document.createElement('canvas');
     out.width = W * 3 + 40; out.height = H + 90;
     const ctx = out.getContext('2d');
@@ -764,7 +772,7 @@ const MapCanvas: React.FC = () => {
     const titles = ['СТАРТ (1 см = 2 км)', 'ВЕСЬ МАРШРУТ', 'ЦЕЛЬ (1 см = 2 км)'];
     panels.forEach((pc, i) => {
       const x = 10 + i * (W + 10);
-      ctx.drawImage(pc, x, 40, W, H);
+      ctx.drawImage(pc, x, 40, pc.clientWidth * S, pc.clientHeight * S);
       ctx.fillStyle = '#7dd3fc'; ctx.font = `bold ${Math.round(13 * S / 2)}px sans-serif`;
       ctx.fillText(titles[i] || '', x + 4, 24);
     });
@@ -2239,6 +2247,12 @@ const MapCanvas: React.FC = () => {
   ];
   const panelH = 260;
 
+  // ─── Изначальная фокусировка всех окон карты — Санкт-Петербург ──────────────
+  const SPB_GEO = { lat: 59.9398, lng: 30.3146 };
+  // Пока пользователь не ввёл свои точки — все окна сфокусированы на СПб;
+  // после ввода старт/цель следуют за данными автоматически (animateTo).
+  const spbPanelCenter = !startGeo && !goalGeo && tripleAllGeoPts.length === 0 ? SPB_GEO : null;
+
   return (
     <div id="map-container" ref={containerRef} className="relative w-full h-full overflow-hidden bg-[#0f1729]">
       {/* Подложка OSM: DOM-слой настоящих <img>-тайлов (как на openstreetmap.org),
@@ -2351,28 +2365,42 @@ const MapCanvas: React.FC = () => {
           if (idx === 0) return {
             ...base,
             title: stepDefs[0].title, icon: '🟢',
-            center: startCenter, zoom: panelZoomFor2km(startCenter.lat),
+            center: spbPanelCenter || startCenter, zoom: panelZoomFor2km((spbPanelCenter || startCenter).lat),
             points: pointsOut.filter((p) => p.label === 'СТАРТ'), lines: linesOut, height: panelH,
           };
           if (idx === 1) return {
             ...base,
             title: stepDefs[1].title, icon: '🧭',
-            center: startCenter, zoom: 10,
+            // изначальная фокусировка — Санкт-Петербург; после ввода данных — авто-fit по маршруту
+            center: spbPanelCenter || startCenter, zoom: 10,
             fitPoints: tripleAllGeoPts.length > 0 ? tripleAllGeoPts : undefined,
-            points: [...pointsOut, ...draftPoints], lines: [...linesOut, ...draftLine], height: panelH,
+            points: [...pointsOut, ...draftPoints], lines: [...linesOut, ...draftLine], height: '100%',
           };
           return {
             ...base,
             title: stepDefs[2].title, icon: '🔴',
-            center: goalCenter, zoom: panelZoomFor2km(goalCenter.lat),
+            center: spbPanelCenter || goalCenter, zoom: panelZoomFor2km((spbPanelCenter || goalCenter).lat),
             points: pointsOut.filter((p) => p.label !== 'СТАРТ'),
             lines: [...(routeLineGeo.length > 1 ? [{ pts: routeLineGeo, color: '#facc15', width: 2 }] : []), ...linesOut],
             height: panelH,
           };
         };
         const stepHint = ['① Утвердите точку старта', '② Утвердите маршрут', '③ Утвердите цель', '✔ Все этапы утверждены — можно запускать'][tripleStep];
+        // Компоновка «три карты»: МАРШРУТ занимает место большой карты (верх),
+        // СТАРТ и ЦЕЛЬ — внизу. Порядок в строке снизу = panelOrder без idx 1.
+        const bottomOrder = panelOrder;
         return (
-        <div id="triple-map-row" className="absolute left-2 right-2 bottom-8 z-30 rounded-xl border border-cyan-700/60 bg-gray-900/95 shadow-2xl p-2">
+        <>
+        {/* ВЕРХ: окно «МАРШРУТ» вместо большой карты */}
+        <div id="triple-route-top" className="absolute inset-0 z-30">
+          <MiniMapPanel
+            {...panelPropsFor(1)}
+            onMapClick={tripleStep === 1 ? handlePanelMapClick : undefined}
+            zones={tripleStep === 1 ? zoneGeoList : []}
+          />
+        </div>
+        {/* НИЗ: окна «СТАРТ» и «ЦЕЛЬ» + панель мастера */}
+        <div id="triple-map-row" className="absolute left-2 right-2 bottom-2 z-40 rounded-xl border border-cyan-700/60 bg-gray-900/95 shadow-2xl p-2">
           <div className="flex flex-wrap items-center gap-2 mb-2 text-xs">
             <span className="font-bold text-cyan-300">Карта миссии роя</span>
             {/* Индикатор шагов мастера */}
@@ -2420,13 +2448,11 @@ const MapCanvas: React.FC = () => {
             <button className="px-2 py-0.5 rounded bg-cyan-800 hover:bg-cyan-700 border border-cyan-600 text-white" onClick={exportTriplePng} title="PNG высокого разрешения: три карты в одном файле">💾 PNG</button>
             <button className="px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 border border-gray-600 text-white" onClick={() => enableTripleMode(false)}>✕ Закрыть</button>
           </div>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-            {panelOrder.map((idx) => (
+          <div className="grid grid-cols-2 gap-2">
+            {bottomOrder.map((idx) => (
               <MiniMapPanel
                 key={idx}
                 {...panelPropsFor(idx)}
-                focused={tripleStep === idx}
-                onFocus={() => { if (launchState === 'idle') bringPanelOnTop(idx); }}
                 onMapClick={tripleStep === idx ? handlePanelMapClick : undefined}
                 zones={tripleStep === idx ? [...zoneGeoList, ...(pendingZone && idx === 2 ? [{ id: 'pendingZone', pts: [], radiusM: pendingZone.radiusM, centerGeo: pendingZone.center, color: '#fb923c' }] : [])] : []}
               />
@@ -2462,6 +2488,7 @@ const MapCanvas: React.FC = () => {
             </span>
           </div>
         </div>
+        </>
         );
       })()}
     </div>
