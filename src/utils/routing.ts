@@ -497,6 +497,16 @@ export function recomputeRoutePixels(route: Route, bounds: MapBounds, mapW: numb
   };
 }
 
+/** Гео -> пиксель растра (точная прямая Mercator-привязка; обратная к pixelToGeoExact).
+ *  Используется режимом «три окна карты» для переноса объектов в виртуальный растр. */
+export function geoToPixelExact(lat: number, lng: number, bounds: MapBounds, mapW: number, mapH: number): Point {
+  const topY = latToMercatorY(bounds.north);
+  const bottomY = latToMercatorY(bounds.south);
+  const fy = Math.max(0, Math.min(1, (latToMercatorY(lat) - topY) / Math.max(1e-12, bottomY - topY)));
+  const fx = Math.max(0, Math.min(1, (lng - bounds.west) / Math.max(1e-12, bounds.east - bounds.west)));
+  return { x: fx * mapW, y: fy * mapH };
+}
+
 export function routePointsToGeo(points: RoutePoint[]): GeoPoint[] {
   return points.map((p) => ({ lat: p.lat, lng: p.lng }));
 }

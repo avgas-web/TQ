@@ -7,10 +7,9 @@ import {
   downloadFile, importFromCSV, importFromGeoJSON, exportProject, importProject,
 } from '../utils/export';
 import MapsPanel from './MapsPanel';
-import ActionModePanel from './ActionModePanel';
 
 const Sidebar: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'action' | 'points' | 'restrictions' | 'export' | 'google'>('action');
+  const [activeTab, setActiveTab] = useState<'points' | 'restrictions' | 'export' | 'google'>('points');
   const [editingMarker, setEditingMarker] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const [editX, setEditX] = useState('');
@@ -152,12 +151,6 @@ const Sidebar: React.FC = () => {
       {/* Tabs */}
       <div className="flex border-b border-gray-700 flex-wrap">
         <button
-          onClick={() => setActiveTab('action')}
-          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'action' ? 'bg-gray-700 text-orange-400' : 'text-gray-400 hover:text-gray-200'}`}
-        >
-          🎯 Действия
-        </button>
-        <button
           onClick={() => setActiveTab('points')}
           className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'points' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
         >
@@ -185,9 +178,6 @@ const Sidebar: React.FC = () => {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto">
-        {activeTab === 'action' && (
-          <ActionModePanel />
-        )}
         {activeTab === 'points' && (
           <div className="p-2">
             {/* Search & Filter */}

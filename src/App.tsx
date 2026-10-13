@@ -47,8 +47,6 @@ const App: React.FC = () => {
     setProjectName,
     deleteMarker,
     selectedMarkerId,
-    actionMode,
-    setActionMode,
     undoDrawingPoint,
     redoDrawingPoint,
   } = useStore();
@@ -152,17 +150,10 @@ const App: React.FC = () => {
         else if (el) el.requestFullscreen?.().catch(() => {});
         return;
       }
-
-      // Режим действий: R (транслит покрывает русскую К)
-      if (key === 'r') {
-        e.preventDefault();
-        setActionMode(!actionMode);
-        return;
-      }
     }
   }, [currentTool, selectedMarkerId, setTool,
     clearDrawingPoints, setMeasurementPoints, deleteMarker, project.settings?.showGrid,
-    project.settings?.theme, updateSettings, actionMode, setActionMode,
+    project.settings?.theme, updateSettings,
     undoDrawingPoint, redoDrawingPoint]);
 
   useEffect(() => {
