@@ -674,6 +674,14 @@ const MapCanvas: React.FC = () => {
     const key = fitKeyParts.join('|');
     if (lastFitKeyRef.current === key) return;
     lastFitKeyRef.current = key;
+    // ВАЖНО («карта грузится, но не видна»): для АКТИВНОЙ тайловой карты растр —
+    // виртуальный полный мир (width = height = 256·2^z). Фит по объектам в таких
+    // координатах давал worldTarget ≈ vh/n и зум ≈ 1…2 — камера улетала «в космос»,
+    // transform слоя становился translate(-1.5e7px, …) и подложка была полностью
+    // вне экрана. Для тайловых карт без снимка авто-фит запрещён: стартовый вид
+    // устанавливает только initial-fit (запрошенный пользователем зум).
+    const isVirtualTileRaster = !map.dataUrl && !!project.settings?.tilesEnabled;
+    if (isVirtualTileRaster) return;
     const fit = fitViewToData(map.width, map.height, map.bounds, pts, canvasSize.width, canvasSize.height);
     if (fit) setViewState(fit);
   }, [project.routes, project.markers, mapLoaded, canvasSize.width, canvasSize.height, project.map?.bounds]);
