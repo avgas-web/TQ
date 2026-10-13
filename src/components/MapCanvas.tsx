@@ -305,25 +305,38 @@ const MapCanvas: React.FC = () => {
     if (!el) return;
     const v = viewRef.current;
     const cs = canvasSizeRef.current;
-    const tilesOn = !!useStore.getState().project.settings?.tilesEnabled &&
-      !!useStore.getState().project.map?.bounds;
-    if (!tilesOn || cs.height <= 0) { el.style.display = 'none'; return; }
+    const st = useStore.getState();
+    const mapBounds = st.project.map?.bounds;
+    const tilesOn = !!st.project.settings?.tilesEnabled && !!mapBounds;
+    if (!tilesOn || !mapBounds || cs.height <= 0) { el.style.display = 'none'; return; }
     const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
     const zoom = clampZoom(zoomAtWorldPx(wp));
-    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[(useStore.getState().project.openStreetMap?.tileServer as any) || 'osm'] ?? MAX_ZOOM);
+    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[(st.project.openStreetMap?.tileServer as any) || 'osm'] ?? MAX_ZOOM);
     const level = Math.max(MIN_ZOOM, Math.min(nativeMax, Math.round(zoom)));
     const n = Math.pow(2, level);
-    // CSS-px на тайл: world-пиксели ВЫБРАННОГО уровня / 2^level (уровень может быть
-    // ограничен nativeMax при зуме за пределы нативных тайлов сервера)
-    const tileCss = (cs.height * Math.pow(2, level)) / n;
+    // ── СТРОГАЯ привязка DOM-слоя к инварианту вида ───────────────────────────
+    // ИСПРАВЛЕНИЕ «карта грузится, но не видна» (два независимых дефекта):
+    //  1) Раньше transform слоя был translate(offsetX, offsetY)·scale(tileCss/256),
+    //     т.е. тайл (0,0) всегда попадал в точку offsets вида — а это world-пиксель
+    //     нуля ТОГО зума, из которого взяты offsets. После любого зума/панорамы
+    //     слой уезжал за экран — подложка формально «грузилась», но была невидима.
+    //  2) Привязка тайлов шла через РАЗМЕРЫ РАСТРА (map.width/height). Но при
+    //     открытии OSM-адреса MapImageLoader устанавливает виртуальный растр
+    //     размером с ЭКРАН (~1200×800 px), тогда как его bounds покрывают весь
+    //     мир. Из-за этого экранный размер тайла считался как wp·(360/lngSpan)
+    //     ≈ wp·n — то есть на фактор 2^level (при z19 — в полмиллиона раз!)
+    //     больше канваса: вся подложка превращалась в одно пятно за пределами
+    //     экрана. Теперь формула ЧИСТО зумовая (как Leaflet/OSM): тайл уровня
+    //     level рисуется размером wp/n CSS-px, а тайл (0,0) ставится в world-px
+    //     (0,0) того же уровня — привязка не зависит от размеров растра вообще.
+    const tileCss = wp / n; // CSS-px на один тайл (2^(zoom-level) — плавный непрерывный зум)
+    const baseX = v.offsetX; // world-пиксель (0,0) уровня на экране
+    const baseY = v.offsetY;
     el.style.display = '';
     el.style.width = `${cs.width}px`;
     el.style.height = `${cs.height}px`;
-    void wp;
-    // Единый transform для всех детей: origin (0,0), сдвиг на offset, масштаб
-    // относительно мира уровня level (origin смещён так, чтобы tx=ty=0 попал в offsetX/Y).
     el.style.transformOrigin = '0 0';
-    el.style.transform = `translate(${v.offsetX}px, ${v.offsetY}px) scale(${tileCss / 256})`;
+    el.style.transform = `translate(${baseX}px, ${baseY}px) scale(${tileCss / 256})`;
   }, []);
   // Обновляем ссылку для rAF-подписчика на viewState (см. useEffect выше)
   useEffect(() => { tileLayerPositionRef.current = positionTileLayer; }, [positionTileLayer]);

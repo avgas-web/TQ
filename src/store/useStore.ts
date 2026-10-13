@@ -1104,22 +1104,25 @@ export const useStore = create<AppState>()(
       loadActiveTileMap: (center, zoom) => {
         const z = Math.max(MIN_MAP_ZOOM_FLOOR, Math.min(19, Math.round(zoom)));
         // ── Эталонная привязка «как на openstreetmap.org» ─────────────────────
-        // Виртуальный растр строится по FULL-меркаторовой сетке уровня z:
-        //   width = height = 256·2^z, pixel(x,y) ⇔ tile(x/256, y/256).
-        // Bounds — ровно видимое окно этого растра вокруг центра. Благодаря этому
-        // ЛЮБОЙ пиксель карты (маршруты, зоны, маркеры, клик, попапы) имеет
-        // однозначную географическую привязку даже после панорамирования ЗА
-        // пределы начального окна — объекты больше не «уезжают» от подложки.
+        // КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ («карта грузится, но не видна»): раньше bounds
+        // строились как ОДНО ОКНО размером 256·2^z вокруг центра, а виртуальный
+        // раст — как ПОЛНЫЙ меркаторов мир уровня z (width = height = 256·2^z).
+        // Из-за этого bounds покрывали весь мир (west ≈ −142°, east > 180°,
+        // north ≈ 88°), а auto-fit при открытии считал из них зум ≈ 23 и уводил
+        // камеру в космос: тайловый слой получал transform вроде
+        // translate(-1.57e7px, -1.24e7px) — подложка «загружалась», но была
+        // полностью вне экрана. Теперь это согласованная пара:
+        //   растр = полный мир уровня z (256·2^z), pixel(x,y) ⇔ tile(x/256, y/256);
+        //   bounds = РОВНО тот же полный мир (−180..180, ±merc-пределы).
+        // Привязка пикселей растра к географии становится тождественной
+        // (pixel ⇔ tile), любой пиксель карты имеет однозначную гео-привязку
+        // при любом панорамировании, а стартовый вид = запрошенный зум z.
         const worldPx = 256 * Math.pow(2, z);
-        const fx = (center.lng + 180) / 360;               // mercator-доля мира по X
-        const fy = latToMercatorY(center.lat);              // mercator-доля мира по Y
-        const x0 = fx * worldPx - worldPx / 2;              // левый край окна (world px)
-        const y0 = fy * worldPx - worldPx / 2;              // верхний край окна (world px)
         const b: MapBounds = {
-          west: ((x0 / worldPx) * 360) - 180,
-          east: (((x0 + worldPx) / worldPx) * 360) - 180,
-          north: mercatorYToLat(y0 / worldPx),
-          south: mercatorYToLat((y0 + worldPx) / worldPx),
+          west: -180,
+          east: 180,
+          north: mercatorYToLat(0),
+          south: mercatorYToLat(1),
         };
         const mapData: MapData = {
           name: `Активная карта: ${center.lat.toFixed(5)}, ${center.lng.toFixed(5)} (z${z})`,
