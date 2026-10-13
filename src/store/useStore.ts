@@ -267,6 +267,8 @@ interface AppState {
   /** Внутренний: немедленная пакетная перестройка (rerouteAllRoutes — троттлинг-обёртка) */
   __rerouteAllRoutesNow?: () => void;
   rerouteAllRoutes: () => void; // пакетная перестройка всех маршрутов после изменения зон/карты
+  /** Немедленно исполнить отложенную пакетную перестройку (без ожидания троттлинга) */
+  flushReroute: () => void;
   setRouteShape: (id: string, shape: 'straight' | 'curve') => void; // прямая или кривая
   setRouteRangeLimit: (id: string, mode: 'off' | 'max' | 'min', meters?: number) => void; // ограничение по дальности
   importLists: (starts: { label: string; lat: number; lng: number; placeName?: string }[], goals: { label: string; lat: number; lng: number; placeName?: string }[]) => number; // импорт списков + привязка к маршрутам
@@ -630,6 +632,12 @@ export const useStore = create<AppState>()(
       },
 
       __rerouteAllRoutesNow: () => rerouteAllRoutesNow(),
+
+      flushReroute: () => {
+        if (rerouteTimer != null) { clearTimeout(rerouteTimer); rerouteTimer = null; }
+        rerouteChainCount = 0;
+        rerouteAllRoutesNow();
+      },
 
       refreshAllRoutesAfterMapChange: () => {
         const state = get();

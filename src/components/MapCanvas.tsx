@@ -3,7 +3,7 @@ import { useStore, scheduleRerouteAll, getActiveZonesCached } from '../store/use
 import { isPointInActiveRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
-import { pixelToGeoExact, geoToPixelExact, routeLengthM, zonesCrossedBy, planPathAroundZones } from '../utils/routing';
+import { pixelToGeoExact, geoToPixelExact, routeLengthM, zonesCrossedBy, planPathAroundZones, smoothPolyline } from '../utils/routing';
 import { getOSMTileUrl, loadTileImage } from '../utils/openStreetMap';
 import MiniMapPanel, { MiniOverlayLine, MiniOverlayPoint, type MiniZone } from './MiniMapPanel';
 import { zoomForGroundMpp, GROUND_MPP_1CM_2KM } from '../utils/pannelli';
@@ -480,6 +480,13 @@ const MapCanvas: React.FC = () => {
   // в дроны, и кнопка «🆕 Новая миссия» очищает данные для следующего полёта.
   // Рой дронов: у всех дронов один старт; общая цель ИЛИ индивидуальные цели.
   const tripleMode = true;
+  // ─── Режимы работы с окнами (отдельные пункты меню):
+  //  'restrictions' — Установка ограничений (клик по ЛЮБОЙ карте ставит зону);
+  //  'route'        — Редактирование маршрута (добавление/перенос/удаление точек).
+  type TripleMode = 'restrictions' | 'route';
+  const [tripleWorkMode, setTripleWorkMode] = useState<TripleMode>('route');
+  const workModeRef = useRef(tripleWorkMode);
+  useEffect(() => { workModeRef.current = tripleWorkMode; }, [tripleWorkMode]);
   const [droneCount, setDroneCount] = useState(4);
   const [sharedGoal, setSharedGoal] = useState(true);
   const [activeUav, setActiveUav] = useState(0);
@@ -526,10 +533,20 @@ const MapCanvas: React.FC = () => {
   const [approvedSteps, setApprovedSteps] = useState<boolean[]>([false, false, false]);
   const [launchState, setLaunchState] = useState<'idle' | 'uploading' | 'done'>('idle');
   const [draftRoutePts, setDraftRoutePts] = useState<{ lat: number; lng: number }[] | null>(null);
-  const [editTool, setEditTool] = useState<'point' | 'zone'>('point');
+  const [routeShape, setRouteShape] = useState<'straight' | 'curve'>('straight');
+  const routeShapeRef = useRef(routeShape);
+  useEffect(() => { routeShapeRef.current = routeShape; }, [routeShape]);
   // Зоны-кандидаты (ставятся на ЛЮБОЙ из трёх карт; uid — для удаления кликом)
   const [pendingZones, setPendingZones] = useState<{ uid: number; center: { lat: number; lng: number }; radiusM: number }[]>([]);
   const pendingZoneUidRef = useRef(1);
+
+  // «Кривая» маршрут: сглаживание ломаной (Catmull-Rom): ключевые точки остаются
+  // на месте, между ними добавляются промежуточные — линия выглядит как кривая.
+  const curveGeo = (pts: { lat: number; lng: number }[]) => {
+    if (routeShape !== 'curve' || pts.length < 3) return pts;
+    const sm = smoothPolyline(pts.map((g) => ({ x: g.lat, y: g.lng })), 8);
+    return sm.map((q) => ({ lat: q.x, lng: q.y }));
+  };
   const addRoute = useStore((s) => s.addRoute);
   const mapBounds = project.map?.bounds;
 
@@ -552,7 +569,7 @@ const MapCanvas: React.FC = () => {
   const canApproveStep = (st: TripleStep): boolean => {
     if (st === 0) return !!startGeo;
     if (st === 1) return (draftRoutePts?.length ?? 0) >= 2 || tripleRoutes.length > 0;
-    if (st === 2) return (!!goalGeo || !sharedGoal) && pendingZones.length === 0; // зоны должны быть утверждены или удалены кликом
+    if (st === 2) return !!goalGeo || !sharedGoal; // зоны-кандидаты утверждаются автоматически при переходе к следующему этапу
     return false;
   };
 
@@ -572,6 +589,8 @@ const MapCanvas: React.FC = () => {
         color: '#ff000080', active: true,
       });
     }
+    // немедленная перестройка маршрутов вокруг новых зон (без троттлинга)
+    useStore.getState().flushReroute();
     return true;
   }, [project.map]);
 
@@ -581,7 +600,7 @@ const MapCanvas: React.FC = () => {
       // ВАЖНО: черновик НЕ сбрасываем сразу — он участвует в fitPoints окна МАРШРУТ;
       // после записи маршрута в проект тройные данные обновятся атомарно, и окно
       // не «прыгнет» на СПб. Сброс — только при смене активного этапа.
-      const pts: RoutePoint[] = draftRoutePts.map((g) => ({ ...geoToPixelExact(g.lat, g.lng, mapBounds, project.map!.width, project.map!.height), lat: g.lat, lng: g.lng }));
+      const pts: RoutePoint[] = curveGeo(draftRoutePts).map((g) => ({ ...geoToPixelExact(g.lat, g.lng, mapBounds, project.map!.width, project.map!.height), lat: g.lat, lng: g.lng }));
       const existing = tripleRoutes[Math.min(activeUav, tripleRoutes.length - 1)];
       if (existing) {
         useStore.setState((cur) => ({
@@ -599,7 +618,6 @@ const MapCanvas: React.FC = () => {
     commitPendingZones(pendingZones);
     setPendingZones([]);
     setApprovedSteps((a) => { const n = [...a]; n[tripleStep] = true; return n; });
-    setEditTool('point');
     if (tripleStep < 2) setTripleStep((tripleStep + 1) as TripleStep);
     else setTripleStep(3);
   }, [tripleStep, draftRoutePts, mapBounds, project.map, tripleRoutes, activeUav, addRoute, pendingZones, commitPendingZones]);
@@ -637,7 +655,7 @@ const MapCanvas: React.FC = () => {
   }, []);
 
   const backTripleStep = useCallback(() => {
-    setDraftRoutePts(null); setPendingZones([]); setEditTool('point');
+    setDraftRoutePts(null); setPendingZones([]);
     if (tripleStep === 3) { setTripleStep(2); setApprovedSteps((a) => [a[0], a[1], false]); }
     else if (tripleStep > 0) {
       setTripleStep((tripleStep - 1) as TripleStep);
@@ -651,14 +669,12 @@ const MapCanvas: React.FC = () => {
   const handlePanelMapClick = useCallback((geo: { lat: number; lng: number; panelIdx?: number }) => {
     if (launchStateRef.current !== 'idle') return;
     const panelIdx = geo.panelIdx ?? tripleStepRef.current;
-    if (editToolRef.current === 'zone') {
-      // Зона ставится в точке клика любой карты. Окна НЕ ротируем и этап не
-      // переключаем — pendingZone не влияет на центры/fit панелей, поэтому
-      // фокусировка карт не сбивается. Утверждение — кнопкой «✓ Утвердить»
-      // на любом этапе либо удалено кликом по ✛ зоны-кандидата.
+    // Режим «Установка ограничений»: клик по ЛЮБОЙ из трёх карт ставит зону.
+    if (workModeRef.current === 'restrictions') {
       setPendingZones((prev) => [...prev, { uid: pendingZoneUidRef.current++, center: { lat: geo.lat, lng: geo.lng }, radiusM: 2000 }]);
       return;
     }
+    // Режим «Редактирование маршрута»: точки старта/цели/маршрута — во всех окнах.
     if (panelIdx === 0) {
       setStartGeo({ lat: geo.lat, lng: geo.lng });
       reopenStepForEdit(0);
@@ -671,8 +687,6 @@ const MapCanvas: React.FC = () => {
     }
   }, [reopenStepForEdit]);
 
-  const editToolRef = useRef(editTool);
-  useEffect(() => { editToolRef.current = editTool; }, [editTool]);
   const tripleStepRef = useRef(tripleStep);
   useEffect(() => { tripleStepRef.current = tripleStep; }, [tripleStep]);
   const launchStateRef = useRef(launchState);
@@ -711,6 +725,7 @@ const MapCanvas: React.FC = () => {
     }
     if (id.startsWith('zone:')) {
       useStore.getState().deleteRestriction(id.slice(5));
+      useStore.getState().flushReroute();
       return;
     }
     if (id.startsWith('drone-goal:')) {
@@ -728,6 +743,7 @@ const MapCanvas: React.FC = () => {
       return;
     }
     useStore.getState().deleteRestriction(id);
+    useStore.getState().flushReroute();
   }, []);
 
   // «ЗАПУСК»: загрузка данных миссии в дроны (имитация телеметрической загрузки)
@@ -774,7 +790,7 @@ const MapCanvas: React.FC = () => {
     if (launchState !== 'done') return;
     setStartGeo(null); setGoalGeo(null); setDraftRoutePts([]); setPendingZones([]);
     setApprovedSteps([false, false, false]); setTripleStep(0); setLaunchState('idle');
-    setEditTool('point'); setActiveUav(0);
+    setActiveUav(0);
     // маршруты предыдущей миссии удаляем из проекта (зоны-ограничения остаются)
     useStore.setState((cur) => ({ project: { ...cur.project, routes: [] } }));
     setPopup({ x: canvasSize.width / 2 - 160, y: 60, title: '🆕 Новая миссия', lines: ['Данные предыдущего полёта очищены.', 'Окно «Старт» активно — кликните по карте, чтобы задать точку старта.'] });
@@ -859,6 +875,18 @@ const MapCanvas: React.FC = () => {
   // Масштаб стартовой/целевой панелей: 1 см = 2 км при высоте панели ~230 px
   const panelZoomFor2km = (lat: number): number =>
     clampZoom(zoomForGroundMpp(GROUND_MPP_1CM_2KM, lat));
+
+  // Перенос путевой точки маршрута drag-ом на любой из карт (редактирование маршрута)
+  const handlePanelPointMove = useCallback((id: string, lat: number, lng: number) => {
+    if (!id.startsWith('draft:')) return;
+    const i = Number(id.slice(6));
+    setDraftRoutePts((prev) => {
+      if (!prev || i < 0 || i >= prev.length) return prev;
+      const n = [...prev]; n[i] = { lat, lng }; return n;
+    });
+  }, []);
+
+  // (curveGeo определён ниже — см. объявление перед мастером этапов)
 
   // Экспорт PNG высокого разрешения: композитинг трёх панелей + легенда
   const exportTriplePng = useCallback(async () => {
@@ -2389,7 +2417,7 @@ const MapCanvas: React.FC = () => {
           });
         })();
         const draftLine: MiniOverlayLine[] = draftRoutePts && draftRoutePts.length >= 2
-          ? [{ pts: draftRoutePts, color: '#34d399', width: 3 }] : [];
+          ? [{ pts: curveGeo(draftRoutePts), color: '#34d399', width: 3 }] : [];
         const draftPoints: MiniOverlayPoint[] = (draftRoutePts || []).map((g, i) => ({ id: `draft:${i}`, lat: g.lat, lng: g.lng, label: `${i + 1}`, color: '#34d399' }));
         const stepDefs = [
           { idx: 0, title: 'СТАРТ (масштаб 1 см = 2 км)', icon: '🟢' },
@@ -2405,6 +2433,8 @@ const MapCanvas: React.FC = () => {
             onFocus: () => { focusAndRaisePanel(idx); },
             onMapClick: handlePanelMapClick,
             onPointClick: handlePanelPointDelete,
+            pointDeleteEnabled: tripleWorkMode === 'route',
+            onPointMove: handlePanelPointMove,
             onZoneClick: handlePanelZoneDelete,
             zones: [...zoneGeoList, ...pendingZoneMini],
           };
@@ -2420,7 +2450,7 @@ const MapCanvas: React.FC = () => {
             // изначальная фокусировка — Санкт-Петербург; после ввода данных — авто-fit по маршруту
             center: routeGeoPts.length > 0 ? routeGeoPts[0] : SPB_GEO, zoom: 10,
             fitPoints: routeGeoPts.length > 0 ? routeGeoPts : undefined,
-            points: [...pointsOut, ...draftPoints], lines: [...linesOut, ...draftLine], height: '100%',
+            points: [...pointsOut, ...draftPoints], lines: [...tripleRoutes.map((r) => ({ pts: curveGeo(r.geo), color: r.color, width: 2 })), ...(startGeo && goalGeo ? [{ pts: [startGeo, goalGeo], color: '#facc15', width: 2, dashed: true }] : []), ...draftLine.map((l) => ({ ...l, pts: curveGeo(l.pts) }))], height: '100%',
           };
           return {
             ...base,
@@ -2455,12 +2485,19 @@ const MapCanvas: React.FC = () => {
               ))}
               <span className="text-gray-400 ml-1">{stepHint}</span>
             </div>
-            {/* Инструменты редактирования: доступны на любом этапе и в любом окне */}
+            {/* Отдельные пункты меню: Установка ограничений / Редактирование маршрута */}
             <div className="flex items-center gap-1">
-              <button className={`px-2 py-0.5 rounded border ${editTool === 'point' ? 'bg-red-800 border-red-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'}`}
-                onClick={() => setEditTool('point')} title="Клик по карте — поставить/перенести цель">🎯 Цель</button>
-              <button className={`px-2 py-0.5 rounded border ${editTool === 'zone' ? 'bg-orange-800 border-orange-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'}`}
-                onClick={() => setEditTool((t) => (t === 'zone' ? 'point' : 'zone'))} title="Клик по ЛЮБОЙ из трёх карт — добавить круговую зону ограничения (r = 2 км) в точке клика; повторное нажатие — выключить инструмент">⛔ Зона 2 км</button>
+              <button role="tab" aria-selected={tripleWorkMode === 'route'}
+                className={`px-2 py-0.5 rounded border ${tripleWorkMode === 'route' ? 'bg-cyan-700 border-cyan-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'}`}
+                onClick={() => setTripleWorkMode('route')}
+                title="Клик по ЛЮБОЙ из трёх карт добавляет/перемещает точку старта, цели или маршрута; drag точки — перенос; ✛ — удаление">✏️ Редактирование маршрута</button>
+              <button role="tab" aria-selected={tripleWorkMode === 'restrictions'}
+                className={`px-2 py-0.5 rounded border ${tripleWorkMode === 'restrictions' ? 'bg-orange-700 border-orange-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'}`}
+                onClick={() => setTripleWorkMode('restrictions')}
+                title="Клик по ЛЮБОЙ из трёх карт ставит круговую зону ограничения (r = 2 км); зоны утверждаются автоматически при переходе к следующему этапу; клик по ✛ зоны — удалить">⛔ Установка ограничений</button>
+              <button className="px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 border border-gray-600 text-gray-300"
+                onClick={() => setRouteShape((sh) => (sh === 'straight' ? 'curve' : 'straight'))}
+                title="Форма линии маршрута: ломаная (по точкам) ⇄ сглаженная кривая (Catmull-Rom)">〰️ {routeShape === 'straight' ? 'Ломаная' : 'Кривая'}</button>
             </div>
             <label className="flex items-center gap-1 text-gray-300">Дронов:
               <input type="number" min={1} max={8} value={droneCount} disabled={launchState !== 'idle'}
