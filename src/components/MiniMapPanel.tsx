@@ -42,7 +42,11 @@ interface MiniMapPanelProps {
   zones?: MiniZone[];
   /** Клик ПО точечному оверлею (удаление точки/объекта): id + тип + гео-позиция */
   onPointClick?: (id: string) => void;
-  /** Клик по зоне (удаление объекта ограничения) */
+  /** Разрешено ли удаление точек кликом по ✛ (в режиме ограничений — false) */
+  pointDeleteEnabled?: boolean;
+  /** Перетащили точку оверлея → новое гео-положение (редактирование маршрута) */
+  onPointMove?: (id: string, lat: number, lng: number) => void;
+  /** Клик по ✛-метке зоны (удаление объекта ограничения) */
   onZoneClick?: (id: string) => void;
 }
 
@@ -79,7 +83,7 @@ function cacheTile(url: string, img: HTMLImageElement | null): void {
 const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   title, icon, center, zoom = 11, fitPoints, minZoom = 3, maxZoom = 20,
   points = [], lines = [], height = 260, onReady,
-  focused = false, onFocus, onMapClick, panelIdx = -1, zones = [], onPointClick, onZoneClick,
+  focused = false, onFocus, onMapClick, panelIdx = -1, zones = [], onPointClick, pointDeleteEnabled = true, onPointMove, onZoneClick,
 }) => {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -120,10 +124,14 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   }, [bump]);
   useEffect(() => () => { if (animRef.current !== null) cancelAnimationFrame(animRef.current); }, []);
 
-  // Ключ внешних данных для отслеживания изменений
+  // Ключ внешних данных для отслеживания изменений.
+  // ВАЖНО (баг «фокусировка сбивается при постановке ограничения»): зоны и
+  // линии НЕ входят в ключ — их добавление/удаление не должно перетягивать
+  // камеру. Авто-наведение срабатывает только при изменении самих точек
+  // (center / fitPoints / точки оверлеев).
   const dataKey = [
     center.lat.toFixed(5), center.lng.toFixed(5), zoom.toFixed(2),
-    fitPoints ? fitPoints.length : 0,
+    fitPoints ? `${fitPoints.length}:${fitPoints.map((p) => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join('|')}` : '0',
     points.map((p) => `${p.id || ''}@${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join('|'),
   ].join('#');
   const lastDataKeyRef = useRef<string | null>(null);
@@ -363,10 +371,16 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   useEffect(() => { onFocusRef.current = onFocus; }, [onFocus]);
   const onPointClickRef = useRef(onPointClick);
   useEffect(() => { onPointClickRef.current = onPointClick; }, [onPointClick]);
+  const pointDeleteEnabledRef = useRef(pointDeleteEnabled);
+  useEffect(() => { pointDeleteEnabledRef.current = pointDeleteEnabled; }, [pointDeleteEnabled]);
+  const onPointMoveRef = useRef(onPointMove);
+  useEffect(() => { onPointMoveRef.current = onPointMove; }, [onPointMove]);
   const onZoneClickRef = useRef(onZoneClick);
   useEffect(() => { onZoneClickRef.current = onZoneClick; }, [onZoneClick]);
   // Позиции оверлеев с последнего кадра — для hit-теста клика удаления
   const hitsRef = useRef<{ pointHits: { id?: string; x: number; y: number }[]; zoneHits: { id?: string; x: number; y: number; r: number }[] }>({ pointHits: [], zoneHits: [] });
+  // Идентификатор точки, которую перетаскиваем (редактирование маршрута drag-ом)
+  const draggingPtRef = useRef<string | null>(null);
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -378,12 +392,34 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       bump();
     };
     let drag: { x: number; y: number; moved: boolean } | null = null;
-    const onDown = (e: PointerEvent) => { drag = { x: e.clientX, y: e.clientY, moved: false }; canvas.setPointerCapture?.(e.pointerId); };
+    const toScreen = (clientX: number, clientY: number) => {
+      const r = rectOf();
+      const { w, h } = sizeRef.current;
+      return { sx: (clientX - r.left) * (w / Math.max(1, r.width)), sy: (clientY - r.top) * (h / Math.max(1, r.height)) };
+    };
+    const onDown = (e: PointerEvent) => {
+      drag = { x: e.clientX, y: e.clientY, moved: false };
+      canvas.setPointerCapture?.(e.pointerId);
+      // Хит-тест по точкам: клик/начало drag ТОЧНО по точке НЕ должно pan-ить карту
+      const { sx, sy } = toScreen(e.clientX, e.clientY);
+      const hit = [...hitsRef.current.pointHits].reverse().find((p) => p.id && (p.x - sx) ** 2 + (p.y - sy) ** 2 <= 144);
+      draggingPtRef.current = hit?.id ?? null;
+    };
     const onMove = (e: PointerEvent) => {
       if (!drag) return;
       const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
       if (Math.abs(dx) + Math.abs(dy) > 2) drag.moved = true;
       drag = { x: e.clientX, y: e.clientY, moved: drag.moved };
+      // Drag точки маршрута/цели: карта стоит, точка «прилипает» к курсору
+      if (draggingPtRef.current && drag.moved && onPointMoveRef.current) {
+        const { w, h } = sizeRef.current;
+        const vb = viewBox(viewRef.current, w, h);
+        const { sx, sy } = toScreen(e.clientX, e.clientY);
+        const geo = screenPxToGeoPanel(vb, sx, sy, w, h);
+        onPointMoveRef.current(draggingPtRef.current, geo.lat, geo.lng);
+        return;
+      }
+      if (draggingPtRef.current) return;
       viewRef.current = panPanelBy(viewRef.current, dx, dy, sizeRef.current.w, sizeRef.current.h);
       bump();
     };
@@ -392,23 +428,33 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       const downX = drag ? drag.x : e.clientX;
       const downY = drag ? drag.y : e.clientY;
       drag = null;
-      if (wasDrag) return;
+      const draggedId = draggingPtRef.current;
+      draggingPtRef.current = null;
+      // Перетащили точку → она уже обновляется в onMove; клик не генерируем
+      if (wasDrag) { if (draggedId) bump(); return; }
       // Клик (без перетаскивания): любой панели разрешено редактирование —
       // фокус + удаление/добавление объектов работают во ВСЕХ окнах сразу.
       const r = rectOf();
+      const { w, h } = sizeRef.current;
+      const sc = toScreen(e.clientX, e.clientY);
       const sx = e.clientX - r.left, sy = e.clientY - r.top;
       if (sx < 0 || sy < 0 || sx > r.width || sy > r.height) return;
+      const vb = viewBox(viewRef.current, w, h);
       // Приоритет: клик ТОЧНО по точке/объекту или зоне на карте = УДАЛИТЬ её.
       // ВАЖНО: проверка хитов выполняется ДО onFocus — иначе клик по ✛ точки
       // сначала поднимает панель вкладкой наверх, канвас пересоздаётся и
       // указатель «теряется» (удаление не срабатывает, фокус сбивается).
-      const { w, h } = sizeRef.current;
-      const vb = viewBox(viewRef.current, w, h);
-      const sc = { x: sx * (w / Math.max(1, r.width)), y: sy * (h / Math.max(1, r.height)) };
-      const hitPt = [...hitsRef.current.pointHits].reverse().find((p) => p.id && (p.x - sc.x) ** 2 + (p.y - sc.y) ** 2 <= 144);
-      if (hitPt?.id) { onPointClickRef.current?.(hitPt.id); return; }
-      const hitZn = [...hitsRef.current.zoneHits].reverse().find((z) => z.id && ((z.x - sc.x) ** 2 + (z.y - sc.y) ** 2 <= Math.min(z.r, 60) ** 2));
-      if (hitZn?.id) { onZoneClickRef.current?.(hitZn.id); return; }
+      if (sc.sx >= 0 && sc.sy >= 0 && sc.sx <= w && sc.sy <= h) {
+        const hitPt = [...hitsRef.current.pointHits].reverse().find((p) => p.id && (p.x - sc.sx) ** 2 + (p.y - sc.sy) ** 2 <= 144);
+        if (hitPt?.id) {
+          // В режиме «Установка ограничений» клик по точке НЕ удаляет её —
+          // удаление доступно в режиме «Редактирование маршрута»
+          if (pointDeleteEnabledRef.current) onPointClickRef.current?.(hitPt.id);
+          return;
+        }
+        const hitZn = [...hitsRef.current.zoneHits].reverse().find((z) => z.id && ((z.x - sc.sx) ** 2 + (z.y - sc.sy) ** 2 <= Math.min(z.r, 60) ** 2));
+        if (hitZn?.id) { onZoneClickRef.current?.(hitZn.id); return; }
+      }
       // Простой клик по свободному месту этой же карты (панорама не двигалась) —
       // добавляем объект без смены вкладки/фокуса: это сохраняет текущую
       // фокусировку всех окон (клик по нижней панели сначала активирует её).
@@ -417,7 +463,7 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
         return;
       }
       if (onMapClickRef.current) {
-        const geo = screenPxToGeoPanel(vb, sc.x, sc.y, w, h);
+        const geo = screenPxToGeoPanel(vb, sc.sx, sc.sy, w, h);
         const idx = panelIdxRef.current;
         onMapClickRef.current(idx >= 0 ? ({ ...geo, panelIdx: idx } as typeof geo) : geo);
       }
