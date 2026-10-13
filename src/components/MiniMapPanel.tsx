@@ -389,6 +389,8 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     };
     const onUp = (e: PointerEvent) => {
       const wasDrag = drag?.moved;
+      const downX = drag ? drag.x : e.clientX;
+      const downY = drag ? drag.y : e.clientY;
       drag = null;
       if (wasDrag) return;
       // Клик (без перетаскивания): любой панели разрешено редактирование —
@@ -396,8 +398,10 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       const r = rectOf();
       const sx = e.clientX - r.left, sy = e.clientY - r.top;
       if (sx < 0 || sy < 0 || sx > r.width || sy > r.height) return;
-      onFocusRef.current?.();
-      // Приоритет: клик ТОЧНО по точке/объекту или зоне на карте = УДАЛИТЬ её
+      // Приоритет: клик ТОЧНО по точке/объекту или зоне на карте = УДАЛИТЬ её.
+      // ВАЖНО: проверка хитов выполняется ДО onFocus — иначе клик по ✛ точки
+      // сначала поднимает панель вкладкой наверх, канвас пересоздаётся и
+      // указатель «теряется» (удаление не срабатывает, фокус сбивается).
       const { w, h } = sizeRef.current;
       const vb = viewBox(viewRef.current, w, h);
       const sc = { x: sx * (w / Math.max(1, r.width)), y: sy * (h / Math.max(1, r.height)) };
@@ -405,6 +409,13 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       if (hitPt?.id) { onPointClickRef.current?.(hitPt.id); return; }
       const hitZn = [...hitsRef.current.zoneHits].reverse().find((z) => z.id && ((z.x - sc.x) ** 2 + (z.y - sc.y) ** 2 <= Math.min(z.r, 60) ** 2));
       if (hitZn?.id) { onZoneClickRef.current?.(hitZn.id); return; }
+      // Простой клик по свободному месту этой же карты (панорама не двигалась) —
+      // добавляем объект без смены вкладки/фокуса: это сохраняет текущую
+      // фокусировку всех окон (клик по нижней панели сначала активирует её).
+      if (Math.abs(e.clientX - downX) + Math.abs(e.clientY - downY) <= 3 && !focusedRef.current) {
+        onFocusRef.current?.();
+        return;
+      }
       if (onMapClickRef.current) {
         const geo = screenPxToGeoPanel(vb, sc.x, sc.y, w, h);
         const idx = panelIdxRef.current;

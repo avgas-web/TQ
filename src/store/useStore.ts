@@ -247,7 +247,6 @@ interface AppState {
   measurementPoints: Point[];
   searchQuery: string;
   filterType: string;
-  actionMode: boolean; // «Режим действий»: маршрут старт→цель с гео-расчётами
   activeRouteId: string | null; // активный маршрут для редактирования кликами
   routeWarnings: Record<string, string[]>; // id маршрута -> предупреждения о пересечении зон (в сессии)
   redoDrawingStack: Point[]; // redo-стек для рисования полигонов
@@ -277,7 +276,6 @@ interface AppState {
   refreshAllRoutesAfterMapChange: () => void; // пересчёт пикселей из lat/lng при загрузке новой карты
   clearRouteWarnings: (id: string) => void;
   setTool: (tool: Tool) => void;
-  setActionMode: (enabled: boolean) => void;
   loadMap: (mapData: MapData) => void;
   addMarker: (marker: Partial<Marker>) => void;
   updateMarker: (id: string, updates: Partial<Marker>) => void;
@@ -375,7 +373,6 @@ export const useStore = create<AppState>()(
       measurementPoints: [],
       searchQuery: '',
       filterType: '',
-      actionMode: false,
       activeRouteId: null,
       routeWarnings: {},
       redoDrawingStack: [],
@@ -738,8 +735,6 @@ export const useStore = create<AppState>()(
       })),
 
       setTool: (tool) => set({ currentTool: tool, isDrawing: false, drawingPoints: [] }),
-
-      setActionMode: (enabled) => set({ actionMode: enabled }),
 
       loadMap: (mapData) => set((state) => ({
         project: {
