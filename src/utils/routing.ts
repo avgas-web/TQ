@@ -150,9 +150,10 @@ export interface VerticalZoneCrossing {
 export function zonesCrossedBy(points: Point[], restrictions: Restriction[]): Restriction[] {
   // Круг задаётся ОДНОЙ точкой + radius: старый фильтр points.length >= 2
   // полностью исключал круговые зоны из проверки пересечений (ложно-чистые
-  // маршруты, проходящие через круг).
+  // маршруты, проходящие через круг). Флаг active больше не участвует: все
+  // поставленные зоны — ограничения на пути маршрута.
   const active = restrictions.filter(
-    (r) => r.active && (r.type === 'circle' ? r.points.length >= 1 && !!r.radius : r.points.length >= 2)
+    (r) => r.type === 'circle' ? r.points.length >= 1 && !!r.radius : r.points.length >= 2
   );
   if (active.length === 0 || points.length < 2) return [];
   const hitIds = new Set<string>();
@@ -181,7 +182,7 @@ export function requiredAbsFromZones(
   let floor: number | null = null;
   let ceiling: number | null = null;
   for (const r of restrictions) {
-    if (!r.active) continue;
+    // флаг active больше не фильтрует зоны (см. zonesCrossedBy)
     const hasMin = typeof r.minHeightAGL === 'number' && Number.isFinite(r.minHeightAGL) && r.minHeightAGL > 0;
     const hasMax = typeof r.maxHeightAGL === 'number' && Number.isFinite(r.maxHeightAGL) && r.maxHeightAGL > 0;
     if (!hasMin && !hasMax) continue;
@@ -211,7 +212,7 @@ export function zoneHasVerticalLimits(r: Restriction): boolean {
  *  нарушение (полёт ниже пола / выше потолка зоны) корректируется по высоте. */
 export function zonesWithVerticalLimitsCrossedBy(points: Point[], restrictions: Restriction[]): Restriction[] {
   const active = restrictions.filter(
-    (r) => r.active && zoneHasVerticalLimits(r) &&
+    (r) => zoneHasVerticalLimits(r) &&
       (r.type === 'circle' ? r.points.length >= 1 && !!r.radius : r.points.length >= 2)
   );
   if (active.length === 0 || points.length < 2) return [];
@@ -270,7 +271,7 @@ interface Obstacle { type: 'rectangle' | 'circle' | 'polygon'; box: { minX: numb
 function buildObstacles(restrictions: Restriction[], margin: number): Obstacle[] {
   const out: Obstacle[] = [];
   for (const r of restrictions) {
-    if (!r.active) continue;
+    // ВСЕ поставленные зоны — препятствия (флаг active устарел)
     const box = restrictionPixelBox(r);
     if (!box) continue;
     out.push({

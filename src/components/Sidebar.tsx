@@ -296,14 +296,16 @@ const Sidebar: React.FC = () => {
                       {' '}{restriction.name}
                     </span>
                     <div className="flex gap-1">
+                      {/* Выбор зоны = выделение для редактирования; ВСЕ зоны —
+                          ограничения на пути маршрутов (флаг active устарел) */}
                       <button
                         onClick={() => setActiveRestriction(
                           restriction.id === activeRestrictionId ? null : restriction.id
                         )}
-                        className={`px-1 text-xs ${restriction.active ? 'text-red-400' : 'text-gray-400 hover:text-white'}`}
-                        title="Активировать"
+                        className="px-1 text-xs text-gray-400 hover:text-white"
+                        title="Выделить зону для редактирования"
                       >
-                        {restriction.active ? '🔴' : '⚪'}
+                        🎯
                       </button>
                       <button
                         onClick={() => deleteRestriction(restriction.id)}

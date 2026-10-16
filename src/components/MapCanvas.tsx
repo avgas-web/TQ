@@ -757,7 +757,8 @@ const MapCanvas: React.FC = () => {
         id: r.id, name: r.name,
         waypoints: r.points.map((p) => ({ lat: p.lat, lng: p.lng })),
       })),
-      zones: st.project.restrictions.filter((z) => z.active).map((z) => ({
+      // все поставленные зоны (флаг active устарел — см. types/Restriction)
+      zones: st.project.restrictions.filter((z) => z.points.length > 0).map((z) => ({
         id: z.id, name: z.name, type: z.type,
         geoPoints: mapBounds && st.project.map ? z.points.map((pt) => {
           const g = pixelToGeoExact(pt, mapBounds, st.project.map!.width, st.project.map!.height);
@@ -1530,9 +1531,12 @@ const MapCanvas: React.FC = () => {
       ctx.scale(vs.scale, vs.scale);
 
       for (const restriction of project.restrictions) {
-        const isActive = restriction.active;
-        ctx.fillStyle = isActive ? 'rgba(255, 50, 50, 0.12)' : 'rgba(100, 100, 100, 0.08)';
-        ctx.strokeStyle = isActive ? 'rgba(255, 80, 80, 0.7)' : 'rgba(150, 150, 150, 0.4)';
+        // ВСЕ поставленные зоны — полные ограничения (флаг active устарел):
+        // раньше неактивные рисовались серыми и не участвовали в обходе, из-за
+        // чего «при утверждении маршрута ограничения пропадали».
+        const isActive = true;
+        ctx.fillStyle = 'rgba(255, 50, 50, 0.12)';
+        ctx.strokeStyle = 'rgba(255, 80, 80, 0.7)';
         ctx.lineWidth = 2 / vs.scale;
 
         if (restriction.type === 'polygon') {
@@ -1823,26 +1827,31 @@ const MapCanvas: React.FC = () => {
           ctx.setLineDash([]);
         }
 
-        // Точки маршрута
+        // Точки маршрута: ключевые (ставит пользователь) — цветные и чуть
+        // крупнее; авто-обходные (результат обхода ограничений) — мелкие
+        // полупрозрачные, их видно как «цепочку» вокруг зон.
         const drawR = (isActive ? 5 : 3.5) / s;
         for (let i = 0; i < route.points.length; i++) {
           const p = route.points[i];
+          const rPt = p.auto ? drawR * 0.55 : drawR;
           ctx.beginPath();
-          ctx.arc(p.x, p.y, drawR, 0, Math.PI * 2);
-          ctx.fillStyle = p.auto ? 'rgba(255,255,255,0.75)' : color;
+          ctx.arc(p.x, p.y, rPt, 0, Math.PI * 2);
+          ctx.fillStyle = p.auto ? 'rgba(255,255,255,0.45)' : color;
           ctx.fill();
           ctx.lineWidth = 1.2 / s;
           ctx.strokeStyle = 'rgba(0,0,0,0.6)';
           ctx.stroke();
-          // Подписи высот (Open-Elevation): у активного маршрута — рельеф/ABS
+          // Подписи высот (Open-Elevation): у активного маршрута — рельеф/ABS;
+          // ручной AGL на этапе помечается стрелкой ↑
           if (isActive && typeof p.altitudeAbs === 'number') {
             const fsA = Math.max(8, 9 / s);
             ctx.font = `${fsA}px sans-serif`;
             ctx.textAlign = 'center';
             ctx.fillStyle = 'rgba(0,0,0,0.75)';
+            const manualTag = typeof p.altitudeAGL === 'number' ? ` ↑${Math.round(p.altitudeAGL)}` : '';
             const tTxt = p.terrainM != null
-              ? `${Math.round(p.altitudeAbs)} м (з ${Math.round(p.terrainM)})`
-              : `${Math.round(p.altitudeAbs)} м`;
+              ? `${Math.round(p.altitudeAbs)} м (з ${Math.round(p.terrainM)})${manualTag}`
+              : `${Math.round(p.altitudeAbs)} м${manualTag}`;
             const twA = ctx.measureText(tTxt).width;
             ctx.fillRect(p.x - twA / 2 - 2 / s, p.y + drawR + 1 / s, twA + 4 / s, fsA + 3 / s);
             ctx.fillStyle = '#7dd3fc';
@@ -2453,7 +2462,7 @@ const MapCanvas: React.FC = () => {
           const map = project.map;
           if (!map?.bounds || map.width <= 0 || map.height <= 0) return [] as { pts: { lat: number; lng: number }[]; color?: string; radiusM?: number; centerGeo?: { lat: number; lng: number } }[];
           const worldPxZ14 = Math.max(256, canvasSizeRef.current.height * Math.pow(2, ZOOM_REF));
-          return (project.restrictions || []).filter((z) => z.active !== false && z.points.length > 0).map((z) => {
+          return (project.restrictions || []).filter((z) => z.points.length > 0).map((z) => {
             const geoPts = z.points.map((p) => pixelToGeoExact(p, map.bounds!, map.width, map.height));
             if (z.type === 'circle' && z.radius) {
               const mppZ14 = metersPerPixelFromWorld(worldPxZ14, geoPts[0].lat);

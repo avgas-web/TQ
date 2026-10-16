@@ -46,6 +46,9 @@ interface MiniMapPanelProps {
   pointDeleteEnabled?: boolean;
   /** Перетащили точку оверлея → новое гео-положение (редактирование маршрута) */
   onPointMove?: (id: string, lat: number, lng: number) => void;
+  /** Drag точки ВЕРТИКАЛЬНО = регулировка высоты этапа этой точки (AGL, м).
+   *  Вызывается при перетаскивании с зажатым Shift. */
+  onPointAltitudeDrag?: (id: string, dyPx: number) => void;
   /** Клик по ✛-метке зоны (удаление объекта ограничения) */
   onZoneClick?: (id: string) => void;
 }
@@ -83,7 +86,7 @@ function cacheTile(url: string, img: HTMLImageElement | null): void {
 const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   title, icon, center, zoom = 11, fitPoints, minZoom = 3, maxZoom = 20,
   points = [], lines = [], height = 260, onReady,
-  focused = false, onFocus, onMapClick, panelIdx = -1, zones = [], onPointClick, pointDeleteEnabled = true, onPointMove, onZoneClick,
+  focused = false, onFocus, onMapClick, panelIdx = -1, zones = [], onPointClick, pointDeleteEnabled = true, onPointMove, onPointAltitudeDrag, onZoneClick,
 }) => {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -375,6 +378,8 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   useEffect(() => { pointDeleteEnabledRef.current = pointDeleteEnabled; }, [pointDeleteEnabled]);
   const onPointMoveRef = useRef(onPointMove);
   useEffect(() => { onPointMoveRef.current = onPointMove; }, [onPointMove]);
+  const onPointAltitudeDragRef = useRef(onPointAltitudeDrag);
+  useEffect(() => { onPointAltitudeDragRef.current = onPointAltitudeDrag; }, [onPointAltitudeDrag]);
   const onZoneClickRef = useRef(onZoneClick);
   useEffect(() => { onZoneClickRef.current = onZoneClick; }, [onZoneClick]);
   // Позиции оверлеев с последнего кадра — для hit-теста клика удаления
@@ -392,6 +397,9 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       bump();
     };
     let drag: { x: number; y: number; moved: boolean } | null = null;
+    // Alt-drag точки = регулировка высоты этапа: накапливаем смещение по Y
+    // и каждые ~12 px вызываем onPointAltitudeDrag(id, dy).
+    let altAccumPx = 0;
     const toScreen = (clientX: number, clientY: number) => {
       const r = rectOf();
       const { w, h } = sizeRef.current;
@@ -404,12 +412,21 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       const { sx, sy } = toScreen(e.clientX, e.clientY);
       const hit = [...hitsRef.current.pointHits].reverse().find((p) => p.id && (p.x - sx) ** 2 + (p.y - sy) ** 2 <= 144);
       draggingPtRef.current = hit?.id ?? null;
+      altAccumPx = 0;
     };
     const onMove = (e: PointerEvent) => {
       if (!drag) return;
       const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
       if (Math.abs(dx) + Math.abs(dy) > 2) drag.moved = true;
       drag = { x: e.clientX, y: e.clientY, moved: drag.moved };
+      // Alt-drag по точке оверлея — регулировка ВЫСОТЫ этапа этой точки
+      // (вверх = выше AGL, вниз = ниже). Карта при этом не панорамится.
+      if (draggingPtRef.current && e.altKey && onPointAltitudeDragRef.current) {
+        altAccumPx -= dy; // экранная Y вниз → уменьшаем высоту
+        while (altAccumPx >= 12) { altAccumPx -= 12; onPointAltitudeDragRef.current(draggingPtRef.current, +12); }
+        while (altAccumPx <= -12) { altAccumPx += 12; onPointAltitudeDragRef.current(draggingPtRef.current, -12); }
+        return;
+      }
       // Drag точки маршрута/цели: карта стоит, точка «прилипает» к курсору
       if (draggingPtRef.current && drag.moved && onPointMoveRef.current) {
         const { w, h } = sizeRef.current;
