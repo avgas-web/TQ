@@ -65,11 +65,17 @@ function drawableRestrictions(restrictions: Restriction[]): Restriction[] {
   );
 }
 
-export function isPointInActiveRestriction(point: Point, restrictions: Restriction[]): boolean {
-  // флаг `active` у зон устарел (см. types/Restriction): все поставленные зоны — ограничения
-  const activeRestrictions = drawableRestrictions(restrictions);
-  if (activeRestrictions.length === 0) return true; // Нет активных ограничений
-  return activeRestrictions.every(r => isPointInRestriction(point, r));
+/** Точка лежит ВНУТРИ хотя бы одной зоны ограничения (без фильтра по
+ *  устаревшему флагу active — все поставленные зоны считаются ограничениями). */
+export function isPointInsideAnyRestriction(point: Point, restrictions: Restriction[]): boolean {
+  return drawableRestrictions(restrictions).some(r => isPointInRestriction(point, r));
+}
+
+/** Обратная проверка «точка вне всех зон» — переименована из
+ *  isPointInActiveRestriction: старое имя инвертировало смысл (true
+ *  возвращалось для точек ВНЕ зон), что сбивало с толку при чтении кода. */
+export function isPointOutsideAllRestrictions(point: Point, restrictions: Restriction[]): boolean {
+  return !isPointInsideAnyRestriction(point, restrictions);
 }
 
 /**

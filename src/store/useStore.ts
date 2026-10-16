@@ -1,11 +1,21 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { v4 as uuidv4 } from 'uuid';
-import type { Project, Marker, Restriction, Layer, Tool, ViewState, MapData, Point, CalibrationPoint, MapBounds, Route, RoutePoint } from '../types';
+import type { Project, Marker, Restriction, Layer, Tool, ViewState, MapData, Point, CalibrationPoint, MapBounds, Route, RoutePoint, DroneAssignment } from '../types';
 import { MAX_ROUTES } from '../types';
+import type { WaypointParamsLite, MissionMetaLite } from '../types';
+import {
+  sanitizeWaypointParams,
+  createMissionMeta,
+  optimizeRoute,
+  generateScanLawnmower,
+  ValidationError,
+  type WaypointParams,
+  type OptimizeAlgorithm,
+} from '../utils/mission';
 import { saveMapToIndexedDB, loadMapFromIndexedDB, deleteMapFromIndexedDB } from '../utils/storage';
 import { geoToPixelFromBounds, calculateBoundsFromCenter, latToMercatorY, mercatorYToLat } from '../utils/googleMaps';
-import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, geoToPixelExact, smoothPolyline, routeLengthM, pointInRestrictionFootprint, requiredAbsFromZones, zoneHasVerticalLimits } from '../utils/routing';
+import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, geoToPixelExact, smoothPolyline, routeLengthM, requiredAbsFromZones } from '../utils/routing';
 import { fetchElevations, computeRouteAltitude } from '../utils/elevation';
 import type { ElevationPoint } from '../utils/elevation';
 import type { RouteShape, RangeLimitMode, ImportPoint, ImportLists } from '../types';
@@ -23,11 +33,6 @@ let altitudeRunId = 0;
 /** Активный AbortController последнего прогона высот — для отмены сетевых
  *  запросов устаревшего прогона при запуске нового. */
 let lastAltitudeController: AbortController | null = null;
-
-/** Есть ли у проекта зон с высотными лимитами (min/max AGL) */
-export function hasVerticalZones(restrictions: Restriction[]): boolean {
-  return restrictions.some((r) => zoneHasVerticalLimits(r));
-}
 
 /** Все зоны участвуют в расчётах независимо от устаревшего флага `active`
  *  (см. комментарий в types/index.ts): раньше «активная» была ровно одна, и
@@ -142,7 +147,7 @@ export function getActiveZonesCached(restrictions: Restriction[]): Restriction[]
 }
 
 /** Отменить отложенную пакетную перестройку (для немедленных действий — autoFixRoute) */
-export function rerouteTimerCleanup() {
+function rerouteTimerCleanup() {
   if (rerouteTimer != null) { clearTimeout(rerouteTimer); rerouteTimer = null; }
 }
 
@@ -331,6 +336,10 @@ export function normalizeViewState(v: any): ViewState {
 
 interface AppState {
   project: Project;
+  /** Назначения дронам/группам: старт, цель, маршрут (персистится в project-агностичном ключе). */
+  droneAssignments: DroneAssignment[];
+  setDroneAssignment: (droneId: string, patch: Partial<Omit<DroneAssignment, 'droneId'>>) => void;
+  removeDroneAssignment: (droneId: string) => void;
   currentTool: Tool;
   activeRestrictionId: string | null;
   selectedMarkerId: string | null;
@@ -365,6 +374,14 @@ interface AppState {
    *  точки. Требуемая ABS = рельеф под точкой + AGL (или просто AGL, если
    *  рельеф ещё не определён). */
   setRoutePointAltitude: (id: string, index: number, aglM: number | null) => void;
+  /** Параметры путевой точки (задержка/угол камеры/скорость/радиус принятия). */
+  setWaypointParams: (routeId: string, index: number, params: Partial<WaypointParams>) => void;
+  /** Метаданные миссии маршрута (create_mission: автор + дата). */
+  setMissionMeta: (routeId: string, author: string) => void;
+  /** Оптимизация порядка точек маршрута; возвращает % сокращения пути. */
+  optimizeRouteOrder: (routeId: string, algorithm: OptimizeAlgorithm) => number | null;
+  /** Генерация «змейки» по полигону области (px-координаты) как нового маршрута. */
+  generateScanRoute: (polygonPx: Point[], spacingPx: number) => string | null;
   /** Ручная высота этапа на ЧЕРНОВИКЕ маршрута (до «Утвердить»): шаг AGL ±stepM
    *  на i-й точке черновика. При задании высоты черновик автоматически
    *  утверждается как маршрут проекта (если точек >= 2). */
@@ -372,7 +389,7 @@ interface AppState {
   /** Черновик маршрута мастера (гео-точки + ручные AGL-высоты этапов по
    *  индексу точки); null = черновика нет. Пишется MapCanvas при редактиро-
    *  вании, читается approveTripleStep / setDraftPointAltitude. */
-  routeDraft: { geo: { lat: number; lng: number }[]; agl: Record<number, number> };
+  routeDraft: { geo: { lat: number; lng: number }[]; agl: Record<number, number>; routeId?: string | null };
   /** Утвердить черновик маршрута как маршрут проекта (общий код мастера:
    *  перенос ручных высот этапов, обход зон, пересчёт высот). idToReplace —
    *  существующий маршрут дрона (редактирование), иначе создаётся новый. */
@@ -504,6 +521,19 @@ export const useStore = create<AppState>()(
       routeWarnings: {},
       redoDrawingStack: [],
       routeDraft: { geo: [], agl: {} },
+      droneAssignments: [],
+
+      setDroneAssignment: (droneId, patch) =>
+        set((state) => {
+          const idx = state.droneAssignments.findIndex((d) => d.droneId === droneId);
+          const next = [...state.droneAssignments];
+          if (idx >= 0) next[idx] = { ...next[idx], ...patch };
+          else next.push({ droneId, startId: null, goalId: null, routeId: null, ...patch });
+          return { droneAssignments: next };
+        }),
+
+      removeDroneAssignment: (droneId) =>
+        set((state) => ({ droneAssignments: state.droneAssignments.filter((d) => d.droneId !== droneId) })),
 
       commitRouteDraft: ({ idToReplace, name, color }) => {
         // Общий код мастера этапов: зафиксировать черновик маршрута как маршрут
@@ -542,9 +572,11 @@ export const useStore = create<AppState>()(
 
       setDraftPointAltitude: (i, stepM) => {
         // Регулировка высоты ЭТАПА на промежуточной точке ещё не утверждённого
-        // черновика: шаг ±stepM метров AGL. Черновик с >=2 точками сразу
-        // утверждается в проект (мастер так и работает), поэтому высота
-        // применяется к реальному маршруту.
+        // черновика: шаг ±stepM метров AGL. Черновик хранится в routeDraft;
+        // если он уже перенесён в проект — высота применяется к маршруту с
+        // ТОЧНОЙ привязкой по id (routeId из мастера), без эвристики «первый
+        // маршрут с таким же набором координат» (могла применить высоту к
+        // чужому маршруту роя с идентичными точками).
         const st = get();
         const draft = st.routeDraft;
         if (i < 0 || i >= draft.geo.length) return;
@@ -552,13 +584,10 @@ export const useStore = create<AppState>()(
         const next = Math.max(0, Math.round((cur + stepM) * 10) / 10);
         const agl = { ...draft.agl, [i]: next };
         set({ routeDraft: { ...draft, agl } });
-        // Если черновик уже утверждён (маршрут есть) — применяем высоту к нему
-        const rid = st.activeRouteId && (st.project.routes || []).find((r) => r.id === st.activeRouteId && !r.points.some((p) => p.auto)) ? st.activeRouteId : null;
-        const matchRoute = (st.project.routes || []).find((r) =>
-          r.points.length === draft.geo.length &&
-          r.points.every((p, j) => Math.abs(p.lat - draft.geo[j].lat) < 1e-7 && Math.abs(p.lng - draft.geo[j].lng) < 1e-7));
-        void rid;
-        if (matchRoute) get().setRoutePointAltitude(matchRoute.id, i, next);
+        const rid = draft.routeId;
+        if (rid && (st.project.routes || []).some((r) => r.id === rid)) {
+          get().setRoutePointAltitude(rid, i, next);
+        }
       },
 
       // ─── Маршруты (режим действий) ────────────────────────────────────────
@@ -745,6 +774,103 @@ export const useStore = create<AppState>()(
         // повторный прогон дешёвым; при недоступном API terrainM остаётся
         // прежним и коррекция выполняется локально).
         void get().updateRouteAltitudes(id);
+      },
+
+      setWaypointParams: (routeId, index, params) => {
+        // add_waypoint(lat, lon, alt, params): задержка/угол камеры/скорость/
+        // радиус принятия хранятся по индексу точки маршрута. Некорректные
+        // значения санитизируются (clamp), а не бросают исключение — UI может
+        // передавать промежуточные состояния полей ввода.
+        const clean = sanitizeWaypointParams(params);
+        set((cur) => ({
+          project: {
+            ...cur.project,
+            routes: (cur.project.routes || []).map((r) => {
+              if (r.id !== routeId) return r;
+              const wp: Record<number, WaypointParamsLite> = { ...(r.waypointParams || {}), [index]: clean };
+              return { ...r, waypointParams: wp };
+            }),
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+      },
+
+      setMissionMeta: (routeId, author) => {
+        // create_mission(): метаданные миссии (ID/название уже есть у Route).
+        const st = get();
+        const route = (st.project.routes || []).find((r) => r.id === routeId);
+        if (!route) return;
+        let meta: MissionMetaLite;
+        try {
+          const m = createMissionMeta(routeId, route.name, author);
+          meta = { author: m.author, createdAt: m.createdAt };
+        } catch (e) {
+          if (!(e instanceof ValidationError)) throw e;
+          meta = { author: author.trim() || '—', createdAt: new Date().toISOString() };
+        }
+        set((cur) => ({
+          project: {
+            ...cur.project,
+            routes: (cur.project.routes || []).map((r) => (r.id === routeId ? { ...r, missionMeta: meta } : r)),
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+      },
+
+      optimizeRouteOrder: (routeId, algorithm) => {
+        // optimize_route(waypoints, algorithm): перестановка путевых точек
+        // (первая — старт — фиксирована). Параметры точек переносятся вместе
+        // с точками. Возвращает % сокращения пути или null. После перестановки
+        // — обход зон и пересчёт высот.
+        const st = get();
+        const route = (st.project.routes || []).find((r) => r.id === routeId);
+        if (!route || route.points.length < 3) return null;
+        // optimizeRoute работает в плоскости lat/lon: карта индексов + прокси-точки.
+        const indexed = route.points.map((p, i) => ({ lat: p.lat, lon: p.lng, __i: i }));
+        const res = optimizeRoute(indexed, algorithm);
+        const newPoints: RoutePoint[] = [];
+        const newWp: Record<number, WaypointParamsLite> = {};
+        res.waypoints.forEach((p, newIndex) => {
+          newPoints.push(route.points[p.__i]);
+          const old = route.waypointParams?.[p.__i];
+          if (old) newWp[newIndex] = old;
+        });
+        set((cur) => ({
+          project: {
+            ...cur.project,
+            routes: (cur.project.routes || []).map((r) =>
+              r.id === routeId ? { ...r, points: newPoints, waypointParams: newWp } : r
+            ),
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+        get().rerouteAroundZones(routeId);
+        void get().updateRouteAltitudes(routeId);
+        return res.improvementPct;
+      },
+
+      generateScanRoute: (polygonPx, spacingPx) => {
+        // scan_area(polygon, altitude, overlap_front, overlap_side): «змейка»
+        // для сплошного сканирования полигона. Шаг змейки считается из
+        // перекрытий вызывающей стороной; сюда приходит готовый spacing в px.
+        const st = get();
+        const map = st.project.map;
+        if (!map?.bounds || polygonPx.length < 3) return null;
+        let lawn: Point[];
+        try {
+          lawn = generateScanLawnmower(polygonPx, spacingPx);
+        } catch (e) {
+          if (e instanceof ValidationError) {
+            set((cur) => ({ routeWarnings: { ...cur.routeWarnings, __scan: [(e as Error).message] } }));
+          }
+          return null;
+        }
+        if (lawn.length < 2) return null;
+        const pts: RoutePoint[] = lawn.map((p) => {
+          const g = pixelToGeoExact(p, map.bounds!, map.width, map.height);
+          return { lat: g.lat, lng: g.lng, x: p.x, y: p.y };
+        });
+        return get().addRoute(pts, `Сканирование ${(st.project.routes || []).length + 1}`);
       },
 
       autoFixRoute: (id) => {
@@ -1493,6 +1619,7 @@ export const useStore = create<AppState>()(
           } : null,
         },
         _currentMapId: state._currentMapId, // Сохраняем ID карты для восстановления
+        droneAssignments: state.droneAssignments, // старт/цель/маршрут каждого дрона
       }),
       onRehydrateStorage: () => (state, error) => {
         if (error) console.warn('[persist] rehydration failed:', error);

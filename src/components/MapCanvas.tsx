@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
 import { useStore, scheduleRerouteAll, getActiveZonesCached } from '../store/useStore';
-import { isPointInActiveRestriction, distanceBetween } from '../utils/geometry';
+import { isPointInsideAnyRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
 import { pixelToGeoExact, geoToPixelExact, routeLengthM, zonesCrossedBy, planPathAroundZones, smoothPolyline } from '../utils/routing';
@@ -489,9 +489,18 @@ const MapCanvas: React.FC = () => {
   useEffect(() => { workModeRef.current = tripleWorkMode; }, [tripleWorkMode]);
   const [droneCount, setDroneCount] = useState(4);
   const [sharedGoal, setSharedGoal] = useState(true);
+  // Общий старт для всего роя (по умолчанию) — либо индивидуальные старты дронов
+  const [sharedStart, setSharedStart] = useState(true);
   const [activeUav, setActiveUav] = useState(0);
   const [startGeo, setStartGeo] = useState<{ lat: number; lng: number } | null>(null);
   const [goalGeo, setGoalGeo] = useState<{ lat: number; lng: number } | null>(null);
+  // Индивидуальные старты дронов (при выключенном «общем старте»): индекс → гео.
+  // Маршрут i-го дрона начинается в startForUav(i) — так же, как цель берётся
+  // из последней точки его маршрута (goalForUav).
+  const [droneStarts, setDroneStarts] = useState<( { lat: number; lng: number } | null )[]>([]);
+  // Индивидуальная цель текущего дрона при «индивидуальных целях»: клик по
+  // окну «Цель» задаёт её; переносится на последнюю точку маршрута этого дрона.
+  const [droneGoals, setDroneGoals] = useState<( { lat: number; lng: number } | null )[]>([]);
   const [pickWhat, setPickWhat] = useState<'none' | 'start' | 'goal'>('none');
   const pickWhatRef = useRef(pickWhat);
   useEffect(() => { pickWhatRef.current = pickWhat; }, [pickWhat]);
@@ -567,7 +576,7 @@ const MapCanvas: React.FC = () => {
     radiusM: pz.radiusM, centerGeo: pz.center, color: '#fb923c',
   }));
   const canApproveStep = (st: TripleStep): boolean => {
-    if (st === 0) return !!startGeo;
+    if (st === 0) return sharedStart ? !!startGeo : droneStarts.some((s) => !!s) || !!startGeo;
     if (st === 1) return (draftRoutePts?.length ?? 0) >= 2 || tripleRoutes.length > 0;
     if (st === 2) return !!goalGeo || !sharedGoal; // зоны-кандидаты утверждаются автоматически при переходе к следующему этапу
     return false;
@@ -600,7 +609,12 @@ const MapCanvas: React.FC = () => {
       // ВАЖНО: черновик НЕ сбрасываем сразу — он участвует в fitPoints окна МАРШРУТ;
       // после записи маршрута в проект тройные данные обновятся атомарно, и окно
       // не «прыгнет» на СПб. Сброс — только при смене активного этапа.
-      const pts: RoutePoint[] = curveGeo(draftRoutePts).map((g) => ({ ...geoToPixelExact(g.lat, g.lng, mapBounds, project.map!.width, project.map!.height), lat: g.lat, lng: g.lng }));
+      let keyGeo = curveGeo(draftRoutePts);
+      // Индивидуальный старт дрона: первый ключевой узел маршрута привязываем
+      // к старту этого дрона (при индивидуальных стартах роя).
+      const myStart = sharedStart ? startGeo : (droneStarts[activeUav] ?? startGeo);
+      if (myStart) keyGeo = [{ lat: myStart.lat, lng: myStart.lng }, ...keyGeo.filter((g) => Math.hypot(g.lat - myStart.lat, g.lng - myStart.lng) > 1e-7)];
+      const pts: RoutePoint[] = keyGeo.map((g) => ({ ...geoToPixelExact(g.lat, g.lng, mapBounds, project.map!.width, project.map!.height), lat: g.lat, lng: g.lng }));
       const existing = tripleRoutes[Math.min(activeUav, tripleRoutes.length - 1)];
       if (existing) {
         useStore.setState((cur) => ({
@@ -610,6 +624,8 @@ const MapCanvas: React.FC = () => {
             updatedAt: new Date().toISOString(),
           },
         }));
+        // обход ограничений + высоты для этого маршрута (async)
+        void useStore.getState().updateRouteAltitudes(existing.id);
       } else {
         addRoute(pts, `Маршрут дрона ${activeUav + 1}`, uavColors[activeUav % uavColors.length]);
       }
@@ -620,7 +636,7 @@ const MapCanvas: React.FC = () => {
     setApprovedSteps((a) => { const n = [...a]; n[tripleStep] = true; return n; });
     if (tripleStep < 2) setTripleStep((tripleStep + 1) as TripleStep);
     else setTripleStep(3);
-  }, [tripleStep, draftRoutePts, mapBounds, project.map, tripleRoutes, activeUav, addRoute, pendingZones, commitPendingZones]);
+  }, [tripleStep, draftRoutePts, mapBounds, project.map, tripleRoutes, activeUav, addRoute, pendingZones, commitPendingZones, sharedStart, startGeo, droneStarts]);
 
   // Безопасный сброс черновика маршрута: если маршрут уже записан в проект
   // (третий источник данных — tripleRoutes), черновик убираем только когда
@@ -676,21 +692,46 @@ const MapCanvas: React.FC = () => {
     }
     // Режим «Редактирование маршрута»: точки старта/цели/маршрута — во всех окнах.
     if (panelIdx === 0) {
-      setStartGeo({ lat: geo.lat, lng: geo.lng });
+      // Индивидуальные старты: клик по окну «Старт» задаёт старт ВЫБРАННОГО дрона
+      if (!sharedStart) {
+        setDroneStarts((prev) => { const n = [...prev]; n[activeUavRef.current] = { lat: geo.lat, lng: geo.lng }; return n; });
+      } else {
+        setStartGeo({ lat: geo.lat, lng: geo.lng });
+      }
       reopenStepForEdit(0);
     } else if (panelIdx === 1) {
       setDraftRoutePts((prev) => [...(prev || []), { lat: geo.lat, lng: geo.lng }]);
       reopenStepForEdit(1);
     } else {
-      setGoalGeo({ lat: geo.lat, lng: geo.lng });
+      // Индивидуальная цель: клик по окну «Цель» переносит цель текущего дрона —
+      // смещаем последний узел его маршрута (маршрут = старт→…→цель).
+      if (!sharedGoal) {
+        const g = { lat: geo.lat, lng: geo.lng };
+        setDroneGoals((prev) => { const n = [...prev]; n[activeUavRef.current] = g; return n; });
+        const st = useStore.getState();
+        const map = st.project.map;
+        const r = (st.project.routes || [])[activeUavRef.current];
+        if (r && map?.bounds && r.points.length >= 2) {
+          // пиксели — из точной гео-привязки текущего растра
+          const px = geoToPixelExact(g.lat, g.lng, map.bounds, map.width, map.height);
+          st.moveRoutePoint(r.id, r.points.length - 1, { x: px.x, y: px.y });
+        } else {
+          setGoalGeo(g);
+        }
+      } else {
+        setGoalGeo({ lat: geo.lat, lng: geo.lng });
+      }
       reopenStepForEdit(2);
     }
-  }, [reopenStepForEdit]);
+  }, [reopenStepForEdit, sharedStart, sharedGoal]);
 
   const tripleStepRef = useRef(tripleStep);
   useEffect(() => { tripleStepRef.current = tripleStep; }, [tripleStep]);
   const launchStateRef = useRef(launchState);
   useEffect(() => { launchStateRef.current = launchState; }, [launchState]);
+  // Индекс активного дрона для стабильных колбэков панелей (клик/drag)
+  const activeUavRef = useRef(activeUav);
+  useEffect(() => { activeUavRef.current = activeUav; }, [activeUav]);
 
   // Смена вкладок из бокового меню: активная карта ВСЕГДА сверху (на месте
   // большой карты). Кнопки этапов работают как вкладки: клик по окну или по
@@ -783,7 +824,7 @@ const MapCanvas: React.FC = () => {
   }, [launchState, startGeo, goalGeo, sharedGoal, droneCount, mapBounds, canvasSize, tripleRoutes]);
 
   // Готовность миссии к запуску: все данные утверждены (шаг 3) либо заданы вручную
-  const missionReady = !!startGeo && ((draftRoutePts?.length ?? 0) >= 2 || tripleRoutes.length > 0) && (!!goalGeo || !sharedGoal);
+  const missionReady = (sharedStart ? !!startGeo : droneStarts.some((s) => !!s) || !!startGeo) && ((draftRoutePts?.length ?? 0) >= 2 || tripleRoutes.length > 0) && (!!goalGeo || !sharedGoal);
   const canLaunch = tripleStep === 3 || missionReady;
 
   // «НОВАЯ МИССИЯ»: после ЗАПУСКА очищаем данные — можно начинать следующий полёт.
@@ -1596,7 +1637,10 @@ const MapCanvas: React.FC = () => {
         const layer = project.layers.find(l => l.id === marker.layer);
         if (layer && !layer.visible) continue;
 
-        const isInRestriction = isPointInActiveRestriction(
+        // П.5: раньше использовался isPointInActiveRestriction с инвертированной
+        // семантикой (true = точка ВНЕ зон) — маркеры краснели как раз тогда,
+        // когда были в безопасности. Теперь честно: красный = внутри зоны.
+        const insideRestriction = isPointInsideAnyRestriction(
           { x: marker.x, y: marker.y },
           project.restrictions
         );
@@ -1613,7 +1657,7 @@ const MapCanvas: React.FC = () => {
         // Draw marker
         ctx.beginPath();
         ctx.arc(marker.x, marker.y, radius, 0, Math.PI * 2);
-        ctx.fillStyle = isInRestriction ? marker.color : '#ff3333';
+        ctx.fillStyle = !insideRestriction ? marker.color : '#ff3333';
         ctx.fill();
         ctx.strokeStyle = isSelected ? '#ffffff' : 'rgba(0,0,0,0.6)';
         ctx.lineWidth = (isSelected ? 3 : 1.5) / vs.scale;
@@ -1637,7 +1681,7 @@ const MapCanvas: React.FC = () => {
         const textWidth = ctx.measureText(marker.name).width;
         ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
         ctx.fillRect(labelX - 2 / vs.scale, labelY - fontSize, textWidth + 4 / vs.scale, fontSize + 4 / vs.scale);
-        ctx.fillStyle = isInRestriction ? '#ffffff' : '#ff6666';
+        ctx.fillStyle = !insideRestriction ? "#ffffff" : "#ff6666";
         ctx.fillText(marker.name, labelX, labelY);
       }
       ctx.restore();
@@ -2114,9 +2158,12 @@ const MapCanvas: React.FC = () => {
           alert('⚠️ Точка вне пределов карты!');
           return;
         }
-        const isInRestriction = isPointInActiveRestriction(mapPoint, project.restrictions);
-        if (!isInRestriction) {
-          if (!confirm('⚠️ Точка находится вне активного ограничения. Всё равно добавить?')) {
+        // Честная семантика: предупреждаем, если точка ВНУТРИ зоны ограничения
+        // (раньше из-за инвертированной isPointInActiveRestriction вопрос
+        // «вне активного ограничения» задавался обратным условием).
+        const insideRestriction = isPointInsideAnyRestriction(mapPoint, project.restrictions);
+        if (insideRestriction) {
+          if (!confirm('⚠️ Точка находится внутри зоны ограничения. Всё равно добавить?')) {
             return;
           }
         }
@@ -2354,9 +2401,19 @@ const MapCanvas: React.FC = () => {
   // ─── Данные для трёх окон карты ─────────────────────────────────────────────
   const goalForUav = (i: number): { lat: number; lng: number } | null => {
     if (sharedGoal) return goalGeo;
+    // Индивидуальная цель дрона: явная (клик по окну «Цель») иначе — последняя
+    // точка его маршрута (маршрут всегда заканчивается в цели).
+    const dg = droneGoals[i];
+    if (dg) return dg;
     const r = tripleRoutes[i];
     if (r && r.geo.length > 0) return r.geo[r.geo.length - 1];
     return goalGeo;
+  };
+  // Стартовая точка i-го дрона: общая (весь рой взлетает с одной точки) или
+  // индивидуальная (задана кликом по окну «Старт», когда общий старт выключен).
+  const startForUav = (i: number): { lat: number; lng: number } | null => {
+    if (sharedStart) return startGeo;
+    return droneStarts[i] ?? startGeo;
   };
   // Изначальная фокусировка всех окон карты — Санкт-Петербург. Ключевой источник
   // данных окна: старт/цель — их точка (пока не задана — СПб); маршрут — точки

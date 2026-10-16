@@ -166,6 +166,32 @@ export interface Route {
   shape?: RouteShape;          // линия маршрута (по умолчанию straight)
   rangeMode?: RangeLimitMode;  // ограничение по дальности (по умолчанию off)
   rangeM?: number;             // предельная дистанция в метрах
+  /** Метаданные миссии (create_mission): автор/название/дата */
+  missionMeta?: MissionMetaLite;
+  /** Параметры путевых точек по индексам (add_waypoint params) */
+  waypointParams?: Record<number, WaypointParamsLite>;
+}
+
+/** Метаданные миссии (минимальная версия для сериализации проекта). */
+export interface MissionMetaLite {
+  author: string;
+  createdAt: string; // ISO 8601
+}
+
+/** Параметры путевой точки: задержка, угол камеры, скорость, радиус принятия. */
+export interface WaypointParamsLite {
+  holdSec: number;
+  cameraAngleDeg: number;
+  speedMs: number;
+  acceptanceRadiusM: number;
+}
+
+/** Назначение дрону/группе: старт, цель, маршрут (Блок 5 + ТЗ пользователя). */
+export interface DroneAssignment {
+  droneId: string;
+  startId?: string | null;  // id из importLists.starts
+  goalId?: string | null;   // id из importLists.goals
+  routeId?: string | null;
 }
 
 /** Импортные списки: стартовые позиции и цели, каждая привязана к маршруту */
