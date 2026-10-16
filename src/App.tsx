@@ -5,6 +5,7 @@ import Sidebar from './components/Sidebar';
 import StatusBar from './components/StatusBar';
 import { useStore } from './store/useStore';
 import { initOpenStreetMap } from './utils/openStreetMap';
+import { useAppInitialization } from './hooks/useAppInitialization';
 
 
 /**
@@ -50,6 +51,10 @@ const App: React.FC = () => {
     undoDrawingPoint,
     redoDrawingPoint,
   } = useStore();
+
+  // Стартовая инициализация доменных сторов: миграция legacy-хранилища,
+  // восстановление карты из IndexedDB, кросс-стор подписки (зоны→маршруты).
+  useAppInitialization();
 
   // Keyboard shortcuts
   const handleKeyDown = useCallback((e: KeyboardEvent) => {

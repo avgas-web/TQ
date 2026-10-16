@@ -1,0 +1,834 @@
+// ═══════════════════════════════════════════════════════════════
+// useMissionStore — доменный стор миссий (Domain-Driven Split #2)
+// Маршруты/waypoints, черновик мастера, предупреждения, оптимизация,
+// «змейка», обход ограничений (A*/видимый граф), высоты по рельефу
+// (Open-Elevation). Данные карты читаются ЧЕРЕЗ useMapStore.getState()
+// (направление зависимостей: mission → map; обратного импорта нет —
+// map вызывает mission только динамическим import() в async-экшенах).
+// ═══════════════════════════════════════════════════════════════
+import { create } from 'zustand';
+import type { StateCreator } from 'zustand';
+import { persist, createJSONStorage } from 'zustand/middleware';
+import { v4 as uuidv4 } from 'uuid';
+import type {
+  Route, RoutePoint, Point, RouteShape, RangeLimitMode, ImportPoint, ImportLists,
+  WaypointParamsLite, MissionMetaLite,
+} from '../types';
+import { MAX_ROUTES } from '../types';
+import {
+  sanitizeWaypointParams,
+  createMissionMeta,
+  optimizeRoute,
+  generateScanLawnmower,
+  ValidationError,
+  type WaypointParams,
+  type OptimizeAlgorithm,
+} from '../utils/mission';
+import {
+  planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact,
+  geoToPixelExact, smoothPolyline, routeLengthM, requiredAbsFromZones,
+} from '../utils/routing';
+import { fetchElevations, computeRouteAltitude } from '../utils/elevation';
+import type { ElevationPoint } from '../utils/elevation';
+import { useMapStore, getActiveZonesCached } from './useMapStore';
+
+const ROUTE_COLORS = ['#00d0ff', '#ff9500', '#a78bfa', '#34d399', '#f472b6', '#facc15', '#fb7185', '#60a5fa'];
+const REROUTE_THROTTLE_MS = 250;
+const MAX_REROUTE_CHAIN = 20;
+
+// ─── Служебное состояние вне стейта zustand (модульные замыкания) ────────────
+// Троттлер пакетной перестройки маршрутов. Ссылку на таймер НЕЛЬЗЯ хранить в
+// объекте стейта: запись в get() напрямую нарушает иммутабельность zustand и
+// теряется при HMR/ре-гидратации persist — из-за этого плановая перестройка
+// могла молча не выполняться.
+let rerouteTimer: number | null = null;
+let rerouteChainCount = 0;
+/** Ссылка на последний незавершённый прогон updateRouteAltitudes — повторный
+ *  вызов отменяет предыдущий запрос (drag точек не должен копить обращения к
+ *  троттлящемуся публичному API). */
+let altitudeRunId = 0;
+let lastAltitudeController: AbortController | null = null;
+
+// ─── Типы стора ────────────────────────────────────────────────
+
+export interface MissionState {
+  routes: Route[];
+  importLists?: ImportLists; // импортированные списки стартов и целей
+  activeRouteId: string | null; // активный маршрут для редактирования кликами
+  routeWarnings: Record<string, string[]>; // id маршрута -> предупреждения (в сессии)
+  /** Черновик маршрута мастера (гео-точки + ручные AGL-высоты этапов по
+   *  индексу точки); пустой = черновика нет. Пишется MapCanvas при
+   *  редактировании, читается approveTripleStep / setDraftPointAltitude. */
+  routeDraft: { geo: { lat: number; lng: number }[]; agl: Record<number, number>; routeId?: string | null };
+}
+
+export interface MissionActions {
+  addRoute: (points: RoutePoint[], name?: string, color?: string) => string | null;
+  deleteRoute: (id: string) => void;
+  renameRoute: (id: string, name: string) => void;
+  setRouteColor: (id: string, color: string) => void;
+  toggleRouteVisible: (id: string) => void;
+  setActiveRoute: (id: string | null) => void;
+  appendRoutePoint: (id: string, p: Point) => void;
+  insertRoutePointAt: (id: string, index: number, p: Point) => void;
+  moveRoutePoint: (id: string, index: number, p: Point) => void;
+  removeRoutePoint: (id: string, index: number) => void;
+  /** Ручная регулировка высоты этапа: AGL задаётся на промежуточной точке;
+   *  требуемая ABS = рельеф под точкой + AGL (с учётом полом/потолком зон). */
+  setRoutePointAltitude: (id: string, index: number, aglM: number | null) => void;
+  /** Параметры путевой точки (задержка/угол камеры/скорость/радиус принятия). */
+  setWaypointParams: (routeId: string, index: number, params: Partial<WaypointParams>) => void;
+  /** Метаданные миссии маршрута (create_mission: автор + дата). */
+  setMissionMeta: (routeId: string, author: string) => void;
+  /** Оптимизация порядка точек маршрута; возвращает % сокращения пути. */
+  optimizeRouteOrder: (routeId: string, algorithm: OptimizeAlgorithm) => number | null;
+  /** Генерация «змейки» по полигону области (px-координаты) как нового маршрута. */
+  generateScanRoute: (polygonPx: Point[], spacingPx: number) => string | null;
+  setDraftPointAltitude: (i: number, stepM: number) => void;
+  commitRouteDraft: (opts: { idToReplace?: string | null; name?: string; color?: string }) => string | null;
+  /** Кнопка «Автокоррекция маршрута»: немедленный обход всех ограничений. */
+  autoFixRoute: (id?: string | null) => void;
+  rerouteAroundZones: (id: string) => void;
+  /** Определение высот полёта по рельефу (Open-Elevation) + автокоррекция
+   *  вертикальных ограничений. routeId — один маршрут; undefined/null — все. */
+  updateRouteAltitudes: (routeId?: string | null) => Promise<void>;
+  rerouteAllRoutes: () => void;
+  flushReroute: () => void;
+  setRouteShape: (id: string, shape: RouteShape) => void;
+  setRouteRangeLimit: (id: string, mode: RangeLimitMode, meters?: number) => void;
+  importRoutes: (starts: ImportInput[], goals: ImportInput[]) => number;
+  clearImportLists: () => void;
+  refreshAllRoutesAfterMapChange: () => void;
+  clearRouteWarnings: (id: string) => void;
+  resetMissions: () => void;
+}
+
+interface ImportInput { label: string; lat: number; lng: number; placeName?: string }
+
+export type MissionStore = MissionState & MissionActions;
+
+// ─── Чистые вспомогательные функции (без state) ────────────────
+
+/** Строгая привязка пикселя к WGS-84 (обратная Mercator-проекция) */
+function pixelToGeoStrict(p: Point, bounds: NonNullable<ReturnType<typeof useMapStore.getState>['map']>['bounds'], mapW: number, mapH: number) {
+  return pixelToGeoExact(p, bounds!, mapW, mapH);
+}
+
+/**
+ * Автокоррекция ВЕРТИКАЛЬНЫХ ограничений: для каждой точки маршрута считаем
+ * требуемую ABS-высоту: max(terrain + запас, terrain + ручной AGL, floor зоны),
+ * ограниченную сверху ceiling зоны. Пол/потолок применяются только там, где
+ * footprint зоны реально накрывает точку. При конфликте floor > ceiling
+ * приоритет отдаётся полу (безопасность превыше потолка) с предупреждением.
+ */
+function applyVerticalLimits(pts: RoutePoint[], restrictions: Parameters<typeof requiredAbsFromZones>[1], clearance: number): string[] {
+  const warns: string[] = [];
+  let conflictRaised = 0;
+  for (const p of pts) {
+    const terr = typeof p.terrainM === 'number' && Number.isFinite(p.terrainM) ? p.terrainM : null;
+    const manualAgl = typeof p.altitudeAGL === 'number' && Number.isFinite(p.altitudeAGL) && p.altitudeAGL >= 0
+      ? p.altitudeAGL : null;
+    let need: number | null = manualAgl !== null
+      ? (terr !== null ? terr + manualAgl : manualAgl)
+      : (terr !== null ? terr + clearance : null);
+    const { floor, ceiling } = requiredAbsFromZones({ x: p.x, y: p.y }, restrictions, terr);
+    if (floor !== null) need = need === null ? floor : Math.max(need, floor);
+    if (ceiling !== null) {
+      if (floor !== null && ceiling < floor - 1e-9) {
+        conflictRaised++;
+        need = need === null ? ceiling : Math.max(need, ceiling);
+      } else if (need !== null && need > ceiling) {
+        need = ceiling;
+      }
+    }
+    if (need !== null) p.altitudeAbs = Math.round(need * 10) / 10;
+  }
+  if (conflictRaised > 0) {
+    warns.push(`Конфликт высотных лимитов зон: маршрут поднят над потолком в ${conflictRaised} т.`);
+  }
+  return warns;
+}
+
+/** Предупреждение о нарушении ограничения маршрута по дальности */
+function rangeLimitWarning(route: Route, pts: RoutePoint[]): string | null {
+  if (!route.rangeMode || route.rangeMode === 'off' || !route.rangeM || route.rangeM <= 0) return null;
+  const len = routeLengthM(pts.map((p) => ({ lat: p.lat, lng: p.lng })));
+  if (route.rangeMode === 'max' && len > route.rangeM) {
+    return `Дальность ${Math.round(len)} м превышает лимит ${Math.round(route.rangeM)} м`;
+  }
+  if (route.rangeMode === 'min' && len < route.rangeM) {
+    return `Дальность ${Math.round(len)} м меньше минимума ${Math.round(route.rangeM)} м`;
+  }
+  return null;
+}
+
+/** Единый планировщик пакетной перестройки всех маршрутов. Идемпотентен:
+ *  повторные вызовы в пределах троттл-окна схлопываются в один прогон.
+ *  Защита от самоподдерживающегося каскада (React #185): счётчик цепочки
+ *  сбрасывается только пользовательскими действиями. */
+export function scheduleRerouteAll(): void {
+  if (rerouteTimer != null) clearTimeout(rerouteTimer);
+  rerouteTimer = window.setTimeout(() => {
+    rerouteTimer = null;
+    if (++rerouteChainCount > MAX_REROUTE_CHAIN) {
+      console.warn('[reroute] цепочка авто-перестроек превысила лимит — остановлено.');
+      return;
+    }
+    rerouteAllRoutesNow();
+  }, REROUTE_THROTTLE_MS);
+}
+
+function rerouteTimerCleanup(): void {
+  if (rerouteTimer != null) { clearTimeout(rerouteTimer); rerouteTimer = null; }
+}
+
+/** Немедленная пакетная перестройка всех маршрутов (троттлер / __rerouteAllNow). */
+function rerouteAllRoutesNow(): void {
+  const state = useMissionStore.getState();
+  const map = useMapStore.getState().map;
+  const routes = state.routes;
+  if (!map?.bounds || routes.length === 0) return;
+  const activeZones = getActiveZonesCached(useMapStore.getState().restrictions);
+  const newRoutes: Route[] = [];
+  const warningsMap: Record<string, string[]> = {};
+  let changed = false;
+  for (const route of routes) {
+    if (route.points.length < 2) { newRoutes.push(route); continue; }
+    let ki: number[] = [];
+    for (let i = 0; i < route.points.length; i++) if (!route.points[i].auto) ki.push(i);
+    if (ki.length < 2) ki = [0, route.points.length - 1];
+    const segBuild = (): RoutePoint[] => {
+      const out: RoutePoint[] = [];
+      for (let k = 0; k < ki.length - 1; k++) {
+        const a = route.points[ki[k]];
+        const b = route.points[ki[k + 1]];
+        out.push({ ...a, auto: undefined });
+        const path = planPathAroundZones({ x: a.x, y: a.y }, { x: b.x, y: b.y }, activeZones, map.width, map.height);
+        for (let i = 1; i < path.length - 1; i++) {
+          const px = path[i];
+          const geo = pixelToGeoStrict(px, map.bounds, map.width, map.height);
+          out.push({ x: px.x, y: px.y, lat: geo.lat, lng: geo.lng, auto: true });
+        }
+      }
+      out.push({ ...route.points[ki[ki.length - 1]] });
+      return out;
+    };
+    // Кривая: сглаживаем ОБХОДНУЮ ЛОМАНУЮ всегда от ключевых точек (не от
+    // уже сглаженного результата — иначе число точек росло экспоненциально).
+    let pts = segBuild();
+    if (route.shape === 'curve') {
+      const smooth = smoothPolyline(pts.map((p) => ({ x: p.x, y: p.y })), 6);
+      const merged: RoutePoint[] = [];
+      for (const sp of smooth) {
+        const near = pts.find((p) => Math.hypot(p.x - sp.x, p.y - sp.y) < 1.5);
+        if (near) { merged.push(near); continue; }
+        const geo = pixelToGeoStrict(sp, map.bounds, map.width, map.height);
+        merged.push({ x: sp.x, y: sp.y, lat: geo.lat, lng: geo.lng, auto: true });
+      }
+      pts = merged;
+    }
+    const crossed = zonesCrossedBy(pts.map((p) => ({ x: p.x, y: p.y })), activeZones);
+    const warns = crossed.map((z) => `Пересекает зону «${z.name}»`);
+    const limitWarn = rangeLimitWarning(route, pts);
+    if (limitWarn) warns.push(limitWarn);
+    if (warns.length > 0) warningsMap[route.id] = warns;
+    // Идемпотентность: геометрия не изменилась — сохраняем ПРЕЖНИЙ объект route
+    // (без нового set() каскад перестроек затухает сам).
+    if (pts.length === route.points.length && pts.every((p, i) => {
+      const q = route.points[i];
+      return p.x === q.x && p.y === q.y && p.auto === q.auto;
+    })) {
+      newRoutes.push(route);
+    } else {
+      changed = true;
+      newRoutes.push({ ...route, points: pts });
+    }
+  }
+  useMissionStore.setState((cur) => {
+    // Полная замена реестра предупреждений: старые записи для «очистившихся»
+    // маршрутов раньше сливались с новыми и ложные предупреждения оставались навсегда.
+    const nextWarnings: Record<string, string[]> = {};
+    for (const [rid, w] of Object.entries(warningsMap)) if (w.length > 0) nextWarnings[rid] = w;
+    const sameWarnings =
+      Object.keys(nextWarnings).length === Object.keys(cur.routeWarnings).length &&
+      Object.keys(nextWarnings).every((k) => cur.routeWarnings[k]?.join('\n') === nextWarnings[k].join('\n'));
+    if (!changed && sameWarnings && cur.routes === routes) return {};
+    return {
+      routeWarnings: sameWarnings ? cur.routeWarnings : nextWarnings,
+      routes: changed ? newRoutes : routes,
+    };
+  });
+}
+
+// ─── Реализация экшенов ────────────────────────────────────────
+
+const initialMissionState: MissionState = {
+  routes: [],
+  importLists: undefined,
+  activeRouteId: null,
+  routeWarnings: {},
+  routeDraft: { geo: [], agl: {} },
+};
+
+type SetFn = (partial: Partial<MissionStore> | ((s: MissionStore) => Partial<MissionStore>)) => void;
+type GetFn = () => MissionStore;
+
+const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> = (rawSet, rawGet) => {
+  const set = rawSet as SetFn;
+  const get = rawGet as GetFn;
+  const actions: MissionActions = {
+    addRoute: (points, name, color) => {
+      const state = get();
+      const map = useMapStore.getState().map;
+      if (state.routes.length >= MAX_ROUTES) {
+        set((cur) => ({ routeWarnings: { ...cur.routeWarnings, __limit: [`Достигнут максимум маршрутов в сессии: ${MAX_ROUTES}. Удалите ненужные.`] } }));
+        return null;
+      }
+      if (!map) {
+        set((cur) => ({ routeWarnings: { ...cur.routeWarnings, __limit: ['Сначала загрузите карту — точки маршрута привязываются к её координатам.'] } }));
+        return null;
+      }
+      const id = uuidv4();
+      const route: Route = {
+        id,
+        name: name || `Маршрут ${state.routes.length + 1}`,
+        color: color || ROUTE_COLORS[state.routes.length % ROUTE_COLORS.length],
+        points,
+        active: true,
+        visible: true,
+        createdAt: new Date().toISOString(),
+      };
+      set((cur) => ({ routes: [...cur.routes, route], activeRouteId: id }));
+      actions.rerouteAroundZones(id);
+      return id;
+    },
+
+    deleteRoute: (id) => set((state) => ({
+      routes: state.routes.filter((r) => r.id !== id),
+      activeRouteId: state.activeRouteId === id ? null : state.activeRouteId,
+    })),
+
+    renameRoute: (id, name) => set((state) => ({
+      routes: state.routes.map((r) => (r.id === id ? { ...r, name } : r)),
+    })),
+
+    setRouteColor: (id, color) => set((state) => ({
+      routes: state.routes.map((r) => (r.id === id ? { ...r, color } : r)),
+    })),
+
+    toggleRouteVisible: (id) => set((state) => ({
+      routes: state.routes.map((r) => (r.id === id ? { ...r, visible: !r.visible } : r)),
+    })),
+
+    setActiveRoute: (id) => set((state) => ({
+      activeRouteId: id,
+      routes: state.routes.map((r) => ({ ...r, active: r.id === id })),
+    })),
+
+    appendRoutePoint: (id, p) => {
+      const state = get();
+      const route = state.routes.find((r) => r.id === id);
+      if (!route || !useMapStore.getState().map) return;
+      // Вставляем точку в ближайшее место ломаной (если клик не «за концом») —
+      // так можно править середину существующего маршрута.
+      let insertAt = route.points.length;
+      if (route.points.length >= 2) {
+        let bestD = Infinity;
+        for (let i = 0; i < route.points.length - 1; i++) {
+          const a = route.points[i], b = route.points[i + 1];
+          const dx = b.x - a.x, dy = b.y - a.y;
+          const len2 = dx * dx + dy * dy || 1e-9;
+          const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2));
+          const d = Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+          if (d < bestD) { bestD = d; insertAt = i + 1; }
+        }
+        const lastA = route.points[route.points.length - 2];
+        const lastB = route.points[route.points.length - 1];
+        const endDist = Math.hypot(p.x - lastB.x, p.y - lastB.y);
+        const midDist = Math.hypot(p.x - (lastA.x + lastB.x) / 2, p.y - (lastA.y + lastB.y) / 2);
+        if (endDist <= midDist) insertAt = route.points.length; // продолжение в конец
+      }
+      actions.insertRoutePointAt(id, insertAt, p);
+    },
+
+    insertRoutePointAt: (id, index, p) => {
+      const map = useMapStore.getState().map;
+      if (!map) return;
+      const geo = map.bounds
+        ? pixelToGeoStrict(p, map.bounds, map.width, map.height)
+        : { lat: NaN, lng: NaN };
+      const rp: RoutePoint = { x: p.x, y: p.y, lat: geo.lat, lng: geo.lng };
+      set((cur) => ({
+        routes: cur.routes.map((r) => {
+          if (r.id !== id) return r;
+          const pts = [...r.points];
+          pts.splice(index, 0, rp);
+          return { ...r, points: pts };
+        }),
+      }));
+      actions.rerouteAroundZones(id);
+    },
+
+    moveRoutePoint: (id, index, p) => {
+      const map = useMapStore.getState().map;
+      if (!map) return;
+      const geo = map.bounds ? pixelToGeoStrict(p, map.bounds, map.width, map.height) : { lat: NaN, lng: NaN };
+      set((cur) => ({
+        routes: cur.routes.map((r) => {
+          if (r.id !== id) return r;
+          const pts = r.points.map((pt, i) =>
+            i === index ? { ...pt, x: p.x, y: p.y, ...(Number.isFinite(geo.lat) ? { lat: geo.lat, lng: geo.lng } : {}) } : pt
+          );
+          return { ...r, points: pts };
+        }),
+      }));
+      actions.rerouteAroundZones(id);
+    },
+
+    removeRoutePoint: (id, index) => {
+      set((state) => ({
+        routes: state.routes
+          .map((r) => (r.id === id ? { ...r, points: r.points.filter((_, i) => i !== index) } : r))
+          .filter((r) => r.points.length >= 2),
+      }));
+      const still = get().routes.find((r) => r.id === id);
+      if (still) actions.rerouteAroundZones(id);
+      else set({ activeRouteId: null });
+    },
+
+    setRoutePointAltitude: (id, index, aglM) => {
+      // Ручная регулировка высоты этапа на промежуточной точке маршрута.
+      // Значение AGL сохраняется в точку; требуемая ABS пересчитывается
+      // applyVerticalLimits (terrain + AGL, с учётом полом/потолком зон).
+      set((cur) => ({
+        routes: cur.routes.map((r) => {
+          if (r.id !== id) return r;
+          const pts = r.points.map((pt, i) =>
+            i === index
+              ? { ...pt, altitudeAGL: aglM === null || !Number.isFinite(aglM) ? null : Math.max(0, aglM) }
+              : pt
+          );
+          return { ...r, points: pts };
+        }),
+      }));
+      // Пересчёт высот по новой конфигурации (кэш Open-Elevation делает
+      // повторный прогон дешёвым).
+      void actions.updateRouteAltitudes(id);
+    },
+
+    setWaypointParams: (routeId, index, params) => {
+      // add_waypoint(lat, lon, alt, params): задержка/угол камеры/скорость/
+      // радиус принятия хранятся по индексу точки маршрута. Некорректные
+      // значения санитизируются (clamp), а не бросают исключение — UI может
+      // передавать промежуточные состояния полей ввода.
+      const clean = sanitizeWaypointParams(params);
+      set((cur) => ({
+        routes: cur.routes.map((r) => {
+          if (r.id !== routeId) return r;
+          const wp: Record<number, WaypointParamsLite> = { ...(r.waypointParams || {}), [index]: clean };
+          return { ...r, waypointParams: wp };
+        }),
+      }));
+    },
+
+    setMissionMeta: (routeId, author) => {
+      // create_mission(): метаданные миссии (ID/название уже есть у Route).
+      const route = get().routes.find((r) => r.id === routeId);
+      if (!route) return;
+      let meta: MissionMetaLite;
+      try {
+        const m = createMissionMeta(routeId, route.name, author);
+        meta = { author: m.author, createdAt: m.createdAt };
+      } catch (e) {
+        if (!(e instanceof ValidationError)) throw e;
+        meta = { author: author.trim() || '—', createdAt: new Date().toISOString() };
+      }
+      set((cur) => ({
+        routes: cur.routes.map((r) => (r.id === routeId ? { ...r, missionMeta: meta } : r)),
+      }));
+    },
+
+    optimizeRouteOrder: (routeId, algorithm) => {
+      // optimize_route(waypoints, algorithm): перестановка путевых точек
+      // (первая — старт — фиксирована). Параметры точек переносятся вместе
+      // с точками. Возвращает % сокращения пути или null.
+      const route = get().routes.find((r) => r.id === routeId);
+      if (!route || route.points.length < 3) return null;
+      const indexed = route.points.map((p, i) => ({ lat: p.lat, lon: p.lng, __i: i }));
+      const res = optimizeRoute(indexed, algorithm);
+      const newPoints: RoutePoint[] = [];
+      const newWp: Record<number, WaypointParamsLite> = {};
+      res.waypoints.forEach((p, newIndex) => {
+        newPoints.push(route.points[p.__i]);
+        const old = route.waypointParams?.[p.__i];
+        if (old) newWp[newIndex] = old;
+      });
+      set((cur) => ({
+        routes: cur.routes.map((r) => (r.id === routeId ? { ...r, points: newPoints, waypointParams: newWp } : r)),
+      }));
+      actions.rerouteAroundZones(routeId);
+      void actions.updateRouteAltitudes(routeId);
+      return res.improvementPct;
+    },
+
+    generateScanRoute: (polygonPx, spacingPx) => {
+      // scan_area(polygon, altitude, overlap_front, overlap_side): «змейка»
+      // для сплошного сканирования полигона. Шаг змейки считается из
+      // перекрытий вызывающей стороной; сюда приходит готовый spacing в px.
+      const map = useMapStore.getState().map;
+      if (!map?.bounds || polygonPx.length < 3) return null;
+      let lawn: Point[];
+      try {
+        lawn = generateScanLawnmower(polygonPx, spacingPx);
+      } catch (e) {
+        if (e instanceof ValidationError) {
+          set((cur) => ({ routeWarnings: { ...cur.routeWarnings, __scan: [(e as Error).message] } }));
+        }
+        return null;
+      }
+      if (lawn.length < 2) return null;
+      const pts: RoutePoint[] = lawn.map((p) => {
+        const g = pixelToGeoExact(p, map.bounds!, map.width, map.height);
+        return { lat: g.lat, lng: g.lng, x: p.x, y: p.y };
+      });
+      return actions.addRoute(pts, `Сканирование ${get().routes.length + 1}`);
+    },
+
+    setDraftPointAltitude: (i, stepM) => {
+      // Регулировка высоты ЭТАПА на промежуточной точке ещё не утверждённого
+      // черновика: шаг ±stepM метров AGL. Привязка к маршруту проекта — по
+      // ТОЧНОМУ id (routeId из мастера), без эвристики «первый маршрут с
+      // таким же набором координат» (могла применить высоту к чужому маршруту).
+      const st = get();
+      const draft = st.routeDraft;
+      if (i < 0 || i >= draft.geo.length) return;
+      const clearance = useMapStore.getState().settings.altitudeClearanceM ?? 50;
+      const cur = draft.agl[i] ?? clearance;
+      const next = Math.max(0, Math.round((cur + stepM) * 10) / 10);
+      const agl = { ...draft.agl, [i]: next };
+      set({ routeDraft: { ...draft, agl } });
+      const rid = draft.routeId;
+      if (rid && st.routes.some((r) => r.id === rid)) {
+        actions.setRoutePointAltitude(rid, i, next);
+      }
+    },
+
+    commitRouteDraft: ({ idToReplace, name, color }) => {
+      // Общий код мастера этапов: зафиксировать черновик маршрута как маршрут
+      // проекта. Ручные высоты этапов (agl по индексу точки) переносятся в
+      // altitudeAGL соответствующих RoutePoint; затем — немедленный обход
+      // ограничений и пересчёт высот (terrain + запас / полом-потолок зон).
+      const st = get();
+      const map = useMapStore.getState().map;
+      const draft = st.routeDraft;
+      if (!map?.bounds || map.width <= 0 || map.height <= 0) return null;
+      if (draft.geo.length < 2) return null;
+      const pts: RoutePoint[] = draft.geo.map((g, i) => ({
+        ...geoToPixelExact(g.lat, g.lng, map.bounds!, map.width, map.height),
+        lat: g.lat, lng: g.lng,
+        altitudeAGL: draft.agl[i] !== undefined ? draft.agl[i] : null,
+      }));
+      let targetId = idToReplace ?? null;
+      if (targetId && !st.routes.some((r) => r.id === targetId)) targetId = null;
+      if (targetId) {
+        set((cur) => ({
+          routes: cur.routes.map((r) => (r.id === targetId ? { ...r, points: pts } : r)),
+        }));
+      } else {
+        const created = actions.addRoute(pts, name, color);
+        if (!created) return null;
+        targetId = created;
+      }
+      actions.autoFixRoute(targetId);
+      return targetId;
+    },
+
+    autoFixRoute: (id) => {
+      // Кнопка «Автокоррекция маршрута»: немедленный обход ВСЕХ ограничений
+      // без ожидания троттлинга подписчика.
+      rerouteTimerCleanup();
+      rerouteChainCount = 0;
+      if (id) {
+        actions.rerouteAroundZones(id);
+        void actions.updateRouteAltitudes(id);
+      } else {
+        rerouteAllRoutesNow();
+        void actions.updateRouteAltitudes();
+      }
+    },
+
+    rerouteAroundZones: (id) => {
+      const state = get();
+      const map = useMapStore.getState().map;
+      const route = state.routes.find((r) => r.id === id);
+      if (!map?.bounds || !route || route.points.length < 2) return;
+      // Активные зоны — из кэша (сбрасывается при изменении restrictions).
+      // Дешёвый «грязевой» тест: если отрезок не задевает ни одну зону,
+      // обходной движок (buildObstacles + граф видимости) не вызывается.
+      const activeZones = getActiveZonesCached(useMapStore.getState().restrictions);
+      const keyIdx: number[] = [];
+      for (let i = 0; i < route.points.length; i++) {
+        if (!route.points[i].auto) keyIdx.push(i);
+      }
+      if (keyIdx.length < 2) keyIdx.push(route.points.length - 1);
+      const newPts: RoutePoint[] = [];
+      for (let k = 0; k < keyIdx.length - 1; k++) {
+        const a = route.points[keyIdx[k]];
+        const b = route.points[keyIdx[k + 1]];
+        newPts.push({ ...a, auto: undefined });
+        let path: Point[];
+        if (activeZones.length === 0 || zonesCrossedBy([a, b], activeZones).length === 0) {
+          path = [a, b]; // сегмент чист — прямой путь
+        } else {
+          path = planPathAroundZones({ x: a.x, y: a.y }, { x: b.x, y: b.y }, activeZones, map.width, map.height);
+        }
+        for (let i = 1; i < path.length - 1; i++) {
+          const px = path[i];
+          const geo = pixelToGeoStrict(px, map.bounds, map.width, map.height);
+          newPts.push({ x: px.x, y: px.y, lat: geo.lat, lng: geo.lng, auto: true });
+        }
+      }
+      newPts.push({ ...route.points[keyIdx[keyIdx.length - 1]] });
+      if (route.shape === 'curve') {
+        const smooth = smoothPolyline(newPts.map((p) => ({ x: p.x, y: p.y })), 6);
+        const merged: RoutePoint[] = [];
+        for (const sp of smooth) {
+          const near = newPts.find((p) => Math.hypot(p.x - sp.x, p.y - sp.y) < 1.5);
+          if (near) { merged.push(near); continue; }
+          const geo = pixelToGeoStrict(sp, map.bounds, map.width, map.height);
+          merged.push({ x: sp.x, y: sp.y, lat: geo.lat, lng: geo.lng, auto: true });
+        }
+        newPts.length = 0;
+        newPts.push(...merged);
+      }
+      // Набор предупреждений ПОЛНОСТЬЮ заменяется для маршрута (пустой массив
+      // удаляет запись) — иначе «застывшие» ложные предупреждения оставались бы навсегда.
+      const crossed = zonesCrossedBy(newPts.map((p) => ({ x: p.x, y: p.y })), activeZones);
+      const warnings = crossed.map((z) => `Пересекает зону «${z.name}»`);
+      const limitWarn = rangeLimitWarning(route, newPts);
+      if (limitWarn) warnings.push(limitWarn);
+      set((cur) => {
+        const rw = { ...cur.routeWarnings };
+        if (warnings.length > 0) rw[id] = warnings;
+        else delete rw[id];
+        return {
+          routeWarnings: rw,
+          routes: cur.routes.map((r) => (r.id === id ? { ...r, points: newPts } : r)),
+        };
+      });
+    },
+
+    updateRouteAltitudes: async (routeId) => {
+      const runId = ++altitudeRunId;
+      // Отменяем сетевые запросы предыдущего прогона (drag точек не должен
+      // копить обращения к троттлящемуся публичному API)
+      try { lastAltitudeController?.abort(); } catch { /* noop */ }
+      const controller = new AbortController();
+      lastAltitudeController = controller;
+      const st = get();
+      const mapState = useMapStore.getState();
+      const map = mapState.map;
+      if (!map?.bounds) return;
+      // Флаг elevationAuto живёт в настройках карты (территория) — уважаем его
+      // во ВСЕХ экшенах: без флага пересчёт не запускается вообще.
+      if (!routeId && !mapState.settings.elevationAuto) return;
+      const clearance = Number.isFinite(mapState.settings.altitudeClearanceM as number)
+        ? (mapState.settings.altitudeClearanceM as number) : 50;
+      const routes = st.routes.filter((r) => r.points.length >= 2);
+      const targets = routeId ? routes.filter((r) => r.id === routeId) : routes;
+      if (targets.length === 0) return;
+
+      // Собираем УНИКАЛЬНЫЕ гео-точки всех целевых маршрутов — один батч
+      // к Open-Elevation вместо N запросов (публичный API троттлится).
+      const keySet = new Map<string, ElevationPoint>();
+      for (const r of targets) {
+        for (const p of r.points) {
+          if (!Number.isFinite(p.lat) || !Number.isFinite(p.lng)) continue;
+          const k = `${p.lat.toFixed(4)},${p.lng.toFixed(4)}`;
+          if (!keySet.has(k)) keySet.set(k, { lat: p.lat, lng: p.lng });
+        }
+      }
+      if (keySet.size === 0) return;
+      const uniqPts = Array.from(keySet.values());
+      const elevs = await fetchElevations(uniqPts, controller.signal);
+      if (runId !== altitudeRunId) return; // более новый прогон отменил этот
+      const elevByKey = new Map<string, number | null>();
+      uniqPts.forEach((p, i) => elevByKey.set(`${p.lat.toFixed(4)},${p.lng.toFixed(4)}`, elevs[i]));
+
+      set((cur) => {
+        const rw: Record<string, string[]> = { ...cur.routeWarnings };
+        const updatedRoutes = cur.routes.map((r) => {
+          if (!targets.some((t) => t.id === r.id)) return r;
+          const pts: RoutePoint[] = r.points.map((p) => {
+            const terr = elevByKey.get(`${p.lat.toFixed(4)},${p.lng.toFixed(4)}`) ?? null;
+            return { ...p, terrainM: terr };
+          });
+          const vWarns = applyVerticalLimits(pts, useMapStore.getState().restrictions, clearance);
+          const merged = [...(rw[r.id] || [])].filter((w) => !w.startsWith('Высота') && !w.startsWith('Конфликт высотных'));
+          for (const w of vWarns) if (!merged.includes(w)) merged.push(w);
+          // Проверка профиля между узлами: интерполяция рельефа ловит «нырки»
+          // маршрута ниже земли. Запускается асинхронно ПОСЛЕ применения
+          // состояния (set ещё не закоммичен — синхронный вызов устаревшим
+          // снапшотом перезаписал бы только что проставленные terrainM).
+          void Promise.resolve().then(() =>
+            computeRouteAltitude(pts.map((p) => ({ lat: p.lat, lng: p.lng })), { clearanceM: clearance }, controller.signal),
+          ).then((info) => {
+            if (runId !== altitudeRunId) return; // защита: профиль отменённого прогона не пишет
+            useMissionStore.setState((s2) => {
+              const w2 = { ...s2.routeWarnings };
+              const base = [...(w2[r.id] || [])].filter((x) => !x.startsWith('Высота'));
+              if (info.terrainConflict) {
+                base.push(`Высота: участок ниже рельефа (мин. АГЛ ${info.minAglM} м) — требуется подъём`);
+              } else if (info.maxTerrainM !== null) {
+                base.push(`Высота: пик рельефа на маршруте ${Math.round(info.maxTerrainM)} м, требуемая ABS ${Math.round(Math.max(...info.absM.filter((v): v is number => v !== null), 0))} м`);
+              }
+              if (base.length > 0) w2[r.id] = base; else delete w2[r.id];
+              return { routeWarnings: w2 };
+            });
+          }).catch(() => { /* сервис недоступен — мягкая деградация */ });
+          if (merged.length > 0) rw[r.id] = merged; else delete rw[r.id];
+          return { ...r, points: pts };
+        });
+        return { routeWarnings: rw, routes: updatedRoutes };
+      });
+    },
+
+    rerouteAllRoutes: () => {
+      // Пользовательское действие (изменение зон/карты через API стора) —
+      // обнуляем счётчик авто-цепочки, лимит в scheduleRerouteAll касается
+      // только самогенерируемых каскадов.
+      rerouteChainCount = 0;
+      scheduleRerouteAll();
+    },
+
+    flushReroute: () => {
+      rerouteTimerCleanup();
+      rerouteChainCount = 0;
+      rerouteAllRoutesNow();
+    },
+
+    setRouteShape: (id, shape) => {
+      set((cur) => ({
+        routes: cur.routes.map((r) => (r.id === id ? { ...r, shape } : r)),
+      }));
+      actions.rerouteAroundZones(id); // перестраиваем сглаживание/ломаную
+    },
+
+    setRouteRangeLimit: (id, mode, meters) => {
+      set((cur) => ({
+        routes: cur.routes.map((r) =>
+          r.id === id ? { ...r, rangeMode: mode, rangeM: mode === 'off' ? undefined : meters ?? r.rangeM } : r
+        ),
+      }));
+      actions.rerouteAroundZones(id); // пересчитать предупреждения по дальности
+    },
+
+    importRoutes: (starts, goals) => {
+      const state = get();
+      const map = useMapStore.getState().map;
+      if (!map) {
+        set((cur) => ({ routeWarnings: { ...cur.routeWarnings, __import: ['Сначала загрузите карту — точки привязываются к её координатам.'] } }));
+        return 0;
+      }
+      const existing = state.routes;
+      const freeSlots = Math.max(0, MAX_ROUTES - existing.length);
+      const n = Math.min(Math.max(starts.length, goals.length), freeSlots);
+      if (n === 0) {
+        set((cur) => ({ routeWarnings: { ...cur.routeWarnings, __import: [`Достигнут максимум маршрутов в сессии: ${MAX_ROUTES}.`] } }));
+        return 0;
+      }
+      const toRoutePoint = (pt: { lat: number; lng: number }): RoutePoint => {
+        const px = map.bounds
+          ? geoToPixelExact(pt.lat, pt.lng, map.bounds, map.width, map.height)
+          : { x: 0, y: 0 };
+        return { lat: pt.lat, lng: pt.lng, x: px.x, y: px.y };
+      };
+      const newRoutes: Route[] = [];
+      const impStarts: ImportPoint[] = [];
+      const impGoals: ImportPoint[] = [];
+      for (let i = 0; i < n; i++) {
+        const s = starts[Math.min(i, starts.length - 1)];
+        const g = goals[Math.min(i, goals.length - 1)];
+        const id = uuidv4();
+        newRoutes.push({
+          id,
+          name: `${s.label || `Старт ${i + 1}`} → ${g.label || `Цель ${i + 1}`}`,
+          color: ROUTE_COLORS[(existing.length + i) % ROUTE_COLORS.length],
+          points: [toRoutePoint(s), toRoutePoint(g)],
+          active: false,
+          visible: true,
+          createdAt: new Date().toISOString(),
+          shape: 'straight',
+        });
+        impStarts.push({ id: uuidv4(), label: s.label || `Старт ${i + 1}`, lat: s.lat, lng: s.lng, routeId: id, placeName: s.placeName });
+        impGoals.push({ id: uuidv4(), label: g.label || `Цель ${i + 1}`, lat: g.lat, lng: g.lng, routeId: id, placeName: g.placeName });
+      }
+      set((cur) => {
+        const prevLists = cur.importLists as ImportLists | undefined;
+        const lists: ImportLists = {
+          starts: [...(prevLists?.starts || []), ...impStarts],
+          goals: [...(prevLists?.goals || []), ...impGoals],
+        };
+        return { routes: [...cur.routes, ...newRoutes], importLists: lists };
+      });
+      actions.rerouteAllRoutes(); // автообход зон для новых маршрутов
+      return n;
+    },
+
+    clearImportLists: () => set({ importLists: undefined }),
+
+    refreshAllRoutesAfterMapChange: () => {
+      const map = useMapStore.getState().map;
+      if (!map?.bounds) return;
+      set((cur) => ({
+        routes: cur.routes.map((r) => recomputeRoutePixels(r, map.bounds!, map.width, map.height)),
+      }));
+      actions.rerouteAllRoutes(); // новые границы карты — пересобираем обходы зон
+    },
+
+    clearRouteWarnings: (id) => set((state) => {
+      const copy = { ...state.routeWarnings };
+      delete copy[id];
+      return { routeWarnings: copy };
+    }),
+
+    resetMissions: () => set({
+      routes: [], activeRouteId: null, routeWarnings: {}, routeDraft: { geo: [], agl: {} }, importLists: undefined,
+    }),
+  };
+  return actions;
+};
+
+// ─── Стор + persist ────────────────────────────────────────────
+
+export const useMissionStore = create<MissionStore>()(
+  persist(
+    (...a) => ({ ...initialMissionState, ...createMissionActions(...a) }),
+    {
+      name: 'tq-mission',
+      version: 1,
+      storage: createJSONStorage(() => localStorage),
+      partialize: (s) => ({
+        routes: s.routes,
+        importLists: s.importLists,
+        activeRouteId: s.activeRouteId,
+        routeWarnings: {},           // сессионные предупреждения не персистим
+        routeDraft: { geo: [], agl: {} }, // черновик мастера — только на сессию
+      }) as MissionState,
+      migrate: (persistedState: unknown) => {
+        const p = persistedState as Partial<MissionState>;
+        if (!Array.isArray(p.routes)) p.routes = [];
+        if (!p.routeDraft) p.routeDraft = { geo: [], agl: {} };
+        if (!p.routeWarnings) p.routeWarnings = {};
+        if (p.activeRouteId === undefined) p.activeRouteId = null;
+        return p as MissionState;
+      },
+    },
+  ),
+);
+
+/** Внутренний хук для совместимости со старым API (`__rerouteAllRoutesNow`). */
+export function rerouteAllNow(): void {
+  rerouteTimerCleanup();
+  rerouteAllRoutesNow();
+}
