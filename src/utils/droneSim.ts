@@ -4,10 +4,23 @@
 // таймаутами, retry-логикой и журналированием. Публичный API повторяет
 // имена функций из ТЗ (preflight_check, arm, takeoff, ...), стиль — camelCase.
 
-import { MAX_ALTITUDE_M, ValidationError, normalizeAngle360 } from './mission';
+import { MAX_ALTITUDE_M, ValidationError, normalizeAngle360, missionChecksum, type RouteNode3D } from './mission';
 
 export type FlightMode = 'Manual' | 'Stabilize' | 'Loiter' | 'Guided' | 'Auto' | 'RTL' | 'Land';
 export const FLIGHT_MODES: readonly FlightMode[] = ['Manual', 'Stabilize', 'Loiter', 'Guided', 'Auto', 'RTL', 'Land'];
+
+/** Детекция распознавателя (CV-канал для track_target). */
+export interface CvDetection {
+  objectId: string;
+  lat: number;
+  lon: number;
+  altM: number;
+  /** Уверенность модели [0..1]. */
+  confidence: number;
+}
+
+/** Источник детекций: callback, возвращающий объекты текущего кадра. */
+export type DetectionSource = () => CvDetection[] | Promise<CvDetection[]>;
 
 export type GeofenceAction = 'report' | 'loiter' | 'rtl' | 'land';
 export type NoFlyShape = 'cylinder' | 'polygon' | 'sphere';
@@ -79,6 +92,8 @@ export interface MissionExecutionState {
   missionId: string | null;
   wpIndex: number;
   status: 'idle' | 'running' | 'paused' | 'done' | 'aborted';
+  /** Чексумма загруженной миссии (для сверки с локальной версией). */
+  checksum?: string;
 }
 
 type LogLevel = 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL';
@@ -118,6 +133,7 @@ export class DroneSim {
   };
   private targets: Map<string, { lat: number; lon: number; altM: number; priority: number; type: TargetType }> = new Map();
   private trackedTargetId: string | null = null;
+  private cvSource: DetectionSource | null = null;
   private gimbal = { pitch: 0, roll: 0, yaw: 0 };
   private media = { photos: 0, videoRecording: false };
   private mission: MissionExecutionState = { missionId: null, wpIndex: 0, status: 'idle' };
@@ -394,11 +410,50 @@ export class DroneSim {
     this.pushLog('INFO', `Цель ${id} (${type}, приоритет ${priority}) назначена`);
   }
 
-  /** Автослежение за целью (track_target); CV-интеграция — заглушка. */
-  trackTarget(objectId: string): void {
+  /**
+   * Автослежение за целью (track_target) с CV-интеграцией.
+   *
+   * Регистрирует callback детектора (например, YOLO через WebRTC-поток):
+   * при каждом вызове `processFrame(detections)` цель, совпавшая по object_id,
+   * обновляет координаты и дрон доворачивается на неё (pointCameraAtTarget).
+   * Без зарегистрированного CV-канала поведение — ручное слежение по последней
+   * известной позиции цели (как раньше).
+   *
+   * Args:
+   *   objectId (string): идентификатор распознанного объекта/цели.
+   *   cv (DetectionSource | null): источник детекций; null — отключить CV-канал.
+   *
+   * Raises:
+   *   ValidationError: цель не зарегистрирована.
+   */
+  trackTarget(objectId: string, cv: DetectionSource | null = null): void {
     if (!this.targets.has(objectId)) throw new ValidationError(`Цель ${objectId} не зарегистрирована`);
     this.trackedTargetId = objectId;
-    this.pushLog('INFO', `Автослежение за ${objectId}`);
+    this.cvSource = cv;
+    this.pushLog('INFO', cv ? `Автослежение за ${objectId} (CV-канал подключён)` : `Автослежение за ${objectId} (ручная позиция)`);
+  }
+
+  /**
+   * Обработка кадра детекций от CV-системы (интеграция recognition-модуля).
+   *
+   * Args:
+   *   detections (CvDetection[]): распознанные объекты кадра.
+   *
+   * Returns:
+   *   boolean: true, если текущая отслеживаемая цель обновлена этим кадром.
+   */
+  processFrame(detections: CvDetection[]): boolean {
+    if (!this.trackedTargetId || !this.cvSource) return false;
+    const det = detections.find((d) => d.objectId === this.trackedTargetId);
+    if (!det) return false;
+    validateGeoPoint(det.lat, det.lon);
+    const t = this.targets.get(this.trackedTargetId)!;
+    t.lat = det.lat;
+    t.lon = det.lon;
+    if (Number.isFinite(det.altM)) t.altM = Math.max(0, Math.min(MAX_ALTITUDE_M, det.altM));
+    this.pointCameraAtTarget(this.trackedTargetId);
+    this.pushLog('DEBUG', `CV: цель ${this.trackedTargetId} обновлена (${det.confidence.toFixed(2)})`);
+    return true;
   }
 
   /** Управление подвесом камеры (set_gimbal), углы нормализуются. */
@@ -586,9 +641,38 @@ export class DroneSim {
 
   // ──────────────────────── Блок 1 (выполнение): миссия ────────────────────────
 
-  loadMission(missionId: string): void {
-    this.mission = { missionId, wpIndex: 0, status: 'running' };
-    this.pushLog('INFO', `Миссия ${missionId} загружена`);
+  /**
+   * Загрузка миссии в память контроллера (upload_mission) с проверкой чексуммы.
+   *
+   * Args:
+   *   missionId (string): идентификатор миссии.
+   *   waypoints (RouteNode3D[]): путевые точки (для расчёта чексуммы).
+   *   expectedChecksum (string | undefined): эталон; по умолчанию — вычисленная
+   *     из точек (эмуляция успешного подтверждения борта).
+   *
+   * Returns:
+   *   { ok: boolean; checksum: string; message?: string }.
+   *
+   * Raises:
+   *   ValidationError: некорректные точки маршрута.
+   */
+  loadMission(
+    missionId: string,
+    waypoints?: RouteNode3D[],
+    expectedChecksum?: string,
+  ): { ok: boolean; checksum: string; message?: string } {
+    let checksum = expectedChecksum ?? '';
+    if (waypoints) {
+      const computed = missionChecksum(waypoints);
+      checksum = expectedChecksum ?? computed;
+      if (expectedChecksum && expectedChecksum !== computed) {
+        this.pushLog('ERROR', `Миссия ${missionId}: чексумма не совпала (${computed} ≠ ${expectedChecksum})`);
+        return { ok: false, checksum: computed, message: 'checksum_mismatch' };
+      }
+    }
+    this.mission = { missionId, wpIndex: 0, status: 'running', checksum };
+    this.pushLog('INFO', `Миссия ${missionId} загружена (чексумма ${checksum || '—'})`);
+    return { ok: true, checksum };
   }
 
   pauseMission(): void {

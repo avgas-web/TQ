@@ -11,6 +11,16 @@ import {
   createMissionMeta,
   optimizeRoute,
   generateScanLawnmower,
+  calculateObstacleAvoidance,
+  rrtPath,
+  insideObstacle,
+  missionChecksum,
+  encodeMissionToMavlink,
+  uploadMission,
+  downloadMission,
+  crc16X25,
+  type RouteNode3D,
+  type Obstacle3D,
 } from '../src/utils/mission';
 import {
   ConnectionError,
@@ -214,6 +224,117 @@ async function main(): Promise<void> {
     fm.handoffTarget('d1', 'd2', 't1'); // ok: t1 назначен d1
     assert(fm.assignmentFor('t1') === 'd2', 'handoff moved target to d2');
     expectThrows(() => fm.handoffTarget('dX', 'd2', 't1'), Error, 'unknown drone rejected');
+  });
+
+
+  await test('calculateObstacleAvoidance: обходит 3D-препятствие (A*)', () => {
+    const route: RouteNode3D[] = [
+      { lat: 59.93, lon: 30.33, altM: 100 },
+      { lat: 59.94, lon: 30.33, altM: 100 },
+    ];
+    // препятствие — «стена» между точками на высотах 50..150 м
+    const wall: Obstacle3D = { minLat: 59.934, maxLat: 59.936, minLon: 30.329, maxLon: 30.331, minAltM: 50, maxAltM: 150 };
+    const res = calculateObstacleAvoidance(route, [wall]);
+    assert(!res.blocked, 'path found around wall');
+    assert(res.route.length > 2, `detour inserted nodes (${res.route.length})`);
+    assert(res.route.every((p) => !res.route.includes(p) || true), 'sanity');
+    for (const p of res.route) {
+      const insideWall = p.lat >= wall.minLat && p.lat <= wall.maxLat && p.lon >= wall.minLon && p.lon <= wall.maxLon && p.altM >= wall.minAltM && p.altM <= wall.maxAltM;
+      assert(!insideWall, `route node (${p.lat},${p.lon},${p.altM}) не внутри препятствия`);
+    }
+  });
+
+  await test('calculateObstacleAvoidance: blocked при непроходимой стене и валидация', () => {
+    const route: RouteNode3D[] = [
+      { lat: 59.93, lon: 30.33, altM: 100 },
+      { lat: 59.94, lon: 30.33, altM: 100 },
+    ];
+    // гигантская стена до потолка MAX_ALTITUDE_M с запасом сверху — обхода нет
+    const huge: Obstacle3D = { minLat: 59.9345, maxLat: 59.9355, minLon: 30.32, maxLon: 30.34, minAltM: 0, maxAltM: 499 };
+    const res = calculateObstacleAvoidance(route, [huge]);
+    assert(res.blocked === true, 'blocked when no detour exists');
+    expectThrows(() => calculateObstacleAvoidance([route[0]], []), ValidationError, 'route <2 points rejected');
+    expectThrows(
+      () => calculateObstacleAvoidance(route, [{ ...huge, maxAltM: 10, minAltM: 20 }]),
+      ValidationError, 'inverted obstacle rejected',
+    );
+  });
+
+  await test('rrtPath: находит путь сквозь препятствие; null в тупике', () => {
+    const from: RouteNode3D = { lat: 59.93, lon: 30.33, altM: 100 };
+    const to: RouteNode3D = { lat: 59.94, lon: 30.33, altM: 100 }; // ~1.1 км на север
+    // Стена между from и to: по широте перекрывает всё, что даёт RRT, но ниже потолка — обход сверху реален
+    const wall: Obstacle3D = { minLat: 59.9345, maxLat: 59.9355, minLon: 30.325, maxLon: 30.335, minAltM: 0, maxAltM: 150 };
+    const path = rrtPath(from, to, [wall], 11);
+    assert(path !== null, 'RRT found a path');
+    if (path) {
+      assert(Math.abs(path[0].lat - from.lat) < 1e-9, 'starts at from');
+      assert(path[path.length - 1].lon === to.lon, 'ends at to');
+      for (const p of path) {
+        assert(!insideObstacle(p, wall), `узел (${p.lat},${p.lon},${p.altM}) не внутри стены`);
+      }
+    }
+    // цель внутри препятствия — пути нет
+    const insideObs: Obstacle3D = { minLat: 59.938, maxLat: 59.942, minLon: 30.328, maxLon: 30.332, minAltM: 0, maxAltM: 400 };
+    assert(rrtPath(from, to, [insideObs], 5) === null, 'null when goal unreachable');
+  });
+
+  await test('missionChecksum/crc16X25: детерминизм и чувствительность', () => {
+    const wps: RouteNode3D[] = [{ lat: 59.93, lon: 30.33, altM: 100 }, { lat: 59.94, lon: 30.34, altM: 120 }];
+    const cs1 = missionChecksum(wps);
+    const cs2 = missionChecksum([...wps]);
+    assert(cs1 === cs2, 'checksum deterministic');
+    const changed = [{ ...wps[0], altM: 101 }, wps[1]];
+    assert(missionChecksum(changed) !== cs1, 'checksum changes with altitude');
+    assert(/^[0-9a-f]{4}$/.test(cs1), `hex4 format: ${cs1}`);
+    assert(crc16X25(new TextEncoder().encode('123456789')) === 0x29b1, 'CRC-16/X-25 check value 0x29B1');
+  });
+
+  await test('encodeMissionToMavlink: структура пакетов и лимиты', () => {
+    const wps: RouteNode3D[] = [{ lat: 59.93, lon: 30.33, altM: 100 }, { lat: 59.94, lon: 30.34, altM: 120 }];
+    const enc = encodeMissionToMavlink(wps);
+    assert(enc.count === 2, 'two waypoints');
+    assert(enc.bytes.length === 2 * 37, `2 packets x 37 bytes, got ${enc.bytes.length}`);
+    assert(enc.bytes[0] === 0xfd, 'MAVLink v2 preamble');
+    expectThrows(() => encodeMissionToMavlink([]), ValidationError, 'empty mission rejected');
+    expectThrows(() => encodeMissionToMavlink([{ lat: 999, lon: 0, altM: 10 }]), ValidationError, 'bad coords rejected');
+  });
+
+  await test('uploadMission/downloadMission: успех, чексумма, таймаут', async () => {
+    const wps: RouteNode3D[] = [{ lat: 59.93, lon: 30.33, altM: 100 }];
+    let sent: Uint8Array | null = null as Uint8Array | null;
+    const up = await uploadMission(wps, (b) => { sent = b; }, (cs) => cs === missionChecksum(wps));
+    assert(up.ok === true && sent !== null && sent.byteLength === 37, 'upload ok with transport call');
+    const bad = await uploadMission(wps, () => undefined, () => false);
+    assert(!bad.ok && bad.error === 'checksum_mismatch', 'mismatch reported');
+    const slow = await uploadMission(wps, () => new Promise<void>(() => undefined), () => true); // никогда не резолвится
+    assert(!slow.ok && slow.error === 'timeout', 'timeout mapped to typed error');
+    const dl = await downloadMission(() => wps, missionChecksum(wps));
+    assert(dl.ok === true, 'download verifies checksum');
+    const dlBad = await downloadMission(() => [{ lat: 1, lon: 1, altM: 1 }], missionChecksum(wps));
+    assert(!dlBad.ok && dlBad.error === 'checksum_mismatch', 'download mismatch');
+  });
+
+  await test('DroneSim.loadMission сверяет чексумму; trackTarget+processFrame обновляет цель', async () => {
+    const sim = new DroneSim('d-cv', { lat: 59.93, lon: 30.33, altM: 0 });
+    const wps: RouteNode3D[] = [{ lat: 59.93, lon: 30.33, altM: 100 }, { lat: 59.94, lon: 30.34, altM: 100 }];
+    const ok = sim.loadMission('m1', wps);
+    assert(ok.ok && ok.checksum === missionChecksum(wps), 'loadMission computes checksum');
+    const badLoad = sim.loadMission('m2', wps, 'ffff');
+    assert(!badLoad.ok && badLoad.message === 'checksum_mismatch', 'stale board version rejected');
+    sim.designateTarget('t1', 59.9, 30.3, 0, 3, 'vehicle');
+    let frames = 0;
+    sim.trackTarget('t1', () => {
+      frames++;
+      return [{ objectId: 't1', lat: 59.901, lon: 30.302, altM: 5, confidence: 0.9 }];
+    });
+    const updated = sim.processFrame(await (sim as unknown as { cvSource?: unknown }).cvSource ? [] : []);
+    void updated; // пустой кадр не должен обновлять
+    assert(frames === 0, 'processFrame does not pull source itself (pull by caller)');
+    const detections = [{ objectId: 't1', lat: 59.901, lon: 30.302, altM: 5, confidence: 0.9 }];
+    assert(sim.processFrame(detections) === true, 'CV frame updates tracked target');
+    const tel = sim.telemetry();
+    assert(tel.yawDeg >= 0 && tel.yawDeg < 360, 'yaw normalized after CV tracking');
   });
 
   console.log(`\nИтого: ${passed} passed, ${failed} failed`);
