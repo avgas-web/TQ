@@ -112,7 +112,7 @@ const AltitudeProfile: React.FC<Props> = ({ routeId, onClose }) => {
 
   const hasAbs = profile ? profile.nodes.some((n) => n.abs !== null) : false;
   const yMax = Math.max(profile?.maxAbs ?? 0, profile?.maxTerrain ?? 0, 10);
-  const yMin = Math.min(0, profile?.minAbs ?? 0, ...((profile?.terrain.filter((v): v is number => typeof v === 'number) || []) as number[]));
+  const yMin = Math.min(0, profile?.minAbs ?? 0, ...(profile ? profile.terrain.filter((v): v is number => typeof v === 'number') : []));
   const span = Math.max(10, yMax - yMin);
 
   const X = (d: number) => PAD_X + (W - 2 * PAD_X) * Math.min(1, Math.max(0, d / (profile?.totalM || 1)));
