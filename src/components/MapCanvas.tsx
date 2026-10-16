@@ -366,7 +366,7 @@ const MapCanvas: React.FC = () => {
     tileDebounceRef.current = setTimeout(pump, idle ? 0 : DEBOUNCE_MS);
     setTilesVersion((t2) => t2 + 1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tilesEnabled, tileStyle, tileServer, offXq, offYq, zoomQ, kxq, kyq, boundsRef]);
+  }, [tilesEnabled, tileStyle, tileServer, offXq, offYq, zoomQ, kxq, kyq, boundsRef, renderTick]);
 
   // Геолокация пользователя (по требованию — кнопка 📍)
   const locateUser = useCallback(() => {
@@ -598,6 +598,9 @@ const MapCanvas: React.FC = () => {
     if (!container) return;
 
     const observer = new ResizeObserver((entries) => {
+      // setViewState — стабильная ссылка zustand (не меняется между рендерами),
+      // поэтому её можно честно указать в зависимостях вместо заглушки exhaustive-deps.
+      const { setViewState } = useStore.getState();
       for (const entry of entries) {
         const w = entry.contentRect.width;
         const h = entry.contentRect.height;
@@ -617,8 +620,7 @@ const MapCanvas: React.FC = () => {
 
     observer.observe(container);
     return () => observer.disconnect();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [setViewState]);
 
   // Стартовый zoom-инвариант z0: фиксируется ОДИН РАЗ на карту (не пересчитывается
   // при ресайзе — иначе масштаб «сбивается»). Тайлы, сетка и линейка используют его всегда.
