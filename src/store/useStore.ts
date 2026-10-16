@@ -5,7 +5,7 @@ import type { Project, Marker, Restriction, Layer, Tool, ViewState, MapData, Poi
 import { MAX_ROUTES } from '../types';
 import { saveMapToIndexedDB, loadMapFromIndexedDB, deleteMapFromIndexedDB } from '../utils/storage';
 import { geoToPixelFromBounds, calculateBoundsFromCenter, latToMercatorY, mercatorYToLat } from '../utils/googleMaps';
-import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, smoothPolyline, routeLengthM, pointInRestrictionFootprint, requiredAbsFromZones, zoneHasVerticalLimits } from '../utils/routing';
+import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, geoToPixelExact, smoothPolyline, routeLengthM, pointInRestrictionFootprint, requiredAbsFromZones, zoneHasVerticalLimits } from '../utils/routing';
 import { fetchElevations, computeRouteAltitude } from '../utils/elevation';
 import type { ElevationPoint } from '../utils/elevation';
 import type { RouteShape, RangeLimitMode, ImportPoint, ImportLists } from '../types';
@@ -516,7 +516,7 @@ export const useStore = create<AppState>()(
         if (!map?.bounds || map.width <= 0 || map.height <= 0) return null;
         if (draft.geo.length < 2) return null;
         const pts: RoutePoint[] = draft.geo.map((g, i) => ({
-          ...pixelToGeoExactToPixel(g, map.bounds!, map.width, map.height),
+          ...geoToPixelExact(g.lat, g.lng, map.bounds!, map.width, map.height),
           lat: g.lat, lng: g.lng,
           altitudeAGL: draft.agl[i] !== undefined ? draft.agl[i] : null,
         }));
