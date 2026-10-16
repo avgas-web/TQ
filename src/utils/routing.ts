@@ -138,7 +138,15 @@ function segmentCircleIntersect(a: Point, b: Point, c: Point, radius: number): b
   return (t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1) || (t1 < 0 && t2 > 1);
 }
 
-/** Зоны, которые пересекает ломаная маршрутa */
+/** Маршрут, пересекающий зону ограничений ПО ВЫСОТЕ: полёт внутри footprint
+ *  зоны ниже её потолка или выше её пола. Такие пересечения нельзя устранить
+ *  обходом на плане — коррекция выполняется по высоте (см. elevation.ts). */
+export interface VerticalZoneCrossing {
+  zone: Restriction;
+  kind: 'below-ceiling' | 'above-floor';
+}
+
+/** Зоны, которые ломаная маршрутa пересекает по горизонтали (footprint) */
 export function zonesCrossedBy(points: Point[], restrictions: Restriction[]): Restriction[] {
   // Круг задаётся ОДНОЙ точкой + radius: старый фильтр points.length >= 2
   // полностью исключал круговые зоны из проверки пересечений (ложно-чистые
@@ -155,6 +163,73 @@ export function zonesCrossedBy(points: Point[], restrictions: Restriction[]): Re
     }
   }
   return active.filter((r) => hitIds.has(r.id));
+}
+
+/** Требуемая ABS-высота (м над уровнем моря) в точке с учётом ВЕРТИКАЛЬНЫХ
+ *  ограничений зон, чей footprint накрывает точку: пол «minHeightAGL от земли»
+ *  = terrain + minHeightAGL, потолок «maxHeightAGL от земли» = terrain +
+ *  maxHeightAGL. Если у зоны задан только потолок и рельеф неизвестен —
+ *  возвращаем null (потолок AGL без знания высоты земли неприменим к ABS).
+ *  При нескольких зонах берётся максимум нижних границ; если требуемый пол
+ *  превышает доступный потолок — ceiling < floor (конфликт лимитов,
+ *  вызывающий код поднимет маршрут над потолком и предупредит). */
+export function requiredAbsFromZones(
+  p: Point,
+  restrictions: Restriction[],
+  terrainM: number | null | undefined,
+): { floor: number | null; ceiling: number | null } {
+  let floor: number | null = null;
+  let ceiling: number | null = null;
+  for (const r of restrictions) {
+    if (!r.active) continue;
+    const hasMin = typeof r.minHeightAGL === 'number' && Number.isFinite(r.minHeightAGL) && r.minHeightAGL > 0;
+    const hasMax = typeof r.maxHeightAGL === 'number' && Number.isFinite(r.maxHeightAGL) && r.maxHeightAGL > 0;
+    if (!hasMin && !hasMax) continue;
+    if (!pointInRestrictionFootprint(p, r)) continue;
+    const terr = typeof terrainM === 'number' && Number.isFinite(terrainM) ? terrainM : null;
+    if (hasMin) {
+      const f = (terr ?? 0) + (r.minHeightAGL as number);
+      if (floor === null || f > floor) floor = f;
+    }
+    if (hasMax && terr !== null) {
+      const c = terr + (r.maxHeightAGL as number);
+      if (ceiling === null || c < ceiling) ceiling = c;
+    }
+  }
+  return { floor, ceiling };
+}
+
+/** Быстрая проверка: может ли зона участвовать в вертикальной коррекции */
+export function zoneHasVerticalLimits(r: Restriction): boolean {
+  const minOk = typeof r.minHeightAGL === 'number' && Number.isFinite(r.minHeightAGL) && r.minHeightAGL > 0;
+  const maxOk = typeof r.maxHeightAGL === 'number' && Number.isFinite(r.maxHeightAGL) && r.maxHeightAGL > 0;
+  return minOk || maxOk;
+}
+
+/** Зоны с высотными лимитами, которые ломаная пересекает СВОИМ footprint.
+ *  Для каждой пересечённой точки вызывающий код получает фактический AGL —
+ *  нарушение (полёт ниже пола / выше потолка зоны) корректируется по высоте. */
+export function zonesWithVerticalLimitsCrossedBy(points: Point[], restrictions: Restriction[]): Restriction[] {
+  const active = restrictions.filter(
+    (r) => r.active && zoneHasVerticalLimits(r) &&
+      (r.type === 'circle' ? r.points.length >= 1 && !!r.radius : r.points.length >= 2)
+  );
+  if (active.length === 0 || points.length < 2) return [];
+  const hitIds = new Set<string>();
+  for (let i = 0; i < points.length - 1; i++) {
+    for (const r of active) {
+      if (hitIds.has(r.id)) continue;
+      if (segmentHitsZone(points[i], points[i + 1], r)) hitIds.add(r.id);
+    }
+  }
+  return active.filter((r) => hitIds.has(r.id));
+}
+
+/** True, если точка лежит внутри footprint зоны (без учёта буфера/активности) */
+export function pointInRestrictionFootprint(p: Point, r: Restriction): boolean {
+  if (r.type === 'circle') return r.points.length >= 1 && !!r.radius && isPointInZone(p, r);
+  if (r.type === 'rectangle') return r.points.length >= 2 && isPointInZone(p, r);
+  return r.points.length >= 3 && isPointInZone(p, r);
 }
 
 /** Суммарная длина ломаной в метрах (WGS-84) */

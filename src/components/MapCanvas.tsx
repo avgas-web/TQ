@@ -990,8 +990,37 @@ const MapCanvas: React.FC = () => {
   // после updateRestriction/deleteRestriction/setActiveRestriction; двойной вызов
   // порождал две гонки троттлеров на одну операцию изменения зон.
   useEffect(() => {
+    let vTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastVKey = '';
     const unsub = useStore.subscribe((s, prev) => {
       if (s.project.restrictions !== prev.project.restrictions) scheduleRerouteAll();
+      // Автокоррекция высот: изменились ВЕРТИКАЛЬНЫЕ лимиты зон, настройки
+      // высот или геометрия маршрутов — пересчитать требуемые ABS-высоты
+      // по рельефу (Open-Elevation; кэш высот делает повторные прогоны дешёвыми).
+      // Троттлинг 600 мс: при drag точек маршрута запросы не должны сыпаться
+      // на каждый mousemove (публичный API тротлится; altitudeRunId отменяет
+      // устаревшие прогоны, но сетевой шторм всё равно недопустим).
+      const vKey = (rs: typeof s.project.restrictions) =>
+        rs.reduce((acc, r) => acc + `${r.active ? 1 : 0}:${r.minHeightAGL ?? ''}:${r.maxHeightAGL ?? ''}|`, '');
+      const geoKey = (s.project.routes || []).map((r) =>
+        `${r.id}:${r.points.length}:${r.points.reduce((a, p) => a + `${p.lat.toFixed(4)},${p.lng.toFixed(4)};`, '')}`
+      ).join('|');
+      const elevAuto = s.project.settings.elevationAuto === true;
+      const needAlt = elevAuto && (
+        vKey(s.project.restrictions) !== vKey(prev.project.restrictions) ||
+        s.project.settings.altitudeClearanceM !== prev.project.settings.altitudeClearanceM ||
+        geoKey !== lastVKey
+      );
+      if (needAlt) {
+        lastVKey = geoKey;
+        if (vTimer) clearTimeout(vTimer);
+        vTimer = setTimeout(() => {
+          vTimer = null;
+          void useStore.getState().updateRouteAltitudes();
+        }, 600);
+      } else if (!elevAuto && vTimer) {
+        clearTimeout(vTimer); vTimer = null;
+      }
     });
     // Клавиатурный зум из App.tsx: событие tq:zoom принимает factor и масштабирует
     // вид вокруг центра канваса через тот же zoomAt, что и колесо мыши
@@ -1805,6 +1834,21 @@ const MapCanvas: React.FC = () => {
           ctx.lineWidth = 1.2 / s;
           ctx.strokeStyle = 'rgba(0,0,0,0.6)';
           ctx.stroke();
+          // Подписи высот (Open-Elevation): у активного маршрута — рельеф/ABS
+          if (isActive && typeof p.altitudeAbs === 'number') {
+            const fsA = Math.max(8, 9 / s);
+            ctx.font = `${fsA}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.fillStyle = 'rgba(0,0,0,0.75)';
+            const tTxt = p.terrainM != null
+              ? `${Math.round(p.altitudeAbs)} м (з ${Math.round(p.terrainM)})`
+              : `${Math.round(p.altitudeAbs)} м`;
+            const twA = ctx.measureText(tTxt).width;
+            ctx.fillRect(p.x - twA / 2 - 2 / s, p.y + drawR + 1 / s, twA + 4 / s, fsA + 3 / s);
+            ctx.fillStyle = '#7dd3fc';
+            ctx.fillText(tTxt, p.x, p.y + drawR + 1 / s + fsA + 1 / s);
+            ctx.textAlign = 'left';
+          }
         }
 
         // Стрелка направления на финише

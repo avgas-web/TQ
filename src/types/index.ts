@@ -17,6 +17,8 @@ export interface Marker {
   comment: string;
   layer: string;
   createdAt: string;
+  /** Высота ландшафта в точке (м, Open-Elevation), проставляется автоматически */
+  terrainM?: number | null;
 }
 
 export interface Restriction {
@@ -27,6 +29,10 @@ export interface Restriction {
   color: string;
   name: string;
   active: boolean;
+  /** Минимальная разрешённая высота полёта над землёй (AGL, м). Маршрут поднимается выше. */
+  minHeightAGL?: number | null;
+  /** Максимальная разрешённая высота полёта над землёй (AGL, м). Маршрут опускается ниже. */
+  maxHeightAGL?: number | null;
 }
 
 export interface Layer {
@@ -85,6 +91,10 @@ export interface Project {
     // Стиль тайловой подложки: только стандартная схема OSM (режимы удалены из приложения)
     tileStyle?: 'scheme';
     tilesEnabled?: boolean;
+    /** Автозапрос высот ландшафта (Open-Elevation) для точек маршрутов/маркеров */
+    elevationAuto?: boolean;
+    /** Запас высоты полёта над рельефом, м (для определения АГЛ-высоты маршрута) */
+    altitudeClearanceM?: number;
   };
   googleMaps: {
     apiKey: string;
@@ -125,6 +135,10 @@ export interface RoutePoint {
   x: number; // пиксель карты (пересчитывается при загрузке/изменении bounds)
   y: number;
   auto?: boolean; // точка добавлена автообходом зон (не ключевая)
+  /** Высота ландшафта в точке (м, Open-Elevation), проставляется автоматически */
+  terrainM?: number | null;
+  /** Требуемая высота полёта ABS (над уровнем моря, м): рельеф + запас / лимиты */
+  altitudeAbs?: number | null;
 }
 
 /** Тип линии маршрута: прямая или кривая (сглаженная сплайн-ломаная) */

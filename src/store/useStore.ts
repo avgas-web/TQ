@@ -5,12 +5,69 @@ import type { Project, Marker, Restriction, Layer, Tool, ViewState, MapData, Poi
 import { MAX_ROUTES } from '../types';
 import { saveMapToIndexedDB, loadMapFromIndexedDB, deleteMapFromIndexedDB } from '../utils/storage';
 import { geoToPixelFromBounds, calculateBoundsFromCenter, latToMercatorY, mercatorYToLat } from '../utils/googleMaps';
-import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, smoothPolyline, routeLengthM } from '../utils/routing';
+import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, smoothPolyline, routeLengthM, pointInRestrictionFootprint, requiredAbsFromZones, zoneHasVerticalLimits } from '../utils/routing';
+import { fetchElevations, computeRouteAltitude } from '../utils/elevation';
+import type { ElevationPoint } from '../utils/elevation';
 import type { RouteShape, RangeLimitMode, ImportPoint, ImportLists } from '../types';
 
 const MIN_MAP_ZOOM_FLOOR = 6;
 
 const ROUTE_COLORS = ['#00d0ff', '#ff9500', '#a78bfa', '#34d399', '#f472b6', '#facc15', '#fb7185', '#60a5fa'];
+
+// ─── Высоты полёта (Open-Elevation) и вертикальные ограничения ──────────────
+
+/** Ссылка на последний незавершённый прогон updateRouteAltitudes — повторный
+ *  вызов отменяет предыдущий запрос (drag точки маршрута не должен копить
+ *  обращения к медленному публичному API). */
+let altitudeRunId = 0;
+/** Активный AbortController последнего прогона высот — для отмены сетевых
+ *  запросов устаревшего прогона при запуске нового. */
+let lastAltitudeController: AbortController | null = null;
+
+/** Есть ли у проекта зон с высотными лимитами (min/max AGL) */
+export function hasVerticalZones(restrictions: Restriction[]): boolean {
+  return restrictions.some((r) => r.active && zoneHasVerticalLimits(r));
+}
+
+/**
+ * Автокоррекция ВЕРТИКАЛЬНЫХ ограничений: для каждой точки маршрута считаем
+ * требуемую ABS-высоту (над уровнем моря):
+ *   required = max( terrain + clearance,                — не ниже рельефа
+ *                   zoneFloor = terrain + minHeightAGL, — выше «пола» зоны
+ *                   zoneCeiling = terrain + maxHeightAGL ) — «потолок» зоны
+ * Пол/потолок применяются только там, где footprint зоны реально накрывает
+ * точку маршрута — лимиты не должны стоять НА пути маршрута. При конфликте
+ * floor > ceiling приоритет отдаётся полу (безопасность превыше потолка),
+ * это помечается предупреждением. Рельеф (terrainM) берётся из кэса/ответа
+ * Open-Elevation; если он недоступен, коррекция выполняется в AGL-модели
+ * относительно нуля (эквивалентно «земля = 0 м»).
+ */
+function applyVerticalLimits(pts: RoutePoint[], restrictions: Restriction[], clearance: number): string[] {
+  const warns: string[] = [];
+  let conflictRaised = 0;
+  for (const p of pts) {
+    const terr = typeof p.terrainM === 'number' && Number.isFinite(p.terrainM) ? p.terrainM : null;
+    // базовое требование: не ниже рельефа + запас
+    let need: number | null = terr !== null ? terr + clearance : null;
+    const { floor, ceiling } = requiredAbsFromZones({ x: p.x, y: p.y }, restrictions, terr);
+    if (floor !== null) need = need === null ? floor : Math.max(need, floor);
+    if (ceiling !== null) {
+      if (floor !== null && ceiling < floor - 1e-9) {
+        // конфликт полов/потолков разных зон на одном footprint — поднимаем над потолком
+        conflictRaised++;
+        need = need === null ? ceiling : Math.max(need, ceiling);
+      } else if (need !== null && need > ceiling) {
+        // маршрут «ныряет» под потолок зоны — опускаем ровно до потолка
+        need = ceiling;
+      }
+    }
+    if (need !== null) p.altitudeAbs = Math.round(need * 10) / 10;
+  }
+  if (conflictRaised > 0) {
+    warns.push(`Конфликт высотных лимитов зон: маршрут поднят над потолком в ${conflictRaised} т.`);
+  }
+  return warns;
+}
 
 /** Предупреждение о нарушении ограничения маршрута по дальности */
 function rangeLimitWarning(route: Route, pts: RoutePoint[]): string | null {
@@ -283,6 +340,9 @@ interface AppState {
   moveRoutePoint: (id: string, index: number, p: Point) => void;
   removeRoutePoint: (id: string, index: number) => void;
   rerouteAroundZones: (id: string) => void; // перестроить обход зон для всего маршрута
+  /** Определение высот полёта по рельефу (Open-Elevation) + автокоррекция
+   *  вертикальных ограничений. routeId — один маршрут; undefined/'' — все. */
+  updateRouteAltitudes: (routeId?: string | null) => Promise<void>;
   /** Внутренний: немедленная пакетная перестройка (rerouteAllRoutes — троттлинг-обёртка) */
   __rerouteAllRoutesNow?: () => void;
   rerouteAllRoutes: () => void; // пакетная перестройка всех маршрутов после изменения зон/карты
@@ -363,6 +423,10 @@ const defaultProject: Project = {
     // Карта активная по умолчанию: тайловая подложка (не фотография), зум/pan/линейка.
     tilesEnabled: true,
     tileStyle: 'scheme',
+    // Высоты полёта: автозапрос рельефа (Open-Elevation) включён по умолчанию,
+    // запас над землёй 50 м (стандарт для БПЛА-планирования).
+    elevationAuto: true,
+    altitudeClearanceM: 50,
   },
   googleMaps: {
     apiKey: '',
@@ -631,6 +695,83 @@ export const useStore = create<AppState>()(
         });
       },
 
+      updateRouteAltitudes: async (routeId) => {
+        const runId = ++altitudeRunId;
+        // Отменяем сетевые запросы предыдущего прогона (drag точек не должен
+        // копить обращения к троттлящемуся публичному API)
+        try { lastAltitudeController?.abort(); } catch { /* noop */ }
+        const controller = new AbortController();
+        lastAltitudeController = controller;
+        const st = get();
+        const map = st.project.map;
+        if (!map?.bounds) return;
+        const clearance = Number.isFinite(st.project.settings.altitudeClearanceM as number)
+          ? (st.project.settings.altitudeClearanceM as number) : 50;
+        const routes = (st.project.routes || []).filter((r) => r.points.length >= 2);
+        const targets = routeId ? routes.filter((r) => r.id === routeId) : routes;
+        if (targets.length === 0) return;
+
+        // Собираем УНИКАЛЬНЫЕ гео-точки всех целевых маршрутов — один батч
+        // к Open-Elevation вместо N запросов (публичный API троттлится).
+        const keySet = new Map<string, ElevationPoint>();
+        for (const r of targets) {
+          for (const p of r.points) {
+            if (!Number.isFinite(p.lat) || !Number.isFinite(p.lng)) continue;
+            const k = `${p.lat.toFixed(4)},${p.lng.toFixed(4)}`;
+            if (!keySet.has(k)) keySet.set(k, { lat: p.lat, lng: p.lng });
+          }
+        }
+        if (keySet.size === 0) return;
+        const uniqPts = Array.from(keySet.values());
+        const elevs = await fetchElevations(uniqPts, controller.signal);
+        if (runId !== altitudeRunId) return; // более новый прогон отменил этот
+        const elevByKey = new Map<string, number | null>();
+        uniqPts.forEach((p, i) => elevByKey.set(`${p.lat.toFixed(4)},${p.lng.toFixed(4)}`, elevs[i]));
+
+        set((cur) => {
+          const rw: Record<string, string[]> = { ...cur.routeWarnings };
+          const updatedRoutes = (cur.project.routes || []).map((r) => {
+            if (!targets.some((t) => t.id === r.id)) return r;
+            const pts: RoutePoint[] = r.points.map((p) => {
+              const terr = elevByKey.get(`${p.lat.toFixed(4)},${p.lng.toFixed(4)}`) ?? null;
+              return { ...p, terrainM: terr };
+            });
+            // Автокоррекция вертикальных ограничений (пол/потолок AGL зон)
+            // + базовое требование «рельеф + запас» → required ABS.
+            const vWarns = applyVerticalLimits(pts, cur.project.restrictions, clearance);
+            const merged = [...(rw[r.id] || [])].filter((w) => !w.startsWith('Высота') && !w.startsWith('Конфликт высотных'));
+            for (const w of vWarns) if (!merged.includes(w)) merged.push(w);
+            // Проверка профиля между узлами: computeRouteAltitude интерполирует
+            // рельеф по Open-Elevation и ловит «нырки» маршрута ниже земли.
+            // Запускается асинхронно ПОСЛЕ применения состояния (set ещё не
+            // закоммичен — синхронный вызов устаревшим снапшотом перезаписал
+            // бы только что проставленные terrainM/altitudeAbs).
+            void Promise.resolve().then(() => computeRouteAltitude(pts.map((p) => ({ lat: p.lat, lng: p.lng })), { clearanceM: clearance }, controller.signal))
+              .then((info) => {
+                if (runId !== altitudeRunId) return;
+                useStore.setState((s2) => {
+                  const w2 = { ...s2.routeWarnings };
+                  const base = [...(w2[r.id] || [])].filter((x) => !x.startsWith('Высота'));
+                  if (info.terrainConflict) {
+                    base.push(`Высота: участок ниже рельефа (мин. АГЛ ${info.minAglM} м) — требуется подъём`);
+                  } else if (info.maxTerrainM !== null) {
+                    base.push(`Высота: пик рельефа на маршруте ${Math.round(info.maxTerrainM)} м, требуемая ABS ${Math.round(Math.max(...info.absM.filter((v): v is number => v !== null), 0))} м`);
+                  }
+                  if (base.length > 0) w2[r.id] = base; else delete w2[r.id];
+                  return { routeWarnings: w2 };
+                });
+              })
+              .catch(() => { /* сервис недоступен — мягкая деградация */ });
+            if (merged.length > 0) rw[r.id] = merged; else delete rw[r.id];
+            return { ...r, points: pts };
+          });
+          return {
+            routeWarnings: rw,
+            project: { ...cur.project, routes: updatedRoutes, updatedAt: new Date().toISOString() },
+          };
+        });
+      },
+
       rerouteAllRoutes: () => {
         // Пользовательское действие (изменение зон/карты через API стора) —
         // обнуляем счётчик авто-цепочки, лимит в scheduleRerouteAll касается
@@ -786,6 +927,7 @@ export const useStore = create<AppState>()(
           comment: markerData.comment || '',
           layer: markerData.layer || 'default',
           createdAt: new Date().toISOString(),
+          terrainM: markerData.terrainM ?? null,
         };
         return {
           project: {
@@ -830,6 +972,8 @@ export const useStore = create<AppState>()(
           color: restrictionData.color || '#ff000080',
           name: restrictionData.name || `Ограничение ${state.project.restrictions.length + 1}`,
           active: restrictionData.active !== undefined ? restrictionData.active : true,
+          minHeightAGL: restrictionData.minHeightAGL ?? null,
+          maxHeightAGL: restrictionData.maxHeightAGL ?? null,
         };
         // ВАЖНО: НЕ вызываем rerouteAllRoutes() синхронно здесь — добавление зоны
         // происходит из обработчика клика/двойного клика; перестройку выполняет
