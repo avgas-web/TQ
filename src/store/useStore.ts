@@ -232,6 +232,25 @@ export function selectViewForRender(s: AppState): ViewState {
 }
 let lastViewSel: { t: number; v: AppState['viewState']; out: ViewState } | null = null;
 
+/**
+ * Нормализация viewState (используется миграцией persist v2). Возвращает объект
+ * с гарантированно числовыми полями; отсутствующее/битое z0 принудительно
+ * помечается как undefined — все потребители вида трактуют undefined z0 как
+ * эталонный ZOOM_REF (`z0 ?? ZOOM_REF`), поэтому явная запись undefined
+ * семантически эквивалентна отсутствию поля и защищает от «грязных» значений
+ * (null/string/NaN) из старых версий хранилища.
+ */
+export function normalizeViewState(v: any): ViewState {
+  const num = (x: any, dflt: number): number => (typeof x === 'number' && Number.isFinite(x) ? x : dflt);
+  const z0 = typeof v?.z0 === 'number' && Number.isFinite(v.z0) ? v.z0 : undefined;
+  return {
+    offsetX: num(v?.offsetX, 0),
+    offsetY: num(v?.offsetY, 0),
+    scale: num(v?.scale, 1),
+    z0,
+  };
+}
+
 interface AppState {
   project: Project;
   currentTool: Tool;
@@ -1251,6 +1270,13 @@ export const useStore = create<AppState>()(
         // Миграция для старых проектов без маршрутов
         if (persistedState.project && !Array.isArray(persistedState.project.routes)) {
           persistedState.project.routes = [];
+        }
+        // Нормализация viewState: старые версии хранилища могли записать вид без
+        // поля z0 (или с «грязным» значением null/строкой). Все потребители вида
+        // защищаются через `z0 ?? ZOOM_REF`, но миграция гарантирует корректные
+        // числовые offset/scale уже на входе — без NaN в координатах канваса.
+        if (persistedState.viewState !== undefined) {
+          persistedState.viewState = normalizeViewState(persistedState.viewState);
         }
         return persistedState;
       },

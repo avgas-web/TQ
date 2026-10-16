@@ -1,6 +1,27 @@
 // Утилиты для работы с Google Maps API
 import type { MapBounds } from "../types";
 
+// Минимальные локальные типы Google Maps JS API (подгружается рантайм-скриптом).
+// Ранее типизация приходила из пакета @types/google.maps; пакет удалён как
+// неиспользуемая зависимость, поэтому объявление сохранено локально — только то,
+// что реально используется в этом модуле (Geocoder + статическая карта).
+interface GmLatLng { lat(): number; lng(): number; }
+interface GmGeocodeResult {
+  formatted_address: string;
+  geometry: { location: GmLatLng };
+}
+interface GmGeocoder {
+  geocode(
+    request: { address?: string; location?: { lat: number; lng: number } },
+    callback: (results: GmGeocodeResult[] | null, status: string) => void
+  ): void;
+}
+declare global {
+  interface Window {
+    google?: { maps: { Geocoder: new () => GmGeocoder } };
+  }
+}
+
 export interface GoogleMapsConfig {
   apiKey: string;
   loaded: boolean;
@@ -87,7 +108,7 @@ export async function geocodeAddress(address: string): Promise<{ lat: number; ln
   }
 
   return new Promise((resolve) => {
-    const geocoder = new window.google.maps.Geocoder();
+    const geocoder = new window.google!.maps.Geocoder();
 
     geocoder.geocode({ address }, (results, status) => {
       if (status === 'OK' && results && results.length > 0) {
@@ -112,7 +133,7 @@ export async function reverseGeocode(lat: number, lng: number): Promise<string |
   }
 
   return new Promise((resolve) => {
-    const geocoder = new window.google.maps.Geocoder();
+    const geocoder = new window.google!.maps.Geocoder();
     const latlng = { lat, lng };
 
     geocoder.geocode({ location: latlng }, (results, status) => {
