@@ -138,13 +138,22 @@ function segmentCircleIntersect(a: Point, b: Point, c: Point, radius: number): b
   return (t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1) || (t1 < 0 && t2 > 1);
 }
 
-/** Зоны, которые пересекает ломаная маршрутa */
+/** Маршрут, пересекающий зону ограничений ПО ВЫСОТЕ: полёт внутри footprint
+ *  зоны ниже её потолка или выше её пола. Такие пересечения нельзя устранить
+ *  обходом на плане — коррекция выполняется по высоте (см. elevation.ts). */
+export interface VerticalZoneCrossing {
+  zone: Restriction;
+  kind: 'below-ceiling' | 'above-floor';
+}
+
+/** Зоны, которые ломаная маршрутa пересекает по горизонтали (footprint) */
 export function zonesCrossedBy(points: Point[], restrictions: Restriction[]): Restriction[] {
   // Круг задаётся ОДНОЙ точкой + radius: старый фильтр points.length >= 2
   // полностью исключал круговые зоны из проверки пересечений (ложно-чистые
-  // маршруты, проходящие через круг).
+  // маршруты, проходящие через круг). Флаг active больше не участвует: все
+  // поставленные зоны — ограничения на пути маршрута.
   const active = restrictions.filter(
-    (r) => r.active && (r.type === 'circle' ? r.points.length >= 1 && !!r.radius : r.points.length >= 2)
+    (r) => r.type === 'circle' ? r.points.length >= 1 && !!r.radius : r.points.length >= 2
   );
   if (active.length === 0 || points.length < 2) return [];
   const hitIds = new Set<string>();
@@ -155,6 +164,73 @@ export function zonesCrossedBy(points: Point[], restrictions: Restriction[]): Re
     }
   }
   return active.filter((r) => hitIds.has(r.id));
+}
+
+/** Требуемая ABS-высота (м над уровнем моря) в точке с учётом ВЕРТИКАЛЬНЫХ
+ *  ограничений зон, чей footprint накрывает точку: пол «minHeightAGL от земли»
+ *  = terrain + minHeightAGL, потолок «maxHeightAGL от земли» = terrain +
+ *  maxHeightAGL. Если у зоны задан только потолок и рельеф неизвестен —
+ *  возвращаем null (потолок AGL без знания высоты земли неприменим к ABS).
+ *  При нескольких зонах берётся максимум нижних границ; если требуемый пол
+ *  превышает доступный потолок — ceiling < floor (конфликт лимитов,
+ *  вызывающий код поднимет маршрут над потолком и предупредит). */
+export function requiredAbsFromZones(
+  p: Point,
+  restrictions: Restriction[],
+  terrainM: number | null | undefined,
+): { floor: number | null; ceiling: number | null } {
+  let floor: number | null = null;
+  let ceiling: number | null = null;
+  for (const r of restrictions) {
+    // флаг active больше не фильтрует зоны (см. zonesCrossedBy)
+    const hasMin = typeof r.minHeightAGL === 'number' && Number.isFinite(r.minHeightAGL) && r.minHeightAGL > 0;
+    const hasMax = typeof r.maxHeightAGL === 'number' && Number.isFinite(r.maxHeightAGL) && r.maxHeightAGL > 0;
+    if (!hasMin && !hasMax) continue;
+    if (!pointInRestrictionFootprint(p, r)) continue;
+    const terr = typeof terrainM === 'number' && Number.isFinite(terrainM) ? terrainM : null;
+    if (hasMin) {
+      const f = (terr ?? 0) + (r.minHeightAGL as number);
+      if (floor === null || f > floor) floor = f;
+    }
+    if (hasMax && terr !== null) {
+      const c = terr + (r.maxHeightAGL as number);
+      if (ceiling === null || c < ceiling) ceiling = c;
+    }
+  }
+  return { floor, ceiling };
+}
+
+/** Быстрая проверка: может ли зона участвовать в вертикальной коррекции */
+export function zoneHasVerticalLimits(r: Restriction): boolean {
+  const minOk = typeof r.minHeightAGL === 'number' && Number.isFinite(r.minHeightAGL) && r.minHeightAGL > 0;
+  const maxOk = typeof r.maxHeightAGL === 'number' && Number.isFinite(r.maxHeightAGL) && r.maxHeightAGL > 0;
+  return minOk || maxOk;
+}
+
+/** Зоны с высотными лимитами, которые ломаная пересекает СВОИМ footprint.
+ *  Для каждой пересечённой точки вызывающий код получает фактический AGL —
+ *  нарушение (полёт ниже пола / выше потолка зоны) корректируется по высоте. */
+export function zonesWithVerticalLimitsCrossedBy(points: Point[], restrictions: Restriction[]): Restriction[] {
+  const active = restrictions.filter(
+    (r) => zoneHasVerticalLimits(r) &&
+      (r.type === 'circle' ? r.points.length >= 1 && !!r.radius : r.points.length >= 2)
+  );
+  if (active.length === 0 || points.length < 2) return [];
+  const hitIds = new Set<string>();
+  for (let i = 0; i < points.length - 1; i++) {
+    for (const r of active) {
+      if (hitIds.has(r.id)) continue;
+      if (segmentHitsZone(points[i], points[i + 1], r)) hitIds.add(r.id);
+    }
+  }
+  return active.filter((r) => hitIds.has(r.id));
+}
+
+/** True, если точка лежит внутри footprint зоны (без учёта буфера/активности) */
+export function pointInRestrictionFootprint(p: Point, r: Restriction): boolean {
+  if (r.type === 'circle') return r.points.length >= 1 && !!r.radius && isPointInZone(p, r);
+  if (r.type === 'rectangle') return r.points.length >= 2 && isPointInZone(p, r);
+  return r.points.length >= 3 && isPointInZone(p, r);
 }
 
 /** Суммарная длина ломаной в метрах (WGS-84) */
@@ -195,7 +271,7 @@ interface Obstacle { type: 'rectangle' | 'circle' | 'polygon'; box: { minX: numb
 function buildObstacles(restrictions: Restriction[], margin: number): Obstacle[] {
   const out: Obstacle[] = [];
   for (const r of restrictions) {
-    if (!r.active) continue;
+    // ВСЕ поставленные зоны — препятствия (флаг active устарел)
     const box = restrictionPixelBox(r);
     if (!box) continue;
     out.push({
@@ -208,17 +284,17 @@ function buildObstacles(restrictions: Restriction[], margin: number): Obstacle[]
   return out;
 }
 
-/** Точка внутри буферной полосы ВДОЛЬ границ зон (сами зоны — проходимы) */
+/** Точка внутри запретной области зоны или её буферной полосы.
+ *  Раньше действовало правило «сами зоны проходимы, запретен только тонкий буфер» —
+ *  из-за этого маршрут мог идти прямо через центр ограничения (обход фактически не
+ *  работал), а прямой путь start→goal формально считался разрешённым. Теперь активные
+ *  зоны — полные запретные диски/фигуры (+margin): планнер обязан их ОБОЙТИ. */
 function blockedPoint(p: Point, obstacles: Obstacle[]): boolean {
   for (const o of obstacles) {
     if (p.x < o.box.minX || p.x > o.box.maxX || p.y < o.box.minY || p.y > o.box.maxY) continue;
     if (!o.r) continue;
-    // «Ограничения работают только внутри себя»: если точка внутри самой зоны —
-    // она НЕ запретная. Маршрут может проходить через зону (с предупреждением).
-    if (isPointInZone(p, o.r)) return false;
-    // запретна только буферная полоса снаружи границы зоны
     if (o.type === 'rectangle') {
-      return true; // bbox с margin без внутренней части = рамка-буфер
+      return true; // bbox с margin целиком
     }
     if (o.type === 'circle' && o.r.points.length >= 1) {
       const c = o.r.points[0];
@@ -226,7 +302,22 @@ function blockedPoint(p: Point, obstacles: Obstacle[]): boolean {
       const dx = p.x - c.x, dy = p.y - c.y;
       if (dx * dx + dy * dy <= rad * rad) return true;
     }
+    // polygon и пр.: внутри фигуры ИЛИ в буферной полосе вдоль рёбер
+    if (isPointInZone(p, o.r)) return true;
     if (o.type === 'polygon' && pointNearPolygonEdges(p, o.r.points, o.margin)) return true;
+  }
+  return false;
+}
+
+/** True, если отрезок задевает запретную область (зону или её буфер) любой из зон */
+function segmentTouchesZones(a: Point, b: Point, obstacles: Obstacle[]): boolean {
+  if (obstacles.length === 0) return false;
+  if (blockedPoint(a, obstacles) || blockedPoint(b, obstacles)) return true;
+  const len = Math.hypot(b.x - a.x, b.y - a.y);
+  const steps = Math.min(256, Math.max(8, Math.ceil(len / 8)));
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    if (blockedPoint({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }, obstacles)) return true;
   }
   return false;
 }
@@ -239,20 +330,43 @@ function isInsideAnyZone(p: Point, obstacles: Obstacle[]): boolean {
   return false;
 }
 
-/** Отрезок запрещён, если хоть где-то попадает в буферную полосу вдоль границ зон */
+/** Отрезок запрещён, если хоть где-то попадает в запретную область зоны или её буфер.
+ *  Быстрая аналитика (circle/rectangle) + сэмплинг только как резерв для полигонов:
+ *  раньше каждый вызов был O(256 точек × зон), из-за чего пакетная перестройка
+ *  маршрутов выполнялась секундами и блокировала поток UI. */
 function segmentBlocked(a: Point, b: Point, obstacles: Obstacle[]): boolean {
   if (obstacles.length === 0) return false;
-  const aIn = isInsideAnyZone(a, obstacles);
-  const bIn = isInsideAnyZone(b, obstacles);
-  if (!aIn && blockedPoint(a, obstacles)) return true;
-  if (!bIn && blockedPoint(b, obstacles)) return true;
-  // семплирование отрезка: попадание в буфер (вне зон) запрещено
-  const len = Math.hypot(b.x - a.x, b.y - a.y);
-  const steps = Math.min(96, Math.max(4, Math.ceil(len / 16)));
-  for (let i = 1; i < steps; i++) {
-    const t = i / steps;
-    const p = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
-    if (!isInsideAnyZone(p, obstacles) && blockedPoint(p, obstacles)) return true;
+  if (blockedPoint(a, obstacles) || blockedPoint(b, obstacles)) return true;
+  for (const o of obstacles) {
+    if (!o.r) continue;
+    // bbox-отсечение отрезка от расширенного бокса зоны
+    if ((a.x < o.box.minX && b.x < o.box.minX) || (a.x > o.box.maxX && b.x > o.box.maxX) ||
+        (a.y < o.box.minY && b.y < o.box.minY) || (a.y > o.box.maxY && b.y > o.box.maxY)) continue;
+    const rad = (o.type === 'circle' && o.r.radius) ? o.r.radius + o.margin : 0;
+    if (o.type === 'circle' && o.r.points.length >= 1 && rad > 0) {
+      const c = o.r.points[0];
+      if (segmentCircleIntersect(a, b, c, rad)) return true;
+      continue;
+    }
+    if (o.type === 'rectangle') {
+      const edges: [Point, Point][] = [
+        [{ x: o.box.minX, y: o.box.minY }, { x: o.box.maxX, y: o.box.minY }],
+        [{ x: o.box.maxX, y: o.box.minY }, { x: o.box.maxX, y: o.box.maxY }],
+        [{ x: o.box.maxX, y: o.box.maxY }, { x: o.box.minX, y: o.box.maxY }],
+        [{ x: o.box.minX, y: o.box.maxY }, { x: o.box.minX, y: o.box.minY }],
+      ];
+      if (edges.some(([e1, e2]) => segmentsIntersect(a, b, e1, e2))) return true;
+      continue;
+    }
+    // polygon: рёбра + margin полоса — через сэмплинг (зоны-полигоны редки)
+    const len = Math.hypot(b.x - a.x, b.y - a.y);
+    const steps = Math.min(128, Math.max(8, Math.ceil(len / 8)));
+    for (let i = 1; i < steps; i++) {
+      const t = i / steps;
+      const p = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+      if (isPointInZone(p, o.r)) return true;
+      if (pointNearPolygonEdges(p, o.r.points, o.margin)) return true;
+    }
   }
   return false;
 }
@@ -274,34 +388,94 @@ function pointToSegmentDist(p: Point, a: Point, b: Point): number {
   return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
 }
 
-/** Граф видимости: узлы = start/goal + углы зон (вынесенные за буфер) */
-function visibilityGraph(start: Point, goal: Point, obstacles: Obstacle[]): { nodes: Point[]; adj: Map<number, Set<number>> } {
+/** Граф видимости: узлы = start/goal + опорные точки ВДОЛЬ границ зон.
+ *  Ключевые свойства корректного обхода:
+ *  • опорные точки ставятся в нескольких радиусах (r+m+4, r+m+12, r+m+28) и по
+ *    32 азимутам — соседние точки одной окружности соединяются короткими
+ *    касательными рёбрами, поэтому «обход по дуге» существует даже когда
+ *    длинная хорда через верх/низ зоны пересекает другие препятствия;
+ *  • для прямоугольников добавляются не только углы, но и середины сторон +
+ *    вынос за угол по диагонали (иначе маршрут упирается в угол без обхода);
+ *  • узлы внутри запретной области отбрасываются;
+ *  • если старт или цель попали внутрь запретной области, граф не строится
+ *    (путь физически невозможен) — вызывающий код уходит на A* по сетке. */
+function visibilityGraph(start: Point, goal: Point, obstacles: Obstacle[]): { nodes: Point[]; adj: Map<number, Set<number>> } | null {
+  if (blockedPoint(start, obstacles) || blockedPoint(goal, obstacles)) return null;
   const nodes: Point[] = [start, goal];
   for (const o of obstacles) {
-    if (o.type === 'polygon' && o.r) {
+    if (o.type === 'circle' && o.r && o.r.points.length >= 1) {
+      const c = o.r.points[0];
+      const base = (o.r.radius || 0) + o.margin;
+      for (const dOff of [4, 12, 28]) {
+        const rad = base + dOff;
+        for (let k = 0; k < 32; k++) {
+          const a = (Math.PI / 16) * k;
+          nodes.push({ x: c.x + Math.cos(a) * rad, y: c.y + Math.sin(a) * rad });
+        }
+      }
+    } else if (o.type === 'polygon' && o.r) {
       const cx = (o.box.minX + o.box.maxX) / 2, cy = (o.box.minY + o.box.maxY) / 2;
       for (const v of o.r.points) {
         const dx = v.x - cx, dy = v.y - cy;
         const l = Math.hypot(dx, dy) || 1;
-        nodes.push({ x: v.x + (dx / l) * (o.margin + 4), y: v.y + (dy / l) * (o.margin + 4) });
+        for (const off of [o.margin + 4, o.margin + 16]) {
+          nodes.push({ x: v.x + (dx / l) * off, y: v.y + (dy / l) * off });
+        }
+      }
+      // середины рёбер (вынесенные наружу) — помогают при вогнутых формах
+      const poly = o.r.points;
+      for (let i = 0; i < poly.length; i++) {
+        const j = (i + 1) % poly.length;
+        const mx = (poly[i].x + poly[j].x) / 2, my = (poly[i].y + poly[j].y) / 2;
+        const nx = my - poly[i].y, ny = -(mx - poly[i].x);
+        const nl = Math.hypot(nx, ny) || 1;
+        const sgn = ((nx * (cx - mx) + ny * (cy - my)) < 0) ? 1 : -1; // наружу от центра
+        const off = o.margin + 6;
+        nodes.push({ x: mx + (sgn * nx / nl) * off, y: my + (sgn * ny / nl) * off });
       }
     } else {
-      nodes.push({ x: o.box.minX, y: o.box.minY }, { x: o.box.maxX, y: o.box.minY });
-      nodes.push({ x: o.box.maxX, y: o.box.maxY }, { x: o.box.minX, y: o.box.maxY });
-    }
-  }
-  const n = nodes.length;
-  const adj = new Map<number, Set<number>>();
-  for (let i = 0; i < n; i++) adj.set(i, new Set());
-  for (let i = 0; i < n; i++) {
-    for (let j = i + 1; j < n; j++) {
-      if (!segmentBlocked(nodes[i], nodes[j], obstacles)) {
-        adj.get(i)!.add(j);
-        adj.get(j)!.add(i);
+      // rectangle: углы с диагональным выносом + середины сторон
+      const { minX, minY, maxX, maxY } = o.box;
+      const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+      const corners: Point[] = [
+        { x: minX, y: minY }, { x: maxX, y: minY }, { x: maxX, y: maxY }, { x: minX, y: maxY },
+      ];
+      for (const v of corners) {
+        const dx = v.x - cx, dy = v.y - cy, l = Math.hypot(dx, dy) || 1;
+        for (const off of [6, 20]) {
+          nodes.push({ x: v.x + (dx / l) * off, y: v.y + (dy / l) * off });
+        }
+      }
+      const mids: Point[] = [
+        { x: cx, y: minY }, { x: maxX, y: cy }, { x: cx, y: maxY }, { x: minX, y: cy },
+      ];
+      for (const v of mids) {
+        const dx = v.x - cx, dy = v.y - cy, l = Math.hypot(dx, dy) || 1;
+        nodes.push({ x: v.x + (dx / l) * (o.margin + 6), y: v.y + (dy / l) * (o.margin + 6) });
       }
     }
   }
-  return { nodes, adj };
+  // Отбрасываем узлы внутри запретной области (пересечение зон и т.п.)
+  const keep = nodes.map((p) => !blockedPoint(p, obstacles));
+  if (!keep[0] || !keep[1]) return null; // старт/цель недостижимы извне
+  const remap = new Map<number, number>();
+  const cleanNodes: Point[] = [];
+  keep.forEach((k, i) => { if (k) { remap.set(i, cleanNodes.length); cleanNodes.push(nodes[i]); } });
+  const n = cleanNodes.length;
+  const adj = new Map<number, Set<number>>();
+  for (let i = 0; i < n; i++) adj.set(i, new Set());
+  for (let i = 0; i < nodes.length; i++) {
+    if (!keep[i]) continue;
+    for (let j = i + 1; j < nodes.length; j++) {
+      if (!keep[j]) continue;
+      if (!segmentBlocked(nodes[i], nodes[j], obstacles)) {
+        const a = remap.get(i)!, b = remap.get(j)!;
+        adj.get(a)!.add(b);
+        adj.get(b)!.add(a);
+      }
+    }
+  }
+  return { nodes: cleanNodes, adj };
 }
 
 function astarGrid(
@@ -418,18 +592,29 @@ export function planPathAroundZones(
   const obstacles = buildObstacles(restrictions, margin);
   if (obstacles.length === 0) return [start, goal];
 
-  // 1) прямая
-  if (!segmentBlocked(start, goal, obstacles)) return [start, goal];
-
-  // 2) граф видимости
-  const vg = visibilityGraph(start, goal, obstacles);
-  const pathVg = dijkstraOnGraph(vg.nodes, vg.adj, 0, 1);
-  if (pathVg) {
-    const pulled = stringPull(pathVg, obstacles);
-    return simplify(pulled);
+  // 2) граф видимости.
+  // ВАЖНО: запретным считается только буфер ВДОЛЬ границ зон (сами зоны проходимы),
+  // поэтому прямая start→goal, пересекающая зону, формально «разрешена» и dijkstra по
+  // полному графу выбирала бы её вместо реального обхода. Чтобы маршрут гарантированно
+  // ОБОГНАЛ активные зоны, строим отдельный граф без прямого ребра start-goal (если оно
+  // заблокировано) — путь в нём обязан идти через внешние точки границ зон.
+  {
+    const vg = visibilityGraph(start, goal, obstacles);
+    const directOk = !segmentBlocked(start, goal, obstacles);
+    if (directOk) return [start, goal]; // зона не задевается — прямой путь оптимален
+    const pathVg = vg ? dijkstraOnGraphNoDirect(vg.nodes, vg.adj) : null;
+    if (pathVg) {
+      let pulled = stringPull(pathVg, obstacles);
+      // Guard: если утончение схлопнуло обход обратно в прямую сквозь зону —
+      // берём сырой путь графа (он идёт по внешним точкам границ зон).
+      if (pulled.length === 2 && segmentBlocked(start, goal, obstacles)) {
+        pulled = pathVg;
+      }
+      return simplify(pulled);
+    }
   }
 
-  // 3) A* по сетке
+  // 3) A* по сетке (граф видимости не помог или старт/цель внутри зоны)
   const minX = Math.min(start.x, goal.x) - mapW * 0.15;
   const maxX = Math.max(start.x, goal.x) + mapW * 0.15;
   const minY = Math.min(start.y, goal.y) - mapH * 0.15;
@@ -439,6 +624,32 @@ export function planPathAroundZones(
     const grid = astarGrid(start, goal, obstacles, span / cells, { minX, minY, maxX, maxY }, cells * cells);
     if (grid) {
       const pulled = stringPull(grid, obstacles);
+      // финальная страховка: если после утончения путь всё же задевает зону —
+      // возвращаем сырую сетку (она строится только по проходимым клеткам)
+      if (pulled.length >= 2 && !segmentTouchesZones(pulled[0], pulled[pulled.length - 1], obstacles) || true) {
+        let bad = false;
+        for (let i = 0; i + 1 < pulled.length; i++) {
+          if (segmentTouchesZones(pulled[i], pulled[i + 1], obstacles)) { bad = true; break; }
+        }
+        return simplify(bad ? grid : pulled);
+      }
+      return simplify(pulled);
+    }
+  }
+  // широкая рамка: если локальный бокс перегорожен «стеной» из зон, расширяем
+  // область поиска до всей карты и окрестностей — иначе fallback-прямая
+  // проходит сквозь ограничение.
+  const gMinX = Math.min(minX, -mapW * 0.05), gMaxX = Math.max(maxX, mapW * 1.05);
+  const gMinY = Math.min(minY, -mapH * 0.05), gMaxY = Math.max(maxY, mapH * 1.05);
+  const gSpan = Math.max(gMaxX - gMinX, gMaxY - gMinY);
+  for (const cells of [96, 160]) {
+    const grid = astarGrid(start, goal, obstacles, gSpan / cells, { minX: gMinX, minY: gMinY, maxX: gMaxX, maxY: gMaxY }, cells * cells);
+    if (grid) {
+      let bad = false;
+      for (let i = 0; i + 1 < grid.length; i++) {
+        if (segmentTouchesZones(grid[i], grid[i + 1], obstacles)) { bad = true; break; }
+      }
+      const pulled = bad ? grid : stringPull(grid, obstacles);
       return simplify(pulled);
     }
   }
@@ -470,6 +681,35 @@ function dijkstraOnGraph(nodes: Point[], adj: Map<number, Set<number>>, s: numbe
   return path.reverse();
 }
 
+/** Dijkstra по графу видимости start(0)→goal(1) с запрещённым прямым ребром 0-1.
+ *  Используется, когда прямое соединение старт-финиш пересекает запретный буфер:
+ *  без этого ограничения dijkstra выбирала бы прямое ребро (в нашем определении
+ *  «запретён только буфер вдоль границ зон, сами зоны проходимы») и маршрут не
+ *  огибал бы ограничения. */
+function dijkstraOnGraphNoDirect(nodes: Point[], adj: Map<number, Set<number>>): Point[] | null {
+  const n = nodes.length;
+  const dist = new Float64Array(n).fill(Infinity);
+  const prev = new Int32Array(n).fill(-1);
+  const done = new Uint8Array(n);
+  dist[0] = 0;
+  for (;;) {
+    let u = -1, bd = Infinity;
+    for (let i = 0; i < n; i++) if (!done[i] && dist[i] < bd) { bd = dist[i]; u = i; }
+    if (u === -1 || u === 1) break;
+    done[u] = 1;
+    for (const v of adj.get(u) ?? []) {
+      if ((u === 0 && v === 1) || (u === 1 && v === 0)) continue; // запрещённое прямое ребро
+      const w = Math.hypot(nodes[v].x - nodes[u].x, nodes[v].y - nodes[u].y);
+      if (dist[u] + w < dist[v]) { dist[v] = dist[u] + w; prev[v] = u; }
+    }
+  }
+  if (dist[1] === Infinity) return null;
+  const path: Point[] = [];
+  let cur = 1;
+  while (cur !== -1) { path.push(nodes[cur]); cur = prev[cur]; }
+  return path.reverse();
+}
+
 /** String pulling: жадно убираем промежуточные точки, если прямая между соседними проходимыми свободна */
 function stringPull(path: Point[], obstacles: Obstacle[]): Point[] {
   if (path.length <= 2) return path;
@@ -495,6 +735,16 @@ export function recomputeRoutePixels(route: Route, bounds: MapBounds, mapW: numb
       return { ...p, x: px.x, y: px.y };
     }),
   };
+}
+
+/** Гео -> пиксель растра (точная прямая Mercator-привязка; обратная к pixelToGeoExact).
+ *  Используется режимом «три окна карты» для переноса объектов в виртуальный растр. */
+export function geoToPixelExact(lat: number, lng: number, bounds: MapBounds, mapW: number, mapH: number): Point {
+  const topY = latToMercatorY(bounds.north);
+  const bottomY = latToMercatorY(bounds.south);
+  const fy = Math.max(0, Math.min(1, (latToMercatorY(lat) - topY) / Math.max(1e-12, bottomY - topY)));
+  const fx = Math.max(0, Math.min(1, (lng - bounds.west) / Math.max(1e-12, bounds.east - bounds.west)));
+  return { x: fx * mapW, y: fy * mapH };
 }
 
 export function routePointsToGeo(points: RoutePoint[]): GeoPoint[] {

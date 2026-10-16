@@ -17,6 +17,8 @@ export interface Marker {
   comment: string;
   layer: string;
   createdAt: string;
+  /** Высота ландшафта в точке (м, Open-Elevation), проставляется автоматически */
+  terrainM?: number | null;
 }
 
 export interface Restriction {
@@ -26,7 +28,15 @@ export interface Restriction {
   radius?: number; // For circle
   color: string;
   name: string;
+  /** Устаревшее поле прежних версий: активна ровно одна зона. БОЛЬШЕ НЕ
+   * используется для фильтрации — все зоны участвуют в обходе и отрисовке
+   * (иначе «утверждение» новой зоны молча снимало с карты все прежние).
+   * Поле оставлено для совместимости старых сохранённых проектов. */
   active: boolean;
+  /** Минимальная разрешённая высота полёта над землёй (AGL, м). Маршрут поднимается выше. */
+  minHeightAGL?: number | null;
+  /** Максимальная разрешённая высота полёта над землёй (AGL, м). Маршрут опускается ниже. */
+  maxHeightAGL?: number | null;
 }
 
 export interface Layer {
@@ -82,12 +92,13 @@ export interface Project {
     gridSize: number;
     showCoordinates: boolean;
     theme: 'dark' | 'light';
-    // Стили тайловой подложки (включаются поверх загруженной карты, не заменяя её)
-    tileStyle?: 'scheme' | 'satellite' | 'hybrid';
+    // Стиль тайловой подложки: только стандартная схема OSM (режимы удалены из приложения)
+    tileStyle?: 'scheme';
     tilesEnabled?: boolean;
-    airportsLayer?: boolean;   // слой аэропортов (Overpass/OSM)
-    geozonesLayer?: boolean;   // слой геозон (NoFly Zones)
-    notamLayer?: boolean;      // слой NOTAM-уведомлений
+    /** Автозапрос высот ландшафта (Open-Elevation) для точек маршрутов/маркеров */
+    elevationAuto?: boolean;
+    /** Запас высоты полёта над рельефом, м (для определения АГЛ-высоты маршрута) */
+    altitudeClearanceM?: number;
   };
   googleMaps: {
     apiKey: string;
@@ -128,6 +139,14 @@ export interface RoutePoint {
   x: number; // пиксель карты (пересчитывается при загрузке/изменении bounds)
   y: number;
   auto?: boolean; // точка добавлена автообходом зон (не ключевая)
+  /** Высота ландшафта в точке (м, Open-Elevation), проставляется автоматически */
+  terrainM?: number | null;
+  /** Требуемая высота полёта ABS (над уровнем моря, м): рельеф + запас / лимиты */
+  altitudeAbs?: number | null;
+  /** Ручная регулировка высоты этапа на ЭТОЙ точке маршрута (AGL, м).
+   *  Задаётся перетаскиванием точки вверх/вниз (или вводом числа); определяет
+   *  высоту всего участка до следующей управляющей точки. */
+  altitudeAGL?: number | null;
 }
 
 /** Тип линии маршрута: прямая или кривая (сглаженная сплайн-ломаная) */

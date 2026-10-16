@@ -7,10 +7,9 @@ import {
   downloadFile, importFromCSV, importFromGeoJSON, exportProject, importProject,
 } from '../utils/export';
 import MapsPanel from './MapsPanel';
-import ActionModePanel from './ActionModePanel';
 
 const Sidebar: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'action' | 'points' | 'restrictions' | 'export' | 'google'>('action');
+  const [activeTab, setActiveTab] = useState<'points' | 'restrictions' | 'export' | 'google'>('points');
   const [editingMarker, setEditingMarker] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const [editX, setEditX] = useState('');
@@ -29,6 +28,9 @@ const Sidebar: React.FC = () => {
     deleteMarker,
     deleteRestriction,
     setActiveRestriction,
+    updateRestriction,
+    updateSettings,
+    updateRouteAltitudes,
     addMarker,
     setSearchQuery,
     setFilterType,
@@ -152,12 +154,6 @@ const Sidebar: React.FC = () => {
       {/* Tabs */}
       <div className="flex border-b border-gray-700 flex-wrap">
         <button
-          onClick={() => setActiveTab('action')}
-          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'action' ? 'bg-gray-700 text-orange-400' : 'text-gray-400 hover:text-gray-200'}`}
-        >
-          🎯 Действия
-        </button>
-        <button
           onClick={() => setActiveTab('points')}
           className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'points' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
         >
@@ -185,9 +181,6 @@ const Sidebar: React.FC = () => {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto">
-        {activeTab === 'action' && (
-          <ActionModePanel />
-        )}
         {activeTab === 'points' && (
           <div className="p-2">
             {/* Search & Filter */}
@@ -303,14 +296,16 @@ const Sidebar: React.FC = () => {
                       {' '}{restriction.name}
                     </span>
                     <div className="flex gap-1">
+                      {/* Выбор зоны = выделение для редактирования; ВСЕ зоны —
+                          ограничения на пути маршрутов (флаг active устарел) */}
                       <button
                         onClick={() => setActiveRestriction(
                           restriction.id === activeRestrictionId ? null : restriction.id
                         )}
-                        className={`px-1 text-xs ${restriction.active ? 'text-red-400' : 'text-gray-400 hover:text-white'}`}
-                        title="Активировать"
+                        className="px-1 text-xs text-gray-400 hover:text-white"
+                        title="Выделить зону для редактирования"
                       >
-                        {restriction.active ? '🔴' : '⚪'}
+                        🎯
                       </button>
                       <button
                         onClick={() => deleteRestriction(restriction.id)}
@@ -324,6 +319,33 @@ const Sidebar: React.FC = () => {
                       : `${restriction.points.length} вершин`
                     }
                   </div>
+                  {/* Вертикальные лимиты зоны (AGL, м): маршрут автоматически
+                      поднимается над «полом» и опускается под «потолок» там,
+                      где footprint зоны реально накрывает его путь */}
+                  <div className="flex items-center gap-2 mt-1 text-xs text-gray-400">
+                    <span title="Минимальная разрешённая высота над землёй (AGL, м)">⬆️пол</span>
+                    <input
+                      type="number"
+                      step={10}
+                      value={restriction.minHeightAGL ?? ''}
+                      placeholder="—"
+                      onChange={(e) => updateRestriction(restriction.id, {
+                        minHeightAGL: e.target.value === '' ? null : Number(e.target.value),
+                      })}
+                      className="w-16 bg-gray-800 border border-gray-600 rounded px-1 py-0.5 text-white"
+                    />
+                    <span title="Максимальная разрешённая высота над землёй (AGL, м)">⬇️пот.</span>
+                    <input
+                      type="number"
+                      step={10}
+                      value={restriction.maxHeightAGL ?? ''}
+                      placeholder="—"
+                      onChange={(e) => updateRestriction(restriction.id, {
+                        maxHeightAGL: e.target.value === '' ? null : Number(e.target.value),
+                      })}
+                      className="w-16 bg-gray-800 border border-gray-600 rounded px-1 py-0.5 text-white"
+                    />
+                  </div>
                 </div>
               ))}
             </div>
@@ -332,6 +354,46 @@ const Sidebar: React.FC = () => {
                 Нет ограничений. Используйте инструменты рисования.
               </p>
             )}
+
+            {/* Настройки автовысот (Open-Elevation) */}
+            <div className="mt-3 p-2 rounded bg-gray-700/50 border border-gray-600 space-y-2">
+              <h4 className="text-xs font-medium text-gray-300">Высоты полёта (Open-Elevation)</h4>
+              <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={project.settings.elevationAuto !== false}
+                  onChange={(e) => {
+                    updateSettings({ elevationAuto: e.target.checked });
+                    if (e.target.checked) void updateRouteAltitudes();
+                  }}
+                />
+                Автоопределение высот по рельефу
+              </label>
+              <div className="flex items-center gap-2 text-xs text-gray-300">
+                <span>Запас над рельефом, м:</span>
+                <input
+                  type="number"
+                  min={0}
+                  step={5}
+                  value={project.settings.altitudeClearanceM ?? 50}
+                  onChange={(e) => updateSettings({
+                    altitudeClearanceM: Number.isFinite(Number(e.target.value))
+                      ? Math.max(0, Number(e.target.value)) : 50,
+                  })}
+                  className="w-16 bg-gray-800 border border-gray-600 rounded px-1 py-0.5 text-white"
+                />
+              </div>
+              <button
+                onClick={() => void updateRouteAltitudes()}
+                className="w-full px-2 py-1 bg-cyan-700 hover:bg-cyan-600 text-white rounded text-xs"
+              >
+                🛰 Пересчитать высоты маршрутов
+              </button>
+              <p className="text-[10px] text-gray-500">
+                Высота каждой точки = рельеф + запас; зоны с полом/потолком AGL
+                автоматически корректируют маршрут на своём footprint.
+              </p>
+            </div>
           </div>
         )}
 

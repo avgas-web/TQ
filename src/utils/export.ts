@@ -216,11 +216,10 @@ export function importProject(json: string): Project | null {
       gridSize: num(data.settings?.gridSize, 100),
       showCoordinates: !!(data.settings?.showCoordinates),
       theme: data.settings?.theme === 'light' ? 'light' : 'dark',
-      tileStyle: ['scheme', 'satellite', 'hybrid'].includes(data.settings?.tileStyle) ? data.settings.tileStyle : undefined,
+      // Внешние слои и режимы спутника/гибрида удалены из приложения —
+      // при импорте старых проектов нормализуем к стандартной схеме.
+      tileStyle: 'scheme' as const,
       tilesEnabled: data.settings?.tilesEnabled,
-      airportsLayer: data.settings?.airportsLayer,
-      geozonesLayer: data.settings?.geozonesLayer,
-      notamLayer: data.settings?.notamLayer,
     },
     googleMaps: {
       apiKey: str(data.googleMaps?.apiKey, ''),
