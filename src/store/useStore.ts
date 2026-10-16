@@ -5,7 +5,7 @@ import type { Project, Marker, Restriction, Layer, Tool, ViewState, MapData, Poi
 import { MAX_ROUTES } from '../types';
 import { saveMapToIndexedDB, loadMapFromIndexedDB, deleteMapFromIndexedDB } from '../utils/storage';
 import { geoToPixelFromBounds, calculateBoundsFromCenter, latToMercatorY, mercatorYToLat } from '../utils/googleMaps';
-import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, geoToPixelExact, smoothPolyline, routeLengthM, pointInRestrictionFootprint, requiredAbsFromZones, zoneHasVerticalLimits } from '../utils/routing';
+import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, geoToPixelExact, smoothPolyline, routeLengthM, requiredAbsFromZones } from '../utils/routing';
 import { fetchElevations, computeRouteAltitude } from '../utils/elevation';
 import type { ElevationPoint } from '../utils/elevation';
 import type { RouteShape, RangeLimitMode, ImportPoint, ImportLists } from '../types';
@@ -23,11 +23,6 @@ let altitudeRunId = 0;
 /** Активный AbortController последнего прогона высот — для отмены сетевых
  *  запросов устаревшего прогона при запуске нового. */
 let lastAltitudeController: AbortController | null = null;
-
-/** Есть ли у проекта зон с высотными лимитами (min/max AGL) */
-export function hasVerticalZones(restrictions: Restriction[]): boolean {
-  return restrictions.some((r) => zoneHasVerticalLimits(r));
-}
 
 /** Все зоны участвуют в расчётах независимо от устаревшего флага `active`
  *  (см. комментарий в types/index.ts): раньше «активная» была ровно одна, и
@@ -142,7 +137,7 @@ export function getActiveZonesCached(restrictions: Restriction[]): Restriction[]
 }
 
 /** Отменить отложенную пакетную перестройку (для немедленных действий — autoFixRoute) */
-export function rerouteTimerCleanup() {
+function rerouteTimerCleanup() {
   if (rerouteTimer != null) { clearTimeout(rerouteTimer); rerouteTimer = null; }
 }
 
@@ -372,7 +367,7 @@ interface AppState {
   /** Черновик маршрута мастера (гео-точки + ручные AGL-высоты этапов по
    *  индексу точки); null = черновика нет. Пишется MapCanvas при редактиро-
    *  вании, читается approveTripleStep / setDraftPointAltitude. */
-  routeDraft: { geo: { lat: number; lng: number }[]; agl: Record<number, number> };
+  routeDraft: { geo: { lat: number; lng: number }[]; agl: Record<number, number>; routeId?: string | null };
   /** Утвердить черновик маршрута как маршрут проекта (общий код мастера:
    *  перенос ручных высот этапов, обход зон, пересчёт высот). idToReplace —
    *  существующий маршрут дрона (редактирование), иначе создаётся новый. */
@@ -542,9 +537,11 @@ export const useStore = create<AppState>()(
 
       setDraftPointAltitude: (i, stepM) => {
         // Регулировка высоты ЭТАПА на промежуточной точке ещё не утверждённого
-        // черновика: шаг ±stepM метров AGL. Черновик с >=2 точками сразу
-        // утверждается в проект (мастер так и работает), поэтому высота
-        // применяется к реальному маршруту.
+        // черновика: шаг ±stepM метров AGL. Черновик хранится в routeDraft;
+        // если он уже перенесён в проект — высота применяется к маршруту с
+        // ТОЧНОЙ привязкой по id (routeId из мастера), без эвристики «первый
+        // маршрут с таким же набором координат» (могла применить высоту к
+        // чужому маршруту роя с идентичными точками).
         const st = get();
         const draft = st.routeDraft;
         if (i < 0 || i >= draft.geo.length) return;
@@ -552,13 +549,10 @@ export const useStore = create<AppState>()(
         const next = Math.max(0, Math.round((cur + stepM) * 10) / 10);
         const agl = { ...draft.agl, [i]: next };
         set({ routeDraft: { ...draft, agl } });
-        // Если черновик уже утверждён (маршрут есть) — применяем высоту к нему
-        const rid = st.activeRouteId && (st.project.routes || []).find((r) => r.id === st.activeRouteId && !r.points.some((p) => p.auto)) ? st.activeRouteId : null;
-        const matchRoute = (st.project.routes || []).find((r) =>
-          r.points.length === draft.geo.length &&
-          r.points.every((p, j) => Math.abs(p.lat - draft.geo[j].lat) < 1e-7 && Math.abs(p.lng - draft.geo[j].lng) < 1e-7));
-        void rid;
-        if (matchRoute) get().setRoutePointAltitude(matchRoute.id, i, next);
+        const rid = draft.routeId;
+        if (rid && (st.project.routes || []).some((r) => r.id === rid)) {
+          get().setRoutePointAltitude(rid, i, next);
+        }
       },
 
       // ─── Маршруты (режим действий) ────────────────────────────────────────
