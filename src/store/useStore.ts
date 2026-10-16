@@ -26,7 +26,17 @@ let lastAltitudeController: AbortController | null = null;
 
 /** Есть ли у проекта зон с высотными лимитами (min/max AGL) */
 export function hasVerticalZones(restrictions: Restriction[]): boolean {
-  return restrictions.some((r) => r.active && zoneHasVerticalLimits(r));
+  return restrictions.some((r) => zoneHasVerticalLimits(r));
+}
+
+/** Все зоны участвуют в расчётах независимо от устаревшего флага `active`
+ *  (см. комментарий в types/index.ts): раньше «активная» была ровно одна, и
+ *  добавление/утверждение новой зоны молча снимало с расчёта все прежние —
+ *  «при утверждении маршрута пропадают ограничения». */
+function drawableZones(restrictions: Restriction[]): Restriction[] {
+  return restrictions.filter(
+    (r) => r.type === 'circle' ? r.points.length >= 1 && !!r.radius : r.points.length >= 2,
+  );
 }
 
 /**
@@ -47,8 +57,15 @@ function applyVerticalLimits(pts: RoutePoint[], restrictions: Restriction[], cle
   let conflictRaised = 0;
   for (const p of pts) {
     const terr = typeof p.terrainM === 'number' && Number.isFinite(p.terrainM) ? p.terrainM : null;
-    // базовое требование: не ниже рельефа + запас
-    let need: number | null = terr !== null ? terr + clearance : null;
+    // Ручная регулировка высоты этапа (AGL на промежуточной точке): если
+    // пользователь задал altitudeAGL, базовая требуемая ABS считается от неё
+    // (рельеф под точкой + AGL); лимиты зон при этом остаются жёсткими.
+    const manualAgl = typeof p.altitudeAGL === 'number' && Number.isFinite(p.altitudeAGL) && p.altitudeAGL >= 0
+      ? p.altitudeAGL : null;
+    // базовое требование: не ниже рельефа + запас (или ручной AGL поверх рельефа)
+    let need: number | null = manualAgl !== null
+      ? (terr !== null ? terr + manualAgl : manualAgl)
+      : (terr !== null ? terr + clearance : null);
     const { floor, ceiling } = requiredAbsFromZones({ x: p.x, y: p.y }, restrictions, terr);
     if (floor !== null) need = need === null ? floor : Math.max(need, floor);
     if (ceiling !== null) {
@@ -117,12 +134,16 @@ export function getActiveZonesCached(restrictions: Restriction[]): Restriction[]
   if (zoneCacheKey && zoneCacheKey.ver === zonesVersion && zoneCacheKey.n === restrictions.length) {
     return zoneCacheList!;
   }
-  const list = restrictions.filter(
-    (r) => r.active && (r.type === 'circle' ? r.points.length >= 1 && !!r.radius : r.points.length >= 2)
-  );
+  // ВСЕ зоны с корректной геометрией (флаг active больше не фильтрует — см. drawableZones)
+  const list = drawableZones(restrictions);
   zoneCacheKey = { ver: zonesVersion, n: restrictions.length };
   zoneCacheList = list;
   return list;
+}
+
+/** Отменить отложенную пакетную перестройку (для немедленных действий — autoFixRoute) */
+export function rerouteTimerCleanup() {
+  if (rerouteTimer != null) { clearTimeout(rerouteTimer); rerouteTimer = null; }
 }
 
 /**
@@ -130,7 +151,7 @@ export function getActiveZonesCached(restrictions: Restriction[]): Restriction[]
  * повторные вызовы в пределах троттл-окна схлопываются в один прогон.
  */
 export function scheduleRerouteAll() {
-  if (rerouteTimer != null) clearTimeout(rerouteTimer);
+  rerouteTimerCleanup();
   rerouteTimer = window.setTimeout(() => {
     rerouteTimer = null;
     // Защита от самоподдерживающегося каскада: пакетная перестройка делает set()
@@ -339,6 +360,27 @@ interface AppState {
   insertRoutePointAt: (id: string, index: number, p: Point) => void;
   moveRoutePoint: (id: string, index: number, p: Point) => void;
   removeRoutePoint: (id: string, index: number) => void;
+  /** Ручная регулировка высоты этапа: AGL-высота задаётся на промежуточной
+   *  (управляющей) точке маршрута и определяет высоту участка до следующей
+   *  точки. Требуемая ABS = рельеф под точкой + AGL (или просто AGL, если
+   *  рельеф ещё не определён). */
+  setRoutePointAltitude: (id: string, index: number, aglM: number | null) => void;
+  /** Ручная высота этапа на ЧЕРНОВИКЕ маршрута (до «Утвердить»): шаг AGL ±stepM
+   *  на i-й точке черновика. При задании высоты черновик автоматически
+   *  утверждается как маршрут проекта (если точек >= 2). */
+  setDraftPointAltitude: (i: number, stepM: number) => void;
+  /** Черновик маршрута мастера (гео-точки + ручные AGL-высоты этапов по
+   *  индексу точки); null = черновика нет. Пишется MapCanvas при редактиро-
+   *  вании, читается approveTripleStep / setDraftPointAltitude. */
+  routeDraft: { geo: { lat: number; lng: number }[]; agl: Record<number, number> };
+  /** Утвердить черновик маршрута как маршрут проекта (общий код мастера:
+   *  перенос ручных высот этапов, обход зон, пересчёт высот). idToReplace —
+   *  существующий маршрут дрона (редактирование), иначе создаётся новый. */
+  commitRouteDraft: (opts: { idToReplace?: string | null; name?: string; color?: string }) => string | null;
+  /** Кнопка «Автокоррекция маршрута»: немедленный обход всех ограничений
+   *  (геометрия — planPathAroundZones по всем зонам + вертикальные лимиты).
+   *  id omitted/null — все маршруты. */
+  autoFixRoute: (id?: string | null) => void;
   rerouteAroundZones: (id: string) => void; // перестроить обход зон для всего маршрута
   /** Определение высот полёта по рельефу (Open-Elevation) + автокоррекция
    *  вертикальных ограничений. routeId — один маршрут; undefined/'' — все. */
@@ -461,6 +503,63 @@ export const useStore = create<AppState>()(
       activeRouteId: null,
       routeWarnings: {},
       redoDrawingStack: [],
+      routeDraft: { geo: [], agl: {} },
+
+      commitRouteDraft: ({ idToReplace, name, color }) => {
+        // Общий код мастера этапов: зафиксировать черновик маршрута как маршрут
+        // проекта. Ручные высоты этапов (agl по индексу точки) переносятся в
+        // altitudeAGL соответствующих RoutePoint; затем — немедленный обход
+        // ограничений и пересчёт высот (terrain + запас / полом-потолок зон).
+        const st = get();
+        const map = st.project.map;
+        const draft = st.routeDraft;
+        if (!map?.bounds || map.width <= 0 || map.height <= 0) return null;
+        if (draft.geo.length < 2) return null;
+        const pts: RoutePoint[] = draft.geo.map((g, i) => ({
+          ...pixelToGeoExactToPixel(g, map.bounds!, map.width, map.height),
+          lat: g.lat, lng: g.lng,
+          altitudeAGL: draft.agl[i] !== undefined ? draft.agl[i] : null,
+        }));
+        let targetId = idToReplace ?? null;
+        if (targetId && !(st.project.routes || []).some((r) => r.id === targetId)) targetId = null;
+        if (targetId) {
+          set((cur) => ({
+            project: {
+              ...cur.project,
+              routes: (cur.project.routes || []).map((r) => (r.id === targetId ? { ...r, points: pts } : r)),
+              updatedAt: new Date().toISOString(),
+            },
+          }));
+        } else {
+          const created = st.addRoute(pts, name, color);
+          if (!created) return null;
+          targetId = created;
+        }
+        // Автокоррекция: обход всех ограничений + определение высот по рельефу
+        get().autoFixRoute(targetId);
+        return targetId;
+      },
+
+      setDraftPointAltitude: (i, stepM) => {
+        // Регулировка высоты ЭТАПА на промежуточной точке ещё не утверждённого
+        // черновика: шаг ±stepM метров AGL. Черновик с >=2 точками сразу
+        // утверждается в проект (мастер так и работает), поэтому высота
+        // применяется к реальному маршруту.
+        const st = get();
+        const draft = st.routeDraft;
+        if (i < 0 || i >= draft.geo.length) return;
+        const cur = draft.agl[i] ?? (st.project.settings.altitudeClearanceM ?? 50);
+        const next = Math.max(0, Math.round((cur + stepM) * 10) / 10);
+        const agl = { ...draft.agl, [i]: next };
+        set({ routeDraft: { ...draft, agl } });
+        // Если черновик уже утверждён (маршрут есть) — применяем высоту к нему
+        const rid = st.activeRouteId && (st.project.routes || []).find((r) => r.id === st.activeRouteId && !r.points.some((p) => p.auto)) ? st.activeRouteId : null;
+        const matchRoute = (st.project.routes || []).find((r) =>
+          r.points.length === draft.geo.length &&
+          r.points.every((p, j) => Math.abs(p.lat - draft.geo[j].lat) < 1e-7 && Math.abs(p.lng - draft.geo[j].lng) < 1e-7));
+        void rid;
+        if (matchRoute) get().setRoutePointAltitude(matchRoute.id, i, next);
+      },
 
       // ─── Маршруты (режим действий) ────────────────────────────────────────
 
@@ -618,6 +717,48 @@ export const useStore = create<AppState>()(
         const still = get().project.routes?.find((r) => r.id === id);
         if (still) get().rerouteAroundZones(id);
         else set({ activeRouteId: null });
+      },
+
+      setRoutePointAltitude: (id, index, aglM) => {
+        // Ручная регулировка высоты этапа на промежуточной точке маршрута.
+        // Значение AGL сохраняется в точку; требуемая ABS пересчитывается
+        // applyVerticalLimits (terrain + AGL, с учётом полом/потолком зон).
+        set((cur) => ({
+          project: {
+            ...cur.project,
+            routes: (cur.project.routes || []).map((r) => {
+              if (r.id !== id) return r;
+              const pts = r.points.map((pt, i) =>
+                i === index
+                  ? {
+                      ...pt,
+                      altitudeAGL: aglM === null || !Number.isFinite(aglM) ? null : Math.max(0, aglM),
+                    }
+                  : pt
+              );
+              return { ...r, points: pts };
+            }),
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+        // Пересчёт высот по новой конфигурации (кэш Open-Elevation делает
+        // повторный прогон дешёвым; при недоступном API terrainM остаётся
+        // прежним и коррекция выполняется локально).
+        void get().updateRouteAltitudes(id);
+      },
+
+      autoFixRoute: (id) => {
+        // Кнопка «Автокоррекция маршрута»: немедленный обход ВСЕХ ограничений
+        // без ожидания троттлинга подписчика.
+        rerouteTimerCleanup();
+        rerouteChainCount = 0;
+        if (id) {
+          get().rerouteAroundZones(id);
+          void get().updateRouteAltitudes(id);
+        } else {
+          rerouteAllRoutesNow();
+          void get().updateRouteAltitudes();
+        }
       },
 
       rerouteAroundZones: (id) => {

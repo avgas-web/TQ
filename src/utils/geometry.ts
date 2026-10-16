@@ -58,8 +58,16 @@ export function isPointInRestriction(point: Point, restriction: Restriction): bo
 /**
  * Проверка, находится ли точка внутри активного ограничения
  */
+/** Зоны с корректной геометрией (без фильтра по устаревшему флагу active) */
+function drawableRestrictions(restrictions: Restriction[]): Restriction[] {
+  return restrictions.filter(
+    (r) => r.type === 'circle' ? r.points.length >= 1 && !!r.radius : r.points.length >= 2,
+  );
+}
+
 export function isPointInActiveRestriction(point: Point, restrictions: Restriction[]): boolean {
-  const activeRestrictions = restrictions.filter(r => r.active);
+  // флаг `active` у зон устарел (см. types/Restriction): все поставленные зоны — ограничения
+  const activeRestrictions = drawableRestrictions(restrictions);
   if (activeRestrictions.length === 0) return true; // Нет активных ограничений
   return activeRestrictions.every(r => isPointInRestriction(point, r));
 }
