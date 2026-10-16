@@ -6,7 +6,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsc tests/mission.test.ts src/utils/mission.ts src/utils/droneSim.ts --outDir .tmp-tests --module commonjs --target es2020 --moduleResolution node --esModuleInterop --skipLibCheck --strict && printf '{\"type\":\"commonjs\"}' > .tmp-tests/package.json && node .tmp-tests/tests/mission.test.js"
   },
   "dependencies": {
     "react": "^18.2.0",

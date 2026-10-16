@@ -89,6 +89,8 @@ interface LogRecord {
 }
 
 const DEFAULT_TIMEOUT_MS = 5000;
+/** Допустимые форматы канала связи: udp://host:port, tcp://host:port, serial://dev, host:port. */
+const CONNECTION_STRING_RE = /^(?:[\w.-]+@)?(?:(?:udp|tcp|serial|ws|wss):\/\/[\w.:/+-]+|[\w.-]+:\d+)$/;
 const RETRY_BASE_DELAY_MS = 100;
 const MIN_SATS = 6;
 const MIN_BATTERY_ARM_PCT = 50;
@@ -122,6 +124,7 @@ export class DroneSim {
   private log: LogRecord[] = [];
   private connectionUp = true;
   private lockChain: Promise<unknown> = Promise.resolve();
+  private heldBy = 0;
 
   constructor(droneId: string, start: Partial<Telemetry> = {}) {
     this.droneId = droneId;
@@ -172,6 +175,18 @@ export class DroneSim {
     return run;
   }
 
+  /** Реентерабельная секция: если замок уже удерживается текущей цепочкой — выполняется сразу. */
+  private async withLockReentrant<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.heldBy > 0) {
+      this.heldBy++;
+      try { return await fn(); } finally { this.heldBy--; }
+    }
+    return this.withLock(async () => {
+      this.heldBy++;
+      try { return await fn(); } finally { this.heldBy--; }
+    });
+  }
+
   /** Выполняет команду с таймаутом и повторными попытками (эксп. задержка). */
   private async withRetry<T>(label: string, fn: () => Promise<T>, timeoutMs = DEFAULT_TIMEOUT_MS, retries = 2): Promise<T> {
     let attempt = 0;
@@ -205,7 +220,7 @@ export class DroneSim {
    *   причин в поле checks.
    */
   async preflightCheck(): Promise<PreflightResult> {
-    return this.withLock(async () => {
+    return this.withLockReentrant(async () => {
       this.requireConnection();
       const checks: Record<string, string> = {};
       if (this.state.sats < MIN_SATS) checks.gps = `GPS fix слабый: ${this.state.sats} спутников (мин. ${MIN_SATS})`;
@@ -221,8 +236,8 @@ export class DroneSim {
 
   /** Вооружение моторов с проверками безопасности (arm). */
   async arm(): Promise<void> {
-    return this.withLock(() =>
-      this.withRetry('arm', async () => {
+    return this.withLockReentrant(async () => {
+      await this.withRetry('arm', async () => {
         this.requireConnection();
         if (this.state.armed) throw new ValidationError('Дрон уже вооружён');
         if (this.state.airborne) throw new ValidationError('Нельзя вооружить дрон в воздухе повторно');
@@ -230,13 +245,13 @@ export class DroneSim {
         if (!pf.ok) throw new HardwareError(`Preflight не пройден: ${Object.values(pf.checks).filter((v) => v !== 'ok').join('; ')}`);
         this.state.armed = true;
         this.pushLog('INFO', 'Моторы вооружены');
-      }),
-    );
+      });
+    });
   }
 
   /** Сброс вооружения; в воздухе disarm запрещён (disarm). */
   async disarm(): Promise<void> {
-    return this.withLock(() =>
+    return this.withLockReentrant(() =>
       this.withRetry('disarm', async () => {
         this.requireConnection();
         if (!this.state.armed) throw new ValidationError('Дрон не вооружён');
@@ -253,7 +268,7 @@ export class DroneSim {
     if (altitudeM <= 0 || altitudeM > MAX_ALTITUDE_M) {
       throw new ValidationError(`Высота взлёта вне диапазона [0..${MAX_ALTITUDE_M}]: ${altitudeM}`);
     }
-    return this.withLock(() =>
+    return this.withLockReentrant(() =>
       this.withRetry('takeoff', async () => {
         this.requireConnection();
         if (!this.state.armed) throw new HardwareError('Вооружите моторы перед взлётом');
@@ -647,7 +662,8 @@ export class FleetManager {
 
   registerDrone(droneId: string, connectionString: string, capabilities: string[]): void {
     if (!droneId.trim()) throw new ValidationError('drone_id пуст');
-    if (!/^[\w.-]+@[\w.-]+(:\d+)?$/.test(connectionString)) throw new ValidationError(`Некорректный connection_string: ${connectionString}`);
+    // Формат: [имя@]udp://host[:порт] | tcp://host:порт | serial://устройство | host:порт
+    if (!CONNECTION_STRING_RE.test(connectionString.trim())) throw new ValidationError(`Некорректный connection_string: ${connectionString}`);
     if (!capabilities.length) throw new ValidationError('capabilities пусты');
     this.drones.set(droneId, { droneId, connectionString, capabilities });
   }
