@@ -7,9 +7,10 @@ import {
   downloadFile, importFromCSV, importFromGeoJSON, exportProject, importProject,
 } from '../utils/export';
 import MapsPanel from './MapsPanel';
+import MissionPanel from './MissionPanel';
 
 const Sidebar: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'points' | 'restrictions' | 'export' | 'google'>('points');
+  const [activeTab, setActiveTab] = useState<'points' | 'restrictions' | 'export' | 'google' | 'mission'>('points');
   const [editingMarker, setEditingMarker] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const [editX, setEditX] = useState('');
@@ -170,6 +171,12 @@ const Sidebar: React.FC = () => {
           className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'google' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
         >
           🗺️ Карты
+        </button>
+        <button
+          onClick={() => setActiveTab('mission')}
+          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'mission' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
+        >
+          🎯 Миссия
         </button>
         <button
           onClick={() => setActiveTab('export')}
@@ -400,6 +407,8 @@ const Sidebar: React.FC = () => {
         {activeTab === 'google' && (
           <MapsPanel />
         )}
+
+        {activeTab === 'mission' && <MissionPanel />}
 
         {activeTab === 'export' && (
           <div className="p-3 space-y-3">
