@@ -188,6 +188,29 @@ export async function loadMapFromIndexedDB(mapId: string): Promise<string | null
 }
 
 /**
+ * Полная очистка хранилища карт (используется кнопкой «Сброс»).
+ * @returns true, если база успешно очищена.
+ */
+export async function clearAllStoredMaps(): Promise<boolean> {
+  try {
+    const db = await initMapDatabase();
+    return new Promise((resolve) => {
+      const transaction = db.transaction([MAP_STORE_NAME], 'readwrite');
+      const store = transaction.objectStore(MAP_STORE_NAME);
+      const request = store.clear();
+      request.onsuccess = () => resolve(true);
+      request.onerror = () => {
+        console.error('Ошибка очистки хранилища карт');
+        resolve(false);
+      };
+    });
+  } catch (error) {
+    console.error('Ошибка очистки IndexedDB:', error);
+    return false;
+  }
+}
+
+/**
  * Удаление карты из IndexedDB
  */
 export async function deleteMapFromIndexedDB(mapId: string): Promise<boolean> {

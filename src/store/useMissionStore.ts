@@ -164,6 +164,8 @@ export interface MissionActions {
    *  только когда всех операций больше нет. */
   beginProcessing: () => void;
   endProcessing: () => void;
+  /** Отменить незавершённый фоновый прогон пересчёта высот (полный сброс). */
+  cancelAltitudeRun: () => void;
 }
 
 interface ImportInput { label: string; lat: number; lng: number; placeName?: string }
@@ -1080,6 +1082,14 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
     // ─── Множественные точки старта/цели + автопрокладка (рабочий процесс ТЗ) ──
 
     addStartPointAt: (geo) => {
+      // Дедупликация по координате: вызывающий код уже проверяет «близкую»
+      // точку, но проверка асинхронна относительно состояния — при быстрых
+      // кликах дубликаты всё же возможны. Дубликат даёт лишнюю пару в
+      // autoPlanRoutes → лишний маршрут из той же точки («разъезжающиеся»
+      // точки). Возвращаем id существующей точки вместо создания новой.
+      const lists0 = get().importLists;
+      const dup = lists0?.starts.find((p) => Math.hypot(p.lat - geo.lat, p.lng - geo.lng) < 1e-7);
+      if (dup && get().startPointIds.includes(dup.id)) return dup.id;
       const n = get().startPointIds.length + 1;
       const id = actions.addStartPoint({ lat: geo.lat, lng: geo.lng, label: `СТАРТ ${n}` });
       set((cur) => ({ startPointIds: [...cur.startPointIds, id], sharedStartId: cur.sharedStartId ?? id }));
@@ -1088,6 +1098,9 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
     },
 
     addGoalPointAt: (geo) => {
+      const lists0 = get().importLists;
+      const dup = lists0?.goals.find((p) => Math.hypot(p.lat - geo.lat, p.lng - geo.lng) < 1e-7);
+      if (dup && get().goalPointIds.includes(dup.id)) return dup.id;
       const n = get().goalPointIds.length + 1;
       const id = actions.addGoalPoint({ lat: geo.lat, lng: geo.lng, label: `ЦЕЛЬ ${n}` });
       set((cur) => ({ goalPointIds: [...cur.goalPointIds, id], sharedGoalId: cur.sharedGoalId ?? id }));
@@ -1149,13 +1162,20 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
       const freeGoals = goals.filter((g) => !boundPointIds.has(g.id));
       const pairs = Math.min(freeStarts.length, freeGoals.length);
       let created = 0;
+      // Пиксели узлов считаем СРАЗУ из актуального растра. Если оставить
+      // x:0,y:0 в надежде на пересчёт внутри reroute — при отсутствии зон
+      // прокладка не трогает координаты, и узлы «уходят в угол карты» (0,0).
+      const mapG = useMapStore.getState().map;
+      const canProject = !!mapG?.bounds && mapG.width > 0 && mapG.height > 0;
       for (let i = 0; i < pairs && cur.routes.length + created < MAX_ROUTES; i++) {
         const s = freeStarts[i];
         const g = freeGoals[i];
+        const sPx = canProject ? geoToPixelExact(s.lat, s.lng, mapG!.bounds!, mapG!.width, mapG!.height) : { x: 0, y: 0 };
+        const gPx = canProject ? geoToPixelExact(g.lat, g.lng, mapG!.bounds!, mapG!.width, mapG!.height) : { x: 0, y: 0 };
         const rid = actions.addRoute(
           [
-            { lat: s.lat, lng: s.lng, x: 0, y: 0, binding: { kind: 'start', pointId: s.id } },
-            { lat: g.lat, lng: g.lng, x: 0, y: 0, binding: { kind: 'goal', pointId: g.id } },
+            { lat: s.lat, lng: s.lng, x: sPx.x, y: sPx.y, binding: { kind: 'start', pointId: s.id } },
+            { lat: g.lat, lng: g.lng, x: gPx.x, y: gPx.y, binding: { kind: 'goal', pointId: g.id } },
           ],
           `${s.label} → ${g.label}`,
         );
@@ -1191,6 +1211,14 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
 
     beginProcessing: () => set((s) => (s.isProcessing ? {} : { isProcessing: true })),
     endProcessing: () => set((s) => (s.isProcessing ? { isProcessing: false } : {})),
+
+    /** Отменить незавершённый фоновый прогон высот (используется полным
+     *  сбросом проекта, чтобы отменённый прогон не дописал данные в стор). */
+    cancelAltitudeRun: () => {
+      altitudeRunId++; // все ожидающие continue-проверки runId станут устаревшими
+      try { lastAltitudeController?.abort(); } catch { /* noop */ }
+      lastAltitudeController = null;
+    },
   };
   Object.assign(target, targetActions);
   return actions;

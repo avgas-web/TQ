@@ -14,6 +14,7 @@ import type { Project, Tool, ViewState, Point } from '../types';
 import { useMapStore, invalidateZoneCache as invalidateZoneCacheLocal, selectViewForRender as selectMapView } from './useMapStore';
 import { useMissionStore, rerouteAllNow } from './useMissionStore';
 import { useFleetStore } from './useFleetStore';
+import { clearAllStoredMaps } from '../utils/storage';
 
 // Реэкспорт публичных утилит старого модуля — компоненты/тесты импортируют их из './useStore'
 export { getActiveZonesCached, invalidateZoneCache, normalizeViewState, selectViewForRender } from './useMapStore';
@@ -327,6 +328,11 @@ shimActions.importProject = (project: Project) => {
 };
 
 shimActions.resetProject = () => {
+  // Сброс — аварийная кнопка: он работает ВСЕГДА, даже если идёт тяжёлая
+  // операция (пересчёт высот / загрузка миссии). Снимаем флаг и отменяем
+  // фоновые прогоны высот, чтобы они не дописали данные после очистки.
+  useMissionStore.setState({ isProcessing: false });
+  try { useMissionStore.getState().cancelAltitudeRun(); } catch { /* noop */ }
   invalidateZoneCacheLocal();
   projectNameRef.value = 'Новый проект';
   projectNameRef.createdAt = new Date().toISOString();
@@ -348,12 +354,18 @@ shimActions.resetProject = () => {
     drawingPoints: [],
     redoDrawingStack: [],
     measurementPoints: [],
+    // Сброс должен сбрасывать ВСЁ — включая ссылку на растр карты в
+    // IndexedDB: иначе после перезагрузки автовосстановление возвращает
+    // старую карту («карта не сбросилась»).
+    _currentMapId: undefined,
   });
   useMissionStore.getState().resetMissions();
   // Полный сброс: парк дронов (назначения, регистрация, индивидуальные
   // старты/цели) тоже очищается — иначе после «Сброса» остаются привязки
   // к удалённым маршрутам и точкам.
   useFleetStore.getState().resetFleet();
+  // Удаляем изображения карт из IndexedDB (несинхронно, best-effort).
+  void clearAllStoredMaps();
 };
 
 /** Сброс троттлера + немедленная пакетная перестройка (прежний внутренний хук). */

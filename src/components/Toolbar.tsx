@@ -129,12 +129,12 @@ const Toolbar: React.FC = () => {
       {/* Reset */}
       <button
         onClick={() => {
-          if (confirm('Сбросить проект? Все данные будут потеряны.')) {
+          if (confirm('Сбросить проект? Будут удалены ВСЕ данные: карта, точки старта/цели, все маршруты, бесполётные зоны, парк дронов и настройки.')) {
             resetProject();
           }
         }}
         className="px-3 py-2 bg-red-700 hover:bg-red-800 text-white rounded text-sm font-medium transition-colors"
-        title="Новый проект"
+        title="Полный сброс: карта, точки, маршруты, ограничения, дроны"
       >
         🔄 Сброс
       </button>
