@@ -69,7 +69,22 @@ export interface MissionState {
   sharedStartId: string | null;
   /** ID общей точки цели из importLists.goals. */
   sharedGoalId: string | null;
+  /** Тип воздушного судна (шаг 1 мастера): 'drone' — дрон до 100 км,
+   *  'uav' — БПЛА до 100 000 км. Влияет на лимиты валидации маршрутов. */
+  craftType: CraftType;
+  /** Множественные общие точки старта/цели (по id из importLists). */
+  startPointIds: string[];
+  goalPointIds: string[];
 }
+
+/** Тип ВС: дрон (короткие дистанции) или дальнобойный БПЛА. */
+export type CraftType = 'drone' | 'uav';
+
+/** Максимальная дальность миссии по типу ВС, м (ТЗ: дрон ≤100 км, БПЛА ≤100 000 км). */
+export const CRAFT_MAX_RANGE_M: Record<CraftType, number> = {
+  drone: 100_000,
+  uav: 100_000_000,
+};
 
 export interface MissionActions {
   addRoute: (points: RoutePoint[], name?: string, color?: string) => string | null;
@@ -129,6 +144,18 @@ export interface MissionActions {
   setSharedStartPoint: (geo: { lat: number; lng: number } | null) => void;
   /** Установка общей точки цели (аналогично, sharedGoalId / importLists.goals). */
   setSharedGoalPoint: (geo: { lat: number; lng: number } | null) => void;
+  /** Добавить точку старта (множественные старты): upsert в importLists.starts,
+   *  id — в startPointIds. При наличии целей автоматически прокладывает маршруты. */
+  addStartPointAt: (geo: { lat: number; lng: number }) => string;
+  /** Добавить точку цели (множественные цели); автопрокладка маршрутов старт→цель. */
+  addGoalPointAt: (geo: { lat: number; lng: number }) => string;
+  /** Удалить точку старта/цели из множественного набора (+каскад маршрутов). */
+  removeStartPoint: (id: string) => void;
+  removeGoalPoint: (id: string) => void;
+  /** Выбор типа ВС (шаг 0 мастера): 'drone' ≤100 км / 'uav' ≤100 000 км. */
+  setCraftType: (t: CraftType) => void;
+  /** Автопрокладка: маршруты старт→цель (пары по индексу) с облётом зон. */
+  autoPlanRoutes: () => number;
   refreshAllRoutesAfterMapChange: () => void;
   clearRouteWarnings: (id: string) => void;
   resetMissions: () => void;
@@ -194,6 +221,11 @@ function rangeLimitWarning(route: Route, pts: RoutePoint[]): string | null {
   }
   if (route.rangeMode === 'min' && len < route.rangeM) {
     return `Дальность ${Math.round(len)} м меньше минимума ${Math.round(route.rangeM)} м`;
+  }
+  // Глобальный лимит по типу ВС (ТЗ: дрон ≤100 км, БПЛА ≤100 000 км) — всегда.
+  const craftCap = CRAFT_MAX_RANGE_M[useMissionStore.getState().craftType];
+  if (len > craftCap) {
+    return `Дальность ${Math.round(len / 1000)} км превышает лимит ${useMissionStore.getState().craftType === 'drone' ? 'дрона' : 'БПЛА'} (${Math.round(craftCap / 1000)} км)`;
   }
   return null;
 }
@@ -309,6 +341,9 @@ const initialMissionState: MissionState = {
   isProcessing: false,
   sharedStartId: null,
   sharedGoalId: null,
+  craftType: 'drone',
+  startPointIds: [],
+  goalPointIds: [],
 };
 
 type SetFn = (partial: Partial<MissionStore> | ((s: MissionStore) => Partial<MissionStore>)) => void;
@@ -1042,6 +1077,79 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
       set({ sharedGoalId: id });
     },
 
+    // ─── Множественные точки старта/цели + автопрокладка (рабочий процесс ТЗ) ──
+
+    addStartPointAt: (geo) => {
+      const n = get().startPointIds.length + 1;
+      const id = actions.addStartPoint({ lat: geo.lat, lng: geo.lng, label: `СТАРТ ${n}` });
+      set((cur) => ({ startPointIds: [...cur.startPointIds, id], sharedStartId: cur.sharedStartId ?? id }));
+      void Promise.resolve().then(() => actions.autoPlanRoutes());
+      return id;
+    },
+
+    addGoalPointAt: (geo) => {
+      const n = get().goalPointIds.length + 1;
+      const id = actions.addGoalPoint({ lat: geo.lat, lng: geo.lng, label: `ЦЕЛЬ ${n}` });
+      set((cur) => ({ goalPointIds: [...cur.goalPointIds, id], sharedGoalId: cur.sharedGoalId ?? id }));
+      void Promise.resolve().then(() => actions.autoPlanRoutes());
+      return id;
+    },
+
+    removeStartPoint: (id) => {
+      set((cur) => ({
+        startPointIds: cur.startPointIds.filter((x) => x !== id),
+        sharedStartId: cur.sharedStartId === id ? null : cur.sharedStartId,
+      }));
+      actions.removeImportPoint('start', id);
+      void Promise.resolve().then(() => actions.autoPlanRoutes());
+    },
+
+    removeGoalPoint: (id) => {
+      set((cur) => ({
+        goalPointIds: cur.goalPointIds.filter((x) => x !== id),
+        sharedGoalId: cur.sharedGoalId === id ? null : cur.sharedGoalId,
+      }));
+      actions.removeImportPoint('goal', id);
+      void Promise.resolve().then(() => actions.autoPlanRoutes());
+    },
+
+    setCraftType: (t) => set({ craftType: t }),
+
+    autoPlanRoutes: () => {
+      const cur = get();
+      const lists = cur.importLists;
+      if (!lists) return 0;
+      const starts = cur.startPointIds.map((id) => lists.starts.find((p) => p.id === id)).filter((p): p is ImportPoint => !!p);
+      const goals = cur.goalPointIds.map((id) => lists.goals.find((p) => p.id === id)).filter((p): p is ImportPoint => !!p);
+      if (starts.length === 0 || goals.length === 0) return 0;
+      // Автопрокладка только для точек без привязанного маршрута; существующие
+      // отредактированные пользователем маршруты не перетираются.
+      const usedRouteIds = new Set<string>();
+      for (const r of cur.routes) for (const p of r.points) if (p.binding?.pointId) usedRouteIds.add(`${p.binding.pointId}|${r.id}`);
+      const freeStarts = starts.filter((s) => !usedRouteIds.has(`${s.id}|`));
+      const freeGoals = goals.filter((g) => !usedRouteIds.has(`${g.id}|`));
+      const pairs = Math.min(freeStarts.length, freeGoals.length);
+      let created = 0;
+      for (let i = 0; i < pairs && cur.routes.length + created < MAX_ROUTES; i++) {
+        const s = freeStarts[i];
+        const g = freeGoals[i];
+        const rid = actions.addRoute(
+          [
+            { lat: s.lat, lng: s.lng, x: 0, y: 0, binding: { kind: 'start', pointId: s.id } },
+            { lat: g.lat, lng: g.lng, x: 0, y: 0, binding: { kind: 'goal', pointId: g.id } },
+          ],
+          `${s.label} → ${g.label}`,
+        );
+        if (rid) created++;
+      }
+      if (created > 0) {
+        // немедленная перестройка с облётом бесполетных зон + валидация дальности
+        actions.flushReroute();
+        void get().updateRouteAltitudes(null);
+      }
+      return created;
+    },
+
     refreshAllRoutesAfterMapChange: () => {
       const map = useMapStore.getState().map;
       if (!map?.bounds) return;
@@ -1059,7 +1167,7 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
 
     resetMissions: () => set({
       routes: [], activeRouteId: null, routeWarnings: {}, routeDraft: { geo: [], agl: {} }, importLists: undefined,
-      sharedStartId: null, sharedGoalId: null,
+      sharedStartId: null, sharedGoalId: null, startPointIds: [], goalPointIds: [],
     }),
 
     beginProcessing: () => set((s) => (s.isProcessing ? {} : { isProcessing: true })),
@@ -1087,6 +1195,9 @@ export const useMissionStore = create<MissionStore>()(
         isProcessing: false,         // тяжёлые операции не переживают перезагрузку
         sharedStartId: s.sharedStartId,
         sharedGoalId: s.sharedGoalId,
+        craftType: s.craftType,
+        startPointIds: s.startPointIds,
+        goalPointIds: s.goalPointIds,
       }) as MissionState,
       migrate: (persistedState: unknown) => {
         const p = persistedState as Partial<MissionState>;
@@ -1096,6 +1207,10 @@ export const useMissionStore = create<MissionStore>()(
         if (p.activeRouteId === undefined) p.activeRouteId = null;
         if (p.sharedStartId === undefined) p.sharedStartId = null;
         if (p.sharedGoalId === undefined) p.sharedGoalId = null;
+        if (p.craftType !== 'drone' && p.craftType !== 'uav') p.craftType = 'drone';
+        // Множественные точки: миграция v1 — одна общая точка → массив id
+        if (!Array.isArray(p.startPointIds)) p.startPointIds = p.sharedStartId ? [p.sharedStartId] : [];
+        if (!Array.isArray(p.goalPointIds)) p.goalPointIds = p.sharedGoalId ? [p.sharedGoalId] : [];
         return p as MissionState;
       },
     },

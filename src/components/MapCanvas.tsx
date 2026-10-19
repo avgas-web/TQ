@@ -554,6 +554,31 @@ const MapCanvas: React.FC = () => {
     if (droneGoalsPersisted.length > 0) setDroneGoals([...droneGoalsPersisted]);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- зеркало при изменении persisted-массива
   }, [droneGoalsPersisted]);
+  // ── Множественные точки старта/цели (store-first) + тип ВС (ТЗ: шаг 0 — выбор типа) ──
+  const craftType = useMissionStore((s) => s.craftType);
+  const setCraftType = useMissionStore((s) => s.setCraftType);
+  const startPointIds = useMissionStore((s) => s.startPointIds);
+  const goalPointIds = useMissionStore((s) => s.goalPointIds);
+  const addStartPointAt = useMissionStore((s) => s.addStartPointAt);
+  const addGoalPointAt = useMissionStore((s) => s.addGoalPointAt);
+  const removeStartPoint = useMissionStore((s) => s.removeStartPoint);
+  const removeGoalPoint = useMissionStore((s) => s.removeGoalPoint);
+  /** UI-зеркала множественных точек (id → гео), гидрируются из importLists стора. */
+  const [multiStarts, setMultiStarts] = useState<{ id: string; lat: number; lng: number }[]>([]);
+  const [multiGoals, setMultiGoals] = useState<{ id: string; lat: number; lng: number }[]>([]);
+  useEffect(() => {
+    const list = (ids: string[], src: { id: string; lat: number; lng: number }[] | undefined) =>
+      ids.map((id) => src?.find((p) => p.id === id)).filter((p): p is { id: string; lat: number; lng: number } => !!p);
+    setMultiStarts(list(startPointIds, importStarts));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- зеркало при изменении набора id
+  }, [startPointIds, importStarts]);
+  useEffect(() => {
+    const list = (ids: string[], src: { id: string; lat: number; lng: number }[] | undefined) =>
+      ids.map((id) => src?.find((p) => p.id === id)).filter((p): p is { id: string; lat: number; lng: number } => !!p);
+    setMultiGoals(list(goalPointIds, importGoals));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- зеркало при изменении набора id
+  }, [goalPointIds, importGoals]);
+
   const [pickWhat, setPickWhat] = useState<'none' | 'start' | 'goal'>('none');
   const pickWhatRef = useRef(pickWhat);
   useEffect(() => { pickWhatRef.current = pickWhat; }, [pickWhat]);
@@ -745,15 +770,19 @@ const MapCanvas: React.FC = () => {
     }
     // Режим «Редактирование маршрута»: точки старта/цели/маршрута — во всех окнах.
     if (panelIdx === 0) {
-      // Индивидуальные старты: клик по окну «Старт» задаёт старт ВЫБРАННОГО дрона
+      const g = { lat: geo.lat, lng: geo.lng };
       if (!sharedStart) {
-        const g = { lat: geo.lat, lng: geo.lng };
+        // Индивидуальные старты: клик по окну «Старт» задаёт старт ВЫБРАННОГО дрона
         setDroneStarts((prev) => { const n = [...prev]; n[activeUavRef.current] = g; return n; });
         setDroneStartAt(activeUavRef.current, g); // store-first: переживает unmount
       } else {
-        const g = { lat: geo.lat, lng: geo.lng };
         setStartGeo(g);
         setSharedStartPoint(g); // upsert 'СТАРТ' в importLists + sharedStartId
+        // Множественные старты (ТЗ): каждая новая точка — отдельный старт роя;
+        // автопрокладка маршрутов старт→цель выполняется в addStartPointAt.
+        if (!startPointIds.some((id) => { const p = importStarts?.find((x) => x.id === id); return !!p && Math.hypot(p.lat - g.lat, p.lng - g.lng) < 1e-7; })) {
+          addStartPointAt(g);
+        }
       }
       reopenStepForEdit(0);
     } else if (panelIdx === 1) {
@@ -780,10 +809,15 @@ const MapCanvas: React.FC = () => {
         const g = { lat: geo.lat, lng: geo.lng };
         setGoalGeo(g);
         setSharedGoalPoint(g); // upsert 'ЦЕЛЬ' в importLists + sharedGoalId
+        // Множественные цели (ТЗ): каждая новая точка — отдельная цель;
+        // при наличии свободных стартов addGoalPointAt прокладывает новый маршрут.
+        if (!goalPointIds.some((id) => { const p = importGoals?.find((x) => x.id === id); return !!p && Math.hypot(p.lat - g.lat, p.lng - g.lng) < 1e-7; })) {
+          addGoalPointAt(g);
+        }
       }
       reopenStepForEdit(2);
     }
-  }, [reopenStepForEdit, sharedStart, sharedGoal, setSharedStartPoint, setSharedGoalPoint, setDroneStartAt, setDroneGoalAt]);
+  }, [reopenStepForEdit, sharedStart, sharedGoal, setSharedStartPoint, setSharedGoalPoint, setDroneStartAt, setDroneGoalAt, startPointIds, goalPointIds, importStarts, importGoals, addStartPointAt, addGoalPointAt]);
 
   const tripleStepRef = useRef(tripleStep);
   useEffect(() => { tripleStepRef.current = tripleStep; }, [tripleStep]);
@@ -810,10 +844,12 @@ const MapCanvas: React.FC = () => {
 
   // ─── Удаление введённых точек/объектов кликом по ✛ на активной карте ───────
   // id форматы: 'triple:start' | 'triple:goal' | 'draft:N' | 'zone:<restrictionId>' |
-  //             'pendingZone:<uid>' | 'drone-goal:<routeId>'
+  //             'pendingZone:<uid>' | 'drone-goal:<routeId>' | 'multiStart:<id>' | 'multiGoal:<id>'
   const handlePanelPointDelete = useCallback((id: string) => {
     if (id === 'triple:start') { setStartGeo(null); setSharedStartPoint(null); return; }
     if (id === 'triple:goal') { setGoalGeo(null); setSharedGoalPoint(null); return; }
+    if (id.startsWith('multiStart:')) { removeStartPoint(id.slice('multiStart:'.length)); return; }
+    if (id.startsWith('multiGoal:')) { removeGoalPoint(id.slice('multiGoal:'.length)); return; }
     if (id.startsWith('pendingZone:')) {
       const uid = Number(id.slice('pendingZone:'.length));
       setPendingZones((prev) => prev.filter((pz) => pz.uid !== uid));
@@ -2382,32 +2418,8 @@ const MapCanvas: React.FC = () => {
       return;
     }
 
-    if (currentTool === 'drawRect') {
-      if (!isDrawing) {
-        addDrawingPoint(mapPoint);
-        setDrawing(true);
-      } else {
-        // Complete rectangle
-        const points = [drawingPoints[0], mapPoint];
-        addRestriction({ type: 'rectangle', points });
-        clearDrawingPoints();
-      }
-      return;
-    }
-
-    if (currentTool === 'drawCircle') {
-      if (!isDrawing) {
-        addDrawingPoint(mapPoint);
-        setDrawing(true);
-      } else {
-        // Complete circle
-        const center = drawingPoints[0];
-        const radius = distanceBetween(center, mapPoint);
-        addRestriction({ type: 'circle', points: [center], radius });
-        clearDrawingPoints();
-      }
-      return;
-    }
+    // drawRect/drawCircle удалены: ограничения — только бесполетные зоны
+    // произвольной геометрии (полигоны). Завершение полигона — двойной клик.
 
     if (currentTool === 'measure') {
       const newPoints = [...measurementPoints, mapPoint];
@@ -2647,6 +2659,11 @@ const MapCanvas: React.FC = () => {
   const pointsOut: MiniOverlayPoint[] = [
     ...(startGeo ? [{ id: 'triple:start', lat: startGeo.lat, lng: startGeo.lng, label: 'СТАРТ', color: '#4ade80' }] : []),
     ...(goalGeo ? [{ id: 'triple:goal', lat: goalGeo.lat, lng: goalGeo.lng, label: sharedGoal ? 'ЦЕЛЬ (общая)' : 'ЦЕЛЬ (выбранная)', color: '#f87171' }] : []),
+    // Множественные старты/цели (ТЗ): все точки набора — с id для удаления кликом.
+    ...multiStarts.filter((p) => !startGeo || Math.hypot(p.lat - startGeo.lat, p.lng - startGeo.lng) > 1e-7)
+      .map((p, i) => ({ id: `multiStart:${p.id}`, lat: p.lat, lng: p.lng, label: `СТАРТ ${i + 2}`, color: '#34d399' })),
+    ...multiGoals.filter((p) => !goalGeo || Math.hypot(p.lat - goalGeo.lat, p.lng - goalGeo.lng) > 1e-7)
+      .map((p, i) => ({ id: `multiGoal:${p.id}`, lat: p.lat, lng: p.lng, label: `ЦЕЛЬ ${i + 2}`, color: '#fb7185' })),
     ...(!sharedGoal ? tripleRoutes.slice(0, droneCount).map((r, i) => {
       const g = r.geo[r.geo.length - 1];
       return g ? { id: `drone-goal:${r.id}`, lat: g.lat, lng: g.lng, label: `Дрон ${i + 1}`, color: uavColors[i % uavColors.length] } : null;
@@ -2863,8 +2880,27 @@ const MapCanvas: React.FC = () => {
               />
             ))}
           </div>
-          {/* Нижняя панель мастера: назад / утвердить / ЗАПУСК */}
+          {/* Нижняя панель мастера: тип ВС / назад / утвердить / ЗАПУСК */}
           <div className="flex items-center gap-2 mt-2 text-xs">
+            {/* Шаг 0 (ТЗ): выбор типа воздушного судна — лимит дальности миссии */}
+            <span className="text-gray-400">Тип ВС:</span>
+            <button
+              className={`px-2 py-1 rounded border font-medium transition-colors ${craftType === 'drone' ? 'bg-emerald-700 border-emerald-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'}`}
+              onClick={() => setCraftType('drone')}
+              disabled={launchState !== 'idle'}
+              title="Дрон: дальность миссии до 100 км"
+            >🛩 Дрон ≤100 км</button>
+            <button
+              className={`px-2 py-1 rounded border font-medium transition-colors ${craftType === 'uav' ? 'bg-indigo-700 border-indigo-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'}`}
+              onClick={() => setCraftType('uav')}
+              disabled={launchState !== 'idle'}
+              title="БПЛА: дальность миссии до 100 000 км"
+            >🛰 БПЛА ≤100 000 км</button>
+            {(multiStarts.length > 1 || multiGoals.length > 1) && (
+              <span className="text-cyan-300" title="Каждая лишняя точка старта/цели порождает отдельный маршрут старт→цель">
+                Старты: {Math.max(1, multiStarts.length)} · Цели: {Math.max(1, multiGoals.length)}
+              </span>
+            )}
             <button
               className="px-3 py-1 rounded bg-gray-800 hover:bg-gray-700 border border-gray-600 text-gray-200 disabled:opacity-40"
               disabled={tripleStep === 0 || launchState !== 'idle'}

@@ -53,9 +53,7 @@ const Toolbar: React.FC = () => {
     { id: 'pan', label: 'Пан', icon: '✋', title: 'Панорамирование (пробел+ЛКМ)' },
     { id: 'select', label: 'Выбор', icon: '👆', title: 'Выбор и перемещение точек' },
     { id: 'addMarker', label: 'Точка', icon: '📍', title: 'Добавить точку' },
-    { id: 'drawRect', label: 'Прям.', icon: '▭', title: 'Нарисовать прямоугольник' },
-    { id: 'drawPolygon', label: 'Полиг.', icon: '⬡', title: 'Нарисовать полигон (двойной клик — завершить)' },
-    { id: 'drawCircle', label: 'Круг', icon: '⭕', title: 'Нарисовать круг' },
+    { id: 'drawPolygon', label: 'NFZ', icon: '⬡', title: 'Бесполетная зона (произвольный полигон; двойной клик — завершить)' },
     { id: 'measure', label: 'Линейка', icon: '📏', title: 'Измерение расстояний' },
   ];
 

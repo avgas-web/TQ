@@ -363,6 +363,7 @@ const BLOCKED_MUTATORS: Array<keyof MisS> = [
   'addRoute', 'deleteRoute', 'appendRoutePoint', 'insertRoutePointAt',
   'removeRoutePoint', 'commitRouteDraft', 'generateScanRoute', 'optimizeRouteOrder',
   'autoFixRoute', 'importRoutes', 'resetMissions', 'setMissionMode',
+  'addStartPointAt', 'addGoalPointAt', 'removeStartPoint', 'removeGoalPoint', 'autoPlanRoutes',
 ];
 /** Синхронные mutate-экшены карты: во время тяжёлой операции тоже блокируются. */
 const BLOCKED_MAP_MUTATORS: Array<keyof MapS> = ['deleteRestriction'];

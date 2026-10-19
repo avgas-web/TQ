@@ -114,7 +114,9 @@ export interface Project {
   };
 }
 
-export type Tool = 'pan' | 'select' | 'addMarker' | 'drawRect' | 'drawPolygon' | 'drawCircle' | 'measure';
+// Ограничения — только бесполетные зоны произвольной геометрии (полигон):
+// инструменты drawRect/drawCircle удалены из рабочего процесса.
+export type Tool = 'pan' | 'select' | 'addMarker' | 'drawPolygon' | 'measure';
 
 export interface ViewState {
   offsetX: number;

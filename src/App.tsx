@@ -120,10 +120,10 @@ const App: React.FC = () => {
       return;
     }
 
-    // Tool shortcuts
-    if (['1', '2', '3', '4', '5', '6', '7'].includes(e.key)) {
+    // Tool shortcuts (без drawRect/drawCircle: ограничения — только NFZ-полигоны)
+    if (['1', '2', '3', '4', '5'].includes(e.key)) {
       e.preventDefault();
-      const tools = ['pan', 'select', 'addMarker', 'drawRect', 'drawPolygon', 'drawCircle', 'measure'] as const;
+      const tools = ['pan', 'select', 'addMarker', 'drawPolygon', 'measure'] as const;
       setTool(tools[Number(e.key) - 1]);
       return;
     }
