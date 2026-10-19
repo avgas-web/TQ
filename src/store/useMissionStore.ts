@@ -60,6 +60,9 @@ export interface MissionState {
    *  индексу точки); пустой = черновика нет. Пишется MapCanvas при
    *  редактировании, читается approveTripleStep / setDraftPointAltitude. */
   routeDraft: { geo: { lat: number; lng: number }[]; agl: Record<number, number>; routeId?: string | null };
+  /** Глобальный флаг «идёт тяжёлая/сетевая операция» (upload миссии, пересчёт
+   *  высот). UI блокирует mutate-кнопки, пока true — защита от гонок состояний. */
+  isProcessing: boolean;
 }
 
 export interface MissionActions {
@@ -101,6 +104,11 @@ export interface MissionActions {
   refreshAllRoutesAfterMapChange: () => void;
   clearRouteWarnings: (id: string) => void;
   resetMissions: () => void;
+  /** Блокировка UI на время сетевой/тяжёлой операции (см. isProcessing).
+   *  Вызовы идемпотентны по счётчику: begin N раз, end N раз — флаг снимается
+   *  только когда всех операций больше нет. */
+  beginProcessing: () => void;
+  endProcessing: () => void;
 }
 
 interface ImportInput { label: string; lat: number; lng: number; placeName?: string }
@@ -268,6 +276,9 @@ const initialMissionState: MissionState = {
   activeRouteId: null,
   routeWarnings: {},
   routeDraft: { geo: [], agl: {} },
+  /** Глобальный флаг «идёт тяжёлая/сетевая операция» (upload миссии, пересчёт
+   *  высот). UI блокирует mutate-кнопки, пока true — защита от гонок состояний. */
+  isProcessing: false,
 };
 
 type SetFn = (partial: Partial<MissionStore> | ((s: MissionStore) => Partial<MissionStore>)) => void;
@@ -276,7 +287,96 @@ type GetFn = () => MissionStore;
 const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> = (rawSet, rawGet) => {
   const set = rawSet as SetFn;
   const get = rawGet as GetFn;
-  const actions: MissionActions = {
+  // Ссылка на target-объект экшенов (присваивается ниже). Нужна, чтобы при
+  // ПОВТОРНОМ вызове инициализатора (persist rehydrate в zustand v5 может
+  // вызвать его ещё раз) не создавать новый замкнутый набор функций: тогда
+  // useMissionStore.getState().x() остаётся === getState().x() до и после
+  // гидрации — селекторы компонентов не «переподписываются» и не ререндерят.
+  let targetRef: MissionActions | null = null;
+
+  /** Тело пересчёта высот — вынесено из метода, чтобы обёртка updateRouteAltitudes
+   *  оставалась тонкой (SOLID/SRP): отмена/блокировка UI отдельно, вычисления отдельно. */
+  const altitudeBody = async (routeId: string | null | undefined, runId: number, controller: AbortController): Promise<void> => {
+    const st = get();
+    const mapState = useMapStore.getState();
+    const clearance = Number.isFinite(mapState.settings.altitudeClearanceM as number)
+      ? (mapState.settings.altitudeClearanceM as number) : 50;
+    const routes = st.routes.filter((r) => r.points.length >= 2);
+    const targets = routeId ? routes.filter((r) => r.id === routeId) : routes;
+    if (targets.length === 0) return;
+
+    // Собираем УНИКАЛЬНЫЕ гео-точки всех целевых маршрутов — один батч
+    // к Open-Elevation вместо N запросов (публичный API троттлится).
+    const keySet = new Map<string, ElevationPoint>();
+    for (const r of targets) {
+      for (const p of r.points) {
+        if (!Number.isFinite(p.lat) || !Number.isFinite(p.lng)) continue;
+        const k = `${p.lat.toFixed(4)},${p.lng.toFixed(4)}`;
+        if (!keySet.has(k)) keySet.set(k, { lat: p.lat, lng: p.lng });
+      }
+    }
+    if (keySet.size === 0) return;
+    const uniqPts = Array.from(keySet.values());
+    const elevs = await fetchElevations(uniqPts, controller.signal);
+    if (runId !== altitudeRunId) return; // более новый прогон отменил этот
+    const elevByKey = new Map<string, number | null>();
+    uniqPts.forEach((p, i) => elevByKey.set(`${p.lat.toFixed(4)},${p.lng.toFixed(4)}`, elevs[i]));
+
+    set((cur) => {
+      const rw: Record<string, string[]> = { ...cur.routeWarnings };
+      const updatedRoutes = cur.routes.map((r) => {
+        if (!targets.some((t) => t.id === r.id)) return r;
+        const pts: RoutePoint[] = r.points.map((p) => {
+          const terr = elevByKey.get(`${p.lat.toFixed(4)},${p.lng.toFixed(4)}`) ?? null;
+          return { ...p, terrainM: terr };
+        });
+        const vWarns = applyVerticalLimits(pts, useMapStore.getState().restrictions, clearance);
+        const merged = [...(rw[r.id] || [])].filter((w) => !w.startsWith('Высота') && !w.startsWith('Конфликт высотных'));
+        for (const w of vWarns) if (!merged.includes(w)) merged.push(w);
+        // Проверка профиля между узлами: интерполяция рельефа ловит «нырки»
+        // маршрута ниже земли. Запускается асинхронно ПОСЛЕ применения
+        // состояния (set ещё не закоммичен — синхронный вызов устаревшим
+        // снапшотом перезаписал бы только что проставленные terrainM).
+        void Promise.resolve().then(() =>
+          computeRouteAltitude(pts.map((p) => ({ lat: p.lat, lng: p.lng })), { clearanceM: clearance }, controller.signal),
+        ).then((info) => {
+          if (runId !== altitudeRunId) return; // защита: профиль отменённого прогона не пишет
+          useMissionStore.setState((s2) => {
+            const w2 = { ...s2.routeWarnings };
+            const base = [...(w2[r.id] || [])].filter((x) => !x.startsWith('Высота'));
+            if (info.terrainConflict) {
+              base.push(`Высота: участок ниже рельефа (мин. АГЛ ${info.minAglM} м) — требуется подъём`);
+            } else if (info.maxTerrainM !== null) {
+              base.push(`Высота: пик рельефа на маршруте ${Math.round(info.maxTerrainM)} м, требуемая ABS ${Math.round(Math.max(...info.absM.filter((v): v is number => v !== null), 0))} м`);
+            }
+            if (base.length > 0) w2[r.id] = base; else delete w2[r.id];
+            return { routeWarnings: w2 };
+          });
+        }).catch(() => { /* сервис недоступен — мягкая деградация */ });
+        if (merged.length > 0) rw[r.id] = merged; else delete rw[r.id];
+        return { ...r, points: pts };
+      });
+      return { routeWarnings: rw, routes: updatedRoutes };
+    });
+  };
+
+  // Экшены обращаются друг к другу через `actions.x()`; при патчинге state
+  // (guard-обёртки шима) мост get().x === actions.x гарантирует, что ВНУТРЕННИЕ
+  // вызовы идут в тот же объект и не обходят блокировку по isProcessing.
+  // При повторном вызове инициализатора переиспользуем target первой сборки:
+  // экшены остаются стабильными по ссылке (Object.assign обновит замыкания
+  // set/get на актуальные — семантика store та же).
+  const target = (targetRef ??= {} as MissionActions);
+  const actions = new Proxy(target, {
+    get(t, k: string | symbol): unknown {
+      if (k === '__target') return t;
+      const patched = (get() as unknown as Record<string | symbol, unknown>)[k];
+      if (typeof patched === 'function' && patched !== (t as unknown as Record<string | symbol, unknown>)[k]) return patched;
+      return (t as unknown as Record<string | symbol, unknown>)[k];
+    },
+  });
+
+  const targetActions: MissionActions = {
     addRoute: (points, name, color) => {
       const state = get();
       const map = useMapStore.getState().map;
@@ -625,72 +725,19 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
       try { lastAltitudeController?.abort(); } catch { /* noop */ }
       const controller = new AbortController();
       lastAltitudeController = controller;
-      const st = get();
       const mapState = useMapStore.getState();
-      const map = mapState.map;
-      if (!map?.bounds) return;
+      if (!mapState.map?.bounds) return;
       // Флаг elevationAuto живёт в настройках карты (территория) — уважаем его
       // во ВСЕХ экшенах: без флага пересчёт не запускается вообще.
       if (!routeId && !mapState.settings.elevationAuto) return;
-      const clearance = Number.isFinite(mapState.settings.altitudeClearanceM as number)
-        ? (mapState.settings.altitudeClearanceM as number) : 50;
-      const routes = st.routes.filter((r) => r.points.length >= 2);
-      const targets = routeId ? routes.filter((r) => r.id === routeId) : routes;
-      if (targets.length === 0) return;
-
-      // Собираем УНИКАЛЬНЫЕ гео-точки всех целевых маршрутов — один батч
-      // к Open-Elevation вместо N запросов (публичный API троттлится).
-      const keySet = new Map<string, ElevationPoint>();
-      for (const r of targets) {
-        for (const p of r.points) {
-          if (!Number.isFinite(p.lat) || !Number.isFinite(p.lng)) continue;
-          const k = `${p.lat.toFixed(4)},${p.lng.toFixed(4)}`;
-          if (!keySet.has(k)) keySet.set(k, { lat: p.lat, lng: p.lng });
-        }
+      actions.beginProcessing();
+      try {
+        await altitudeBody(routeId, runId, controller);
+      } finally {
+        // Снимаем блокировку только если этот прогон всё ещё актуален:
+        // более новый вызов уже сам выставил флаг и продлит блокировку.
+        if (runId === altitudeRunId) actions.endProcessing();
       }
-      if (keySet.size === 0) return;
-      const uniqPts = Array.from(keySet.values());
-      const elevs = await fetchElevations(uniqPts, controller.signal);
-      if (runId !== altitudeRunId) return; // более новый прогон отменил этот
-      const elevByKey = new Map<string, number | null>();
-      uniqPts.forEach((p, i) => elevByKey.set(`${p.lat.toFixed(4)},${p.lng.toFixed(4)}`, elevs[i]));
-
-      set((cur) => {
-        const rw: Record<string, string[]> = { ...cur.routeWarnings };
-        const updatedRoutes = cur.routes.map((r) => {
-          if (!targets.some((t) => t.id === r.id)) return r;
-          const pts: RoutePoint[] = r.points.map((p) => {
-            const terr = elevByKey.get(`${p.lat.toFixed(4)},${p.lng.toFixed(4)}`) ?? null;
-            return { ...p, terrainM: terr };
-          });
-          const vWarns = applyVerticalLimits(pts, useMapStore.getState().restrictions, clearance);
-          const merged = [...(rw[r.id] || [])].filter((w) => !w.startsWith('Высота') && !w.startsWith('Конфликт высотных'));
-          for (const w of vWarns) if (!merged.includes(w)) merged.push(w);
-          // Проверка профиля между узлами: интерполяция рельефа ловит «нырки»
-          // маршрута ниже земли. Запускается асинхронно ПОСЛЕ применения
-          // состояния (set ещё не закоммичен — синхронный вызов устаревшим
-          // снапшотом перезаписал бы только что проставленные terrainM).
-          void Promise.resolve().then(() =>
-            computeRouteAltitude(pts.map((p) => ({ lat: p.lat, lng: p.lng })), { clearanceM: clearance }, controller.signal),
-          ).then((info) => {
-            if (runId !== altitudeRunId) return; // защита: профиль отменённого прогона не пишет
-            useMissionStore.setState((s2) => {
-              const w2 = { ...s2.routeWarnings };
-              const base = [...(w2[r.id] || [])].filter((x) => !x.startsWith('Высота'));
-              if (info.terrainConflict) {
-                base.push(`Высота: участок ниже рельефа (мин. АГЛ ${info.minAglM} м) — требуется подъём`);
-              } else if (info.maxTerrainM !== null) {
-                base.push(`Высота: пик рельефа на маршруте ${Math.round(info.maxTerrainM)} м, требуемая ABS ${Math.round(Math.max(...info.absM.filter((v): v is number => v !== null), 0))} м`);
-              }
-              if (base.length > 0) w2[r.id] = base; else delete w2[r.id];
-              return { routeWarnings: w2 };
-            });
-          }).catch(() => { /* сервис недоступен — мягкая деградация */ });
-          if (merged.length > 0) rw[r.id] = merged; else delete rw[r.id];
-          return { ...r, points: pts };
-        });
-        return { routeWarnings: rw, routes: updatedRoutes };
-      });
     },
 
     rerouteAllRoutes: () => {
@@ -795,7 +842,11 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
     resetMissions: () => set({
       routes: [], activeRouteId: null, routeWarnings: {}, routeDraft: { geo: [], agl: {} }, importLists: undefined,
     }),
+
+    beginProcessing: () => set((s) => (s.isProcessing ? {} : { isProcessing: true })),
+    endProcessing: () => set((s) => (s.isProcessing ? { isProcessing: false } : {})),
   };
+  Object.assign(target, targetActions);
   return actions;
 };
 
@@ -814,6 +865,7 @@ export const useMissionStore = create<MissionStore>()(
         activeRouteId: s.activeRouteId,
         routeWarnings: {},           // сессионные предупреждения не персистим
         routeDraft: { geo: [], agl: {} }, // черновик мастера — только на сессию
+        isProcessing: false,         // тяжёлые операции не переживают перезагрузку
       }) as MissionState,
       migrate: (persistedState: unknown) => {
         const p = persistedState as Partial<MissionState>;

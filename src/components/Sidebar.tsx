@@ -20,6 +20,7 @@ const Sidebar: React.FC = () => {
 
   const {
     project,
+    isProcessing,
     selectedMarkerId,
     searchQuery,
     filterType,
@@ -316,7 +317,9 @@ const Sidebar: React.FC = () => {
                       </button>
                       <button
                         onClick={() => deleteRestriction(restriction.id)}
-                        className="px-1 text-xs text-gray-400 hover:text-red-400"
+                        disabled={isProcessing}
+                        title={isProcessing ? 'Блокировано: идёт тяжёлая операция (пересчёт высот / загрузка миссии)' : 'Удалить зону'}
+                        className="px-1 text-xs text-gray-400 hover:text-red-400 disabled:opacity-40 disabled:cursor-not-allowed"
                       >🗑️</button>
                     </div>
                   </div>
@@ -392,9 +395,11 @@ const Sidebar: React.FC = () => {
               </div>
               <button
                 onClick={() => void updateRouteAltitudes()}
-                className="w-full px-2 py-1 bg-cyan-700 hover:bg-cyan-600 text-white rounded text-xs"
+                disabled={isProcessing}
+                title={isProcessing ? 'Пересчёт уже выполняется' : undefined}
+                className="w-full px-2 py-1 bg-cyan-700 hover:bg-cyan-600 text-white rounded text-xs disabled:opacity-40 disabled:cursor-not-allowed"
               >
-                🛰 Пересчитать высоты маршрутов
+                {isProcessing ? '⏳ Пересчёт высот…' : '🛰 Пересчитать высоты маршрутов'}
               </button>
               <p className="text-[10px] text-gray-500">
                 Высота каждой точки = рельеф + запас; зоны с полом/потолком AGL

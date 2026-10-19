@@ -44,6 +44,9 @@ export interface LegacySnapshot {
   redoDrawingStack: Point[];
   _currentMapId?: string;
   routeDraft: MisS['routeDraft'];
+  /** Глобальный флаг «идёт тяжёлая/сетевая операция» (upload миссии, пересчёт
+   *  высот) — проксируется из useMissionStore для UI-блокировок. */
+  isProcessing: boolean;
 }
 
 const projectNameRef = { value: 'Новый проект', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
@@ -89,6 +92,7 @@ function buildSnapshot(): LegacySnapshot {
     redoDrawingStack: m.redoDrawingStack,
     _currentMapId: m._currentMapId,
     routeDraft: mi.routeDraft,
+    isProcessing: mi.isProcessing,
   };
 }
 
@@ -350,6 +354,58 @@ shimActions.resetProject = () => {
 
 /** Сброс троттлера + немедленная пакетная перестройка (прежний внутренний хук). */
 shimActions.__rerouteAllRoutesNow = () => rerouteAllNow();
+
+// ─── Защита от гонок состояний: mutate-экшены отклоняются, пока isProcessing ──
+// setRoutePointAltitude НЕ блокируется: ручная регулировка высоты этапа должна
+// оставаться доступной всегда (она сама запускает пересчёт через очередь).
+const MUTATE_GUARD_MS = 120_000; // страховка: зависший прогон не должен «заморозить» UI навсегда
+const BLOCKED_MUTATORS: Array<keyof MisS> = [
+  'addRoute', 'deleteRoute', 'appendRoutePoint', 'insertRoutePointAt',
+  'removeRoutePoint', 'commitRouteDraft', 'generateScanRoute', 'optimizeRouteOrder',
+  'autoFixRoute', 'importRoutes', 'resetMissions',
+];
+/** Синхронные mutate-экшены карты: во время тяжёлой операции тоже блокируются. */
+const BLOCKED_MAP_MUTATORS: Array<keyof MapS> = ['deleteRestriction'];
+let lastGuardPassTs = Date.now();
+const guardWrapped = new Map<string, (...a: unknown[]) => unknown>();
+
+function makeGuarded(key: string, store: { getState(): object }): (...a: unknown[]) => unknown {
+  const cacheKey = `${String(key)}@${store === useMissionStore ? 'mission' : 'map'}`;
+  const cached = guardWrapped.get(cacheKey);
+  if (cached) return cached;
+  const orig = (store.getState() as unknown as Record<string, unknown>)[key] as ((...a: unknown[]) => unknown) | undefined;
+  if (typeof orig !== 'function') return () => null;
+  const wrapped = function (this: unknown, ...args: unknown[]): unknown {
+    const st = useMissionStore.getState();
+    if (st.isProcessing && Date.now() - lastGuardPassTs < MUTATE_GUARD_MS) {
+      console.warn(`[mission] экшен «${String(key)}» отклонён: идёт тяжёлая операция (пересчёт высот / загрузка миссии)`);
+      return null;
+    }
+    lastGuardPassTs = Date.now();
+    return orig.apply(this, args);
+  };
+  guardWrapped.set(cacheKey, wrapped);
+  return wrapped;
+}
+
+/**
+ * Оборачивает mutate-экшены стора защитой по флагу isProcessing. Идемпотентно:
+ * повторные вызовы возвращают те же обёртки из кэша guardWrapped.
+ */
+export function installMissionGuards(): void {
+  for (const key of BLOCKED_MUTATORS) {
+    const wrapped = makeGuarded(key as string, useMissionStore);
+    (shimActions as Record<string, unknown>)[key] = wrapped;
+    useMissionStore.setState({ [key]: wrapped } as never);
+  }
+  for (const key of BLOCKED_MAP_MUTATORS) {
+    const wrapped = makeGuarded(key as string, useMapStore);
+    (shimActions as Record<string, unknown>)[key] = wrapped;
+    useMapStore.setState({ [key]: wrapped } as never);
+  }
+}
+installMissionGuards();
+
 
 /** Селектор вида для React-компонентов (прежний API, делегирует map-стор). */
 export { selectMapView };

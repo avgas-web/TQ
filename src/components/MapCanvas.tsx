@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
 import { useStore, scheduleRerouteAll, getActiveZonesCached } from '../store/useStore';
+import { useMissionStore } from '../store/useMissionStore';
 import { isPointInsideAnyRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
@@ -122,11 +123,20 @@ function fitViewToData(
   minFy -= (maxFy - minFy) * pad || 1e-4; maxFy += (maxFy - minFy) * pad || 1e-4;
   const wFrac = Math.max(1e-9, maxFx - minFx);
   const hFrac = Math.max(1e-9, maxFy - minFy);
-  // нужный мир в px, чтобы bbox с запасом влез в окно
-  const worldTarget = Math.min(vw / wFrac, vh / hFrac);
+  // КРИТ. ФИКС пропорций: world-px изотропны (квадратные тайлы Mercator), т.е.
+  // width_px = height_px = worldPx. Поэтому целевой размер мира считаем как
+  // Math.min от независимых требований ширины и высоты — иначе подбор только по
+  // высоте (vh / hFrac) гарантированно НЕ вмещает bbox по ширине, и «компенсация»
+  // растяжением давала бы искажение aspect ratio (сплющивание/растягивание).
+  const worldTargetW = vw / wFrac;
+  const worldTargetH = vh / hFrac;
+  const worldTarget = Math.min(worldTargetW, worldTargetH);
   let zoom = zoomAtWorldPx(worldTarget);
   zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));
-  const worldPx = Math.max(256, vh * Math.pow(2, zoom));
+  // Ограничение зумом может оставить мир крупнее окна — тогда bbox физически не
+  // влезает (ниже MIN_ZOOM опускаться нельзя): центрируем по минимуму и честно
+  // показываем обрезку, вместо того чтобы искажать пропорции не-равномерным scale.
+  const worldPx = Math.max(256, Math.min(worldTarget, 256 * Math.pow(2, zoom)));
   const scale = worldPx / (vh * Math.pow(2, ZOOM_REF)); // scale относительно z0=ZOOM_REF
   // центр bbox в world-px -> смещение, чтобы центр оказался в центре экрана
   const cxW = ((minFx + maxFx) / 2) * worldPx;
@@ -787,10 +797,14 @@ const MapCanvas: React.FC = () => {
     useStore.getState().flushReroute();
   }, []);
 
-  // «ЗАПУСК»: загрузка данных миссии в дроны (имитация телеметрической загрузки)
+  // «ЗАПУСК»: загрузка данных миссии в дроны (имитация телеметрической загрузки).
+  // На время async-операции выставляем isProcessing в mission-сторе — mutate-экшены
+  // (addRoute/deleteRoute/commitRouteDraft/…) блокируются гардом шима, UI-кнопки —
+  // через disabled по этому же флагу (защита от гонок состояний).
   const launchMission = useCallback(async () => {
     if (launchState !== 'idle') return;
     setLaunchState('uploading');
+    useMissionStore.getState().beginProcessing();
     const st = useStore.getState();
     const mission = {
       start: startGeo, goal: goalGeo, sharedGoal, droneCount,
@@ -820,6 +834,8 @@ const MapCanvas: React.FC = () => {
       ] });
     } catch {
       setLaunchState('idle');
+    } finally {
+      useMissionStore.getState().endProcessing();
     }
   }, [launchState, startGeo, goalGeo, sharedGoal, droneCount, mapBounds, canvasSize, tripleRoutes]);
 
@@ -1260,6 +1276,55 @@ const MapCanvas: React.FC = () => {
     };
   }, []);
 
+  // Drag-обратная связь: refs читаются внутри эффекта рендера (deps ниже),
+  // чтобы захваченный элемент подсвечивался в реальном времени.
+  const draggingMarkerRef = useRef<string | null>(null);
+  const draggingRouteRef = useRef<{ routeId: string; index: number } | null>(null);
+  useEffect(() => { draggingMarkerRef.current = draggingMarker; }, [draggingMarker]);
+  useEffect(() => { draggingRouteRef.current = draggingRoute; }, [draggingRoute]);
+
+  // Fallback-заглушка «нет карты»: hit-зоны нарисованных кнопок + скрытый input
+  // для загрузки файла прямо с канваса (без похода в тулбар).
+  type FallbackBtn = { id: 'tile' | 'upload'; rect: { x: number; y: number; w: number; h: number } };
+  const fallbackButtonsRef = useRef<FallbackBtn[]>([]);
+  const fallbackFileInputRef = useRef<HTMLInputElement | null>(null);
+  const loadActiveTileHere = useCallback((): void => {
+    const st = useStore.getState();
+    const cs = canvasSizeRef.current;
+    const v = viewRef.current;
+    const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
+    const latC = mercToLat((cs.height / 2 - v.offsetY) / wp);
+    const lngC = ((cs.width / 2 - v.offsetX) / wp) * 360 - 180;
+    const zNow = clampZoom(zoomAtWorldPx(wp));
+    st.loadActiveTileMap({ lat: latC, lng: lngC }, Math.round(Math.min(12, zNow)));
+  }, []);
+  const handleFallbackFile = useCallback((e: React.ChangeEvent<HTMLInputElement>): void => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    const validTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/bmp'];
+    if (!validTypes.includes(file.type)) {
+      setFallbackMsg('Поддерживаются только PNG, JPG, WebP, BMP');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      const dataUrl = ev.target?.result as string;
+      const img = new Image();
+      img.onload = () => {
+        useStore.getState().loadMap({
+          name: file.name, width: img.width, height: img.height, dataUrl,
+          source: 'local',
+        });
+        setRenderTick((t) => t + 1);
+      };
+      img.onerror = () => setFallbackMsg('Не удалось прочитать изображение');
+      img.src = dataUrl;
+    };
+    reader.readAsDataURL(file);
+  }, []);
+  const [fallbackMsg, setFallbackMsg] = useState<string>('');
+
   // Render canvas
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1295,18 +1360,52 @@ const MapCanvas: React.FC = () => {
     }
 
     if (!project.map || (!mapImageRef.current && !tilesActiveNow)) {
-      // No map - draw placeholder (fallback-состояние без тайловой подложки)
+      // Fallback-состояние без тайловой подложки и без растра: вместо «синего
+      // прямоугольника» — информативная заглушка с реальными кнопками действий.
+      // (Раньше этот блок был закомментирован как недоделанный placeholder.)
       ctx.fillStyle = '#1a2744';
       ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
-      ctx.fillStyle = '#4a6fa5';
-      ctx.font = '18px sans-serif';
+      // Декоративная сетка, чтобы экран не выглядел «мёртвым»
+      ctx.strokeStyle = 'rgba(90, 130, 190, 0.15)';
+      ctx.lineWidth = 1;
+      const gs = 48;
+      for (let gx = 0; gx < canvasSize.width; gx += gs) { ctx.beginPath(); ctx.moveTo(gx + 0.5, 0); ctx.lineTo(gx + 0.5, canvasSize.height); ctx.stroke(); }
+      for (let gy = 0; gy < canvasSize.height; gy += gs) { ctx.beginPath(); ctx.moveTo(0, gy + 0.5); ctx.lineTo(canvasSize.width, gy + 0.5); ctx.stroke(); }
+      const cx0 = canvasSize.width / 2;
+      const cy0 = canvasSize.height / 2;
       ctx.textAlign = 'center';
-      ctx.fillText('Загрузите карту для начала работы', canvasSize.width / 2, canvasSize.height / 2 - 10);
+      ctx.fillStyle = '#dbe7ff';
+      ctx.font = 'bold 20px sans-serif';
+      ctx.fillText('Карта ещё не загружена', cx0, cy0 - 46);
+      ctx.fillStyle = '#8fa8cc';
       ctx.font = '14px sans-serif';
-      ctx.fillStyle = '#3a5a85';
-      ctx.fillText('Нажмите кнопку «Карта» в панели инструментов', canvasSize.width / 2, canvasSize.height / 2 + 15);
+      ctx.fillText('Загрузите растровую карту (PNG/JPG/WebP/BMP)', cx0, cy0 - 22);
+      ctx.fillText('или включите активную тайловую карту OSM вокруг текущей позиции.', cx0, cy0 - 2);
+      // Кнопка 1: быстрая активная карта (центр по умолчанию, z12)
+      const btnW = 250, btnH = 38, gap = 12;
+      const b1x = cx0 - btnW - gap / 2, b1y = cy0 + 22;
+      const b2x = cx0 + gap / 2, b2y = cy0 + 22;
+      fallbackButtonsRef.current = [
+        { id: 'tile', rect: { x: b1x, y: b1y, w: btnW, h: btnH } },
+        { id: 'upload', rect: { x: b2x, y: b2y, w: btnW, h: btnH } },
+      ];
+      for (const [i, label] of [[0, '🌍 Активная карта (OSM)'], [1, '🗺️ Загрузить файл…']] as const) {
+        const r = i === 0 ? { x: b1x, y: b1y } : { x: b2x, y: b2y };
+        ctx.fillStyle = i === 0 ? '#0b6fb8' : '#2c4a73';
+        ctx.beginPath();
+        const rad = 8;
+        ctx.roundRect(r.x, r.y, btnW, btnH, rad);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 14px sans-serif';
+        ctx.fillText(label, r.x + btnW / 2, r.y + btnH / 2 + 5);
+      }
       return;
     }
+    fallbackButtonsRef.current = [];
 
     // Draw map: подложка OSM — DOM-слой (см. syncTileDom), canvas прозрачен и
     // рисует поверх неё ТОЛЬКО объекты. Растровая карта (Google/Yandex/local) —
@@ -1646,7 +1745,22 @@ const MapCanvas: React.FC = () => {
         );
 
         const isSelected = marker.id === selectedMarkerId;
-        const radius = (isSelected ? 12 : 8) / vs.scale;
+        // Drag-обратная связь: захваченный маркер — увеличенная «тень-подсветка»,
+        // прозрачность и явная белая обводка (пользователь видит, что элемент схвачен).
+        const isDragging = draggingMarkerRef.current === marker.id;
+        const radius = (isSelected || isDragging ? 12 : 8) / vs.scale;
+
+        if (isDragging) {
+          ctx.beginPath();
+          ctx.arc(marker.x, marker.y, radius * 1.9, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(0, 208, 255, 0.28)';
+          ctx.fill();
+          ctx.setLineDash([4 / vs.scale, 3 / vs.scale]);
+          ctx.strokeStyle = 'rgba(0, 208, 255, 0.9)';
+          ctx.lineWidth = 2 / vs.scale;
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
 
         // Shadow
         ctx.beginPath();
@@ -1655,13 +1769,15 @@ const MapCanvas: React.FC = () => {
         ctx.fill();
 
         // Draw marker
+        ctx.globalAlpha = isDragging ? 0.75 : 1;
         ctx.beginPath();
         ctx.arc(marker.x, marker.y, radius, 0, Math.PI * 2);
         ctx.fillStyle = !insideRestriction ? marker.color : '#ff3333';
         ctx.fill();
-        ctx.strokeStyle = isSelected ? '#ffffff' : 'rgba(0,0,0,0.6)';
-        ctx.lineWidth = (isSelected ? 3 : 1.5) / vs.scale;
+        ctx.strokeStyle = isDragging ? '#00d0ff' : isSelected ? '#ffffff' : 'rgba(0,0,0,0.6)';
+        ctx.lineWidth = (isDragging || isSelected ? 3 : 1.5) / vs.scale;
         ctx.stroke();
+        ctx.globalAlpha = 1;
 
         // Inner dot
         ctx.beginPath();
@@ -1878,12 +1994,27 @@ const MapCanvas: React.FC = () => {
         for (let i = 0; i < route.points.length; i++) {
           const p = route.points[i];
           const rPt = p.auto ? drawR * 0.55 : drawR;
+          // Drag-обратная связь: захваченная точка маршрута — пульсирующая
+          // cyan-подсветка + увеличенный радиус, видно что элемент «схвачен».
+          const drag = draggingRouteRef.current;
+          const isDragPt = isActive && !!drag && drag.routeId === route.id && drag.index === i;
+          if (isDragPt) {
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, rPt * 2.4, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(0, 208, 255, 0.30)';
+            ctx.fill();
+            ctx.setLineDash([4 / s, 3 / s]);
+            ctx.strokeStyle = 'rgba(0, 208, 255, 0.95)';
+            ctx.lineWidth = 2 / s;
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
           ctx.beginPath();
-          ctx.arc(p.x, p.y, rPt, 0, Math.PI * 2);
+          ctx.arc(p.x, p.y, isDragPt ? rPt * 1.6 : rPt, 0, Math.PI * 2);
           ctx.fillStyle = p.auto ? 'rgba(255,255,255,0.45)' : color;
           ctx.fill();
-          ctx.lineWidth = 1.2 / s;
-          ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+          ctx.lineWidth = (isDragPt ? 2.2 : 1.2) / s;
+          ctx.strokeStyle = isDragPt ? '#00d0ff' : 'rgba(0,0,0,0.6)';
           ctx.stroke();
           // Подписи высот (Open-Elevation): у активного маршрута — рельеф/ABS;
           // ручной AGL на этапе помечается стрелкой ↑
@@ -1965,7 +2096,7 @@ const MapCanvas: React.FC = () => {
       ctx.restore();
     }
 
-  }, [project, renderTick, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, tilesVersion, userPos]);
+  }, [project, renderTick, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, tilesVersion, userPos, draggingMarker, draggingRoute]);
 
   // Mouse wheel zoom (к колесу курсора; границы minZoom/maxZoom внутри zoomAt)
   // ВАЖНО: React навешивает on-wheel/on-touch как passive-слушатели, и вызов
@@ -2049,6 +2180,23 @@ const MapCanvas: React.FC = () => {
 
     const screenX = e.clientX - rect.left;
     const screenY = e.clientY - rect.top;
+
+    // Fallback-экран «нет карты»: кликабельные кнопки действий (hit-зоны
+    // регистрируются в render-эффекте). Условие совпадает с рендером заглушки:
+    // нет растра И тайловая подложка не активна.
+    const tilesActive = !!project.settings?.tilesEnabled && !!project.map?.bounds;
+    if (!project.map && !tilesActive) {
+      const hit = fallbackButtonsRef.current.find(
+        (b) => screenX >= b.rect.x && screenX <= b.rect.x + b.rect.w &&
+              screenY >= b.rect.y && screenY <= b.rect.y + b.rect.h,
+      );
+      if (hit) {
+        if (hit.id === 'tile') loadActiveTileHere();
+        else fallbackFileInputRef.current?.click();
+      }
+      return;
+    }
+
     const mapPoint = screenToMap(screenX, screenY);
 
     if (currentTool === 'pan' || e.button === 1 || (e.button === 0 && e.shiftKey)) {
@@ -2226,7 +2374,7 @@ const MapCanvas: React.FC = () => {
   }, [currentTool, project, isDrawing, drawingPoints, measurementPoints,
     screenToMap, addMarker, selectMarker, addDrawingPoint, addRestriction,
     clearDrawingPoints, setDrawing, setMeasurementPoints,
-    activeRouteId, appendRoutePoint, setActiveRoute]);
+    activeRouteId, appendRoutePoint, setActiveRoute, loadActiveTileHere]);
 
   // Быстрое создание маршрута кликами в режиме действий:
   // первый клик — точка старта (маршрут-заготовка), каждый следующий — новая точка.
@@ -2309,6 +2457,9 @@ const MapCanvas: React.FC = () => {
     isPanningRef.current = false;
     setDraggingMarker(null);
     setDraggingRoute(null);
+    // Сброс подсветки захвата должен отрисоваться немедленно (иначе ref уже null,
+    // а новый кадр не запланирован — «гост»-подсветка залипает до следующего действия)
+    setRenderTick((t) => t + 1);
   }, []);
 
   // Double click - finish polygon drawing / clear measurement / удалить точку маршрута
@@ -2458,6 +2609,19 @@ const MapCanvas: React.FC = () => {
         aria-hidden="true"
         style={{ position: 'absolute', top: 0, left: 0, overflow: 'hidden', transformOrigin: '0 0', pointerEvents: 'none', zIndex: 0 }}
       />
+      {/* Скрытый input для загрузки файла с fallback-кнопки «Загрузить файл…» */}
+      <input
+        ref={(el) => { fallbackFileInputRef.current = el; }}
+        type="file"
+        accept="image/png,image/jpeg,image/webp,image/bmp"
+        className="hidden"
+        onChange={handleFallbackFile}
+      />
+      {fallbackMsg && (
+        <div className="absolute z-30 left-1/2 top-4 -translate-x-1/2 rounded-md bg-red-900/90 border border-red-500 text-white text-xs px-3 py-2 shadow-lg">
+          {fallbackMsg}
+        </div>
+      )}
       <canvas
         ref={canvasRef}
         style={{

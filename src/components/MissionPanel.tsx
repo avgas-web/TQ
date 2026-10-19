@@ -17,6 +17,8 @@ const ALGORITHMS: Array<{ id: OptimizeAlgorithm; label: string }> = [
 
 const MissionPanel: React.FC = () => {
   const project = useStore((s) => s.project);
+  // Флаг тяжёлой операции (пересчёт высот / загрузка миссии) — блокирует mutate-кнопки
+  const isProcessing = useStore((s) => s.isProcessing);
   const activeRouteId = useStore((s) => s.activeRouteId);
   const setActiveRoute = useStore((s) => s.setActiveRoute);
   const optimizeRouteOrder = useStore((s) => s.optimizeRouteOrder);
@@ -120,8 +122,13 @@ const MissionPanel: React.FC = () => {
               <option key={a.id} value={a.id}>{a.label}</option>
             ))}
           </select>
-          <button onClick={runOptimize} className="px-3 py-1 bg-cyan-600 hover:bg-cyan-700 rounded text-white">
-            Оптимизировать
+          <button
+            onClick={runOptimize}
+            disabled={isProcessing}
+            title={isProcessing ? 'Блокировано: идёт тяжёлая операция' : undefined}
+            className="px-3 py-1 bg-cyan-600 hover:bg-cyan-700 rounded text-white disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {isProcessing ? '⏳ Занято…' : 'Оптимизировать'}
           </button>
         </div>
         {optMsg && <div className="text-[11px] text-emerald-300 mt-1">{optMsg}</div>}
@@ -140,8 +147,13 @@ const MissionPanel: React.FC = () => {
             title="Шаг линий сканирования, пикселей карты"
           />
           <span className="text-[11px] text-gray-500">шаг, px</span>
-          <button onClick={runScan} className="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 rounded text-white">
-            Построить
+          <button
+            onClick={runScan}
+            disabled={isProcessing}
+            title={isProcessing ? 'Блокировано: идёт тяжёлая операция' : undefined}
+            className="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 rounded text-white disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {isProcessing ? '⏳ Занято…' : 'Построить'}
           </button>
         </div>
       </div>
