@@ -362,7 +362,7 @@ const MUTATE_GUARD_MS = 120_000; // страховка: зависший про�
 const BLOCKED_MUTATORS: Array<keyof MisS> = [
   'addRoute', 'deleteRoute', 'appendRoutePoint', 'insertRoutePointAt',
   'removeRoutePoint', 'commitRouteDraft', 'generateScanRoute', 'optimizeRouteOrder',
-  'autoFixRoute', 'importRoutes', 'resetMissions',
+  'autoFixRoute', 'importRoutes', 'resetMissions', 'setMissionMode',
 ];
 /** Синхронные mutate-экшены карты: во время тяжёлой операции тоже блокируются. */
 const BLOCKED_MAP_MUTATORS: Array<keyof MapS> = ['deleteRestriction'];

@@ -7,7 +7,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "tsc tests/mission.test.ts src/utils/mission.ts src/utils/droneSim.ts --outDir .tmp-tests --module commonjs --target es2020 --moduleResolution node --esModuleInterop --skipLibCheck --strict && printf '{\"type\":\"commonjs\"}' > .tmp-tests/package.json && node .tmp-tests/tests/mission.test.js"
+    "test": "tsc tests/mission.test.ts tests/droneProfiles.test.ts src/utils/mission.ts src/utils/droneSim.ts src/utils/droneProfiles.ts --outDir .tmp-tests --module commonjs --target es2020 --moduleResolution node --esModuleInterop --skipLibCheck --strict && node -e 'require(\"fs\").writeFileSync(\".tmp-tests/package.json\", JSON.stringify({type:\"commonjs\"}))' && node .tmp-tests/tests/mission.test.js && node .tmp-tests/tests/droneProfiles.test.js"
   },
   "dependencies": {
     "react": "^18.2.0",

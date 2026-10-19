@@ -31,6 +31,7 @@ import {
 import { fetchElevations, computeRouteAltitude } from '../utils/elevation';
 import type { ElevationPoint } from '../utils/elevation';
 import { useMapStore, getActiveZonesCached } from './useMapStore';
+import { validateRouteForMode, type DroneMode, type DroneClass } from '../utils/droneProfiles';
 
 const ROUTE_COLORS = ['#00d0ff', '#ff9500', '#a78bfa', '#34d399', '#f472b6', '#facc15', '#fb7185', '#60a5fa'];
 const REROUTE_THROTTLE_MS = 250;
@@ -83,6 +84,11 @@ export interface MissionActions {
   setWaypointParams: (routeId: string, index: number, params: Partial<WaypointParams>) => void;
   /** Метаданные миссии маршрута (create_mission: автор + дата). */
   setMissionMeta: (routeId: string, author: string) => void;
+  /** Режим работы миссии: короткие дистанции (агродроны) / дальнобойные до 50 000 км.
+   *  Валидирует длину и высоты маршрута против лимитов профиля; предупреждения —
+   *  в routeWarnings[routeId]. Возвращает список предупреждений либо null, если
+   *  режим недопустим для этого маршрута (ValidationError перехвачен в warning). */
+  setMissionMode: (routeId: string, mode: DroneMode, droneClass?: DroneClass) => string[] | null;
   /** Оптимизация порядка точек маршрута; возвращает % сокращения пути. */
   optimizeRouteOrder: (routeId: string, algorithm: OptimizeAlgorithm) => number | null;
   /** Генерация «змейки» по полигону области (px-координаты) как нового маршрута. */
@@ -551,14 +557,59 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
       let meta: MissionMetaLite;
       try {
         const m = createMissionMeta(routeId, route.name, author);
-        meta = { author: m.author, createdAt: m.createdAt };
+        meta = { author: m.author, createdAt: m.createdAt, mode: route.missionMeta?.mode, droneClass: route.missionMeta?.droneClass };
       } catch (e) {
         if (!(e instanceof ValidationError)) throw e;
-        meta = { author: author.trim() || '—', createdAt: new Date().toISOString() };
+        meta = { author: author.trim() || '—', createdAt: new Date().toISOString(), mode: route.missionMeta?.mode, droneClass: route.missionMeta?.droneClass };
       }
       set((cur) => ({
         routes: cur.routes.map((r) => (r.id === routeId ? { ...r, missionMeta: meta } : r)),
       }));
+    },
+
+    setMissionMode: (routeId, mode, droneClass) => {
+      // Выбор режима работы для миссии маршрута + валидация против профиля.
+      const st = get();
+      const route = st.routes.find((r) => r.id === routeId);
+      if (!route) return null;
+      const lengthM = routeLengthM(route.points.map((p) => ({ lat: p.lat, lng: p.lng })));
+      const agls = route.points
+        .map((p) => p.altitudeAGL)
+        .filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0);
+      const maxAgl = agls.length > 0 ? Math.max(...agls) : null;
+      let warns: string[];
+      try {
+        warns = validateRouteForMode(lengthM, maxAgl, mode);
+      } catch (e) {
+        if (!(e instanceof ValidationError)) throw e;
+        // Жёсткое нарушение лимита профиля — не применяем режим, отдаём warning.
+        const msg = (e as Error).message;
+        set((cur) => ({
+          routeWarnings: { ...cur.routeWarnings, [routeId]: [...(cur.routeWarnings[routeId] || []), `Режим: ${msg}`] },
+        }));
+        return null;
+      }
+      set((cur) => ({
+        routes: cur.routes.map((r) => (r.id === routeId
+          ? {
+              ...r,
+              missionMeta: {
+                author: r.missionMeta?.author || 'Оператор GCS',
+                createdAt: r.missionMeta?.createdAt || new Date().toISOString(),
+                mode,
+                droneClass: droneClass ?? r.missionMeta?.droneClass ?? 'standard',
+              },
+            }
+          : r)),
+        routeWarnings: (() => {
+          const w = { ...cur.routeWarnings };
+          const base = (w[routeId] || []).filter((x) => !x.startsWith('Режим:') && !x.startsWith('Профиль:'));
+          const next = [...base, ...warns.map((x) => `Профиль: ${x}`)];
+          if (next.length > 0) w[routeId] = next; else delete w[routeId];
+          return w;
+        })(),
+      }));
+      return warns;
     },
 
     optimizeRouteOrder: (routeId, algorithm) => {

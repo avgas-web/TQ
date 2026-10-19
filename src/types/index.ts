@@ -176,6 +176,10 @@ export interface Route {
 export interface MissionMetaLite {
   author: string;
   createdAt: string; // ISO 8601
+  /** Режим работы дрона для этой миссии (профиль парка). */
+  mode?: 'short_range' | 'long_range';
+  /** Класс применения: обычный / агродрон. */
+  droneClass?: 'standard' | 'agri';
 }
 
 /** Параметры путевой точки: задержка, угол камеры, скорость, радиус принятия. */
@@ -192,6 +196,15 @@ export interface DroneAssignment {
   startId?: string | null;  // id из importLists.starts
   goalId?: string | null;   // id из importLists.goals
   routeId?: string | null;
+}
+
+/** Видеоканал дрона → GCS (симуляция стрима в браузере). */
+export interface DroneVideoState {
+  streaming: boolean;
+  /** Запрошен ли поток (кнопка «видео»). */
+  requested: boolean;
+  note: string;
+  ok: boolean;
 }
 
 /** Импортные списки: стартовые позиции и цели, каждая привязана к маршруту */
