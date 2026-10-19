@@ -1,4 +1,5 @@
 // Утилиты для работы с хранилищем данных
+import { eventBus } from './eventBus';
 
 const STORAGE_KEY = 'totalquadro-storage';
 const MAP_DB_NAME = 'totalquadro-maps';
@@ -52,15 +53,11 @@ export function cleanupLocalStorage(): void {
 /**
  * Пользовательское уведомление об ошибке сохранения (UX-слой).
  * console.error сам по себе невидим пользователю — при переполнении хранилища
- * данные терялись молча. Dispatch собственного события; компоненты могут
- * подписаться на него для показа тоста. detail содержит только текст (строку).
+ * данные терялись молча. Типобезопасная шина eventBus вместо window CustomEvent:
+ * компоненты подписываются через eventBus.on('storage:error', …).
  */
 export function notifyStorageError(message: string): void {
-  try {
-    window.dispatchEvent(new CustomEvent('tq:storage-error', { detail: message }));
-  } catch {
-    /* окружение без DOM — тихо пропускаем */
-  }
+  eventBus.emit('storage:error', { message });
 }
 
 /**
