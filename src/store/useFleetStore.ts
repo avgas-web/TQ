@@ -9,12 +9,22 @@
 import { create } from 'zustand';
 import type { StateCreator } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
-import type { DroneAssignment, DroneVideoState } from '../types';
+import type { DroneAssignment, DroneVideoState, Route } from '../types';
 import { MAX_FLEET_SIZE } from '../types';
+import { routeLengthM } from '../utils/routing';
+import { ValidationError } from '../utils/mission';
 import {
   DRONE_PROFILES, getProfile, modeFromCapabilities, videoLinkStatus,
+  validateRouteForMode,
   type DroneMode, type DroneClass,
 } from '../utils/droneProfiles';
+
+/** Реестр маршрутов вне стора (без цикла модулей fleet↔mission):
+ *  useMissionStore регистрирует в нём актуальный массив routes после каждого set. */
+const routeRegistry: { current: Route[] } = { current: [] };
+export function registerRoutesForFleet(routes: Route[]): void {
+  routeRegistry.current = routes;
+}
 
 /** Дрон, зарегистрированный в парке (упрощённая запись стора). */
 export interface FleetDroneRecord {
@@ -127,6 +137,28 @@ const createFleetActions: StateCreator<FleetStore, [], [], FleetActions> = (set,
 
   setDroneMode: (droneId, mode) => {
     if (!(mode in DRONE_PROFILES)) return; // неизвестный режим — игнор (валидация на границе)
+    const rec = get().drones.find((d) => d.droneId === droneId);
+    if (!rec) return;
+    // ЖЁСТКАЯ блокировка: если назначенному дрону маршруту не хватает дальности/
+    // высотной полосы нового профиля — режим НЕ меняется (hard ValidationError).
+    const assignment = get().droneAssignments.find((a) => a.droneId === droneId);
+    if (assignment?.routeId) {
+      const route = routeRegistry.current.find((r) => r.id === assignment.routeId);
+      if (route && route.points.length >= 2) {
+        try {
+          const lenM = routeLengthM(route.points.map((p) => ({ lat: p.lat, lng: p.lng })));
+          const maxAgl = route.points.reduce<number | null>(
+            (acc, p) => (typeof p.altitudeAGL === 'number' ? Math.max(acc ?? 0, p.altitudeAGL) : acc), null);
+          validateRouteForMode(lenM, maxAgl, mode);
+        } catch (err) {
+          if (err instanceof ValidationError) {
+            console.warn(`[fleet] смена режима «${mode}» для ${droneId} заблокирована:`, err.message);
+            return; // жёсткая ошибка — режим НЕ применяется
+          }
+          throw new Error(`fleet mode validation failed: ${String(err)}`);
+        }
+      }
+    }
     set((state) => ({ drones: state.drones.map((d) => (d.droneId === droneId ? { ...d, mode } : d)) }));
   },
 

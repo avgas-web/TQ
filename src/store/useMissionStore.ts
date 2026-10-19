@@ -12,7 +12,7 @@ import { persist, createJSONStorage } from 'zustand/middleware';
 import { v4 as uuidv4 } from 'uuid';
 import type {
   Route, RoutePoint, Point, RouteShape, RangeLimitMode, ImportPoint, ImportLists,
-  WaypointParamsLite, MissionMetaLite, WaypointBinding,
+  WaypointParamsLite, MissionMetaLite, WaypointBinding, Restriction,
 } from '../types';
 import { MAX_ROUTES } from '../types';
 import {
@@ -31,6 +31,7 @@ import {
 import { fetchElevations, computeRouteAltitude } from '../utils/elevation';
 import type { ElevationPoint } from '../utils/elevation';
 import { useMapStore, getActiveZonesCached } from './useMapStore';
+import { registerRoutesForFleet } from './useFleetStore';
 import { validateRouteForMode, type DroneMode, type DroneClass } from '../utils/droneProfiles';
 
 const ROUTE_COLORS = ['#00d0ff', '#ff9500', '#a78bfa', '#34d399', '#f472b6', '#facc15', '#fb7185', '#60a5fa'];
@@ -49,6 +50,63 @@ let rerouteChainCount = 0;
  *  троттлящемуся публичному API). */
 let altitudeRunId = 0;
 let lastAltitudeController: AbortController | null = null;
+
+// ─── Web Worker для тяжёлой геометрии роутинга (A*/граф видимости) ───────────
+// Тяжёлые сегменты (нужен обход зон) считаются ВНЕ Main Thread. Прямые сегменты
+// (чистый cheap test) не гоняем через postMessage — это дороже расчёта.
+type WorkerPathResult = { path: Point[] } | { error: string };
+let routingWorker: Worker | null = null;
+let routingWorkerBroken = false;
+let workerTaskSeq = 0;
+const workerPending = new Map<number, (r: WorkerPathResult) => void>();
+
+function getRoutingWorker(): Worker | null {
+  if (routingWorkerBroken) return null;
+  if (routingWorker) return routingWorker;
+  try {
+    const w = new Worker(new URL('../workers/routing.worker.ts', import.meta.url), { type: 'module' });
+    w.addEventListener('message', (e: MessageEvent<{ taskId: number; ok: boolean; path?: Point[]; error?: string }>) => {
+      const res = e.data;
+      if (!res || typeof res.taskId !== 'number') return;
+      const cb = workerPending.get(res.taskId);
+      if (!cb) return; // устаревшая задача — игнор (race guard)
+      workerPending.delete(res.taskId);
+      if (res.ok && Array.isArray(res.path)) cb({ path: res.path });
+      else cb({ error: res.error ?? 'worker returned no path' });
+    });
+    w.addEventListener('error', () => {
+      routingWorkerBroken = true;
+      for (const [, cb] of workerPending) cb({ error: 'routing worker crashed' });
+      workerPending.clear();
+      try { w.terminate(); } catch { /* noop */ }
+      if (routingWorker === w) routingWorker = null;
+    });
+    routingWorker = w;
+    return w;
+  } catch {
+    routingWorkerBroken = true; // окружение без Workers (SSR/тесты) — синхронный фолбэк
+    return null;
+  }
+}
+
+/** Проложить сегмент в воркере; null = воркер недоступен/ошибка ( caller применит синхронный план). */
+function planSegmentViaWorker(
+  start: Point, goal: Point, restrictions: Restriction[], mapW: number, mapH: number,
+): Promise<Point[] | null> {
+  const w = getRoutingWorker();
+  if (!w) return Promise.resolve(null);
+  const taskId = ++workerTaskSeq;
+  return new Promise<Point[] | null>((resolve) => {
+    const timer = setTimeout(() => {
+      if (workerPending.delete(taskId)) resolve(null); // завис — синхронный фолбэк
+    }, 15_000);
+    workerPending.set(taskId, (r) => {
+      clearTimeout(timer);
+      resolve('path' in r ? r.path : null);
+    });
+    w.postMessage({ taskId, kind: 'plan-segment', start, goal, restrictions, mapWidth: mapW, mapHeight: mapH });
+  });
+}
 
 // ─── Типы стора ────────────────────────────────────────────────
 
@@ -259,6 +317,63 @@ function rerouteAllRoutesNow(): void {
   const routes = state.routes;
   if (!map?.bounds || routes.length === 0) return;
   const activeZones = getActiveZonesCached(useMapStore.getState().restrictions);
+  // Тяжёлые сегменты (нужен обход) — в Web Worker; чистые — прямые на месте.
+  const heavy: { routeId: string; segIdx: number; start: Point; goal: Point }[] = [];
+  for (const route of routes) {
+    if (route.points.length < 2) continue;
+    let ki: number[] = [];
+    for (let i = 0; i < route.points.length; i++) if (!route.points[i].auto) ki.push(i);
+    if (ki.length < 2) ki = [0, route.points.length - 1];
+    for (let k = 0; k < ki.length - 1; k++) {
+      const a = route.points[ki[k]];
+      const b = route.points[ki[k + 1]];
+      if (activeZones.length > 0 && zonesCrossedBy([a, b], activeZones).length > 0) {
+        heavy.push({ routeId: route.id, segIdx: k, start: { x: a.x, y: a.y }, goal: { x: b.x, y: b.y } });
+      }
+    }
+  }
+  if (heavy.length > 0) {
+    // Асинхронный маршрут через воркер: синхронный прогон здесь же даёт
+    // мгновенный результат (не блокируем UI ожиданием), а ответы воркера
+    // точечно заменяют тяжёлые сегменты и запускают финальный идемпотентный проход.
+    const w = getRoutingWorker();
+    if (w) {
+      let pending = heavy.length;
+      let anyOk = false;
+      for (const h of heavy) {
+        void planSegmentViaWorker(h.start, h.goal, activeZones, map.width, map.height).then((path) => {
+          if (path && path.length >= 2) {
+            anyOk = true;
+            useMissionStore.setState((cur) => ({
+              routes: cur.routes.map((r) => {
+                if (r.id !== h.routeId) return r;
+                let kk: number[] = [];
+                for (let i = 0; i < r.points.length; i++) if (!r.points[i].auto) kk.push(i);
+                if (kk.length < 2) kk = [0, r.points.length - 1];
+                const ka = r.points[kk[h.segIdx]];
+                const kb = r.points[kk[h.segIdx + 1]];
+                if (!ka || !kb) return r;
+                const mid: RoutePoint[] = [];
+                for (let i = 1; i < path.length - 1; i++) {
+                  const px = path[i];
+                  const geo = pixelToGeoStrict(px, map.bounds!, map.width, map.height);
+                  mid.push({ x: px.x, y: px.y, lat: geo.lat, lng: geo.lng, auto: true });
+                }
+                const pts = [...r.points];
+                const ia = kk[h.segIdx];
+                const ib = kk[h.segIdx + 1];
+                pts.splice(ia + 1, ib - ia - 1, ...mid);
+                pts[ia] = { ...pts[ia], auto: undefined };
+                return { ...r, points: pts };
+              }),
+            }));
+          }
+          if (--pending === 0 && anyOk) rerouteAllRoutesNow(); // финальная сверка/warnings
+        });
+      }
+      // не возвращаемся: синхронный pass ниже всё равно нужен (warnings/идемпотентность)
+    }
+  }
   const newRoutes: Route[] = [];
   const warningsMap: Record<string, string[]> = {};
   let changed = false;
@@ -1269,3 +1384,10 @@ export function rerouteAllNow(): void {
   rerouteTimerCleanup();
   rerouteAllRoutesNow();
 }
+
+// Синхронизация реестра маршрутов для fleet-стора (жёсткая блокировка смены
+// режима по профилю; без цикла модулей — fleet не импортирует mission).
+registerRoutesForFleet(useMissionStore.getState().routes);
+useMissionStore.subscribe((s, prev) => {
+  if (s.routes !== prev.routes) registerRoutesForFleet(s.routes);
+});
