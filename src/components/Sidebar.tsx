@@ -8,9 +8,12 @@ import {
 } from '../utils/export';
 import MapsPanel from './MapsPanel';
 import MissionPanel from './MissionPanel';
+import AltitudeProfile from './AltitudeProfile';
 
 const Sidebar: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'points' | 'restrictions' | 'export' | 'google' | 'mission'>('points');
+  const [activeTab, setActiveTab] = useState<'points' | 'restrictions' | 'route' | 'export' | 'google' | 'mission'>('points');
+  // Профиль высот открывается из вкладки «Маршрут» для выбранного маршрута.
+  const [showProfileFor, setShowProfileFor] = useState<string | null>(null);
   const [editingMarker, setEditingMarker] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const [editX, setEditX] = useState('');
@@ -21,6 +24,9 @@ const Sidebar: React.FC = () => {
   const {
     project,
     isProcessing,
+    activeRouteId,
+    routeWarnings,
+    autoFixRoute,
     selectedMarkerId,
     searchQuery,
     filterType,
@@ -168,6 +174,12 @@ const Sidebar: React.FC = () => {
           🚧 Зоны ({project.restrictions.length})
         </button>
         <button
+          onClick={() => setActiveTab('route')}
+          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'route' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
+        >
+          🧭 Маршрут ({(project.routes ?? []).length})
+        </button>
+        <button
           onClick={() => setActiveTab('google')}
           className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'google' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
         >
@@ -189,6 +201,45 @@ const Sidebar: React.FC = () => {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto">
+        {activeTab === 'route' && (
+          <div className="p-2 space-y-2">
+            <div className="text-xs text-gray-400">
+              Активный маршрут: <span className="text-cyan-300">{(project.routes ?? []).find(r => r.id === activeRouteId)?.name ?? '—'}</span>
+            </div>
+            <button
+              onClick={() => setShowProfileFor(activeRouteId)}
+              disabled={!activeRouteId}
+              className="w-full px-2 py-1.5 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 rounded text-xs text-white"
+            >
+              📈 Показать профиль высот маршрута
+            </button>
+            <button
+              onClick={() => autoFixRoute(activeRouteId)}
+              disabled={!activeRouteId || isProcessing}
+              title={isProcessing ? 'Дождитесь окончания обработки' : 'Перестроить активный маршрут в обход всех зон'}
+              className="w-full px-2 py-1.5 bg-cyan-700 hover:bg-cyan-600 disabled:opacity-40 rounded text-xs text-white"
+            >
+              🔧 Автокоррекция маршрута (облёт зон)
+            </button>
+            {(() => {
+              const warns = activeRouteId ? routeWarnings[activeRouteId] ?? [] : [];
+              if (warns.length === 0) return null;
+              return (
+                <div className="rounded border border-yellow-600/50 bg-yellow-900/20 p-2 space-y-1">
+                  {warns.map((w, i) => (
+                    <div key={i} className={`text-xs ${w.startsWith('Высота') || w.startsWith('Конфликт') ? 'text-orange-300' : 'text-yellow-300'}`}>
+                      ⚠️ {w}
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+            {showProfileFor && (
+              <AltitudeProfile routeId={showProfileFor} onClose={() => setShowProfileFor(null)} />
+            )}
+          </div>
+        )}
+
         {activeTab === 'points' && (
           <div className="p-2">
             {/* Search & Filter */}

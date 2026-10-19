@@ -15,6 +15,7 @@ import { useMapStore, invalidateZoneCache as invalidateZoneCacheLocal, selectVie
 import { useMissionStore, rerouteAllNow } from './useMissionStore';
 import { useFleetStore } from './useFleetStore';
 import { clearAllStoredMaps } from '../utils/storage';
+import { sanitizeProjectData } from '../utils/projectSchema';
 
 // Реэкспорт публичных утилит старого модуля — компоненты/тесты импортируют их из './useStore'
 export { getActiveZonesCached, invalidateZoneCache, normalizeViewState, selectViewForRender } from './useMapStore';
@@ -307,24 +308,34 @@ shimActions.exportProject = (): Project => snapshot.project;
 
 shimActions.importProject = (project: Project) => {
   invalidateZoneCacheLocal(); // набор зон заменён целиком — кэш недействителен
-  projectNameRef.value = project.projectName ?? 'Новый проект';
-  projectNameRef.createdAt = project.createdAt ?? projectNameRef.createdAt;
-  projectNameRef.updatedAt = project.updatedAt ?? new Date().toISOString();
+  // Zod-валидация внешних данных ПЕРЕД попаданием в стейт (краш-защита от
+  // битых .tqproj: NaN-координаты, вырожденные bounds, строки вместо чисел).
+  let geo: Record<string, unknown>;
+  try {
+    geo = sanitizeProjectData(project);
+  } catch (e) {
+    console.warn('[importProject] schema sanitize failed:', e);
+    geo = project as unknown as Record<string, unknown>;
+  }
+  const p = geo as unknown as Project;
+  projectNameRef.value = p.projectName ?? 'Новый проект';
+  projectNameRef.createdAt = p.createdAt ?? projectNameRef.createdAt;
+  projectNameRef.updatedAt = p.updatedAt ?? new Date().toISOString();
   useMapStore.setState({
-    map: project.map ?? null,
-    markers: project.markers ?? [],
-    restrictions: project.restrictions ?? [],
-    layers: project.layers?.length ? project.layers : [{ id: 'default', name: 'Основной', visible: true, locked: false }],
-    calibration: project.calibration ?? { enabled: false, points: [] },
-    googleMaps: project.googleMaps ?? { apiKey: '', enabled: false },
-    yandexMaps: project.yandexMaps ?? { apiKey: '', enabled: false },
-    openStreetMap: project.openStreetMap ?? { enabled: false, tileServer: 'osm' },
-    settings: project.settings ?? useMapStore.getState().settings,
+    map: p.map ?? null,
+    markers: p.markers ?? [],
+    restrictions: p.restrictions ?? [],
+    layers: p.layers?.length ? p.layers : [{ id: 'default', name: 'Основной', visible: true, locked: false }],
+    calibration: p.calibration ?? { enabled: false, points: [] },
+    googleMaps: p.googleMaps ?? { apiKey: '', enabled: false },
+    yandexMaps: p.yandexMaps ?? { apiKey: '', enabled: false },
+    openStreetMap: p.openStreetMap ?? { enabled: false, tileServer: 'osm' },
+    settings: p.settings ?? useMapStore.getState().settings,
     viewState: { offsetX: 0, offsetY: 0, scale: 1 },
     selectedMarkerId: null,
     selectedRestrictionId: null,
   });
-  useMissionStore.setState({ routes: project.routes ?? [], importLists: project.importLists });
+  useMissionStore.setState({ routes: p.routes ?? [], importLists: p.importLists });
 };
 
 shimActions.resetProject = () => {

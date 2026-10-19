@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import "./index.css";
 import App from "./App.tsx";
+import { AppErrorBoundary } from "./components/AppErrorBoundary.tsx";
 
 // Экран с текстом ошибки вместо «белого листа» при сбое загрузки/рендера
 function showError(title: string, detail: unknown) {
@@ -27,44 +28,13 @@ if (!rootEl) {
   showError("Не найден элемент #root. Проверьте index.html.", "");
 } else {
   try {
-    // Error Boundary: ошибки внутри React-дерева не дают белый экран
-    class ErrorBoundary extends React.Component<
-      { children: React.ReactNode },
-      { error: Error | null }
-    > {
-      state = { error: null as Error | null };
-      static getDerivedStateFromError(error: Error) {
-        return { error };
-      }
-      componentDidCatch(error: Error) {
-        console.error("Ошибка рендера React:", error);
-      }
-      render() {
-        if (this.state.error) {
-          return (
-            <pre
-              style={{
-                padding: "2rem",
-                fontFamily: "monospace",
-                color: "#b00020",
-                background: "#fff",
-                whiteSpace: "pre-wrap",
-                minHeight: "100vh",
-              }}
-            >
-              {`Ошибка приложения:\n\n${this.state.error.stack || this.state.error.message}`}
-            </pre>
-          );
-        }
-        return this.props.children;
-      }
-    }
-
+    // AppErrorBoundary (src/components/AppErrorBoundary.tsx): диагностика краша,
+    // кнопки «Продолжить» и «Сбросить данные» (очистка tq-map/tq-mission/tq-fleet).
     ReactDOM.createRoot(rootEl).render(
       <React.StrictMode>
-        <ErrorBoundary>
+        <AppErrorBoundary>
           <App />
-        </ErrorBoundary>
+        </AppErrorBoundary>
       </React.StrictMode>
     );
   } catch (err) {

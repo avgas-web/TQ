@@ -18,6 +18,7 @@ import type {
 export type ProjectSettings = Project['settings'];
 import { saveMapToIndexedDB, loadMapFromIndexedDB } from '../utils/storage';
 import { mercatorYToLat } from '../utils/googleMaps';
+import { sanitizeProjectData } from '../utils/projectSchema';
 
 const MIN_MAP_ZOOM_FLOOR = 6;
 
@@ -502,6 +503,15 @@ export const useMapStore = create<MapStore>()(
         // Нормализация viewState: старые версии могли записать вид без z0 или
         // с «грязным» значением null/строка/NaN.
         if (p.viewState !== undefined) p.viewState = normalizeViewState(p.viewState);
+        // Zod-санитайзер внешних данных: конечные числа, диапазоны lat/lon,
+        // bounds north>south/east>west, канонизация legacy rectangle→polygon,
+        // дефолты для дефектных секций. Ошибку не кидаем — persist-миграция
+        // должна вернуть состояние любой ценой; битые секции чинятся дефолтами.
+        try {
+          Object.assign(p, sanitizeProjectData(p));
+        } catch (e) {
+          console.warn('[tq-map migrate] schema sanitize skipped:', e);
+        }
         return p as unknown as MapState;
       },
       onRehydrateStorage: () => (state, error) => {

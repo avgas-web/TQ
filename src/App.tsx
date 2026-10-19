@@ -5,26 +5,25 @@ import Sidebar from './components/Sidebar';
 import StatusBar from './components/StatusBar';
 import { useStore } from './store/useStore';
 import { initOpenStreetMap } from './utils/openStreetMap';
+import { eventBus } from './utils/eventBus';
 import { useAppInitialization } from './hooks/useAppInitialization';
 
 
 /**
  * Тост-уведомление об ошибках хранилища (quota-exceeded и т.п.).
- * storage.ts диспатчит window-событие 'tq:storage-error' — молчаливая потеря
- * данных при переполнении localStorage теперь видна пользователю.
+ * storage.ts эмитит 'storage:error' через типобезопасный eventBus — молчаливая
+ * потеря данных при переполнении localStorage теперь видна пользователю.
  */
 const StorageToast: React.FC = () => {
   const [message, setMessage] = useState<string | null>(null);
   useEffect(() => {
-    const onError = (e: Event) => {
-      const detail = (e as CustomEvent<string>).detail;
-      if (typeof detail === 'string' && detail) {
-        setMessage(detail);
+    const off = eventBus.on('storage:error', ({ message: msg }) => {
+      if (msg) {
+        setMessage(msg);
         window.setTimeout(() => setMessage(null), 6000);
       }
-    };
-    window.addEventListener('tq:storage-error', onError);
-    return () => window.removeEventListener('tq:storage-error', onError);
+    });
+    return off;
   }, []);
   if (!message) return null;
   return (
@@ -110,13 +109,13 @@ const App: React.FC = () => {
     // scale без корректировки offset.
     if (e.key === '+' || e.key === '=' || e.key === '§') {
       e.preventDefault();
-      window.dispatchEvent(new CustomEvent('tq:zoom', { detail: 1.2 }));
+      eventBus.emit('map:zoom-request', { factor: 1.2 });
       return;
     }
 
     if (e.key === '-' || e.key === '_' || e.key === '–') {
       e.preventDefault();
-      window.dispatchEvent(new CustomEvent('tq:zoom', { detail: 1 / 1.2 }));
+      eventBus.emit('map:zoom-request', { factor: 1 / 1.2 });
       return;
     }
 

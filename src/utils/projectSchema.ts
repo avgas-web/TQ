@@ -13,6 +13,7 @@ const lonOrNull = finiteNumber.refine((v) => v >= -180 && v <= 180, 'Долго�
 
 export const PointSchema = z.object({ x: finiteNumber, y: finiteNumber });
 
+/** Маркер: полные атрибуты + дефолты; доп. поля (binding и т.п.) сохраняются. */
 export const MarkerSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -26,8 +27,13 @@ export const MarkerSchema = z.object({
   layer: z.string().default('default'),
   createdAt: z.string().default(() => new Date().toISOString()),
   terrainM: finiteNumber.nullable().optional(),
-});
+}).passthrough();
 
+/**
+ * Тип зоны. Продуктово оставлены только полигоны NFZ произвольной геометрии,
+ * но legacy-сохранённые проекты ('rectangle'/'circle') обязаны переживать
+ * миграцию без потери данных — принимаем все три значения, канонализируем ниже.
+ */
 export const RestrictionSchema = z.object({
   id: z.string(),
   type: z.enum(['rectangle', 'polygon', 'circle']),
@@ -38,9 +44,16 @@ export const RestrictionSchema = z.object({
   active: z.boolean().default(true),
   minHeightAGL: finiteNumber.nonnegative().nullable().optional(),
   maxHeightAGL: finiteNumber.nonnegative().nullable().optional(),
+}).transform((r): typeof r => {
+  // Legacy-канонизация: прямоугольник → полигон из 4 углов (без потерь формы).
+  if (r.type === 'rectangle' && r.points.length === 2) {
+    const [a, b] = r.points;
+    return { ...r, type: 'polygon', points: [{ x: a.x, y: a.y }, { x: b.x, y: a.y }, { x: b.x, y: b.y }, { x: a.x, y: b.y }] };
+  }
+  return r;
 }).refine(
   (r) => (r.type === 'circle' ? r.points.length >= 1 : r.points.length !== 1),
-  'Зона недопустима: circle требует центр; polygon/rectangle — 0 или ≥2 точек (1 точка — вырожденная зона)',
+  'Зона недопустима: circle требует центр; polygon — 0 или ≥2 точек (1 точка — вырожденная зона)',
 );
 
 export const LayerSchema = z.object({
@@ -162,6 +175,48 @@ export function parseProject(raw: unknown): ProjectParseResult {
     ok: false,
     errors: parsed.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`),
   };
+}
+
+/**
+ * Схема снапшота гео-части проекта (useMapStore.getGeoSnapshot): те же поля,
+ * что ProjectSchema, но routes/importLists исключены (они в tq-mission).
+ */
+const GeoSnapshotSchema = ProjectSchema.omit({ routes: true }).partial({ version: true });
+
+/**
+ * Best-effort санитайзер внешних данных: валидирует через Zod и ДОПОЛНЯЕТ
+ * дефолтами, а не отвергает объект целиком (legacy-проекты богаты полевыми
+ * расширениями, которых нет в схеме). Падает только если вход — не объект.
+ * Используется на границах persist-migration и импорта .tqproj.
+ */
+export function sanitizeProjectData(raw: unknown): Record<string, unknown> {
+  const obj = (raw ?? {}) as Record<string, unknown>;
+  if (typeof obj !== 'object' || Array.isArray(obj)) {
+    throw new TypeError('sanitizeProjectData: ожидался plain-object снапшот проекта');
+  }
+  // 1) Полная строгая схема: если прошла — берём канонизированные данные
+  //    (прямоугольники→полигоны, finite-числа, bounds north>south и т.д.),
+  //    но сохраняем исходные расширенные поля, которые schema бы вырезала.
+  const strict = GeoSnapshotSchema.safeParse(obj);
+  if (strict.success) return { ...obj, ...(strict.data as Record<string, unknown>) };
+  // 2) Строгая схема не прошла (битые legacy-поля) — точечная починка по секциям:
+  //    каждая секция валидируется отдельно; дефектная секция заменяется дефолтом,
+  //    остальные данные пользователя сохраняются.
+  const out: Record<string, unknown> = { ...obj };
+  const fixSection = <K extends keyof ValidatedProject>(key: K, schema: z.ZodTypeAny): void => {
+    const r = schema.safeParse(obj[key as string]);
+    out[key as string] = r.success ? r.data : undefined; // undefined → default при {...obj} слиянии ниже
+  };
+  fixSection('markers', z.array(MarkerSchema));
+  fixSection('restrictions', z.array(RestrictionSchema));
+  fixSection('layers', z.array(LayerSchema));
+  fixSection('calibration', GeoSnapshotSchema.shape.calibration);
+  fixSection('map', MapDataSchema.nullable());
+  fixSection('settings', GeoSnapshotSchema.shape.settings);
+  for (const k of ['markers', 'restrictions', 'layers', 'calibration', 'map', 'settings']) {
+    if (out[k] === undefined) delete out[k]; // пусть ProjectSchema применит дефолт
+  }
+  return out;
 }
 
 /** Валидация viewState из хранилища (замена ad-hoc normalizeViewState). */

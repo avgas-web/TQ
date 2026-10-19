@@ -9,6 +9,7 @@ import { pixelToGeoExact, geoToPixelExact, routeLengthM, zonesCrossedBy, planPat
 import { getOSMTileUrl, loadTileImage } from '../utils/openStreetMap';
 import MiniMapPanel, { MiniOverlayLine, MiniOverlayPoint, type MiniZone } from './MiniMapPanel';
 import { zoomForGroundMpp, GROUND_MPP_1CM_2KM } from '../utils/pannelli';
+import { eventBus } from '../utils/eventBus';
 import type { Point, Route, RoutePoint, MapBounds } from '../types';
 
 /** Границы зума тайловой карты: minZoom 3 (вся страна/регион), maxZoom 19 (уровни OSM).
@@ -1172,17 +1173,16 @@ const MapCanvas: React.FC = () => {
         clearTimeout(vTimer); vTimer = null;
       }
     });
-    // Клавиатурный зум из App.tsx: событие tq:zoom принимает factor и масштабирует
-    // вид вокруг центра канваса через тот же zoomAt, что и колесо мыши
-    // (единые границы minZoom..maxNativeZoom, центр не «прыгает»).
-    const onZoomEvent = (e: Event) => {
-      const factor = (e as CustomEvent<number>).detail;
+    // Клавиатурный зум из App.tsx: типобезопасный eventBus ('map:zoom-request')
+    // вместо window CustomEvent — масштабирует вид вокруг центра канваса через
+    // тот же zoomAt, что и колесо мыши (единые границы minZoom..maxNativeZoom,
+    // центр не «прыгает»).
+    const offZoomBus = eventBus.on('map:zoom-request', ({ factor }) => {
       if (typeof factor === 'number' && isFinite(factor) && factor > 0) zoomAt(factor);
-    };
-    window.addEventListener('tq:zoom', onZoomEvent);
+    });
     return () => {
       unsub();
-      window.removeEventListener('tq:zoom', onZoomEvent);
+      offZoomBus();
     };
   }, [zoomAt]);
 
