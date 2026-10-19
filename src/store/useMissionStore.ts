@@ -367,10 +367,23 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
   // экшены остаются стабильными по ссылке (Object.assign обновит замыкания
   // set/get на актуальные — семантика store та же).
   const target = (targetRef ??= {} as MissionActions);
+  // ВАЖНО: в zustand v5 persist middleware обращается к api.getState() ЕЩЁ ДО
+  // инициализации базового стора (например, при вычислении options.name /
+  // partialize на первом прогоне) — в этот момент get() возвращает undefined,
+  // и обращение вида get()[k] падало с «Cannot read properties of undefined
+  // (reading 'addRoute')» прямо на старте приложения. Резолв защищён: при
+  // пустом сторе берём только собственные поля target (patched-обёрток шима
+  // на этом этапе ещё не существует).
   const actions = new Proxy(target, {
     get(t, k: string | symbol): unknown {
       if (k === '__target') return t;
-      const patched = (get() as unknown as Record<string | symbol, unknown>)[k];
+      let cur: Record<string | symbol, unknown> | undefined;
+      try {
+        cur = get() as unknown as Record<string | symbol, unknown>;
+      } catch {
+        cur = undefined; // стор ещё не создан — фолбэк на target
+      }
+      const patched = cur?.[k];
       if (typeof patched === 'function' && patched !== (t as unknown as Record<string | symbol, unknown>)[k]) return patched;
       return (t as unknown as Record<string | symbol, unknown>)[k];
     },

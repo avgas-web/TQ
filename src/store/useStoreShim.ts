@@ -369,12 +369,38 @@ const BLOCKED_MAP_MUTATORS: Array<keyof MapS> = ['deleteRestriction'];
 let lastGuardPassTs = Date.now();
 const guardWrapped = new Map<string, (...a: unknown[]) => unknown>();
 
-function makeGuarded(key: string, store: { getState(): object }): (...a: unknown[]) => unknown {
-  const cacheKey = `${String(key)}@${store === useMissionStore ? 'mission' : 'map'}`;
+// ИСПРАВЛЕНИЕ краша «Cannot read properties of undefined (reading 'addRoute')»:
+// раньше обёртки isProcessing-гарда записывались ПРЯМО в доменные сторы через
+// setState. Это ломало работу в двух случаях:
+//  1) любой setState/persist-rehydrate, вычисляющий следующий стейт из
+//     предыдущего (spread/getState()), мог потерять либо удвоить обёртку —
+//     пока обёртка не читалась из стора же, её «оригинал» становился undefined
+//     и первый же вызов st.addRoute(...) падал внутри Object.get;
+//  2) внутренние вызовы самого стора (rerouteAllRoutesNow -> addRoute и т.п.)
+//     начинали проходить через гард и молча отклоняться во время isProcessing.
+// Теперь оригиналы захватываются один раз при загрузке модуля (до любых
+// setState), а обёртки существуют ТОЛЬКО в shimActions — фасадном объекте
+// legacy-совместимости. Доменные сторы остаются нетронутыми.
+const missionOriginals: Record<string, ((...a: unknown[]) => unknown) | undefined> = {};
+for (const key of BLOCKED_MUTATORS) {
+  const v = (useMissionStore.getState() as unknown as Record<string, unknown>)[key];
+  if (typeof v === 'function') missionOriginals[key] = v as (...a: unknown[]) => unknown;
+}
+const mapOriginals: Record<string, ((...a: unknown[]) => unknown) | undefined> = {};
+for (const key of BLOCKED_MAP_MUTATORS) {
+  const v = (useMapStore.getState() as unknown as Record<string, unknown>)[key];
+  if (typeof v === 'function') mapOriginals[key] = v as (...a: unknown[]) => unknown;
+}
+
+function makeGuarded(key: string, domain: 'mission' | 'map'): (...a: unknown[]) => unknown {
+  const cacheKey = `${key}@${domain}`;
   const cached = guardWrapped.get(cacheKey);
   if (cached) return cached;
-  const orig = (store.getState() as unknown as Record<string, unknown>)[key] as ((...a: unknown[]) => unknown) | undefined;
-  if (typeof orig !== 'function') return () => null;
+  const orig = domain === 'mission' ? missionOriginals[key] : mapOriginals[key];
+  // Если метод вдруг отсутствует в снимке — фолбэк всегда резолвится через
+  // ЖИВОЙ getState(), так что undefined/рекурсия невозможны.
+  const fallback = (store: { getState(): object }): ((...a: unknown[]) => unknown) | undefined =>
+    (store.getState() as unknown as Record<string, unknown>)[key] as ((...a: unknown[]) => unknown) | undefined;
   const wrapped = function (this: unknown, ...args: unknown[]): unknown {
     const st = useMissionStore.getState();
     if (st.isProcessing && Date.now() - lastGuardPassTs < MUTATE_GUARD_MS) {
@@ -382,26 +408,25 @@ function makeGuarded(key: string, store: { getState(): object }): (...a: unknown
       return null;
     }
     lastGuardPassTs = Date.now();
-    return orig.apply(this, args);
+    const fn = typeof orig === 'function' ? orig : fallback(domain === 'mission' ? useMissionStore : useMapStore);
+    if (typeof fn !== 'function') return null;
+    return fn.apply(this, args);
   };
   guardWrapped.set(cacheKey, wrapped);
   return wrapped;
 }
 
 /**
- * Оборачивает mutate-экшены стора защитой по флагу isProcessing. Идемпотентно:
- * повторные вызовы возвращают те же обёртки из кэша guardWrapped.
+ * Регистрирует guarded-обёртки mutate-экшенов в facade-объекте shimActions
+ * (только для legacy API useStore). Идемпотентно: повторные вызовы возвращают
+ * те же обёртки из кэша guardWrapped. Доменные сторы НЕ мутируются.
  */
 export function installMissionGuards(): void {
   for (const key of BLOCKED_MUTATORS) {
-    const wrapped = makeGuarded(key as string, useMissionStore);
-    (shimActions as Record<string, unknown>)[key] = wrapped;
-    useMissionStore.setState({ [key]: wrapped } as never);
+    (shimActions as Record<string, unknown>)[key] = makeGuarded(key as string, 'mission');
   }
   for (const key of BLOCKED_MAP_MUTATORS) {
-    const wrapped = makeGuarded(key as string, useMapStore);
-    (shimActions as Record<string, unknown>)[key] = wrapped;
-    useMapStore.setState({ [key]: wrapped } as never);
+    (shimActions as Record<string, unknown>)[key] = makeGuarded(key as string, 'map');
   }
 }
 installMissionGuards();
