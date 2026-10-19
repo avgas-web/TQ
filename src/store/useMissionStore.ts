@@ -1122,6 +1122,17 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
     },
 
     autoPlanRoutes: () => {
+      // Точки старта/цели хранятся в гео-координатах, а маршруты — в пикселях.
+      // Если у узлов нет корректных пиксельных координат (карта ещё не была
+      // загружена в момент постановки точки — узел создаётся с x:0,y:0), они
+      // «уходят в угол карты». Перед прокладкой пересчитываем пиксели всех
+      // существующих маршрутов по актуальным границам растра.
+      const mapPre = useMapStore.getState().map;
+      if (mapPre?.bounds && mapPre.width > 0 && mapPre.height > 0) {
+        set((s) => ({
+          routes: s.routes.map((r) => recomputeRoutePixels(r, mapPre.bounds!, mapPre.width, mapPre.height)),
+        }));
+      }
       const cur = get();
       const lists = cur.importLists;
       if (!lists) return 0;
