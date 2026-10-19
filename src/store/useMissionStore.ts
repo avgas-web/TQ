@@ -1113,7 +1113,13 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
       void Promise.resolve().then(() => actions.autoPlanRoutes());
     },
 
-    setCraftType: (t) => set({ craftType: t }),
+    setCraftType: (t) => {
+      set({ craftType: t });
+      // Смена типа ВС меняет лимит дальности миссии — перепроверяем маршруты.
+      // При сужении профиля (uav→drone) превышения всплывут в routeWarnings;
+      // при расширении — предупреждения устаревают и снимаются reroute-прогоном.
+      actions.flushReroute();
+    },
 
     autoPlanRoutes: () => {
       const cur = get();
@@ -1124,10 +1130,12 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
       if (starts.length === 0 || goals.length === 0) return 0;
       // Автопрокладка только для точек без привязанного маршрута; существующие
       // отредактированные пользователем маршруты не перетираются.
-      const usedRouteIds = new Set<string>();
-      for (const r of cur.routes) for (const p of r.points) if (p.binding?.pointId) usedRouteIds.add(`${p.binding.pointId}|${r.id}`);
-      const freeStarts = starts.filter((s) => !usedRouteIds.has(`${s.id}|`));
-      const freeGoals = goals.filter((g) => !usedRouteIds.has(`${g.id}|`));
+      // Точка считается занятой, если хоть один маршрут содержит её в binding
+      // ЛЮБОГО узла (стартовый, целевой или пользовательский waypoint-якорь).
+      const boundPointIds = new Set<string>();
+      for (const r of cur.routes) for (const p of r.points) if (p.binding?.pointId) boundPointIds.add(p.binding.pointId);
+      const freeStarts = starts.filter((s) => !boundPointIds.has(s.id));
+      const freeGoals = goals.filter((g) => !boundPointIds.has(g.id));
       const pairs = Math.min(freeStarts.length, freeGoals.length);
       let created = 0;
       for (let i = 0; i < pairs && cur.routes.length + created < MAX_ROUTES; i++) {
