@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
 import { useStore, scheduleRerouteAll, getActiveZonesCached } from '../store/useStore';
 import { useMissionStore } from '../store/useMissionStore';
+import { useFleetStore } from '../store/useFleetStore';
 import { isPointInsideAnyRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
@@ -503,6 +504,21 @@ const MapCanvas: React.FC = () => {
   const [sharedStart, setSharedStart] = useState(true);
   const [activeUav, setActiveUav] = useState(0);
   const [startGeo, setStartGeo] = useState<{ lat: number; lng: number } | null>(null);
+  // ── Персистентные точки старта/цели (store-first) ──────────────────────────
+  // Единый источник истины для общих точек: useMissionStore.importLists.
+  // Локальные startGeo/goalGeo остаются быстрым UI-зеркалом, но ИНИЦИАЛИЗИРУЮТСЯ
+  // из стора и ПИШУТСЯ в стор — после unmount/remount MapCanvas (смена карты,
+  // переключение панели) точки больше не «исчезают».
+  const sharedStartId = useMissionStore((s) => s.sharedStartId);
+  const sharedGoalId = useMissionStore((s) => s.sharedGoalId);
+  const importStarts = useMissionStore((s) => s.importLists?.starts);
+  const importGoals = useMissionStore((s) => s.importLists?.goals);
+  const droneStartsPersisted = useFleetStore((s) => s.droneStarts);
+  const droneGoalsPersisted = useFleetStore((s) => s.droneGoals);
+  const setSharedStartPoint = useMissionStore((s) => s.setSharedStartPoint);
+  const setSharedGoalPoint = useMissionStore((s) => s.setSharedGoalPoint);
+  const setDroneStartAt = useFleetStore((s) => s.setDroneStartAt);
+  const setDroneGoalAt = useFleetStore((s) => s.setDroneGoalAt);
   const [goalGeo, setGoalGeo] = useState<{ lat: number; lng: number } | null>(null);
   // Индивидуальные старты дронов (при выключенном «общем старте»): индекс → гео.
   // Маршрут i-го дрона начинается в startForUav(i) — так же, как цель берётся
@@ -511,6 +527,33 @@ const MapCanvas: React.FC = () => {
   // Индивидуальная цель текущего дрона при «индивидуальных целях»: клик по
   // окну «Цель» задаёт её; переносится на последнюю точку маршрута этого дрона.
   const [droneGoals, setDroneGoals] = useState<( { lat: number; lng: number } | null )[]>([]);
+
+  // ── Гидрация store-first точек (исправление бага «точки исчезают») ─────────
+  // При монтировании MapCanvas (смена карты/панели/unmount→remount) восстанавливаем
+  // UI-зеркала из сторов: общая точка старта/цели — из importLists по shared*Id,
+  // индивидуальные старты/цели дронов — из useFleetStore.droneStarts/droneGoals.
+  useEffect(() => {
+    if (sharedStartId && importStarts) {
+      const p = importStarts.find((x) => x.id === sharedStartId);
+      if (p) setStartGeo({ lat: p.lat, lng: p.lng });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- гидрация только при смене id/списка
+  }, [sharedStartId, importStarts]);
+  useEffect(() => {
+    if (sharedGoalId && importGoals) {
+      const p = importGoals.find((x) => x.id === sharedGoalId);
+      if (p) setGoalGeo({ lat: p.lat, lng: p.lng });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- гидрация только при смене id/списка
+  }, [sharedGoalId, importGoals]);
+  useEffect(() => {
+    if (droneStartsPersisted.length > 0) setDroneStarts([...droneStartsPersisted]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- зеркало при изменении persisted-массива
+  }, [droneStartsPersisted]);
+  useEffect(() => {
+    if (droneGoalsPersisted.length > 0) setDroneGoals([...droneGoalsPersisted]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- зеркало при изменении persisted-массива
+  }, [droneGoalsPersisted]);
   const [pickWhat, setPickWhat] = useState<'none' | 'start' | 'goal'>('none');
   const pickWhatRef = useRef(pickWhat);
   useEffect(() => { pickWhatRef.current = pickWhat; }, [pickWhat]);
@@ -704,9 +747,13 @@ const MapCanvas: React.FC = () => {
     if (panelIdx === 0) {
       // Индивидуальные старты: клик по окну «Старт» задаёт старт ВЫБРАННОГО дрона
       if (!sharedStart) {
-        setDroneStarts((prev) => { const n = [...prev]; n[activeUavRef.current] = { lat: geo.lat, lng: geo.lng }; return n; });
+        const g = { lat: geo.lat, lng: geo.lng };
+        setDroneStarts((prev) => { const n = [...prev]; n[activeUavRef.current] = g; return n; });
+        setDroneStartAt(activeUavRef.current, g); // store-first: переживает unmount
       } else {
-        setStartGeo({ lat: geo.lat, lng: geo.lng });
+        const g = { lat: geo.lat, lng: geo.lng };
+        setStartGeo(g);
+        setSharedStartPoint(g); // upsert 'СТАРТ' в importLists + sharedStartId
       }
       reopenStepForEdit(0);
     } else if (panelIdx === 1) {
@@ -718,6 +765,7 @@ const MapCanvas: React.FC = () => {
       if (!sharedGoal) {
         const g = { lat: geo.lat, lng: geo.lng };
         setDroneGoals((prev) => { const n = [...prev]; n[activeUavRef.current] = g; return n; });
+        setDroneGoalAt(activeUavRef.current, g); // store-first
         const st = useStore.getState();
         const map = st.project.map;
         const r = (st.project.routes || [])[activeUavRef.current];
@@ -729,11 +777,13 @@ const MapCanvas: React.FC = () => {
           setGoalGeo(g);
         }
       } else {
-        setGoalGeo({ lat: geo.lat, lng: geo.lng });
+        const g = { lat: geo.lat, lng: geo.lng };
+        setGoalGeo(g);
+        setSharedGoalPoint(g); // upsert 'ЦЕЛЬ' в importLists + sharedGoalId
       }
       reopenStepForEdit(2);
     }
-  }, [reopenStepForEdit, sharedStart, sharedGoal]);
+  }, [reopenStepForEdit, sharedStart, sharedGoal, setSharedStartPoint, setSharedGoalPoint, setDroneStartAt, setDroneGoalAt]);
 
   const tripleStepRef = useRef(tripleStep);
   useEffect(() => { tripleStepRef.current = tripleStep; }, [tripleStep]);
@@ -762,8 +812,8 @@ const MapCanvas: React.FC = () => {
   // id форматы: 'triple:start' | 'triple:goal' | 'draft:N' | 'zone:<restrictionId>' |
   //             'pendingZone:<uid>' | 'drone-goal:<routeId>'
   const handlePanelPointDelete = useCallback((id: string) => {
-    if (id === 'triple:start') { setStartGeo(null); return; }
-    if (id === 'triple:goal') { setGoalGeo(null); return; }
+    if (id === 'triple:start') { setStartGeo(null); setSharedStartPoint(null); return; }
+    if (id === 'triple:goal') { setGoalGeo(null); setSharedGoalPoint(null); return; }
     if (id.startsWith('pendingZone:')) {
       const uid = Number(id.slice('pendingZone:'.length));
       setPendingZones((prev) => prev.filter((pz) => pz.uid !== uid));
@@ -786,7 +836,7 @@ const MapCanvas: React.FC = () => {
       const r = (st.project.routes || []).find((rr) => rr.id === rid);
       if (r && r.points.length > 0) st.removeRoutePoint(rid, r.points.length - 1);
     }
-  }, []);
+  }, [setSharedStartPoint, setSharedGoalPoint]);
   const handlePanelZoneDelete = useCallback((id: string) => {
     if (id.startsWith('pendingZone:')) {
       const uid = Number(id.slice('pendingZone:'.length));
@@ -847,6 +897,10 @@ const MapCanvas: React.FC = () => {
   const newMission = useCallback(() => {
     if (launchState !== 'done') return;
     setStartGeo(null); setGoalGeo(null); setDraftRoutePts([]); setPendingZones([]);
+    // очистка store-first зеркал: общие точки + индивидуальные старты/цели дронов
+    setSharedStartPoint(null); setSharedGoalPoint(null);
+    setDroneStarts([]); setDroneGoals([]);
+    useFleetStore.setState({ droneStarts: [], droneGoals: [] });
     setApprovedSteps([false, false, false]); setTripleStep(0); setLaunchState('idle');
     setActiveUav(0);
     // маршруты предыдущей миссии удаляем из проекта (зоны-ограничения остаются)
@@ -922,7 +976,9 @@ const MapCanvas: React.FC = () => {
       const mx = (e.clientX - r.left - v.offsetX) / v.scale;
       const my = (e.clientY - r.top - v.offsetY) / v.scale;
       const g = pixelToGeoExact({ x: mx, y: my }, map.bounds, map.width, map.height);
-      if (what === 'start') setStartGeo(g); else setGoalGeo(g);
+      // store-first: точка переживает unmount/remount MapCanvas (смена карты)
+      if (what === 'start') { setStartGeo(g); useMissionStore.getState().setSharedStartPoint(g); }
+      else { setGoalGeo(g); useMissionStore.getState().setSharedGoalPoint(g); }
       setPickWhat('none');
     };
     canvas.addEventListener('click', onClick, true); // capture: выполняемся до основной обработки кликов
@@ -1241,8 +1297,13 @@ const MapCanvas: React.FC = () => {
     }
   }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled, mapLoaded, canvasSize.width]);
 
-  // Отдельный эффект: как только появляются точки маршрутов/маркеров —
-  // автоматически подогнать вид под все объекты (один раз на набор объектов)
+  // Отдельный эффект: при ПЕРВОМ появлении объектов на новой карте —
+  // автоматически подогнать вид под все объекты ровно один раз.
+  // Ключ — ТОЛЬКО идентификатор карты (mapId): раньше в ключ входили id всех
+  // маршрутов/маркеров, из-за чего добавление/удаление любой точки меняло ключ
+  // и верхняя карта самовольно «возвращалась»/перемасштабивалась под bbox всех
+  // объектов (автовозврат вида). Теперь ручной зум/пан пользователя никогда не
+  // откатывается: перестройка маршрутов меняет только содержимое, но не вид.
   const lastFitKeyRef = useRef<string | null>(null);
   useEffect(() => {
     const map = project.map;
@@ -1251,18 +1312,13 @@ const MapCanvas: React.FC = () => {
     for (const r of project.routes || []) if (r.visible !== false) for (const p of r.points) pts.push({ x: p.x, y: p.y });
     for (const m of project.markers) pts.push({ x: m.x, y: m.y });
     if (pts.length < 2) return;
-    // Ключ — ТОЛЬКО набор объектов (mapId + упорядоченные id маршрутов/маркеров),
-    // но не их количество и не dataUrl. Старый ключ `${dataUrl}|${pts.length}`
-    // менялся при каждом добавлении/удалении точки → вид самовольно перемасштабивался
-    // под все объекты, откатывая ручной зум пользователя (редактирование маршрутов
-    // становилось невозможным). Смена карты определяется по mapId (стабилен между
-    // загрузками), а не по dataUrl (меняется при каждой перезагрузке одного bbox).
-    const fitKeyParts: string[] = [String(map.mapId || '')];
-    for (const r of project.routes || []) fitKeyParts.push(`R:${r.id}`);
-    for (const m of project.markers) fitKeyParts.push(`M:${m.id}`);
-    const key = fitKeyParts.join('|');
-    if (lastFitKeyRef.current === key) return;
-    lastFitKeyRef.current = key;
+    // Ключ — ТОЛЬКО идентификатор карты + «есть ли объекты» (переход 0→N).
+    // Смена состава объектов (добавление/удаление точек, перестройка маршрутов)
+    // НЕ должна трогать вид — иначе верхняя карта самовольно возвращается к
+    // общему bbox и сбрасывает ручной зум пользователя.
+    const fitKey = String(map.mapId || '') + ':' + (pts.length > 0 ? 'has' : 'empty');
+    if (lastFitKeyRef.current === fitKey) return;
+    lastFitKeyRef.current = fitKey;
     const fit = fitViewToData(map.width, map.height, map.bounds, pts, canvasSize.width, canvasSize.height);
     if (fit) setViewState(fit);
   }, [project.routes, project.markers, mapLoaded, canvasSize.width, canvasSize.height, project.map?.bounds]);

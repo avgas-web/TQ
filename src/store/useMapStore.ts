@@ -264,10 +264,23 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
     markers: state.markers.map((m) => (m.id === id ? { ...m, ...updates } : m)),
   })),
 
-  deleteMarker: (id) => set((state) => ({
-    markers: state.markers.filter((m) => m.id !== id),
-    selectedMarkerId: state.selectedMarkerId === id ? null : state.selectedMarkerId,
-  })),
+  deleteMarker: (id) => {
+    // Тип точки нужен ДО удаления — по нему решаем, каскадировать ли маршруты.
+    const kind = (() => {
+      const mk = get().markers.find((m) => m.id === id);
+      return mk?.type === 'start' || mk?.type === 'goal' ? mk.type : null;
+    })();
+    set((state) => ({
+      markers: state.markers.filter((m) => m.id !== id),
+      selectedMarkerId: state.selectedMarkerId === id ? null : state.selectedMarkerId,
+    }));
+    // Каскад старта/цели: при удалении точки start/goal удаляем привязанные
+    // маршруты и чистим назначения дронов (иначе остаются «висячие» ссылки —
+    // точки на нижней карте исчезают, а маршрут/назначение продолжает жить).
+    // Маршруты живут в mission-сторе, назначения — во fleet-сторе: обращение
+    // через динамический import разрывает потенциальный цикл map↔mission↔fleet.
+    if (kind) void cascadeRemoveStartGoal(id, kind === 'start' ? 'start' : 'goal');
+  },
 
   addRestriction: (restrictionData) => {
     invalidateZoneCache();
@@ -504,6 +517,51 @@ export const useMapStore = create<MapStore>()(
     },
   ),
 );
+
+/**
+ * Каскад удаления точки старта/цели (map → mission → fleet, без циклов:
+ * dynamic import — миссия/флот не импортируют map-стор на уровне модуля).
+ * При удалении маркера type='start'|'goal':
+ *  1) чистим sharedStartId/sharedGoalId, если они указывали на этот id;
+ *  2) удаляем маршруты, привязанные к точке (route.points[].binding.pointId);
+ *  3) снимаем назначения дронов (startId/goalId/routeId) с удалёнными ссылками.
+ * Иначе остаются «висячие» ссылки: точки на карте исчезают, а маршрут и
+ * назначение продолжают жить (прежний баг исчезновения точек).
+ */
+export async function cascadeRemoveStartGoal(
+  markerId: string,
+  kind: 'start' | 'goal',
+): Promise<void> {
+  const [{ useMissionStore }, { useFleetStore }] = await Promise.all([
+    import('./useMissionStore'),
+    import('./useFleetStore'),
+  ]);
+  const mission = useMissionStore.getState();
+
+  // 1) общие точки старта/цели (store-first зеркала в importLists)
+  if (kind === 'start' && mission.sharedStartId === markerId) {
+    useMissionStore.setState({ sharedStartId: null });
+  } else if (kind === 'goal' && mission.sharedGoalId === markerId) {
+    useMissionStore.setState({ sharedGoalId: null });
+  }
+
+  // 2) маршруты, узлы которых привязаны к удалённой точке
+  const deadRouteIds = mission.routes
+    .filter((r) => r.points.some((p) => p.binding && p.binding.kind === kind && p.binding.pointId === markerId))
+    .map((r) => r.id);
+  for (const rid of deadRouteIds) mission.deleteRoute(rid);
+
+  // 3) назначения дронов: отвязываем удалённую точку и съевшиеся маршруты
+  const fleet = useFleetStore.getState();
+  for (const a of fleet.droneAssignments) {
+    let changed = false;
+    const patch: Partial<typeof a> = {};
+    if (kind === 'start' && a.startId === markerId) { patch.startId = null; changed = true; }
+    if (kind === 'goal' && a.goalId === markerId) { patch.goalId = null; changed = true; }
+    if (a.routeId && deadRouteIds.includes(a.routeId)) { patch.routeId = null; changed = true; }
+    if (changed) fleet.setDroneAssignment(a.droneId, patch);
+  }
+}
 
 /**
  * Селектор вида для React-компонентов. Возвращает НОВЫЙ объект только когда

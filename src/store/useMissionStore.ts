@@ -12,7 +12,7 @@ import { persist, createJSONStorage } from 'zustand/middleware';
 import { v4 as uuidv4 } from 'uuid';
 import type {
   Route, RoutePoint, Point, RouteShape, RangeLimitMode, ImportPoint, ImportLists,
-  WaypointParamsLite, MissionMetaLite,
+  WaypointParamsLite, MissionMetaLite, WaypointBinding,
 } from '../types';
 import { MAX_ROUTES } from '../types';
 import {
@@ -64,6 +64,11 @@ export interface MissionState {
   /** Глобальный флаг «идёт тяжёлая/сетевая операция» (upload миссии, пересчёт
    *  высот). UI блокирует mutate-кнопки, пока true — защита от гонок состояний. */
   isProcessing: boolean;
+  /** ID общей точки старта из importLists.starts (null = не задана).
+   *  Единый источник истины для MapCanvas: локальный useState только зеркалит. */
+  sharedStartId: string | null;
+  /** ID общей точки цели из importLists.goals. */
+  sharedGoalId: string | null;
 }
 
 export interface MissionActions {
@@ -107,6 +112,23 @@ export interface MissionActions {
   setRouteRangeLimit: (id: string, mode: RangeLimitMode, meters?: number) => void;
   importRoutes: (starts: ImportInput[], goals: ImportInput[]) => number;
   clearImportLists: () => void;
+  /** Точечное добавление точки старта/цели (множественные старты/цели). */
+  addStartPoint: (p: { lat: number; lng: number; label?: string }) => string;
+  addGoalPoint: (p: { lat: number; lng: number; label?: string }) => string;
+  updateImportPoint: (id: string, patch: Partial<Pick<ImportPoint, 'lat' | 'lng' | 'label' | 'routeId'>>) => void;
+  removeImportPoint: (kind: 'start' | 'goal', id: string) => void;
+  /** Привязка узла маршрута к точке списка старта/цели. */
+  bindRoutePoint: (routeId: string, index: number, binding: WaypointBinding | null) => void;
+  /** Полная привязка маршрута к стартовой и целевой точкам списков. */
+  bindRouteToPoints: (routeId: string, startId: string | null, goalId: string | null) => void;
+  /** Перенос точки списка (старт/цель): обновляет координату, все привязанные
+   *  узлы маршрутов и автоматически перестраивает эти маршруты вокруг зон. */
+  moveImportPointAndRebuild: (kind: 'start' | 'goal', id: string, geo: { lat: number; lng: number }) => void;
+  /** Установка общей точки старта: upsert записи с label 'СТАРТ' в importLists.starts
+   *  и сохранение её id в sharedStartId (store-first, переживает unmount MapCanvas). */
+  setSharedStartPoint: (geo: { lat: number; lng: number } | null) => void;
+  /** Установка общей точки цели (аналогично, sharedGoalId / importLists.goals). */
+  setSharedGoalPoint: (geo: { lat: number; lng: number } | null) => void;
   refreshAllRoutesAfterMapChange: () => void;
   clearRouteWarnings: (id: string) => void;
   resetMissions: () => void;
@@ -285,6 +307,8 @@ const initialMissionState: MissionState = {
   /** Глобальный флаг «идёт тяжёлая/сетевая операция» (upload миссии, пересчёт
    *  высот). UI блокирует mutate-кнопки, пока true — защита от гонок состояний. */
   isProcessing: false,
+  sharedStartId: null,
+  sharedGoalId: null,
 };
 
 type SetFn = (partial: Partial<MissionStore> | ((s: MissionStore) => Partial<MissionStore>)) => void;
@@ -888,6 +912,136 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
 
     clearImportLists: () => set({ importLists: undefined }),
 
+    addStartPoint: (p) => {
+      const id = uuidv4();
+      set((cur) => {
+        const lists: ImportLists = cur.importLists ?? { starts: [], goals: [] };
+        const n = lists.starts.length + 1;
+        return { importLists: { ...lists, starts: [...lists.starts, { id, label: p.label || `Старт ${n}`, lat: p.lat, lng: p.lng, routeId: null }] } };
+      });
+      return id;
+    },
+
+    addGoalPoint: (p) => {
+      const id = uuidv4();
+      set((cur) => {
+        const lists: ImportLists = cur.importLists ?? { starts: [], goals: [] };
+        const n = lists.goals.length + 1;
+        return { importLists: { ...lists, goals: [...lists.goals, { id, label: p.label || `Цель ${n}`, lat: p.lat, lng: p.lng, routeId: null }] } };
+      });
+      return id;
+    },
+
+    updateImportPoint: (id, patch) => set((cur) => {
+      const lists = cur.importLists;
+      if (!lists) return {};
+      const upd = (arr: ImportPoint[]) => arr.map((pt) => (pt.id === id ? { ...pt, ...patch } : pt));
+      return { importLists: { starts: upd(lists.starts), goals: upd(lists.goals) } };
+    }),
+
+    removeImportPoint: (kind, id) => set((cur) => {
+      const lists = cur.importLists;
+      if (!lists) return {};
+      const next: ImportLists = kind === 'start'
+        ? { starts: lists.starts.filter((p) => p.id !== id), goals: lists.goals }
+        : { starts: lists.starts, goals: lists.goals.filter((p) => p.id !== id) };
+      // отвязываем узлы маршрутов от удалённой точки
+      const routes = cur.routes.map((r) => ({
+        ...r,
+        points: r.points.map((p) => (p.binding && p.binding.pointId === id ? { ...p, binding: undefined } : p)),
+      }));
+      return { importLists: next, routes };
+    }),
+
+    bindRoutePoint: (routeId, index, binding) => set((cur) => ({
+      routes: cur.routes.map((r) => (r.id !== routeId ? r : {
+        ...r,
+        points: r.points.map((p, i) => (i === index ? { ...p, binding: binding ?? undefined } : p)),
+      })),
+    })),
+
+    bindRouteToPoints: (routeId, startId, goalId) => set((cur) => ({
+      routes: cur.routes.map((r) => {
+        if (r.id !== routeId) return r;
+        const pts = r.points.map((p, i) => {
+          if (i === 0 && startId) return { ...p, binding: { kind: 'start' as const, pointId: startId } };
+          if (i === r.points.length - 1 && goalId) return { ...p, binding: { kind: 'goal' as const, pointId: goalId } };
+          return p;
+        });
+        return { ...r, points: pts };
+      }),
+    })),
+
+    moveImportPointAndRebuild: (kind, id, geo) => {
+      const touched: string[] = [];
+      set((cur) => {
+        const lists = cur.importLists;
+        if (!lists) return {};
+        const upd = (arr: ImportPoint[]) => arr.map((pt) => (pt.id === id ? { ...pt, lat: geo.lat, lng: geo.lng } : pt));
+        const next: ImportLists = kind === 'start'
+          ? { starts: upd(lists.starts), goals: lists.goals }
+          : { starts: lists.starts, goals: upd(lists.goals) };
+        const map = useMapStore.getState().map;
+        if (!map?.bounds || map.width <= 0 || map.height <= 0) return { importLists: next };
+        // переносим ВСЕ узлы всех маршрутов, привязанные к этой точке,
+        // и запоминаем маршруты для автоматической перестройки вокруг зон
+        const routes = cur.routes.map((r) => {
+          let changed = false;
+          const pts = r.points.map((p) => {
+            if (p.binding && p.binding.kind === kind && p.binding.pointId === id) {
+              changed = true;
+              return { ...p, ...geoToPixelExact(geo.lat, geo.lng, map.bounds!, map.width, map.height), lat: geo.lat, lng: geo.lng };
+            }
+            return p;
+          });
+          if (changed) touched.push(r.id);
+          return changed ? { ...r, points: pts } : r;
+        });
+        return { importLists: next, routes };
+      });
+      for (const rid of touched) actions.rerouteAroundZones(rid);
+      if (touched.length > 0) void get().updateRouteAltitudes(null);
+    },
+
+    setSharedStartPoint: (geo) => {
+      if (geo === null) {
+        const id = get().sharedStartId;
+        if (id) actions.removeImportPoint('start', id);
+        set({ sharedStartId: null });
+        return;
+      }
+      const cur = get();
+      const lists: ImportLists = cur.importLists ?? { starts: [], goals: [] };
+      const existing = cur.sharedStartId ? lists.starts.find((p) => p.id === cur.sharedStartId) : undefined;
+      if (existing) {
+        actions.updateImportPoint(existing.id, { lat: geo.lat, lng: geo.lng });
+        // координата общей точки старта изменилась — перестраиваем привязанные маршруты
+        actions.moveImportPointAndRebuild('start', existing.id, geo);
+        return;
+      }
+      const id = actions.addStartPoint({ ...geo, label: 'СТАРТ' });
+      set({ sharedStartId: id });
+    },
+
+    setSharedGoalPoint: (geo) => {
+      if (geo === null) {
+        const id = get().sharedGoalId;
+        if (id) actions.removeImportPoint('goal', id);
+        set({ sharedGoalId: null });
+        return;
+      }
+      const cur = get();
+      const lists: ImportLists = cur.importLists ?? { starts: [], goals: [] };
+      const existing = cur.sharedGoalId ? lists.goals.find((p) => p.id === cur.sharedGoalId) : undefined;
+      if (existing) {
+        actions.updateImportPoint(existing.id, { lat: geo.lat, lng: geo.lng });
+        actions.moveImportPointAndRebuild('goal', existing.id, geo);
+        return;
+      }
+      const id = actions.addGoalPoint({ ...geo, label: 'ЦЕЛЬ' });
+      set({ sharedGoalId: id });
+    },
+
     refreshAllRoutesAfterMapChange: () => {
       const map = useMapStore.getState().map;
       if (!map?.bounds) return;
@@ -905,6 +1059,7 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
 
     resetMissions: () => set({
       routes: [], activeRouteId: null, routeWarnings: {}, routeDraft: { geo: [], agl: {} }, importLists: undefined,
+      sharedStartId: null, sharedGoalId: null,
     }),
 
     beginProcessing: () => set((s) => (s.isProcessing ? {} : { isProcessing: true })),
@@ -930,6 +1085,8 @@ export const useMissionStore = create<MissionStore>()(
         routeWarnings: {},           // сессионные предупреждения не персистим
         routeDraft: { geo: [], agl: {} }, // черновик мастера — только на сессию
         isProcessing: false,         // тяжёлые операции не переживают перезагрузку
+        sharedStartId: s.sharedStartId,
+        sharedGoalId: s.sharedGoalId,
       }) as MissionState,
       migrate: (persistedState: unknown) => {
         const p = persistedState as Partial<MissionState>;
@@ -937,6 +1094,8 @@ export const useMissionStore = create<MissionStore>()(
         if (!p.routeDraft) p.routeDraft = { geo: [], agl: {} };
         if (!p.routeWarnings) p.routeWarnings = {};
         if (p.activeRouteId === undefined) p.activeRouteId = null;
+        if (p.sharedStartId === undefined) p.sharedStartId = null;
+        if (p.sharedGoalId === undefined) p.sharedGoalId = null;
         return p as MissionState;
       },
     },

@@ -147,6 +147,9 @@ export interface RoutePoint {
    *  Задаётся перетаскиванием точки вверх/вниз (или вводом числа); определяет
    *  высоту всего участка до следующей управляющей точки. */
   altitudeAGL?: number | null;
+  /** Привязка узла к точке списка старта/цели: при переносе такой точки
+   *  маршрут автоматически перестраивается (routeId хранится в ImportPoint). */
+  binding?: WaypointBinding;
 }
 
 /** Тип линии маршрута: прямая или кривая (сглаженная сплайн-ломаная) */
@@ -170,6 +173,13 @@ export interface Route {
   missionMeta?: MissionMetaLite;
   /** Параметры путевых точек по индексам (add_waypoint params) */
   waypointParams?: Record<number, WaypointParamsLite>;
+}
+
+/** Привязка путевой точки к списку старта/цели (importLists) — узел, а не весь маршрут. */
+export interface WaypointBinding {
+  kind: 'start' | 'goal';
+  /** id из importLists.starts / importLists.goals */
+  pointId: string;
 }
 
 /** Метаданные миссии (минимальная версия для сериализации проекта). */
@@ -196,6 +206,17 @@ export interface DroneAssignment {
   startId?: string | null;  // id из importLists.starts
   goalId?: string | null;   // id из importLists.goals
   routeId?: string | null;
+  /** Имена дронов группы (роль в группе — leader и т.п.). Пусто = соло-дрон. */
+  groupMembers?: string[];
+}
+
+/** Группа дронов на один общий маршрут (до MAX_GROUP_SIZE штук). */
+export interface DroneGroup {
+  id: string;
+  name: string;
+  memberIds: string[];
+  routeId: string | null;
+  formation?: 'line' | 'v-shape' | 'grid';
 }
 
 /** Видеоканал дрона → GCS (симуляция стрима в браузере). */
@@ -223,3 +244,8 @@ export interface ImportLists {
 }
 
 export const MAX_ROUTES = 10000;
+
+/** Максимум дронов в парке (рой до 10 000 БПЛА). */
+export const MAX_FLEET_SIZE = 10000;
+/** Максимум дронов в одной группе (группа летит по одному маршруту). */
+export const MAX_GROUP_SIZE = 10000;
