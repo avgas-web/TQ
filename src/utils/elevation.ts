@@ -40,21 +40,40 @@ function dedupe(points: ElevationPoint[]): ElevationPoint[] {
 /** Запрос батча высот к Open-Elevation. Батчи разбиваются по ≤100 точек
  *  (защита от слишком больших URL/таймаутов), выполняются последовательно
  *  (публичный API бесплатно троттлит частые запросы). */
+interface RawElevationResult {
+  latitude?: unknown;
+  longitude?: unknown;
+  elevation?: unknown;
+}
+interface ElevationResponseShape {
+  results?: unknown;
+}
+
+/** Таймаут одного запроса к публичному API: без него зависшее соединение
+ *  (open-elevation медленно отвечает под нагрузкой) вешает весь прогон
+ *  пересчёта высот — «кнопка Пересчитать не работает». */
+const REQUEST_TIMEOUT_MS = 25_000;
+
 async function fetchElevationsBatch(points: ElevationPoint[], signal?: AbortSignal): Promise<(number | null)[]> {
   const results: (number | null)[] = new Array(points.length).fill(null);
   const CHUNK = 100;
   for (let off = 0; off < points.length; off += CHUNK) {
     const chunk = points.slice(off, off + CHUNK);
+    // Собственный сигнал с таймаутом, наследующий отмену внешнего.
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
+    const onOuterAbort = (): void => timeout.abort();
+    signal?.addEventListener('abort', onOuterAbort);
     try {
       const resp = await fetch(OPEN_ELEVATION_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ locations: chunk.map((p) => ({ latitude: p.lat, longitude: p.lng })) }),
-        signal,
+        signal: timeout.signal,
       });
       if (!resp.ok) throw new Error(`Open-Elevation HTTP ${resp.status}`);
-      const json = await resp.json();
-      const list: any[] = Array.isArray(json?.results) ? json.results : [];
+      const json = (await resp.json()) as ElevationResponseShape;
+      const list: RawElevationResult[] = Array.isArray(json?.results) ? (json.results as RawElevationResult[]) : [];
       // API обычно сохраняет порядок, но сопоставляем надёжно по координатам
       const byKey = new Map<string, number>();
       for (const r of list) {
@@ -68,10 +87,13 @@ async function fetchElevationsBatch(points: ElevationPoint[], signal?: AbortSign
         results[off + i] = v ?? null;
       });
     } catch (err) {
-      if ((err as any)?.name === 'AbortError') throw err;
+      if ((err as { name?: string })?.name === 'AbortError' && signal?.aborted) throw err; // явная отмена прогона — не глотаем
       console.warn('[elevation] запрос батча не выполнен:', (err as Error)?.message);
       // остальные чанки помечаем null — вызывающий код деградирует мягко
       for (let i = off; i < Math.min(off + CHUNK, points.length); i++) results[i] = null;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onOuterAbort);
     }
   }
   return results;

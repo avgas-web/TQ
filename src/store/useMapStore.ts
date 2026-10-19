@@ -350,9 +350,21 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
     calibration: { ...state.calibration, enabled },
   })),
 
-  updateSettings: (settings) => set((state) => ({
-    settings: { ...state.settings, ...settings },
-  })),
+  updateSettings: (settings) => {
+    const prevElevationAuto = get().settings.elevationAuto;
+    set((state) => ({
+      settings: { ...state.settings, ...settings },
+    }));
+    // Включение «авто-высот по рельефу» должно сразу запускать пересчёт —
+    // иначе пользователь ставит галочку и видит пустые terrainM до первого
+    // изменения геометрии («не работает запрос рельефа»). Динамический
+    // import сохраняет направление зависимостей map → mission.
+    if (settings.elevationAuto === true && prevElevationAuto !== true) {
+      void import('./useMissionStore')
+        .then((m) => m.useMissionStore.getState().updateRouteAltitudes())
+        .catch(() => { /* миссия ещё не загружена — следующий прогон посчитает */ });
+    }
+  },
 
   setGoogleMapsApiKey: (apiKey) => set((state) => ({ googleMaps: { ...state.googleMaps, apiKey } })),
   toggleGoogleMaps: (enabled) => set((state) => ({ googleMaps: { ...state.googleMaps, enabled } })),

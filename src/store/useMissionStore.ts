@@ -50,6 +50,13 @@ let rerouteChainCount = 0;
  *  троттлящемуся публичному API). */
 let altitudeRunId = 0;
 let lastAltitudeController: AbortController | null = null;
+/** Per-route «занятость» прогонов updateRouteAltitudes(null). Раньше один
+ *  глобальный runId приводил к взаимной отмене параллельных вызовов: ручная
+ *  кнопка «Пересчитать высоты» (routeId=null) отменяла начатый drag-прогон по
+ *  конкретной точке и наоборот — heights «не пересчитывались». Теперь прогон
+ *  над всеми маршрутами не блокируется и не отменяет прогоны по отдельным
+ *  маршрутам, а одноимённые целевые прогоны корректно отменяют друг друга. */
+const activeAltitudeRuns = new Map<string, number>();
 
 // ─── Web Worker для тяжёлой геометрии роутинга (A*/граф видимости) ───────────
 // Тяжёлые сегменты (нужен обход зон) считаются ВНЕ Main Thread. Прямые сегменты
@@ -478,7 +485,7 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
 
   /** Тело пересчёта высот — вынесено из метода, чтобы обёртка updateRouteAltitudes
    *  оставалась тонкой (SOLID/SRP): отмена/блокировка UI отдельно, вычисления отдельно. */
-  const altitudeBody = async (routeId: string | null | undefined, runId: number, controller: AbortController): Promise<void> => {
+  const altitudeBody = async (routeId: string | null | undefined, runKey: string, runId: number, controller: AbortController): Promise<void> => {
     const st = get();
     const mapState = useMapStore.getState();
     const clearance = Number.isFinite(mapState.settings.altitudeClearanceM as number)
@@ -499,8 +506,17 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
     }
     if (keySet.size === 0) return;
     const uniqPts = Array.from(keySet.values());
-    const elevs = await fetchElevations(uniqPts, controller.signal);
-    if (runId !== altitudeRunId) return; // более новый прогон отменил этот
+    let elevs: (number | null)[];
+    try {
+      elevs = await fetchElevations(uniqPts, controller.signal);
+    } catch (err) {
+      // Явная отмена более новым прогоном — тихо выходим; сетевые ошибки
+      // fetchElevationsBatch гасит сам (мягкая деградация в null).
+      if ((err as { name?: string })?.name === 'AbortError') return;
+      console.warn('[elevation] сервис недоступен:', (err as Error)?.message);
+      elevs = uniqPts.map(() => null);
+    }
+    if (activeAltitudeRuns.get(runKey) !== runId) return; // более новый прогон этого же ключа отменил этот
     const elevByKey = new Map<string, number | null>();
     uniqPts.forEach((p, i) => elevByKey.set(`${p.lat.toFixed(4)},${p.lng.toFixed(4)}`, elevs[i]));
 
@@ -522,7 +538,7 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
         void Promise.resolve().then(() =>
           computeRouteAltitude(pts.map((p) => ({ lat: p.lat, lng: p.lng })), { clearanceM: clearance }, controller.signal),
         ).then((info) => {
-          if (runId !== altitudeRunId) return; // защита: профиль отменённого прогона не пишет
+          if (activeAltitudeRuns.get(runKey) !== runId) return; // защита: профиль отменённого прогона не пишет
           useMissionStore.setState((s2) => {
             const w2 = { ...s2.routeWarnings };
             const base = [...(w2[r.id] || [])].filter((x) => !x.startsWith('Высота'));
@@ -534,7 +550,7 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
             if (base.length > 0) w2[r.id] = base; else delete w2[r.id];
             return { routeWarnings: w2 };
           });
-        }).catch(() => { /* сервис недоступен — мягкая деградация */ });
+        }).catch(() => { /* сервис недоступен / отмена — мягкая деградация */ });
         if (merged.length > 0) rw[r.id] = merged; else delete rw[r.id];
         return { ...r, points: pts };
       });
@@ -959,21 +975,30 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
     },
 
     updateRouteAltitudes: async (routeId) => {
+      const runKey = routeId ?? '__all__';
       const runId = ++altitudeRunId;
-      // Отменяем сетевые запросы предыдущего прогона (drag точек не должен
-      // копить обращения к троттлящемуся публичному API)
-      try { lastAltitudeController?.abort(); } catch { /* noop */ }
+      // Отменяем сетевые запросы предыдущего прогона ТОГО ЖЕ ключа (drag точек
+      // не должен копить обращения к троттлящемуся публичному API). Прогоны по
+      // разным ключам (например, ручной «Пересчитать все» и автоматический по
+      // изменённой точке) больше НЕ отменяют друг друга — раньше из-за одного
+      // глобального runId параллельные вызовы взаимно убивали друг друга и
+      // пересчёт высот молча не применялся.
+      const prev = lastAltitudeController;
       const controller = new AbortController();
       lastAltitudeController = controller;
+      activeAltitudeRuns.set(runKey, runId);
+      if (prev && runKey === '__all__') { try { prev.abort(); } catch { /* noop */ } }
       const mapState = useMapStore.getState();
-      if (!mapState.map?.bounds) return;
+      if (!mapState.map?.bounds) { activeAltitudeRuns.delete(runKey); return; }
       // Флаг elevationAuto живёт в настройках карты (территория) — уважаем его
-      // во ВСЕХ экшенах: без флага пересчёт не запускается вообще.
-      if (!routeId && !mapState.settings.elevationAuto) return;
+      // для АВТОМАТИЧЕСКИХ прогонов (routeId=null): без флага автопересчёт не
+      // запускается. Ручной запуск (конкретный маршрут / кнопка) работает всегда.
+      if (!routeId && !mapState.settings.elevationAuto) { activeAltitudeRuns.delete(runKey); return; }
       actions.beginProcessing();
       try {
-        await altitudeBody(routeId, runId, controller);
+        await altitudeBody(routeId, runKey, runId, controller);
       } finally {
+        if (activeAltitudeRuns.get(runKey) === runId) activeAltitudeRuns.delete(runKey);
         // Снимаем блокировку только если этот прогон всё ещё актуален:
         // более новый вызов уже сам выставил флаг и продлит блокировку.
         if (runId === altitudeRunId) actions.endProcessing();
@@ -1331,6 +1356,7 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
      *  сбросом проекта, чтобы отменённый прогон не дописал данные в стор). */
     cancelAltitudeRun: () => {
       altitudeRunId++; // все ожидающие continue-проверки runId станут устаревшими
+      activeAltitudeRuns.clear(); // per-route прогоны тоже объявляются устаревшими
       try { lastAltitudeController?.abort(); } catch { /* noop */ }
       lastAltitudeController = null;
     },
