@@ -54,6 +54,29 @@ interface ElevationResponseShape {
  *  пересчёта высот — «кнопка Пересчитать не работает». */
 const REQUEST_TIMEOUT_MS = 25_000;
 
+/** Разобрать ответ API для чанка: сопоставление по координатам (API обычно
+ *  сохраняет порядок, но надёжнее keyed-сопоставление), null для отсутствующих. */
+function readChunkResults(
+  json: ElevationResponseShape,
+  chunk: ElevationPoint[],
+  results: (number | null)[],
+  off: number,
+): (number | null)[] {
+  const list: RawElevationResult[] = Array.isArray(json?.results) ? (json.results as RawElevationResult[]) : [];
+  const byKey = new Map<string, number>();
+  for (const r of list) {
+    if (typeof r?.elevation === 'number' && Number.isFinite(r.elevation) &&
+        typeof r?.latitude === 'number' && typeof r?.longitude === 'number') {
+      byKey.set(cacheKey(r.latitude, r.longitude), r.elevation);
+    }
+  }
+  chunk.forEach((p, i) => {
+    const v = byKey.get(cacheKey(p.lat, p.lng));
+    results[off + i] = v ?? null;
+  });
+  return results;
+}
+
 async function fetchElevationsBatch(points: ElevationPoint[], signal?: AbortSignal): Promise<(number | null)[]> {
   const results: (number | null)[] = new Array(points.length).fill(null);
   const CHUNK = 100;
@@ -71,21 +94,34 @@ async function fetchElevationsBatch(points: ElevationPoint[], signal?: AbortSign
         body: JSON.stringify({ locations: chunk.map((p) => ({ latitude: p.lat, longitude: p.lng })) }),
         signal: timeout.signal,
       });
-      if (!resp.ok) throw new Error(`Open-Elevation HTTP ${resp.status}`);
-      const json = (await resp.json()) as ElevationResponseShape;
-      const list: RawElevationResult[] = Array.isArray(json?.results) ? (json.results as RawElevationResult[]) : [];
-      // API обычно сохраняет порядок, но сопоставляем надёжно по координатам
-      const byKey = new Map<string, number>();
-      for (const r of list) {
-        if (typeof r?.elevation === 'number' && Number.isFinite(r.elevation) &&
-            typeof r?.latitude === 'number' && typeof r?.longitude === 'number') {
-          byKey.set(cacheKey(r.latitude, r.longitude), r.elevation);
+      // 429 Too Many Requests (публичный Open-Elevation троттлит частые
+      // обращения): одна вежливая повторная попытка с backoff по Retry-After
+      // (или 3 с). Если снова 429 — НЕ роняем приложение: мягкая деградация
+      // ниже (null-высоты + warning в routeWarnings у вызывающего кода).
+      if (resp.status === 429 && !timeout.signal.aborted) {
+        const raHeader = Number(resp.headers?.get?.('Retry-After'));
+        const delayMs = Number.isFinite(raHeader) && raHeader > 0 ? Math.min(raHeader * 1000, 10_000) : 3_000;
+        await new Promise<void>((res) => {
+          const t = setTimeout(res, delayMs);
+          const stop = (): void => { clearTimeout(t); res(); };
+          timeout.signal.addEventListener('abort', stop, { once: true });
+        });
+        if (!timeout.signal.aborted) {
+          const retry = await fetch(OPEN_ELEVATION_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ locations: chunk.map((p) => ({ latitude: p.lat, longitude: p.lng })) }),
+            signal: timeout.signal,
+          });
+          if (retry.ok) {
+            const json = (await retry.json()) as ElevationResponseShape;
+            return readChunkResults(json, chunk, results, off);
+          }
         }
       }
-      chunk.forEach((p, i) => {
-        const v = byKey.get(cacheKey(p.lat, p.lng));
-        results[off + i] = v ?? null;
-      });
+      if (!resp.ok) throw new Error(`Open-Elevation HTTP ${resp.status}`);
+      const json = (await resp.json()) as ElevationResponseShape;
+      return readChunkResults(json, chunk, results, off);
     } catch (err) {
       if ((err as { name?: string })?.name === 'AbortError' && signal?.aborted) throw err; // явная отмена прогона — не глотаем
       console.warn('[elevation] запрос батча не выполнен:', (err as Error)?.message);

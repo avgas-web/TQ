@@ -238,6 +238,7 @@ const MapCanvas: React.FC = () => {
     activeRouteId,
     isDrawing,
     drawingPoints,
+    cursorPosition,
     measurementPoints,
     setViewState,
     setCursorPosition,
@@ -246,6 +247,7 @@ const MapCanvas: React.FC = () => {
     selectMarker,
     addRestriction,
     addDrawingPoint,
+    undoDrawingPoint,
     clearDrawingPoints,
     setDrawing,
     setMeasurementPoints,
@@ -266,6 +268,16 @@ const MapCanvas: React.FC = () => {
   // получить undefined-вид (краш «viewState is not defined» / reading 'scale').
   const viewRef = useRef(useStore.getState().viewState);
   useEffect(() => { viewRef.current = useStore.getState().viewState; });
+  // Актуальная позиция курсора для «резинки» превью полигона (ref — без ре-рендера)
+  const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
+  const rafDrawRef = useRef(0);
+  const schedulePolygonDraw = useCallback(() => {
+    if (rafDrawRef.current) return;
+    rafDrawRef.current = requestAnimationFrame(() => {
+      rafDrawRef.current = 0;
+      setRenderTick((t) => t + 1);
+    });
+  }, []);
   const [renderTick, setRenderTick] = useState(0);
   useEffect(() => {
     let raf = 0;
@@ -2063,7 +2075,22 @@ const MapCanvas: React.FC = () => {
 
       ctx.setLineDash([]);
 
-      // Draw vertices
+      // Rubber-band preview: пунктирная линия от последней вершины к курсору
+      const cur = cursorPosRef.current ?? cursorPosition;
+      if (cur && drawingPoints.length > 0) {
+        const lastP = drawingPoints[drawingPoints.length - 1];
+        ctx.save();
+        ctx.strokeStyle = 'rgba(0, 221, 255, 0.55)';
+        ctx.lineWidth = 1.5 / vs.scale;
+        ctx.setLineDash([4 / vs.scale, 4 / vs.scale]);
+        ctx.beginPath();
+        ctx.moveTo(lastP.x, lastP.y);
+        ctx.lineTo(cur.x, cur.y);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Draw vertices (с порядковыми номерами 1, 2, 3...)
       for (let i = 0; i < drawingPoints.length; i++) {
         const p = drawingPoints[i];
         ctx.beginPath();
@@ -2073,6 +2100,10 @@ const MapCanvas: React.FC = () => {
         ctx.strokeStyle = '#000';
         ctx.lineWidth = 1 / vs.scale;
         ctx.stroke();
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `bold ${11 / vs.scale}px sans-serif`;
+        ctx.textAlign = 'left';
+        ctx.fillText(String(i + 1), p.x + 7 / vs.scale, p.y - 7 / vs.scale);
       }
 
       // Instructions
@@ -2080,8 +2111,8 @@ const MapCanvas: React.FC = () => {
         ctx.fillStyle = 'rgba(0, 200, 255, 0.9)';
         ctx.font = `${12 / vs.scale}px sans-serif`;
         ctx.textAlign = 'left';
-        const lastP = drawingPoints[drawingPoints.length - 1];
-        ctx.fillText('Клик — добавить вершину, двойной клик — завершить', lastP.x + 10 / vs.scale, lastP.y - 10 / vs.scale);
+        const lastP = cur ?? drawingPoints[drawingPoints.length - 1];
+        ctx.fillText('Клик — добавить вершину, двойной клик или Enter — завершить, Esc — отмена, Ctrl+Z — убрать точку', lastP.x + 10 / vs.scale, lastP.y - 10 / vs.scale);
       }
 
       ctx.restore();
@@ -2579,6 +2610,12 @@ const MapCanvas: React.FC = () => {
     if (nowMs - lastCursorUpdateRef.current >= 100) {
       lastCursorUpdateRef.current = nowMs;
       setCursorPosition(mapPoint);
+      cursorPosRef.current = mapPoint;
+    } else if (drawingPoints.length > 0 && currentTool === 'drawPolygon') {
+      // Резинка-превью требует актуального курсора между троттл-окнами:
+      // пишем в ref и планируем кадр без ре-рендера подписанных компонентов.
+      cursorPosRef.current = mapPoint;
+      schedulePolygonDraw();
     }
 
     if (isPanningRef.current) {
@@ -2612,7 +2649,8 @@ const MapCanvas: React.FC = () => {
       moveRoutePoint(draggingRoute.routeId, draggingRoute.index, { x: clampedX, y: clampedY });
     }
   }, [screenToMap, setCursorPosition, setViewState,
-    draggingMarker, draggingRoute, project.map, updateMarker, moveRoutePoint]);
+    draggingMarker, draggingRoute, project.map, updateMarker, moveRoutePoint,
+    drawingPoints.length, currentTool, schedulePolygonDraw]);
 
   // Mouse up
   const handleMouseUp = useCallback(() => {
@@ -2655,6 +2693,35 @@ const MapCanvas: React.FC = () => {
     }
   }, [currentTool, drawingPoints, addRestriction, clearDrawingPoints, setMeasurementPoints,
     activeRouteId, project.map, project.routes, screenToMap, removeRoutePoint]);
+
+  // Горячие клавиши рисования полигона: Enter — завершить (>=3 точек),
+  // Esc — отменить, Ctrl+Z / Cmd+Z — убрать последнюю вершину.
+  useEffect(() => {
+    if (currentTool !== 'drawPolygon') return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      if (e.key === 'Enter') {
+        if (drawingPoints.length >= 3) {
+          e.preventDefault();
+          addRestriction({ type: 'polygon', points: [...drawingPoints] });
+          clearDrawingPoints();
+        }
+      } else if (e.key === 'Escape') {
+        if (drawingPoints.length > 0) {
+          e.preventDefault();
+          clearDrawingPoints();
+        }
+      } else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'z' || e.key === 'Z')) {
+        if (drawingPoints.length > 0) {
+          e.preventDefault();
+          undoDrawingPoint();
+        }
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [currentTool, drawingPoints, addRestriction, clearDrawingPoints, undoDrawingPoint]);
 
   // Right click - cancel drawing
   const handleContextMenu = useCallback((e: React.MouseEvent) => {

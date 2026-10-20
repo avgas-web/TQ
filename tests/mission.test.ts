@@ -338,7 +338,19 @@ async function main(): Promise<void> {
   });
 
   console.log(`\nИтого: ${passed} passed, ${failed} failed`);
-  if (failed > 0) (globalThis as { process?: { exit(code: number): void } }).process?.exit(1);
+  // Совместимость с Vitest: не убиваем процесс, а бросаем ошибку — vitest
+  // пометит тест-файл упавшим; в plain-node раннере throw даст ненулевой код.
+  if (failed > 0) throw new Error(`FAILED: ${failed} ассертов с ошибкой`);
+  return passed;
 }
 
-main().catch((e) => { console.error(e); (globalThis as { process?: { exit(code: number): void } }).process?.exit(1); });
+export const missionTestSummary = main().catch((e) => { console.error(e); throw e; });
+
+// ─── Интеграция с Vitest: прогон того же набора ассертов как один it() ───
+import { describe, it as vIt } from 'vitest';
+describe('mission.test.ts (self-contained suite)', () => {
+  vIt('все ассерты проходят', async () => {
+    const p = await main();
+    if (p <= 0) throw new Error('no assertions ran');
+  });
+});

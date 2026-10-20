@@ -7,17 +7,21 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "tsc tests/mission.test.ts tests/droneProfiles.test.ts src/utils/mission.ts src/utils/droneSim.ts src/utils/droneProfiles.ts --outDir .tmp-tests --module commonjs --target es2020 --moduleResolution node --esModuleInterop --skipLibCheck --strict && node -e 'require(\"fs\").writeFileSync(\".tmp-tests/package.json\", JSON.stringify({type:\"commonjs\"}))' && node .tmp-tests/tests/mission.test.js && node .tmp-tests/tests/droneProfiles.test.js"
+    "test": "vitest run",
+    "lint": "eslint .",
+    "prepare": "husky"
   },
   "dependencies": {
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "uuid": "^9.0.1",
-    "zustand": "^5.0.15",
-    "zod": "^4.6.7"
+    "zod": "^4.6.7",
+    "zustand": "^5.0.15"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.7",
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/react": "^16.3.3",
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
     "@types/uuid": "^9.0.8",

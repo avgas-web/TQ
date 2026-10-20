@@ -1,7 +1,7 @@
 // Тесты двух режимов работы парка: короткие дистанции (агродроны) и
 // дальнобойные БПЛА (до 50 000 км), включая видеосигнал.
-// Runner: plain node + микрофреймворк expect (как tests/mission.test.ts),
-// без внешних зависимостей (vitest в проекте не установлен).
+// Runner: Vitest + микрофреймворк expect (как tests/mission.test.ts).
+import { describe, it as vitestCase } from 'vitest';
 import {
   DRONE_PROFILES, LONG_RANGE_MAX_MISSION_M, getProfile, parseDroneMode,
   modeFromCapabilities, validateRouteForMode, estimateFlightTimeMin, videoLinkStatus,
@@ -44,7 +44,7 @@ function expect(actual: unknown) {
     toHaveLength: (n: number): void => { if ((actual as unknown[]).length !== n) throw new Error(`длина ${(actual as unknown[]).length} != ${n}`); },
   };
 }
-const it = (name: string, fn: () => void): void => {
+const it = (name: string, fn: () => void): void => { // sync micro-runner
   try { fn(); passed++; console.log(`  ✓ ${name}`); }
   catch (e) { failed++; console.error(`  ✗ ${name}\n    ${(e as Error).message}`); }
 };
@@ -122,4 +122,13 @@ it('видеоканал: в зоне — ok; вне зоны короткого
 });
 
 console.log(`\nИтого droneProfiles: ${passed} passed, ${failed} failed`);
-if (failed > 0) (globalThis as { process?: { exit(code: number): void } }).process?.exit(1);
+
+// ─── Интеграция с Vitest: микрофреймворк выше выполняется при импорте файла;
+// каждый кейс уже прогнан синхронно. Этот suite отражает результат в vitest:
+// при любой упавшей проверке it бросает ошибку (без process.exit-заглушек).
+describe('droneProfiles.test.ts (self-contained suite)', () => {
+  vitestCase(`все ${passed} ассертов прошли`, () => {
+    if (failed > 0) throw new Error(`${failed} failed`);
+    if (passed <= 0) throw new Error('no assertions ran');
+  });
+});
