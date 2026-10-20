@@ -51,6 +51,8 @@ interface MiniMapPanelProps {
   onPointAltitudeDrag?: (id: string, dyPx: number) => void;
   /** Клик по ✛-метке зоны (удаление объекта ограничения) */
   onZoneClick?: (id: string) => void;
+  /** Двойной клик по свободной карте панели (замыкание полигона NFZ-черновика) */
+  onPanelDoubleClick?: () => void;
 }
 
 /** Зоны для отрисовки: с опциональным id (для удаления кликом) */
@@ -87,6 +89,7 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   title, icon, center, zoom = 11, fitPoints, minZoom = 3, maxZoom = 20,
   points = [], lines = [], height = 260, onReady,
   focused = false, onFocus, onMapClick, panelIdx = -1, zones = [], onPointClick, pointDeleteEnabled = true, onPointMove, onPointAltitudeDrag, onZoneClick,
+  onPanelDoubleClick,
 }) => {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -382,6 +385,8 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   useEffect(() => { onPointAltitudeDragRef.current = onPointAltitudeDrag; }, [onPointAltitudeDrag]);
   const onZoneClickRef = useRef(onZoneClick);
   useEffect(() => { onZoneClickRef.current = onZoneClick; }, [onZoneClick]);
+  const onPanelDoubleClickRef = useRef(onPanelDoubleClick);
+  useEffect(() => { onPanelDoubleClickRef.current = onPanelDoubleClick; }, [onPanelDoubleClick]);
   // Позиции оверлеев с последнего кадра — для hit-теста клика удаления
   const hitsRef = useRef<{ pointHits: { id?: string; x: number; y: number }[]; zoneHits: { id?: string; x: number; y: number; r: number }[] }>({ pointHits: [], zoneHits: [] });
   // Идентификатор точки, которую перетаскиваем (редактирование маршрута drag-ом)
@@ -485,17 +490,26 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
         onMapClickRef.current(idx >= 0 ? ({ ...geo, panelIdx: idx } as typeof geo) : geo);
       }
     };
+    const onDblClick = (e: MouseEvent) => {
+      // Двойной клик по свободной карте панели — замыкание полигона NFZ.
+      // Нативный dblclick идёт ПОСЛЕ двух pointerup (дважды сработал onMapClick),
+      // поэтому здесь только закрываем черновик зоны, без добавления точки.
+      e.preventDefault();
+      onPanelDoubleClickRef.current?.();
+    };
     canvas.addEventListener('wheel', onWheel, { passive: false });
     canvas.addEventListener('pointerdown', onDown);
     canvas.addEventListener('pointermove', onMove);
     canvas.addEventListener('pointerup', onUp);
     canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('dblclick', onDblClick);
     return () => {
       canvas.removeEventListener('wheel', onWheel);
       canvas.removeEventListener('pointerdown', onDown);
       canvas.removeEventListener('pointermove', onMove);
       canvas.removeEventListener('pointerup', onUp);
       canvas.removeEventListener('pointercancel', onUp);
+      canvas.removeEventListener('dblclick', onDblClick);
     };
   }, [bump, minZoom, maxZoom]);
 

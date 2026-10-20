@@ -625,7 +625,11 @@ const MapCanvas: React.FC = () => {
   const routeShapeRef = useRef(routeShape);
   useEffect(() => { routeShapeRef.current = routeShape; }, [routeShape]);
   // Зоны-кандидаты (ставятся на ЛЮБОЙ из трёх карт; uid — для удаления кликом)
-  const [pendingZones, setPendingZones] = useState<{ uid: number; center: { lat: number; lng: number }; radiusM: number }[]>([]);
+  // Кандидаты зон ограничения — ПОЛИГОНЫ по точкам (ТЗ: ставятся точками,
+  // беспилотная зона внутри замкнутой границы). Клики в режиме «Установка
+  // ограничений» добавляют вершину текущего полигона; двойной клик замыкает
+  // зону и создаёт новый candidate.
+  const [pendingZones, setPendingZones] = useState<{ uid: number; pts: { lat: number; lng: number }[] }[]>([]);
   const pendingZoneUidRef = useRef(1);
 
   // «Кривая» маршрут: сглаживание ломаной (Catmull-Rom): ключевые точки остаются
@@ -649,10 +653,9 @@ const MapCanvas: React.FC = () => {
 
   const focusPanelIdx = tripleStep === 3 ? -1 : tripleStep;
   // Зоны ограничения, поставленные на ЛЮБОЙ из трёх карт (в т.ч. неактивной),
-  // ждут утверждения — рисуем кандидатов во всех окнах с id для удаления.
+  // ждут утверждения — рисуем кандидатов-полигоны во всех окнах с id для удаления.
   const pendingZoneMini = pendingZones.map((pz) => ({
-    id: `pendingZone:${pz.uid}`, pts: [] as { lat: number; lng: number }[],
-    radiusM: pz.radiusM, centerGeo: pz.center, color: '#fb923c',
+    id: `pendingZone:${pz.uid}`, pts: pz.pts, color: '#fb923c',
   }));
   const canApproveStep = (st: TripleStep): boolean => {
     if (st === 0) return sharedStart ? !!startGeo : droneStarts.some((s) => !!s) || !!startGeo;
@@ -662,18 +665,17 @@ const MapCanvas: React.FC = () => {
   };
 
   // Утвердить все ожидающие зоны как ограничения проекта (зоны можно ставить
-  // на любой карте и утверждать на любом этапе). radius хранится в пикселях
-  // z-мира основного канваса (worldPx = canvasH·2^ZOOM_REF).
-  const commitPendingZones = useCallback((zones: { center: { lat: number; lng: number }; radiusM: number }[]): boolean => {
+  // на любой карте и утверждать на любом этапе). Кандидат — полигон по гео-
+  // точкам; пиксели вычисляются через точную гео-привязку текущего растра.
+  const commitPendingZones = useCallback((zones: { pts: { lat: number; lng: number }[] }[]): boolean => {
     if (zones.length === 0) return false;
     const map = project.map;
     if (!map?.bounds || map.width <= 0 || map.height <= 0) return false;
-    const worldPxZ = Math.max(256, canvasSizeRef.current.height * Math.pow(2, ZOOM_REF));
     for (const pz of zones) {
-      const mppZ = metersPerPixelFromWorld(worldPxZ, pz.center.lat);
-      const c = geoToPixelExact(pz.center.lat, pz.center.lng, map.bounds!, map.width, map.height);
+      if (pz.pts.length < 3) continue; // полигон без замкнутой границы не создаём
+      const pxPts = pz.pts.map((g) => geoToPixelExact(g.lat, g.lng, map.bounds!, map.width, map.height));
       useStore.getState().addRestriction({
-        type: 'circle', points: [c], radius: pz.radiusM / Math.max(mppZ, 1e-9),
+        type: 'polygon', points: pxPts,
         color: '#ff000080', active: true,
       });
     }
@@ -764,9 +766,23 @@ const MapCanvas: React.FC = () => {
   const handlePanelMapClick = useCallback((geo: { lat: number; lng: number; panelIdx?: number }) => {
     if (launchStateRef.current !== 'idle') return;
     const panelIdx = geo.panelIdx ?? tripleStepRef.current;
-    // Режим «Установка ограничений»: клик по ЛЮБОЙ из трёх карт ставит зону.
+    // Режим «Установка ограничений»: клик по ЛЮБОЙ из трёх карт добавляет
+    // ВЕРШИНУ полигона NFZ (ТЗ: зона ставится точками, внутри замкнутой
+    // границы). Двойной клик по карте замыкает текущий полигон (≥3 вершин).
     if (workModeRef.current === 'restrictions') {
-      setPendingZones((prev) => [...prev, { uid: pendingZoneUidRef.current++, center: { lat: geo.lat, lng: geo.lng }, radiusM: 2000 }]);
+      setPendingZones((prev) => {
+        const n = [...prev];
+        const last = n[n.length - 1];
+        if (last && last.pts.length > 0) {
+          // не дублируем практически совпадающие вершины
+          const lp = last.pts[last.pts.length - 1];
+          if (Math.hypot(lp.lat - geo.lat, lp.lng - geo.lng) < 1e-9) return prev;
+          n[n.length - 1] = { ...last, pts: [...last.pts, { lat: geo.lat, lng: geo.lng }] };
+        } else {
+          n.push({ uid: pendingZoneUidRef.current++, pts: [{ lat: geo.lat, lng: geo.lng }] });
+        }
+        return n;
+      });
       return;
     }
     // Режим «Редактирование маршрута»: точки старта/цели/маршрута — во всех окнах.
@@ -1028,7 +1044,15 @@ const MapCanvas: React.FC = () => {
     clampZoom(zoomForGroundMpp(GROUND_MPP_1CM_2KM, lat));
 
   // Перенос путевой точки маршрута drag-ом на любой из карт (редактирование маршрута)
+  // Стабильные ссылки для dblclick-обработчика панелей (замыкания на state
+  // в нативных слушателях MiniMapPanel недопустимы — ref-мост).
+  const handlePanelMapClickRef = useRef(handlePanelMapClick);
+  useEffect(() => { handlePanelMapClickRef.current = handlePanelMapClick; }, [handlePanelMapClick]);
+  const pendingZonesRef = useRef(pendingZones);
+  useEffect(() => { pendingZonesRef.current = pendingZones; }, [pendingZones]);
+
   const handlePanelPointMove = useCallback((id: string, lat: number, lng: number) => {
+    // Вершину черновика NFZ двигать нельзя (проще удалить ✛ и поставить заново).
     if (!id.startsWith('draft:')) return;
     const i = Number(id.slice(6));
     setDraftRoutePts((prev) => {
@@ -2786,6 +2810,17 @@ const MapCanvas: React.FC = () => {
             onPointMove: handlePanelPointMove,
             onZoneClick: handlePanelZoneDelete,
             zones: [...zoneGeoList, ...pendingZoneMini],
+            // Двойной клик по карте панели в режиме ограничений — замкнуть
+            // текущий полигон NFZ (создать новый черновик для следующей зоны).
+            onPanelDoubleClick: () => {
+              if (workModeRef.current !== 'restrictions') return;
+              const last = pendingZonesRef.current[pendingZonesRef.current.length - 1];
+              if (!last || last.pts.length < 3) {
+                setPendingZones((prev) => prev.map((pz) => (pz === last ? { ...pz, pts: [] } : pz)));
+                return;
+              }
+              setPendingZones((prev) => [...prev, { uid: pendingZoneUidRef.current++, pts: [] }]);
+            },
           };
           if (idx === 0) return {
             ...base,
