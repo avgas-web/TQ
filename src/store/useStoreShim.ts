@@ -11,7 +11,7 @@
 // ═══════════════════════════════════════════════════════════════
 import { useSyncExternalStore } from 'react';
 import type { Project, Tool, ViewState, Point } from '../types';
-import { useMapStore, invalidateZoneCache as invalidateZoneCacheLocal, selectViewForRender as selectMapView } from './useMapStore';
+import { useMapStore, invalidateZoneCache as invalidateZoneCacheLocal, selectViewForRender as selectMapView, defaultMapSettings } from './useMapStore';
 import { useMissionStore, rerouteAllNow } from './useMissionStore';
 import { useFleetStore } from './useFleetStore';
 import { clearAllStoredMaps } from '../utils/storage';
@@ -381,6 +381,17 @@ shimActions.resetProject = () => {
   // старты/цели) тоже очищается — иначе после «Сброса» остаются привязки
   // к удалённым маршрутам и точкам.
   useFleetStore.getState().resetFleet();
+  // Фикс «кнопка Сброс не работает» (второй корень): resetMissions() выше
+  // оставляет профильные настройки (craftType, высоты), а в map-части могли
+  // остаться legacy-поля elevationAuto/altitudeClearanceM, перезаписывающие
+  // дефолты при гидрации persist. Возвращаем обе группы к чистым значениям.
+  useMissionStore.setState({ craftType: 'drone' });
+  useMapStore.setState((cur) => {
+    const rest = { ...cur.settings } as Record<string, unknown>;
+    delete rest.elevationAuto;
+    delete rest.altitudeClearanceM;
+    return { settings: { ...defaultMapSettings, ...rest } as typeof cur.settings };
+  });
   // Удаляем изображения карт из IndexedDB (несинхронно, best-effort).
   void clearAllStoredMaps();
 };

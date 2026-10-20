@@ -12,7 +12,7 @@ import { persist, createJSONStorage } from 'zustand/middleware';
 import { v4 as uuidv4 } from 'uuid';
 import type {
   Route, RoutePoint, Point, RouteShape, RangeLimitMode, ImportPoint, ImportLists,
-  WaypointParamsLite, MissionMetaLite, WaypointBinding, Restriction,
+  WaypointParamsLite, MissionMetaLite, WaypointBinding, Restriction, MapBounds,
 } from '../types';
 import { MAX_ROUTES } from '../types';
 import {
@@ -242,6 +242,22 @@ export type MissionStore = MissionState & MissionActions;
 /** Строгая привязка пикселя к WGS-84 (обратная Mercator-проекция) */
 function pixelToGeoStrict(p: Point, bounds: NonNullable<ReturnType<typeof useMapStore.getState>['map']>['bounds'], mapW: number, mapH: number) {
   return pixelToGeoExact(p, bounds!, mapW, mapH);
+}
+
+/**
+ * Строгая привязка WGS-84 → пиксель растра.
+ * ИСПРАВЛЕНИЕ бага «точки уходят в угол карты»: раньше для гео→пиксель местами
+ * использовался geoToPixelFromBounds БЕЗ clamp — при lat=90° (или при расшаренных
+ * bounds виртуального растра) mercator-Y уходит в ±Infinity, fy становится NaN и
+ * точка «уезжала» в угол/за пределы канваса. Здесь — клампим входные значения и
+ * гарантируем finite-результат (fallback на центр растра вместо NaN).
+ */
+function geoToPixelStrict(lat: number, lng: number, bounds: MapBounds, mapW: number, mapH: number): Point {
+  const safeLat = Math.max(-85.05112878, Math.min(85.05112878, Number.isFinite(lat) ? lat : 0));
+  const safeLng = Math.max(-180, Math.min(180, Number.isFinite(lng) ? lng : 0));
+  const px = geoToPixelExact(safeLat, safeLng, bounds, mapW, mapH);
+  if (!Number.isFinite(px.x) || !Number.isFinite(px.y)) return { x: mapW / 2, y: mapH / 2 };
+  return { x: Math.max(0, Math.min(mapW, px.x)), y: Math.max(0, Math.min(mapH, px.y)) };
 }
 
 /**
@@ -893,7 +909,7 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
       if (!map?.bounds || map.width <= 0 || map.height <= 0) return null;
       if (draft.geo.length < 2) return null;
       const pts: RoutePoint[] = draft.geo.map((g, i) => ({
-        ...geoToPixelExact(g.lat, g.lng, map.bounds!, map.width, map.height),
+        ...geoToPixelStrict(g.lat, g.lng, map.bounds!, map.width, map.height),
         lat: g.lat, lng: g.lng,
         altitudeAGL: draft.agl[i] !== undefined ? draft.agl[i] : null,
       }));
@@ -917,9 +933,17 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
       // без ожидания троттлинга подписчика.
       rerouteTimerCleanup();
       rerouteChainCount = 0;
-      if (id) {
-        actions.rerouteAroundZones(id);
-        void actions.updateRouteAltitudes(id);
+      // Фикс «не работает автокоррекция» (молчаливость): раньше при вызове без
+      // аргумента и пустом activeRouteId маршрут выбирался ниже по nil-safe
+      // ветке, но если маршрутов вообще не было — кнопка молча ничего не делала.
+      const targetId = id ?? get().activeRouteId ?? get().routes[0]?.id ?? null;
+      if (!targetId && get().routes.length === 0) {
+        set((cur) => ({ routeWarnings: { ...cur.routeWarnings, __autofix: ['Автокоррекция: нет ни одного маршрута — сначала поставьте старт и цель.'] } }));
+        return;
+      }
+      if (targetId) {
+        actions.rerouteAroundZones(targetId);
+        void actions.updateRouteAltitudes(targetId);
       } else {
         rerouteAllRoutesNow();
         void actions.updateRouteAltitudes();
@@ -930,7 +954,12 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
       const state = get();
       const map = useMapStore.getState().map;
       const route = state.routes.find((r) => r.id === id);
-      if (!map?.bounds || !route || route.points.length < 2) return;
+      if (!route || route.points.length < 2) return;
+      if (!map?.bounds) {
+        // Молчаливый ранний выход был вторым корнем «не работает автокоррекция».
+        set((cur) => ({ routeWarnings: { ...cur.routeWarnings, [route.id]: [...(cur.routeWarnings[route.id] || []), 'Облёт зон: границы карты не заданы — включите активную карту (OSM) или загрузите растр.'] } }));
+        return;
+      }
       // Активные зоны — из кэша (сбрасывается при изменении restrictions).
       // Дешёвый «грязевой» тест: если отрезок не задевает ни одну зону,
       // обходной движок (buildObstacles + граф видимости) не вызывается.
@@ -1002,11 +1031,24 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
       activeAltitudeRuns.set(runKey, runId);
       if (prev && runKey === '__all__') { try { prev.abort(); } catch { /* noop */ } }
       const mapState = useMapStore.getState();
-      if (!mapState.map?.bounds) { activeAltitudeRuns.delete(runKey); return; }
+      // Фикс «не работает запрос рельефа / пересчёт высот» (молчаливость):
+      // раньше ранние выходы были полностью без обратной связи — пользователь
+      // жал на кнопку, ничего не происходило и причина была не видна.
+      if (!mapState.map?.bounds) {
+        activeAltitudeRuns.delete(runKey);
+        set((cur) => ({ routeWarnings: { ...cur.routeWarnings, __elevation: ['Рельеф: карта/границы не загружены — пересчёт высот невозможен. Загрузите карту или включите активную тайловую карту (OSM).'] } }));
+        return;
+      }
       // Флаг elevationAuto живёт в настройках карты (территория) — уважаем его
       // для АВТОМАТИЧЕСКИХ прогонов (routeId=null): без флага автопересчёт не
       // запускается. Ручной запуск (конкретный маршрут / кнопка) работает всегда.
-      if (!routeId && !mapState.settings.elevationAuto) { activeAltitudeRuns.delete(runKey); return; }
+      if (!routeId && !mapState.settings.elevationAuto) {
+        activeAltitudeRuns.delete(runKey);
+        set((cur) => ({ routeWarnings: { ...cur.routeWarnings, __elevation: ['Рельеф: авторасчёт высот отключён (галка «Авто-высоты по рельефу»). Включите его или жмите «Пересчитать высоты» вручную.'] } }));
+        return;
+      }
+      // Явный сигнал начала работы: без него «кнопка не реагирует» ощущается
+      // как зависание (батч к Open-Elevation занимает секунды).
       actions.beginProcessing();
       try {
         await altitudeBody(routeId, runKey, runId, controller);
@@ -1064,7 +1106,7 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
       }
       const toRoutePoint = (pt: { lat: number; lng: number }): RoutePoint => {
         const px = map.bounds
-          ? geoToPixelExact(pt.lat, pt.lng, map.bounds, map.width, map.height)
+          ? geoToPixelStrict(pt.lat, pt.lng, map.bounds, map.width, map.height)
           : { x: 0, y: 0 };
         return { lat: pt.lat, lng: pt.lng, x: px.x, y: px.y };
       };
@@ -1180,7 +1222,7 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
           const pts = r.points.map((p) => {
             if (p.binding && p.binding.kind === kind && p.binding.pointId === id) {
               changed = true;
-              return { ...p, ...geoToPixelExact(geo.lat, geo.lng, map.bounds!, map.width, map.height), lat: geo.lat, lng: geo.lng };
+              return { ...p, ...geoToPixelStrict(geo.lat, geo.lng, map.bounds!, map.width, map.height), lat: geo.lat, lng: geo.lng };
             }
             return p;
           });
@@ -1323,8 +1365,8 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
       for (let i = 0; i < pairs && cur.routes.length + created < MAX_ROUTES; i++) {
         const s = freeStarts[i];
         const g = freeGoals[i];
-        const sPx = canProject ? geoToPixelExact(s.lat, s.lng, mapG!.bounds!, mapG!.width, mapG!.height) : { x: 0, y: 0 };
-        const gPx = canProject ? geoToPixelExact(g.lat, g.lng, mapG!.bounds!, mapG!.width, mapG!.height) : { x: 0, y: 0 };
+        const sPx = canProject ? geoToPixelStrict(s.lat, s.lng, mapG!.bounds!, mapG!.width, mapG!.height) : { x: 0, y: 0 };
+        const gPx = canProject ? geoToPixelStrict(g.lat, g.lng, mapG!.bounds!, mapG!.width, mapG!.height) : { x: 0, y: 0 };
         const rid = actions.addRoute(
           [
             { lat: s.lat, lng: s.lng, x: sPx.x, y: sPx.y, binding: { kind: 'start', pointId: s.id } },

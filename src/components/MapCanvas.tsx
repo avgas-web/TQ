@@ -1524,6 +1524,11 @@ const MapCanvas: React.FC = () => {
         ctx.font = 'bold 14px sans-serif';
         ctx.fillText(label, r.x + btnW / 2, r.y + btnH / 2 + 5);
       }
+      // Баг «плохо работает установка бесполётных зон (не видно установленных
+      // точек)»: раньше этот блок завершал рендер ранним return — live-preview
+      // рисования полигона (вершины и границы) был полностью невидим до
+      // загрузки карты. Рисуем текущее начертание ЗДЕСЬ, поверх заглушки.
+      if (drawingPoints.length > 0) drawCurrentDrawing(ctx);
       return;
     }
     fallbackButtonsRef.current = [];
@@ -2367,6 +2372,13 @@ const MapCanvas: React.FC = () => {
       if (hit) {
         if (hit.id === 'tile') loadActiveTileHere();
         else fallbackFileInputRef.current?.click();
+      }
+      // Фикс «не видно установленных точек зоны»: рисование полигона доступно
+      // и без карты — вершины хранятся в Экранных координатах проекта
+      // (виртуальный растр). Клик по кнопке не добавляет вершину.
+      if (!hit && currentTool === 'drawPolygon' && e.button === 0) {
+        addDrawingPoint(screenToMap(screenX, screenY));
+        setDrawing(true);
       }
       return;
     }
