@@ -220,13 +220,29 @@ interface UseStoreShim {
 }
 
 function buildMerged(): StoreView {
-  // Экшены доменных сторов доступны через spread getState(); порядок важен:
-  // project/UI-поля снапшота перекрывают одноимённые «сырые» поля сторов.
+  // ФИКС «кнопка Сброс не работает»: shim-экшены верхнего уровня
+  // (resetProject/importProject/exportProject/setProjectName) навешаны на
+  // фасад useStore (shimActions), но НЕ попадают в spread доменных сторов —
+  // поэтому useStore.getState().resetProject() был undefined и вызов из
+  // Toolbar падал молча. Добавляем facade в конец цепочки: его методы
+  // (включая guarded-обёртки installMissionGuards) всегда присутствуют в
+  // getState(). Порядок важен: facade перекрывает «сырые» оригиналы сторов
+  // своими guarded-версиями — это штатное поведение legacy-API.
+  const facade = useStore as unknown as Record<string, unknown>;
+  const facadeOnly: Record<string, unknown> = {};
+  for (const k of Object.keys(facade)) {
+    if (typeof facade[k] === 'function' && !(k in useMapStore.getState()) && !(k in useMissionStore.getState()) && !(k in useFleetStore.getState())) {
+      facadeOnly[k] = facade[k];
+    }
+  }
   return {
     ...useMapStore.getState(),
     ...useMissionStore.getState(),
     ...useFleetStore.getState(),
     ...snapshot,
+    // resetProject и прочие проектные экшены фасада (setProjectName,
+    // exportProject, importProject, __rerouteAllRoutesNow):
+    ...facadeOnly,
   } as StoreView;
 }
 
@@ -392,8 +408,31 @@ shimActions.resetProject = () => {
     delete rest.altitudeClearanceM;
     return { settings: { ...defaultMapSettings, ...rest } as typeof cur.settings };
   });
-  // Удаляем изображения карт из IndexedDB (несинхронно, best-effort).
-  void clearAllStoredMaps();
+  // КРИТИЧЕСКИЙ ФИКС «Сброс не удаляет данные»: очистка СОСТОЯНИЯ в памяти
+  // без записи в persist-storage. zustand persist подписан на каждый set(),
+  // поэтому сразу после очистки он сериализует пустое состояние в localStorage
+  // — перезапись «грязного» кэша гарантирована и синхронна (без await).
+  // Удаление ключей ДО setState давало гонку: любой set() между удалением и
+  // гидрацией снова создавал ключ с частичными данными, и после F5 старые
+  // точки/маршруты «воскресали».
+  // Удаляем изображения карт из IndexedDB (несинхронно, best-effort) и
+  // legacy-ключи (старый монолитный totalquadro-storage, backup-копии):
+  // иначе автовосстановление App при следующем запуске возвращает старые
+  // точки/маршруты («Сброс не работает» после перезагрузки страницы).
+  void clearAllStoredMaps().finally(() => {
+    try {
+      localStorage.removeItem('tq-map');
+      localStorage.removeItem('tq-mission');
+      localStorage.removeItem('tq-fleet');
+      localStorage.removeItem('totalquadro-storage');
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('totalquadro-backup')) localStorage.removeItem(k);
+      }
+    } catch (e) {
+      console.warn('[resetProject] persist storage cleanup failed:', e);
+    }
+  });
 };
 
 /** Сброс троттлера + немедленная пакетная перестройка (прежний внутренний хук). */
