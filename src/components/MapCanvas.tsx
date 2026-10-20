@@ -304,8 +304,9 @@ const MapCanvas: React.FC = () => {
   // Кэш тайлов, дозагрузка при изменении вида; maxNativeZoom — выше не растягиваем.
   const tilesEnabled = !!project.settings?.tilesEnabled && !!project.map?.bounds;
   // Только стандартная схема OSM (режимы «спутник/гибрид» удалены из приложения)
-  const tileStyle: 'scheme' = 'scheme';
-  const tileServer = (project.openStreetMap?.tileServer as any) || 'osm';
+  type TileStyle = 'scheme';
+  const tileStyle = 'scheme' as const satisfies TileStyle;
+  const tileServer: 'osm' | 'opentopomap' | 'carto' = project.openStreetMap?.tileServer ?? 'osm';
   // ЕДИНАЯ инвариантная привязка вида (см. комментарий над worldPxOf):
   //   zoom = z0 + log2(scale),  worldPx = canvasHeight · 2^zoom.
   const effZ0 = vs.z0 ?? ZOOM_REF;
@@ -738,7 +739,7 @@ const MapCanvas: React.FC = () => {
     if (tripleStep !== 1 && draftRoutePts !== null) {
       setDraftRoutePts(null);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tripleStep]);
 
   // ─── Авто-утверждение этапов: данные заданы → этап утверждается сам, фокус
@@ -1689,23 +1690,21 @@ const MapCanvas: React.FC = () => {
         const botMercY = latToMerc(bounds.south);
         const mercPerMapPx = (botMercY - topMercY) / map.height;
         let my = Math.max(0, vy0);
-        let accM = 0;
+        const bottomY = Math.min(map.height, vy1);
         const yLines: number[] = [];
-        if (my > 0) {
-          // найти первый узел ниже верха экрана: интегрируем метры от верха bounds
-          // (для простоты стартуем с 0 от северной границы)
-        }
-        while (true) {
+        // Интегрируем метрическую сетку от северной границы до нижней видимой
+        // точки; цикл имеет три гарантии завершения: прирост my, лимит высоты
+        // и жёсткий лимит числа линий (защита от вырожденных масштабов).
+        while (my <= bottomY && yLines.length <= 500) {
           const latAtY = mercToLat(topMercY + my * mercPerMapPx);
           const cosLat = Math.max(0.05, Math.cos((latAtY * Math.PI) / 180));
           const dMerc = (stepM / (mppMap * cosLat * cosLat)) * mercPerMapPx; // Mercator Δ на один шаг
+          if (!(dMerc > 0)) break; // защита от NaN/0 шага
           my += dMerc;
-          accM += stepM;
-          if (my > Math.min(map.height, vy1)) break;
+          if (my > bottomY) break;
           yLines.push(my);
-          if (yLines.length > 500) break; // защита от вырожденных случаев
         }
-        void accM; void cosTop;
+        void cosTop;
         ctx.beginPath();
         for (const y of yLines) {
           ctx.moveTo(Math.max(0, vx0), y);

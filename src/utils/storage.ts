@@ -11,10 +11,8 @@ const MAP_STORE_NAME = 'maps';
 export function checkLocalStorageQuota(): { used: number; available: number; percentage: number } {
   let used = 0;
   
-  for (let key in localStorage) {
-    if (localStorage.hasOwnProperty(key)) {
-      used += localStorage[key].length + key.length;
-    }
+  for (const key of Object.keys(localStorage)) {
+    used += (localStorage.getItem(key)?.length ?? 0) + key.length;
   }
   
   // Примерный лимит localStorage (5 МБ)

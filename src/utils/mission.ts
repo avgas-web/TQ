@@ -472,7 +472,7 @@ export function calculateObstacleAvoidance(
     validateGeoBox(o);
     if (o.maxAltM < o.minAltM) throw new ValidationError(`Препятствие: maxAlt < minAlt (${o.minAltM}>${o.maxAltM})`);
   }
-  let out: RouteNode3D[] = [route[0]];
+  const out: RouteNode3D[] = [route[0]];
   let blocked = false;
   for (let s = 1; s < route.length; s++) {
     const from = out[out.length - 1];

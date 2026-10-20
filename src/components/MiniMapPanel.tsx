@@ -148,10 +148,10 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     if (fitPoints && fitPoints.length > 0) {
       const aspect = sizeRef.current.w > 0 && sizeRef.current.h > 0 ? sizeRef.current.w / sizeRef.current.h : 1.5;
       const v = fitView(fitPoints, aspect, minZoom, maxZoom);
-      if (v) { first ? (viewRef.current = v, bump()) : animateTo(v); }
+      if (v) { if (first) { viewRef.current = v; bump(); } else { animateTo(v); } }
     } else {
       const v = panelViewOf(center.lat, center.lng, zoom);
-      first ? (viewRef.current = v, bump()) : animateTo(v);
+      if (first) { viewRef.current = v; bump(); } else { animateTo(v); }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dataKey]);

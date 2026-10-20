@@ -29,7 +29,7 @@ export interface OSMConfig {
   loaded: boolean;
 }
 
-let osmConfig: OSMConfig = {
+const osmConfig: OSMConfig = {
   loaded: false,
 };
 

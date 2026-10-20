@@ -28,7 +28,7 @@ function expect(actual: unknown) {
       }
     },
     toMatch: (re: RegExp): void => { if (!re.test(String(actual))) throw new Error(`«${actual}» не соответствует ${re}`); },
-    toBeInstanceOf: (Ctor: Function): void => { if (!(actual instanceof (Ctor as new (...a: never[]) => unknown))) throw new Error(`${fmt(actual)} не экземпляр ${Ctor.name}`); },
+    toBeInstanceOf: (Ctor: new (...args: never[]) => unknown): void => { if (!(actual instanceof (Ctor as new (...a: never[]) => unknown))) throw new Error(`${fmt(actual)} не экземпляр ${Ctor.name}`); },
     get not(): typeof actual extends never ? never : ReturnType<typeof expect> {
       return {
         toThrow: (): void => { /* no-op: см. dedicated test ниже */ },
