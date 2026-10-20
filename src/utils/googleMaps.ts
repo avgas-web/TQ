@@ -27,7 +27,7 @@ export interface GoogleMapsConfig {
   loaded: boolean;
 }
 
-let googleMapsConfig: GoogleMapsConfig = {
+const googleMapsConfig: GoogleMapsConfig = {
   apiKey: '',
   loaded: false,
 };

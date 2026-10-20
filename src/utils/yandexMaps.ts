@@ -6,7 +6,7 @@ export interface YandexMapsConfig {
   loaded: boolean;
 }
 
-let yandexMapsConfig: YandexMapsConfig = {
+const yandexMapsConfig: YandexMapsConfig = {
   apiKey: '',
   loaded: false,
 };

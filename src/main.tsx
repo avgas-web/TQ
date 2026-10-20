@@ -12,8 +12,12 @@ function showError(title: string, detail: unknown) {
   pre.textContent = `${title}\n\n${
     detail instanceof Error ? detail.stack || detail.message : String(detail)
   }`;
-  document.getElementById("root")?.replaceChildren(pre) ??
+  const rootEl = document.getElementById("root");
+  if (rootEl) {
+    rootEl.replaceChildren(pre);
+  } else {
     document.body.appendChild(pre);
+  }
 }
 
 // Независимо от того, какой скрипт упадёт (наш бандл или внешний CDN),

@@ -1,9 +1,7 @@
 node_modules/
-dist/
-.tmp-tests/
+*.log
+*.tmp
 
-# secrets & test artifacts
-.env
-.env.local
-.env.*.local
+# build/test artifacts
 coverage/
+.tmp-tests/
