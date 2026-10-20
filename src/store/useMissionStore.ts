@@ -50,6 +50,23 @@ let rerouteChainCount = 0;
  *  троттлящемуся публичному API). */
 let altitudeRunId = 0;
 let lastAltitudeController: AbortController | null = null;
+/** Флаг «в воркере сейчас идёт асинхронный обход тяжёлых сегментов». Пока он
+ *  true, троттлер scheduleRerouteAll НЕ сбрасывает таймер: перестройка должна
+ *  произойти строго ПОСЛЕ применения результатов воркера. Без этого флага
+ *  каскад «ответ воркера → set(routes) → подписчик зон → новый reroute» мог
+ *  схлопнуться в лимит MAX_REROUTE_CHAIN и остановиться ДО финальной сверки —
+ *  маршруты оставались пересекающими NFZ молча (обход не был обязательным). */
+let workerReroutePending = false;
+/** Ретраи tail-guard'а обязательного обхода (сбрасываются при чистой геометрии). */
+let rerouteRetries = 0;
+
+/** Есть ли хоть один маршрут, всё ещё пересекающий активную NFZ. */
+function anyRouteCrossesActiveZone(): boolean {
+  const zones = getActiveZonesCached(useMapStore.getState().restrictions);
+  if (zones.length === 0) return false;
+  return useMissionStore.getState().routes.some((r) =>
+    r.points.length >= 2 && zonesCrossedBy(r.points.map((p) => ({ x: p.x, y: p.y })), zones).length > 0);
+}
 /** Per-route «занятость» прогонов updateRouteAltitudes(null). Раньше один
  *  глобальный runId приводил к взаимной отмене параллельных вызовов: ручная
  *  кнопка «Пересчитать высоты» (routeId=null) отменяла начатый drag-прогон по
@@ -317,15 +334,45 @@ function rangeLimitWarning(route: Route, pts: RoutePoint[]): string | null {
  *  повторные вызовы в пределах троттл-окна схлопываются в один прогон.
  *  Защита от самоподдерживающегося каскада (React #185): счётчик цепочки
  *  сбрасывается только пользовательскими действиями. */
+/** Максимум фоновых повторов, если обход ещё не достигнут (см. tail-guard). */
+const MAX_REROUTE_RETRIES = 3;
+
 export function scheduleRerouteAll(): void {
+  // ОБЯЗАТЕЛЬНЫЙ автоматический обход NFZ: если в воркере ещё идут тяжёлые
+  // сегменты, НЕ сбрасываем уже запланированный таймер — иначе бесконечные
+  // микро-изменения (перетаскивание зоны вершиной) откладывали бы перестройку
+  // вечно и маршруты оставались бы сквозь запретные зоны.
+  if (rerouteTimer != null && workerReroutePending) return;
   if (rerouteTimer != null) clearTimeout(rerouteTimer);
   rerouteTimer = window.setTimeout(() => {
     rerouteTimer = null;
     if (++rerouteChainCount > MAX_REROUTE_CHAIN) {
       console.warn('[reroute] цепочка авто-перестроек превысила лимит — остановлено.');
+      // Финальная гарантия обязательности: при достижении лимита каскада всё
+      // равно выполняем ОДИН синхронный проход без троттлинга (он идемпотентен
+      // и сам затухает, если геометрия чистая). Раньше здесь был молчаливый
+      // return — маршруты могли остаться пересекающими NFZ навсегда.
+      rerouteChainCount = 0;
+      rerouteAllRoutesNow();
       return;
     }
     rerouteAllRoutesNow();
+    // Tail-guard «обязательности»: если после прохода хоть один маршрут всё
+    // ещё пересекает активную NFZ (например, ответы воркера ещё в полёте),
+    // планируем ещё один проход с СОБСТВЕННЫМ лимитом ретраев. Без этого
+    // пользовательские действия могли обнулять счётчик каскада в вечном
+    // цикле и маршруты оставались бы сквозь зоны. При чистой геометрии
+    // guard не срабатывает — каскад затухает сам.
+    if (anyRouteCrossesActiveZone()) {
+      if (rerouteRetries < MAX_REROUTE_RETRIES) {
+        rerouteRetries++;
+        scheduleRerouteAll();
+      } else {
+        console.warn('[reroute] обход NFZ не достигнут за', MAX_REROUTE_RETRIES, 'ретая — остановлено.');
+      }
+    } else {
+      rerouteRetries = 0;
+    }
   }, REROUTE_THROTTLE_MS);
 }
 
@@ -363,6 +410,9 @@ function rerouteAllRoutesNow(): void {
     if (w) {
       let pending = heavy.length;
       let anyOk = false;
+      // Пока есть незавершённые worker-обходы, троттлер не должен отменять
+      // уже запланированную перестройку (см. scheduleRerouteAll).
+      workerReroutePending = true;
       for (const h of heavy) {
         void planSegmentViaWorker(h.start, h.goal, activeZones, map.width, map.height).then((path) => {
           if (path && path.length >= 2) {
@@ -391,7 +441,18 @@ function rerouteAllRoutesNow(): void {
               }),
             }));
           }
-          if (--pending === 0 && anyOk) rerouteAllRoutesNow(); // финальная сверка/warnings
+          if (--pending === 0) {
+            workerReroutePending = false;
+            // Финальная обязательная сверка: применяем результаты воркера и
+            // пересобираем предупреждения. Если обход всё ещё не достигнут —
+            // гарантированно планируем ещё один проход (идемпотентный).
+            rerouteAllRoutesNow();
+            const st = useMissionStore.getState();
+            const zonesNow = getActiveZonesCached(useMapStore.getState().restrictions);
+            const stillCrossed = st.routes.some((r) =>
+              r.points.length >= 2 && zonesCrossedBy(r.points.map((p) => ({ x: p.x, y: p.y })), zonesNow).length > 0);
+            if (stillCrossed) scheduleRerouteAll();
+          }
         });
       }
       // не возвращаемся: синхронный pass ниже всё равно нужен (warnings/идемпотентность)
@@ -400,6 +461,26 @@ function rerouteAllRoutesNow(): void {
   const newRoutes: Route[] = [];
   const warningsMap: Record<string, string[]> = {};
   let changed = false;
+  // «Мёртвые» обходные точки (auto:true), которые больше НИЧЕГО не обходят
+  // (зона удалена/сдвинута, сегмент старт→след_ключа чист) — автоматически
+  // удаляются. Раньше после удаления NFZ служебные точки-обходы оставались в
+  // маршруте навсегда: ломаная из 4+ точек жила вместо прямой старт→финиш,
+  // искажая длину и пересчёт высот. Идемпотентно: повторный проход ничего уже
+  // не меняет (все оставшиеся auto-точки реально нужны).
+  const pruneAutoPoints = (pts: RoutePoint[]): RoutePoint[] => {
+    if (!pts.some((p) => p.auto)) return pts;
+    const keep: RoutePoint[] = [];
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      if (!p.auto) { keep.push(p); continue; }
+      const prevK = keep[keep.length - 1];
+      const nextK = pts.slice(i + 1).find((q) => !q.auto);
+      if (!prevK || !nextK) { keep.push(p); continue; }
+      if (zonesCrossedBy([prevK, nextK], activeZones).length > 0) keep.push(p);
+      // иначе точка больше не участвует в обходе — выбрасываем
+    }
+    return keep.length >= 2 ? keep : pts;
+  };
   for (const route of routes) {
     if (route.points.length < 2) { newRoutes.push(route); continue; }
     let ki: number[] = [];
@@ -434,6 +515,9 @@ function rerouteAllRoutesNow(): void {
         merged.push({ x: sp.x, y: sp.y, lat: geo.lat, lng: geo.lng, auto: true });
       }
       pts = merged;
+    } else {
+      // Ломаная: чистим устаревшие обходные точки (см. pruneAutoPoints выше).
+      pts = pruneAutoPoints(pts);
     }
     const crossed = zonesCrossedBy(pts.map((p) => ({ x: p.x, y: p.y })), activeZones);
     const warns = crossed.map((z) => `Пересекает зону «${z.name}»`);
@@ -999,6 +1083,7 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
         newPts.length = 0;
         newPts.push(...merged);
       }
+
       // Набор предупреждений ПОЛНОСТЬЮ заменяется для маршрута (пустой массив
       // удаляет запись) — иначе «застывшие» ложные предупреждения оставались бы навсегда.
       const crossed = zonesCrossedBy(newPts.map((p) => ({ x: p.x, y: p.y })), activeZones);
