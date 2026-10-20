@@ -507,6 +507,7 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
     if (keySet.size === 0) return;
     const uniqPts = Array.from(keySet.values());
     let elevs: (number | null)[];
+    let serviceError: string | null = null;
     try {
       elevs = await fetchElevations(uniqPts, controller.signal);
     } catch (err) {
@@ -514,11 +515,20 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
       // fetchElevationsBatch гасит сам (мягкая деградация в null).
       if ((err as { name?: string })?.name === 'AbortError') return;
       console.warn('[elevation] сервис недоступен:', (err as Error)?.message);
+      serviceError = (err as Error)?.message ?? 'network error';
       elevs = uniqPts.map(() => null);
     }
     if (activeAltitudeRuns.get(runKey) !== runId) return; // более новый прогон этого же ключа отменил этот
     const elevByKey = new Map<string, number | null>();
     uniqPts.forEach((p, i) => elevByKey.set(`${p.lat.toFixed(4)},${p.lng.toFixed(4)}`, elevs[i]));
+    // Раньше пустой ответ сервиса был полностью молчаливым: высот нет и причины
+    // не видно. Пишем явный warning в routeWarnings['__elevation'].
+    const gotAny = elevs.some((e) => typeof e === 'number' && Number.isFinite(e));
+    const elevationWarn: string[] = !gotAny
+      ? [serviceError
+          ? `Рельеф: Open-Elevation недоступен (${serviceError}) — высоты по рельефу не рассчитаны`
+          : 'Рельеф: Open-Elevation вернул пустой ответ — heights по рельефу не рассчитаны (проверьте сеть или повторите пересчёт)']
+      : [];
 
     set((cur) => {
       const rw: Record<string, string[]> = { ...cur.routeWarnings };
@@ -554,6 +564,9 @@ const createMissionActions: StateCreator<MissionStore, [], [], MissionActions> =
         if (merged.length > 0) rw[r.id] = merged; else delete rw[r.id];
         return { ...r, points: pts };
       });
+      // Явная видимость сбоя сервиса рельефа (см. elevationWarn выше)
+      if (elevationWarn.length > 0) rw['__elevation'] = elevationWarn;
+      else delete rw['__elevation'];
       return { routeWarnings: rw, routes: updatedRoutes };
     });
   };

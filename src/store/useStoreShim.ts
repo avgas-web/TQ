@@ -344,6 +344,12 @@ shimActions.resetProject = () => {
   // фоновые прогоны высот, чтобы они не дописали данные после очистки.
   useMissionStore.setState({ isProcessing: false });
   try { useMissionStore.getState().cancelAltitudeRun(); } catch { /* noop */ }
+  // ВАЖНО (баг «кнопка Сброс не работает»): снимаем страж guarded-экшенов.
+  // lastGuardPassTs обновляется КАЖДЫМ пропущенным mutate-экшеном, поэтому
+  // при непрерывной работе он всегда молод (<120 с) и зависший isProcessing
+  // никогда не разблокировался бы автоматически — UI оставался замороженным
+  // навсегда. Сброс обязан снимать блокировку принудительно.
+  lastGuardPassTs = Date.now() + MUTATE_GUARD_MS;
   invalidateZoneCacheLocal();
   projectNameRef.value = 'Новый проект';
   projectNameRef.createdAt = new Date().toISOString();
@@ -385,16 +391,21 @@ shimActions.__rerouteAllRoutesNow = () => rerouteAllNow();
 // ─── Защита от гонок состояний: mutate-экшены отклоняются, пока isProcessing ──
 // setRoutePointAltitude НЕ блокируется: ручная регулировка высоты этапа должна
 // оставаться доступной всегда (она сама запускает пересчёт через очередь).
+// Объявлены ДО resetProject (TDZ): сброс принудительно разблокирует страж.
+let lastGuardPassTs = Date.now();
 const MUTATE_GUARD_MS = 120_000; // страховка: зависший прогон не должен «заморозить» UI навсегда
+// ВАЖНО: autoFixRoute НЕ блокируется — это АВАРИЙНАЯ кнопка пользователя
+// («не работает автокоррекция»): она должна работать всегда, включая момент
+// сразу после сброса или во время фоновых операций. Внутри она сама отменяет
+// троттлер и перезапускает прогоны высот через штатный race-guard стора.
 const BLOCKED_MUTATORS: Array<keyof MisS> = [
   'addRoute', 'deleteRoute', 'appendRoutePoint', 'insertRoutePointAt',
   'removeRoutePoint', 'commitRouteDraft', 'generateScanRoute', 'optimizeRouteOrder',
-  'autoFixRoute', 'importRoutes', 'resetMissions', 'setMissionMode',
+  'importRoutes', 'resetMissions', 'setMissionMode',
   'addStartPointAt', 'addGoalPointAt', 'removeStartPoint', 'removeGoalPoint', 'autoPlanRoutes',
 ];
 /** Синхронные mutate-экшены карты: во время тяжёлой операции тоже блокируются. */
 const BLOCKED_MAP_MUTATORS: Array<keyof MapS> = ['deleteRestriction'];
-let lastGuardPassTs = Date.now();
 const guardWrapped = new Map<string, (...a: unknown[]) => unknown>();
 
 // ИСПРАВЛЕНИЕ краша «Cannot read properties of undefined (reading 'addRoute')»:
@@ -431,9 +442,16 @@ function makeGuarded(key: string, domain: 'mission' | 'map'): (...a: unknown[]) 
     (store.getState() as unknown as Record<string, unknown>)[key] as ((...a: unknown[]) => unknown) | undefined;
   const wrapped = function (this: unknown, ...args: unknown[]): unknown {
     const st = useMissionStore.getState();
+    // Страж-фолбэк: если isProcessing завис (прогон упал без endProcessing),
+    // а за MUTATE_GUARD_MS не было ни одного пропущенного экшена — разблокируем
+    // UI автоматически, иначе приложение осталось бы «замороженным» навсегда.
     if (st.isProcessing && Date.now() - lastGuardPassTs < MUTATE_GUARD_MS) {
       console.warn(`[mission] экшен «${String(key)}» отклонён: идёт тяжёлая операция (пересчёт высот / загрузка миссии)`);
       return null;
+    }
+    if (st.isProcessing) {
+      console.warn(`[mission] isProcessing завис > ${MUTATE_GUARD_MS} мс — принудительная разблокировкаguarded-экшенов`);
+      useMissionStore.setState({ isProcessing: false });
     }
     lastGuardPassTs = Date.now();
     const fn = typeof orig === 'function' ? orig : fallback(domain === 'mission' ? useMissionStore : useMapStore);

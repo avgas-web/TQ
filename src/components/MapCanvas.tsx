@@ -1049,7 +1049,12 @@ const MapCanvas: React.FC = () => {
   const handlePanelMapClickRef = useRef(handlePanelMapClick);
   useEffect(() => { handlePanelMapClickRef.current = handlePanelMapClick; }, [handlePanelMapClick]);
   const pendingZonesRef = useRef(pendingZones);
-  useEffect(() => { pendingZonesRef.current = pendingZones; }, [pendingZones]);
+  useEffect(() => {
+    pendingZonesRef.current = pendingZones;
+    // Черновик NFZ меняется при каждом клике — канвас перерисовываем сразу,
+    // иначе поставленные точки на главной карте не видны до следующего рендера.
+    setRenderTick((t) => t + 1);
+  }, [pendingZones]);
 
   const handlePanelPointMove = useCallback((id: string, lat: number, lng: number) => {
     // Вершину черновика NFZ двигать нельзя (проще удалить ✛ и поставить заново).
@@ -1541,6 +1546,9 @@ const MapCanvas: React.FC = () => {
     // Draw restrictions
     drawRestrictions(ctx);
 
+    // Draw pending NFZ polygon drafts (вершины/контур на главной карте)
+    drawPendingZones(ctx);
+
     // Draw markers
     drawMarkers(ctx);
 
@@ -1839,6 +1847,56 @@ const MapCanvas: React.FC = () => {
           ctx.fillStyle = isActive ? 'rgba(255, 100, 100, 0.8)' : 'rgba(150, 150, 150, 0.6)';
           ctx.fill();
         }
+      }
+      ctx.restore();
+    }
+
+    // Черновики NFZ-полигонов (ставятся кликами, замыкаются двойным кликом):
+    // рисуем на ГЛАВНОЙ карте — раньше вершины были видны только в мини-панели,
+    // из-за чего «не видно установленных точек» при рисовании зон.
+    function drawPendingZones(ctx: CanvasRenderingContext2D) {
+      const pend = pendingZonesRef.current;
+      if (pend.length === 0 || !project.map?.bounds || project.map.width <= 0 || project.map.height <= 0) return;
+      const bounds = project.map.bounds;
+      const w = project.map.width;
+      const h = project.map.height;
+      ctx.save();
+      ctx.translate(vs.offsetX, vs.offsetY);
+      ctx.scale(vs.scale, vs.scale);
+      for (const pz of pend) {
+        if (pz.pts.length === 0) continue;
+        const pxPts = pz.pts.map((g) => geoToPixelExact(g.lat, g.lng, bounds, w, h));
+        if (pxPts.length >= 3) {
+          ctx.beginPath();
+          ctx.moveTo(pxPts[0].x, pxPts[0].y);
+          for (let i = 1; i < pxPts.length; i++) ctx.lineTo(pxPts[i].x, pxPts[i].y);
+          ctx.closePath();
+          ctx.fillStyle = 'rgba(251, 146, 60, 0.18)';
+          ctx.fill();
+        }
+        if (pxPts.length >= 2) {
+          ctx.beginPath();
+          ctx.moveTo(pxPts[0].x, pxPts[0].y);
+          for (let i = 1; i < pxPts.length; i++) ctx.lineTo(pxPts[i].x, pxPts[i].y);
+          ctx.strokeStyle = '#fb923c';
+          ctx.lineWidth = 2 / vs.scale;
+          ctx.setLineDash([6 / vs.scale, 4 / vs.scale]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+        // Вершины: белые точки с оранжевой обводкой + нумерация
+        ctx.font = `${11 / vs.scale}px sans-serif`;
+        pxPts.forEach((p, i) => {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 5 / vs.scale, 0, Math.PI * 2);
+          ctx.fillStyle = '#ffffff';
+          ctx.fill();
+          ctx.lineWidth = 2 / vs.scale;
+          ctx.strokeStyle = '#fb923c';
+          ctx.stroke();
+          ctx.fillStyle = '#ea580c';
+          ctx.fillText(String(i + 1), p.x + 7 / vs.scale, p.y - 5 / vs.scale);
+        });
       }
       ctx.restore();
     }

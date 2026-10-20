@@ -223,11 +223,13 @@ const Sidebar: React.FC = () => {
             </button>
             {(() => {
               const warns = activeRouteId ? routeWarnings[activeRouteId] ?? [] : [];
-              if (warns.length === 0) return null;
+              // Глобальные предупреждения сервиса рельефа (не привязаны к маршруту)
+              const elevWarns = routeWarnings['__elevation'] ?? [];
+              if (warns.length === 0 && elevWarns.length === 0) return null;
               return (
                 <div className="rounded border border-yellow-600/50 bg-yellow-900/20 p-2 space-y-1">
-                  {warns.map((w, i) => (
-                    <div key={i} className={`text-xs ${w.startsWith('Высота') || w.startsWith('Конфликт') ? 'text-orange-300' : 'text-yellow-300'}`}>
+                  {[...warns, ...elevWarns].map((w, i) => (
+                    <div key={i} className={`text-xs ${w.startsWith('Высота') || w.startsWith('Конфликт') || w.startsWith('Рельеф') ? 'text-orange-300' : 'text-yellow-300'}`}>
                       ⚠️ {w}
                     </div>
                   ))}
