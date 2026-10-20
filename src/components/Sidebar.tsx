@@ -36,6 +36,7 @@ const Sidebar: React.FC = () => {
     setSearchQuery,
     setFilterType,
     importProject: doImportProject,
+    isProcessing,
   } = useStore();
 
   // Filtered markers
@@ -316,7 +317,9 @@ const Sidebar: React.FC = () => {
                       </button>
                       <button
                         onClick={() => deleteRestriction(restriction.id)}
-                        className="px-1 text-xs text-gray-400 hover:text-red-400"
+                        disabled={isProcessing}
+                        title={isProcessing ? 'Блокировано во время обработки (isProcessing)' : undefined}
+                        className="px-1 text-xs text-gray-400 hover:text-red-400 disabled:opacity-40 disabled:cursor-not-allowed"
                       >🗑️</button>
                     </div>
                   </div>
@@ -392,7 +395,9 @@ const Sidebar: React.FC = () => {
               </div>
               <button
                 onClick={() => void updateRouteAltitudes()}
-                className="w-full px-2 py-1 bg-cyan-700 hover:bg-cyan-600 text-white rounded text-xs"
+                disabled={isProcessing}
+                title={isProcessing ? 'Блокировано во время обработки (isProcessing)' : undefined}
+                className="w-full px-2 py-1 bg-cyan-700 hover:bg-cyan-600 text-white rounded text-xs disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 🛰 Пересчитать высоты маршрутов
               </button>

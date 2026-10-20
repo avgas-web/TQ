@@ -37,6 +37,14 @@ function dedupe(points: ElevationPoint[]): ElevationPoint[] {
   return out;
 }
 
+/** In-flight дедупликация: одинаковый набор точек, уже запрошенный незавершённым
+ *  прогоном, не должен идти в сеть повторно (гонка «перетяни точку трижды»). */
+const inflight = new Map<string, Promise<(number | null)[]>>();
+
+function inflightKey(points: ElevationPoint[]): string {
+  return points.map((p) => cacheKey(p.lat, p.lng)).join('|');
+}
+
 /** Запрос батча высот к Open-Elevation. Батчи разбиваются по ≤100 точек
  *  (защита от слишком больших URL/таймаутов), выполняются последовательно
  *  (публичный API бесплатно троттлит частые запросы). */
@@ -44,6 +52,7 @@ async function fetchElevationsBatch(points: ElevationPoint[], signal?: AbortSign
   const results: (number | null)[] = new Array(points.length).fill(null);
   const CHUNK = 100;
   for (let off = 0; off < points.length; off += CHUNK) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     const chunk = points.slice(off, off + CHUNK);
     try {
       const resp = await fetch(OPEN_ELEVATION_URL, {
@@ -77,6 +86,35 @@ async function fetchElevationsBatch(points: ElevationPoint[], signal?: AbortSign
   return results;
 }
 
+/** Обёртка над fetchElevationsBatch с in-flight дедупликацией: параллельные
+ *  прогоны, запросившие тот же набор точек, получают один и тот же сетевой
+ *  запрос. Отмена (abort) одного из потребителей не отменяет общий запрос —
+ *  результат всё равно кладётся в elevCache и переиспользуется; это безопаснее,
+ *  чем рвать троттлящийся публичный API на каждом drag-событии. */
+async function fetchElevationsShared(points: ElevationPoint[], signal?: AbortSignal): Promise<(number | null)[]> {
+  const key = inflightKey(points);
+  let p = inflight.get(key);
+  if (!p) {
+    p = fetchElevationsBatch(points).finally(() => {
+      if (inflight.get(key) === p) inflight.delete(key);
+    });
+    inflight.set(key, p);
+  }
+  // Дождаться общего запроса, но корректно отреагировать на abort своего сигнала
+  if (signal) {
+    await new Promise<void>((resolve, reject) => {
+      if (signal.aborted) return reject(new DOMException('Aborted', 'AbortError'));
+      const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+      signal.addEventListener('abort', onAbort, { once: true });
+      p!.then(() => { signal.removeEventListener('abort', onAbort); resolve(); },
+             () => { signal.removeEventListener('abort', onAbort); resolve(); });
+    });
+  } else {
+    await p.catch(() => undefined);
+  }
+  return (await p).slice();
+}
+
 /**
  * Массив высот ландшафта (м, WGS-84/EGM96) для точек. Гарантирует тот же
  * порядок и длину, что и вход: недоступные точки — null. Кэшируется.
@@ -85,7 +123,10 @@ export async function fetchElevations(points: ElevationPoint[], signal?: AbortSi
   const out: (number | null)[] = new Array(points.length).fill(null);
   const uniq = dedupe(points);
   const missing = uniq.filter((p) => !elevCache.has(cacheKey(p.lat, p.lng)));
-  const fetched = missing.length > 0 ? await fetchElevationsBatch(missing, signal) : [];
+  // Фиксация снапшота сигнала ДО сетевой фазы: отменённый прогон не должен
+  // начинать новые обращения даже если чек внутри батча «проскочит» гонку.
+  if (signal?.aborted) return points.map((pt) => elevCache.get(cacheKey(pt.lat, pt.lng)) ?? null);
+  const fetched = missing.length > 0 ? await fetchElevationsShared(missing, signal) : [];
   missing.forEach((p, i) => {
     const v = fetched[i];
     if (typeof v === 'number') elevCache.set(cacheKey(p.lat, p.lng), v);
@@ -153,6 +194,7 @@ export async function computeRouteAltitude(
 
   const profile = interpolateProfile(geoPoints);
   const profElev = await fetchElevations(profile, signal);
+  if (signal?.aborted) return empty; // прогон отменён — не пишем устаревшие предупреждения
   if (profElev.every((v) => v === null)) return empty; // сервис недоступен — мягкая деградация
 
   // Для каждого узла — рельеф на его позиции + максимум рельефа на соседних

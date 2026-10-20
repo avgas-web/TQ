@@ -280,7 +280,7 @@ const MapCanvas: React.FC = () => {
   // Кэш тайлов, дозагрузка при изменении вида; maxNativeZoom — выше не растягиваем.
   const tilesEnabled = !!project.settings?.tilesEnabled && !!project.map?.bounds;
   // Только стандартная схема OSM (режимы «спутник/гибрид» удалены из приложения)
-  const tileStyle: 'scheme' = 'scheme';
+  const tileStyle = 'scheme' as const;
   const tileServer = (project.openStreetMap?.tileServer as any) || 'osm';
   // ЕДИНАЯ инвариантная привязка вида (см. комментарий над worldPxOf):
   //   zoom = z0 + log2(scale),  worldPx = canvasHeight · 2^zoom.
@@ -645,7 +645,7 @@ const MapCanvas: React.FC = () => {
     if (tripleStep !== 1 && draftRoutePts !== null) {
       setDraftRoutePts(null);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tripleStep]);
 
   // ─── Авто-утверждение этапов: данные заданы → этап утверждается сам, фокус

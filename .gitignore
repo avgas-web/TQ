@@ -1,7 +1,21 @@
-node_modules/
 dist/
+node_modules/
+
+# environment secrets (no secrets in git)
 .env
+.env.local
+.env.*.local
 *.local
+
+# test / coverage artifacts
+coverage/
+.nyc_output/
+.tmp-tests/
+
+# logs
+*.log
+
+# editor & OS
+.vscode/*
+.idea/
 .DS_Store
-npm-debug.log*
-route.test.mjs

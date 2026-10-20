@@ -18,6 +18,8 @@ import { geoToPixelFromBounds, calculateBoundsFromCenter, latToMercatorY, mercat
 import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, geoToPixelExact, smoothPolyline, routeLengthM, requiredAbsFromZones } from '../utils/routing';
 import { fetchElevations, computeRouteAltitude } from '../utils/elevation';
 import type { ElevationPoint } from '../utils/elevation';
+import { parseViewState } from '../utils/projectSchema';
+import { makeStoreShim } from '../hooks/useStoreShim';
 import type { RouteShape, RangeLimitMode, ImportPoint, ImportLists } from '../types';
 
 const MIN_MAP_ZOOM_FLOOR = 6;
@@ -323,15 +325,10 @@ let lastViewSel: { t: number; v: AppState['viewState']; out: ViewState } | null 
  * семантически эквивалентна отсутствию поля и защищает от «грязных» значений
  * (null/string/NaN) из старых версий хранилища.
  */
-export function normalizeViewState(v: any): ViewState {
-  const num = (x: any, dflt: number): number => (typeof x === 'number' && Number.isFinite(x) ? x : dflt);
-  const z0 = typeof v?.z0 === 'number' && Number.isFinite(v.z0) ? v.z0 : undefined;
-  return {
-    offsetX: num(v?.offsetX, 0),
-    offsetY: num(v?.offsetY, 0),
-    scale: num(v?.scale, 1),
-    z0,
-  };
+export function normalizeViewState(v: unknown): ViewState {
+  // Единая точка нормализации вида — строгая реализация в projectSchema
+  // (parseViewState никогда не бросает и возвращает только конечные числа).
+  return parseViewState(v);
 }
 
 interface AppState {
@@ -349,6 +346,13 @@ interface AppState {
   viewTick: number;
   cursorPosition: Point | null;
   isDrawing: boolean;
+  /** Флаг «тяжёлой» операции (загрузка миссии в дроны / пакетный пересчёт).
+   *  Пока true — мутации стейта через makeGuarded-обёртки блокируются, а
+   *  кнопки удаления зон / оптимизации / пересчёта высот disabled в DOM. */
+  isProcessing: boolean;
+  setProcessing: (v: boolean) => void;
+  /** Обёртка мутатора: пока isProcessing === true, вызов — no-op. */
+  makeGuarded: <A extends unknown[], R>(fn: (...args: A) => R) => (...args: A) => R | undefined;
   drawingPoints: Point[];
   measurementPoints: Point[];
   searchQuery: string;
@@ -513,6 +517,16 @@ export const useStore = create<AppState>()(
       viewTick: 0,
       cursorPosition: null,
       isDrawing: false,
+      isProcessing: false,
+      setProcessing: (v) => set({ isProcessing: v === true }),
+      // NOTE: the inner closure is typed with `unknown[]`/`unknown` and cast to
+      // the generic signature once — casting the spread call site directly would
+      // hit TS's "A is not assignable to A" variance error for generic tuples.
+      makeGuarded: (<A extends unknown[], R>(fn: (...args: A) => R) =>
+        ((...args: unknown[]) => {
+          if (get().isProcessing) return undefined;
+          return fn(...(args as A));
+        }) as ((...args: A) => R | undefined)) as AppState['makeGuarded'],
       drawingPoints: [],
       measurementPoints: [],
       searchQuery: '',
@@ -818,6 +832,7 @@ export const useStore = create<AppState>()(
       },
 
       optimizeRouteOrder: (routeId, algorithm) => {
+        if (get().isProcessing) return null; // UI-защита: мутация запрещена во время аплоада
         // optimize_route(waypoints, algorithm): перестановка путевых точек
         // (первая — старт — фиксирована). Параметры точек переносятся вместе
         // с точками. Возвращает % сокращения пути или null. После перестановки
@@ -850,6 +865,7 @@ export const useStore = create<AppState>()(
       },
 
       generateScanRoute: (polygonPx, spacingPx) => {
+        if (get().isProcessing) return null; // UI-защита: мутация запрещена во время аплоада
         // scan_area(polygon, altitude, overlap_front, overlap_side): «змейка»
         // для сплошного сканирования полигона. Шаг змейки считается из
         // перекрытий вызывающей стороной; сюда приходит готовый spacing в px.
@@ -963,20 +979,42 @@ export const useStore = create<AppState>()(
       },
 
       updateRouteAltitudes: async (routeId) => {
+        // ВАЖНО (race guard): все синхронные мутации — ДО первого await.
+        // Если отменять предыдущий контроллер после await, два быстрых
+        // последовательных вызова создали бы по контроллеру и ни один не
+        // был бы помечен aborted до старта сети (drag точек копил бы
+        // обращения к троттлящемуся публичному API).
         const runId = ++altitudeRunId;
-        // Отменяем сетевые запросы предыдущего прогона (drag точек не должен
-        // копить обращения к троттлящемуся публичному API)
-        try { lastAltitudeController?.abort(); } catch { /* noop */ }
+        const stale = lastAltitudeController;
         const controller = new AbortController();
         lastAltitudeController = controller;
+        try { stale?.abort(); } catch { /* noop */ }
         const st = get();
         const map = st.project.map;
-        if (!map?.bounds) return;
+        // ВАЖНО: при досрочном выходе сбрасываем счётчик прогона, иначе
+        // «мёртвый» runId останется текущим и завершающийся более старый
+        // прогон не сможет быть им отменён (его routeWarnings перезапишут
+        // состояние после отмены).
+        if (!map?.bounds) {
+          if (runId === altitudeRunId && lastAltitudeController === controller) {
+            altitudeRunId--;
+            lastAltitudeController = null;
+          }
+          return;
+        }
         const clearance = Number.isFinite(st.project.settings.altitudeClearanceM as number)
           ? (st.project.settings.altitudeClearanceM as number) : 50;
         const routes = (st.project.routes || []).filter((r) => r.points.length >= 2);
         const targets = routeId ? routes.filter((r) => r.id === routeId) : routes;
-        if (targets.length === 0) return;
+        if (targets.length === 0) {
+          // Досрочный выход без сетевой фазы: не оставляем «мёртвый» runId и
+          // контроллер, иначе следующий прогон не отменит корректно состояние.
+          if (runId === altitudeRunId && lastAltitudeController === controller) {
+            altitudeRunId--;
+            lastAltitudeController = null;
+          }
+          return;
+        }
 
         // Собираем УНИКАЛЬНЫЕ гео-точки всех целевых маршрутов — один батч
         // к Open-Elevation вместо N запросов (публичный API троттлится).
@@ -988,13 +1026,23 @@ export const useStore = create<AppState>()(
             if (!keySet.has(k)) keySet.set(k, { lat: p.lat, lng: p.lng });
           }
         }
-        if (keySet.size === 0) return;
+        if (keySet.size === 0) {
+          if (runId === altitudeRunId && lastAltitudeController === controller) {
+            altitudeRunId--;
+            lastAltitudeController = null;
+          }
+          return;
+        }
         const uniqPts = Array.from(keySet.values());
         const elevs = await fetchElevations(uniqPts, controller.signal);
         if (runId !== altitudeRunId) return; // более новый прогон отменил этот
         const elevByKey = new Map<string, number | null>();
         uniqPts.forEach((p, i) => elevByKey.set(`${p.lat.toFixed(4)},${p.lng.toFixed(4)}`, elevs[i]));
 
+        // Фиксация снапшота сигнала ДО микрозадач computeRouteAltitude: если
+        // прогон отменят во время set(), ни один «хвост» не должен попасть в
+        // routeWarnings (иначе отменённый запрос перезапишет предупреждения).
+        const tailAborted = (): boolean => controller.signal.aborted || runId !== altitudeRunId;
         set((cur) => {
           const rw: Record<string, string[]> = { ...cur.routeWarnings };
           const updatedRoutes = (cur.project.routes || []).map((r) => {
@@ -1015,7 +1063,7 @@ export const useStore = create<AppState>()(
             // бы только что проставленные terrainM/altitudeAbs).
             void Promise.resolve().then(() => computeRouteAltitude(pts.map((p) => ({ lat: p.lat, lng: p.lng })), { clearanceM: clearance }, controller.signal))
               .then((info) => {
-                if (runId !== altitudeRunId) return;
+                if (tailAborted()) return;
                 useStore.setState((s2) => {
                   const w2 = { ...s2.routeWarnings };
                   const base = [...(w2[r.id] || [])].filter((x) => !x.startsWith('Высота'));
@@ -1216,14 +1264,17 @@ export const useStore = create<AppState>()(
         },
       })),
 
-      deleteMarker: (id) => set((state) => ({
+      deleteMarker: (id) => {
+        if (get().isProcessing) return; // UI-защита от мутаций во время аплоада
+        set((state) => ({
         project: {
           ...state.project,
           markers: state.project.markers.filter((m) => m.id !== id),
           updatedAt: new Date().toISOString(),
         },
         selectedMarkerId: state.selectedMarkerId === id ? null : state.selectedMarkerId,
-      })),
+      }));
+      },
 
       selectMarker: (id) => set({ selectedMarkerId: id, selectedRestrictionId: null }),
 
@@ -1295,7 +1346,10 @@ export const useStore = create<AppState>()(
         // двойной запуск пакетной перестройки на каждое изменение зон.
       },
 
+      // ВАЖНО: deleteRestriction объявлена ДО makeGuarded, поэтому ссылка на
+      // get() внутри — «поздняя» (lazy), вызывается только при клике.
       deleteRestriction: (id) => {
+        if (get().isProcessing) return; // UI-защита от мутаций во время аплоада
         invalidateZoneCache();
         set((state) => ({
           project: {
@@ -1695,3 +1749,6 @@ export const useStore = create<AppState>()(
     }
   )
 );
+
+/** Безопасный доступ к состоянию стора из раннего контекста (до гидрации persist). */
+export const getAppStateSafe = makeStoreShim(useStore);

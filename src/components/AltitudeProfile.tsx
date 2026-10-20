@@ -98,18 +98,6 @@ const AltitudeProfile: React.FC<Props> = ({ routeId, onClose }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dataKey]);
 
-  if (!route) {
-    return (
-      <div className="absolute z-50 w-[320px] rounded-lg border border-gray-600 bg-gray-900/95 shadow-xl text-xs text-gray-300 p-2">
-        <div className="flex items-center justify-between mb-1">
-          <span className="font-bold text-cyan-300">Профиль высот</span>
-          <button className="text-gray-400 hover:text-white px-1" onClick={onClose} aria-label="Закрыть окно профиля">✕</button>
-        </div>
-        Маршрутов пока нет — добавьте маршрут в режиме «Редактирование маршрута».
-      </div>
-    );
-  }
-
   const hasAbs = profile ? profile.nodes.some((n) => n.abs !== null) : false;
   const yMax = Math.max(profile?.maxAbs ?? 0, profile?.maxTerrain ?? 0, 10);
   const yMin = Math.min(0, profile?.minAbs ?? 0, ...(profile ? profile.terrain.filter((v): v is number => typeof v === 'number') : []));
@@ -124,8 +112,7 @@ const AltitudeProfile: React.FC<Props> = ({ routeId, onClose }) => {
     const pts = profile.nodes.filter((n) => n.abs !== null);
     if (pts.length < 2) return '';
     return pts.map((n, i) => `${i === 0 ? 'M' : 'L'}${X(n.distM).toFixed(1)},${Y(n.abs as number).toFixed(1)}`).join(' ');
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [profile, hasAbs]);
+  }, [profile, hasAbs, yMin, yMax]);
 
   // область рельефа (серая подложка)
   const terrainArea = useMemo(() => {
@@ -138,8 +125,19 @@ const AltitudeProfile: React.FC<Props> = ({ routeId, onClose }) => {
     return `M${X(withElev[0].d).toFixed(1)},${base} ` +
       withElev.map((o) => `L${X(o.d).toFixed(1)},${Y(o.e).toFixed(1)}`).join(' ') +
       ` L${X(withElev[withElev.length - 1].d).toFixed(1)},${base} Z`;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [profile, yMin]);
+  }, [profile, yMin, yMax]);
+
+  if (!route) {
+    return (
+      <div className="absolute z-50 w-[320px] rounded-lg border border-gray-600 bg-gray-900/95 shadow-xl text-xs text-gray-300 p-2">
+        <div className="flex items-center justify-between mb-1">
+          <span className="font-bold text-cyan-300">Профиль высот</span>
+          <button className="text-gray-400 hover:text-white px-1" onClick={onClose} aria-label="Закрыть окно профиля">✕</button>
+        </div>
+        Маршрутов пока нет — добавьте маршрут в режиме «Редактирование маршрута».
+      </div>
+    );
+  }
 
   const fmtM = (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(2)} км` : `${Math.round(v)} м`);
 

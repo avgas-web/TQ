@@ -25,6 +25,7 @@ const MissionPanel: React.FC = () => {
   const setMissionMeta = useStore((s) => s.setMissionMeta);
   const droneAssignments = useStore((s) => s.droneAssignments);
   const setDroneAssignment = useStore((s) => s.setDroneAssignment);
+  const isProcessing = useStore((s) => s.isProcessing);
 
   const routes = useMemo(() => project.routes || [], [project.routes]);
   const route = routes.find((r) => r.id === activeRouteId) ?? routes[0] ?? null;
@@ -63,7 +64,7 @@ const MissionPanel: React.FC = () => {
   };
 
   /** Демонстрация цикла управления из Блоков 2/6 на симуляторе DroneSim. */
-  const runSimCycle = async (): Promise<void> {
+  const runSimCycle = async (): Promise<void> => {
     const sim = new DroneSim('demo-uav', { lat: 59.93, lon: 30.33, batteryPct: 90 });
     const logs: string[] = [];
     try {
@@ -120,7 +121,7 @@ const MissionPanel: React.FC = () => {
               <option key={a.id} value={a.id}>{a.label}</option>
             ))}
           </select>
-          <button onClick={runOptimize} className="px-3 py-1 bg-cyan-600 hover:bg-cyan-700 rounded text-white">
+          <button onClick={runOptimize} disabled={isProcessing} title={isProcessing ? 'Блокировано во время обработки (isProcessing)' : undefined} className="px-3 py-1 bg-cyan-600 hover:bg-cyan-700 rounded text-white disabled:opacity-40 disabled:cursor-not-allowed">
             Оптимизировать
           </button>
         </div>
