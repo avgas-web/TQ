@@ -3,6 +3,7 @@ import MapCanvas from './components/MapCanvas';
 import Toolbar from './components/Toolbar';
 import Sidebar from './components/Sidebar';
 import StatusBar from './components/StatusBar';
+import { MissionWizard } from './components/wizard/MissionWizard';
 import { useStore } from './store/useStore';
 import { initOpenStreetMap } from './utils/openStreetMap';
 import { eventBus } from './utils/eventBus';
@@ -37,6 +38,10 @@ const StorageToast: React.FC = () => {
 };
 
 const App: React.FC = () => {
+  // Режим мастера планирования миссий (по умолчанию — новый мастер; legacy-редактор доступен через переключатель в шапке)
+  const [wizardMode, setWizardMode] = useState<boolean>(
+    () => localStorage.getItem('tq-ui-mode') !== 'legacy',
+  );
   const {
     currentTool,
     setTool,
@@ -215,6 +220,17 @@ const App: React.FC = () => {
           🎯 TotalQuadro Coordinate Marker
         </h1>
         <span className="ml-2 text-xs text-gray-500">v1.0</span>
+        <button
+          onClick={() => {
+            const next = !wizardMode;
+            setWizardMode(next);
+            localStorage.setItem('tq-ui-mode', next ? 'wizard' : 'legacy');
+          }}
+          className="ml-3 px-2 py-0.5 bg-cyan-800 hover:bg-cyan-700 border border-cyan-600 rounded text-xs text-white"
+          title="Переключить мастер планирования миссий / классический редактор"
+        >
+          {wizardMode ? '🧭 Мастер миссий' : '🗺️ Редактор'}
+        </button>
         <div className="flex-1" />
         <div className="flex items-center gap-2">
           <input
@@ -261,7 +277,12 @@ const App: React.FC = () => {
       {/* Toolbar */}
       <Toolbar />
 
-      {/* Main content: desktop — 2 колонки; mobile — вертикально, карта 300–400 px + панель */}
+      {wizardMode ? (
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <MissionWizard />
+        </div>
+      ) : (
+      /* Main content: desktop — 2 колонки; mobile — вертикально, карта 300–400 px + панель */
       <div className={"flex-1 flex overflow-hidden relative " + (isMobile ? "flex-col" : "flex-row")}>
         {/* Canvas */}
         <div className={isMobile ? "relative w-full shrink-0" : "flex-1 relative"} style={isMobile ? { height: 350 } : undefined}>
@@ -294,9 +315,9 @@ const App: React.FC = () => {
           <Sidebar />
         </div>
       </div>
+      )}
 
-      {/* Status bar */}
-      <StatusBar />
+      {!wizardMode && <StatusBar />}
 
       <StorageToast />
     </div>

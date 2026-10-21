@@ -37,6 +37,13 @@ function dedupe(points: ElevationPoint[]): ElevationPoint[] {
   return out;
 }
 
+/** Сброс кэша высот. Используется тестами для изоляции: module-level кэш
+ *  живёт всю жизнь воркера, и без очистки мок-fetch из одного теста мог
+ *  «прижить» значение для координат другого теста. */
+export function __resetElevationCacheForTests(): void {
+  elevCache.clear();
+}
+
 /** Запрос батча высот к Open-Elevation. Батчи разбиваются по ≤100 точек
  *  (защита от слишком больших URL/таймаутов), выполняются последовательно
  *  (публичный API бесплатно троттлит частые запросы). */
@@ -63,17 +70,28 @@ function readChunkResults(
   off: number,
 ): (number | null)[] {
   const list: RawElevationResult[] = Array.isArray(json?.results) ? (json.results as RawElevationResult[]) : [];
+  const isValidElev = (r: RawElevationResult | undefined): r is RawElevationResult & { elevation: number } =>
+    !!r && typeof r.elevation === 'number' && Number.isFinite(r.elevation);
+  // Сопоставление по координатам (API обычно сохраняет порядок, но надёжнее
+  // keyed-сопоставление). Если ответ не содержит latitude/longitude (упрощённые
+  // мок-ответы или нестандартные прокси) — откат на позиционное сопоставление:
+  // API гарантирует тот же порядок locations, что и в запросе.
   const byKey = new Map<string, number>();
+  let anyCoordMatched = false;
   for (const r of list) {
-    if (typeof r?.elevation === 'number' && Number.isFinite(r.elevation) &&
-        typeof r?.latitude === 'number' && typeof r?.longitude === 'number') {
+    if (isValidElev(r) && typeof r.latitude === 'number' && typeof r.longitude === 'number') {
       byKey.set(cacheKey(r.latitude, r.longitude), r.elevation);
     }
   }
   chunk.forEach((p, i) => {
     const v = byKey.get(cacheKey(p.lat, p.lng));
-    results[off + i] = v ?? null;
+    if (v !== undefined) { results[off + i] = v; anyCoordMatched = true; }
+    else if (byKey.size === 0) {
+      // ни одна запись не имеет координат → используем порядок ответа
+      results[off + i] = isValidElev(list[i]) ? list[i].elevation : null;
+    } else results[off + i] = null;
   });
+  void anyCoordMatched;
   return results;
 }
 
