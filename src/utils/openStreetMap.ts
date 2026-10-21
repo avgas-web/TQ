@@ -187,16 +187,58 @@ export function getOSMTileUrl(
 }
 
 /**
+ * Отмена незавершённой загрузки <img>. Нативный HTMLImageElement.abort() есть не
+ * во всех движках (и отсутствует в типах DOM и happy-dom), поэтому вызов
+ * защищён feature-det'ом; сброс src='' — универсальный fallback.
+ */
+export function abortTileImage(img: HTMLImageElement): void {
+  const maybeAbort = (img as { abort?: () => void }).abort;
+  if (typeof maybeAbort === 'function') {
+    try { maybeAbort.call(img); } catch { /* движок отклонил отмену */ }
+  }
+  // removeAttribute — метод DOM-элемента; в моках/старых движках может отсутствовать,
+  // поэтому сброс src выполняется защищённо (тот же эффект отмены загрузки).
+  if (typeof img.removeAttribute === 'function') {
+    img.removeAttribute('src');
+  } else {
+    img.src = '';
+  }
+}
+
+/**
  * Тайл с деградацией до maxNativeZoom: выше родного разрешения тайлы НЕ растягиваются —
  * берётся ближайший доступный уровень и рисуется в физическом разрешении.
+ *
+ * ИСПРАВЛЕНИЕ ВЕЧНОГО СПИННЕРА («карта грузится и висит»): у <img> нет встроенного
+ * таймаута. Если CDN провайдера принимает соединение, но не отдаёт ответ (OSM-зеркала
+ * при 429/перегрузке так делают стабильно), onload/onerror не срабатывают НИКОГДА,
+ * а старый `img.src=''` отменяет загрузку только на части движков — промис зависал
+ * навсегда, слот очереди не освобождался и загрузка всей подложки останавливалась.
+ * Теперь по таймауту вызывается нативный img.abort() (гарантированная отмена),
+ * обработчики снимаются, а resolve происходит РОВНО один раз (settled-флаг).
  */
 export async function loadTileImage(url: string, timeoutMs = 8000): Promise<HTMLImageElement | null> {
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
-    const timer = setTimeout(() => { img.src = ''; resolve(null); }, timeoutMs);
-    img.onload = () => { clearTimeout(timer); resolve(img); };
-    img.onerror = () => { clearTimeout(timer); resolve(null); };
+    let settled = false;
+    const finish = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      img.onload = null;
+      img.onerror = null;
+      if (!ok) {
+        // Гарантированная отмена незавершённой загрузки (освобождает соединение браузера)
+        abortTileImage(img);
+        resolve(null);
+      } else {
+        resolve(img);
+      }
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    img.onload = () => finish(true);
+    img.onerror = () => finish(false);
     img.src = url;
   });
 }

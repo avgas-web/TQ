@@ -6,7 +6,7 @@ import { isPointInsideAnyRestriction, distanceBetween } from '../utils/geometry'
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
 import { pixelToGeoExact, geoToPixelExact, routeLengthM, zonesCrossedBy, planPathAroundZones, smoothPolyline } from '../utils/routing';
-import { getOSMTileUrl, loadTileImage } from '../utils/openStreetMap';
+import { getOSMTileUrl, loadTileImage, abortTileImage } from '../utils/openStreetMap';
 import MiniMapPanel, { MiniOverlayLine, MiniOverlayPoint, type MiniZone } from './MiniMapPanel';
 import { zoomForGroundMpp, GROUND_MPP_1CM_2KM } from '../utils/pannelli';
 import { eventBus } from '../utils/eventBus';
@@ -457,12 +457,29 @@ const MapCanvas: React.FC = () => {
           activeTilesRef.current++;
           const p = loadTileImage(u, 10000) // таймаут: зависший тайл не блокирует очередь
             .then((loaded) => {
-              tileCache.current.set(u, loaded || undefined);
-              if (tileCache.current.size > TILE_CACHE_MAX) {
-                const firstKey = tileCache.current.keys().next().value as string | undefined;
-                if (firstKey !== undefined) tileCache.current.delete(firstKey);
+              if (loaded) {
+                tileCache.current.set(u, loaded);
+                if (tileCache.current.size > TILE_CACHE_MAX) {
+                  const firstKey = tileCache.current.keys().next().value as string | undefined;
+                  if (firstKey !== undefined) tileCache.current.delete(firstKey);
+                }
+                if (tileElsRef.current.get(u) === imgEl) imgEl.src = u;
+              } else {
+                // ИСПРАВЛЕНИЕ «краш/зависание при загрузке карт»: раньше в кэш
+                // писался undefined-запись, и DOM <img> получал src на тайл,
+                // который НЕ загрузился (битый CDN/429). Браузер оставлял
+                // незавершённую загрузку на элементе подложки — слой гасил
+                // canvas-оверлей и страница «висела». Теперь неудачные тайлы
+                // в кэш НЕ попадают: при следующем проходе синхронизации они
+                // будут перезапрошены (с дебаунсом), а на экране останется
+                // пустой slot без битого запроса.
+                tileCache.current.delete(u);
+                if (tileElsRef.current.get(u) === imgEl) {
+                  abortTileImage(imgEl);
+                  tileElsRef.current.delete(u);
+                  imgEl.remove();
+                }
               }
-              if (loaded && tileElsRef.current.get(u) === imgEl) imgEl.src = u;
             })
             .finally(() => {
               tilePending.current.delete(u);
@@ -1268,7 +1285,22 @@ const MapCanvas: React.FC = () => {
     });
 
     observer.observe(container);
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      // ИСПРАВЛЕНИЕ утечки при переходе между шагами Мастера: очистка дебаунса
+      // и незавершённых загрузок тайлов. Без этого pending-промисы держат ссылки
+      // на DOM-элементы размонтированного слоя, а setTimeout(pump) после
+      // unmount вызывал setTilesVersion на несмонтированном компоненте.
+      if (tileDebounceRef.current) clearTimeout(tileDebounceRef.current);
+      tileQueueRef.current.length = 0;
+      for (const img of tileElsRef.current.values()) {
+        abortTileImage(img);
+        img.remove();
+      }
+      tileElsRef.current.clear();
+      tilePending.current.clear();
+      activeTilesRef.current = 0;
+    };
   }, [setViewState]);
 
   // Стартовый zoom-инвариант z0: фиксируется ОДИН РАЗ на карту (не пересчитывается
