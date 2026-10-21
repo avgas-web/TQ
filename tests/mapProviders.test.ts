@@ -1,0 +1,103 @@
+// ═══════════════════════════════════════════════════════════════
+// Тесты реестра провайдеров карт и дефолтов (ТЗ «Интеграция 2ГИС»,
+// «Автоматическая загрузка и дефолты»).
+// - Дефолтный провайдер при инициализации стора — 'osm'.
+// - Переключение на '2gis' обновляет URL-шаблон тайлов.
+// - Отсутствие API-ключа Google/Яндекс => состояние ошибки, без краша.
+// - Регрессия: OSM/Topo/Carto работают без ключей.
+// ═══════════════════════════════════════════════════════════════
+import { describe, it, expect, beforeEach } from 'vitest';
+import {
+  getProviderStatus,
+  tileUrlTemplate,
+  providerRequiresKey,
+  KEYLESS_PROVIDERS,
+} from '../src/utils/mapProviders';
+import { useMapStore } from '../src/store/useMapStore';
+
+type ProjectSlice = Parameters<typeof getProviderStatus>[0];
+
+const noKeys: ProjectSlice = { googleMaps: undefined, yandexMaps: undefined };
+const withGoogleKey: ProjectSlice = {
+  googleMaps: { enabled: true, apiKey: 'AIza-test-key' },
+  yandexMaps: undefined,
+};
+
+describe('mapProviders: дефолты стора', () => {
+  beforeEach(() => {
+    // Полный сброс к начальному состоянию (без persist-артефактов других тестов).
+    useMapStore.setState(useMapStore.getInitialState());
+  });
+
+  it('дефолтный тайловый провайдер при инициализации — osm', () => {
+    const st = useMapStore.getState();
+    expect(st.openStreetMap.tileServer).toBe('osm');
+    expect(KEYLESS_PROVIDERS.has('osm')).toBe(true);
+  });
+
+  it('переключение провайдера на 2gis корректно обновляет состояние стора', () => {
+    useMapStore.getState().setOSMTileServer('2gis');
+    expect(useMapStore.getState().openStreetMap.tileServer).toBe('2gis');
+    useMapStore.getState().setOSMTileServer('osm');
+    expect(useMapStore.getState().openStreetMap.tileServer).toBe('osm');
+  });
+});
+
+describe('mapProviders: URL-шаблоны тайлов', () => {
+  it('2gis использует XYZ-протокол tile-b01.2gis.com с x/y/z', () => {
+    const t = tileUrlTemplate('2gis');
+    expect(t).toContain('2gis.com');
+    expect(t).toContain('x={x}');
+    expect(t).toContain('y={y}');
+    expect(t).toContain('z={z}');
+  });
+
+  it('osm — дефолтный шаблон openstreetmap.org (регрессия не сломана)', () => {
+    expect(tileUrlTemplate('osm')).toContain('tile.openstreetmap.org/{z}/{x}/{y}');
+  });
+
+  it('google/yandex/opentopomap/carto имеют собственные шаблоны', () => {
+    expect(tileUrlTemplate('google')).toContain('google.com');
+    expect(tileUrlTemplate('yandex')).toMatch(/webmap|yandex/);
+    expect(tileUrlTemplate('opentopomap')).toContain('opentopomap');
+    expect(tileUrlTemplate('carto')).toContain('cartocdn');
+  });
+});
+
+describe('mapProviders: graceful degradation без ключей', () => {
+  it('Google без ключа: НЕ падает, возвращает ready:false + понятное сообщение', () => {
+    const s = getProviderStatus(noKeys, 'google');
+    expect(s.ready).toBe(false);
+    expect(s.requiresKey).toBe(true);
+    expect(s.message).toMatch(/API-ключ/);
+    expect(s.message).toMatch(/OSM|2ГИС/);
+  });
+
+  it('Яндекс без ключа: ready:false + сообщение о ключе', () => {
+    const s = getProviderStatus(noKeys, 'yandex');
+    expect(s.ready).toBe(false);
+    expect(s.message).toMatch(/Яндекс/);
+  });
+
+  it('Google С валидным включённым ключом: ready:true', () => {
+    const s = getProviderStatus(withGoogleKey, 'google');
+    expect(s.ready).toBe(true);
+    expect(s.message).toBeUndefined();
+  });
+
+  it('Google с ключом, но выключенным провайдером: ready:false', () => {
+    const s = getProviderStatus(
+      { ...withGoogleKey, googleMaps: { ...withGoogleKey.googleMaps!, enabled: false } },
+      'google',
+    );
+    expect(s.ready).toBe(false);
+  });
+
+  it('бесплатные провайдеры (osm/2gis/topo/carto) всегда ready без ключа', () => {
+    for (const id of ['osm', '2gis', 'opentopomap', 'carto'] as const) {
+      const s = getProviderStatus(noKeys, id);
+      expect(s.ready).toBe(true);
+      expect(providerRequiresKey(id)).toBe(false);
+    }
+  });
+});

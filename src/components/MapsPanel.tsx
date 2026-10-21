@@ -13,7 +13,8 @@ const MapsPanel: React.FC = () => {
   const [zoomInput, setZoomInput] = useState('15');
   const [googleMapType, setGoogleMapType] = useState<'roadmap' | 'satellite' | 'hybrid' | 'terrain'>('satellite');
   const [yandexMapType, setYandexMapType] = useState<'map' | 'satellite' | 'hybrid'>('satellite');
-  const [osmTileServer, setOsmTileServer] = useState<'osm' | 'opentopomap' | 'carto'>('osm');
+  type TileServerId = 'osm' | 'opentopomap' | 'carto' | '2gis';
+  const [osmTileServer, setOsmTileServer] = useState<TileServerId>('osm');
   const [widthInput, setWidthInput] = useState('2048');
   const [heightInput, setHeightInput] = useState('2048');
   const [loading, setLoading] = useState(false);
@@ -111,7 +112,9 @@ const MapsPanel: React.FC = () => {
         result = await geocodeAddress(addressInput);
       } else if (activeProvider === 'yandex' && isYandexMapsLoaded()) {
         result = await yandexGeocode(addressInput);
-      } else if (activeProvider === 'osm') {
+      } else if (activeProvider === 'osm' || activeProvider === '2gis') {
+        // 2ГИС-вкладка использует тот же бесплатный геокодер (Nominatim): у 2ГИС
+        // публичного геокодинга без ключа нет, а тайлы — есть.
         const res = await osmGeocode(addressInput);
         result = res.point;
         if (!result) {
@@ -218,6 +221,27 @@ const MapsPanel: React.FC = () => {
           bounds: mapResult.bounds,
           source: 'yandex',
         });
+      } else if (activeProvider === '2gis') {
+        // ЗАГРУЗКА КАРТ 2ГИС: публичные тайловые серверы sl/tile-b01.2gis.com,
+        // API ключ НЕ требуется. Тайлсервер фиксируется в сторе, после чего
+        // создается активная тайловая карта с той же строгой Mercator-привязкой,
+        // что и OSM — точки/маршруты ставятся по реальным координатам.
+        setOSMTileServer('2gis');
+        const geoRes = await osmGeocode(addressInput);
+        geoResult = geoRes.point;
+        if (!geoResult) {
+          setError(geoRes.kind === 'not_found' ? 'Место не найдено.' : 'Сервис геокодирования временно недоступен. Попробуйте ещё раз.');
+          setLoading(false);
+          return;
+        }
+        loadActiveTileMap(geoResult, zoom);
+        useStore.setState((cur) => ({
+          project: cur.project.map
+            ? { ...cur.project, map: { ...cur.project.map, source: '2gis' } }
+            : cur.project,
+        }));
+        setSuccess('Карта 2ГИС загружена: доступен зум и панорама, привязка к координатам строгая.');
+        return;
       } else if (activeProvider === 'osm') {
         // ПРОСТАЯ ЗАГРУЗКА KAK НА OPENSTREETMAP.ORG: вместо «фотографии»-стоп-кадра
         // (сотни тайлов в один большой PNG — медленно и с потерей чёткости при зуме)
@@ -233,6 +257,22 @@ const MapsPanel: React.FC = () => {
         }
 
         loadActiveTileMap(geoResult, zoom);
+        // При выборе сервера тайлов «2ГИС» на вкладке OSM подложка мгновенно
+        // переключается на tiles 2gis (effect в MapCanvas сбрасывает кэш тайлов).
+        // Источник карты помечаем для бейджа/статистики.
+        if (osmTileServer === '2gis') {
+          useStore.setState((cur) => ({
+            project: cur.project.map
+              ? { ...cur.project, map: { ...cur.project.map, source: '2gis' } }
+              : cur.project,
+          }));
+        } else {
+          useStore.setState((cur) => ({
+            project: cur.project.map
+              ? { ...cur.project, map: { ...cur.project.map, source: 'osm' } }
+              : cur.project,
+          }));
+        }
 
         // Снимок-подложка для OSM НЕ загружается: активная тайловая карта уже
         // является основной подложкой (как на openstreetmap.org). Фоновый big-PNG
@@ -265,6 +305,7 @@ const MapsPanel: React.FC = () => {
     { id: 'google' as MapProvider, name: 'Google', icon: '🌍', enabled: project.googleMaps?.enabled },
     { id: 'yandex' as MapProvider, name: 'Яндекс', icon: '🗺️', enabled: project.yandexMaps?.enabled },
     { id: 'osm' as MapProvider, name: 'OSM', icon: '🌐', enabled: project.openStreetMap?.enabled },
+    { id: '2gis' as MapProvider, name: '2ГИС', icon: '🧭', enabled: project.openStreetMap?.tileServer === '2gis' },
   ];
 
   return (
@@ -344,13 +385,14 @@ const MapsPanel: React.FC = () => {
           <select
             value={osmTileServer}
             onChange={(e) => {
-              const value = e.target.value as 'osm' | 'opentopomap' | 'carto';
+              const value = e.target.value as TileServerId;
               setOsmTileServer(value);
               setOSMTileServer(value);
             }}
             className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white"
           >
             <option value="osm">OpenStreetMap</option>
+            <option value="2gis">2ГИС (без API ключа)</option>
             <option value="opentopomap">OpenTopoMap</option>
             <option value="carto">CartoDB Light</option>
           </select>
@@ -421,13 +463,14 @@ const MapsPanel: React.FC = () => {
             <select
               value={osmTileServer}
               onChange={(e) => {
-                const value = e.target.value as 'osm' | 'opentopomap' | 'carto';
+                const value = e.target.value as TileServerId;
                 setOsmTileServer(value);
                 setOSMTileServer(value);
               }}
               className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white"
             >
               <option value="osm">OSM Standard</option>
+              <option value="2gis">2ГИС</option>
               <option value="opentopomap">Topo</option>
               <option value="carto">Light</option>
             </select>
@@ -456,7 +499,7 @@ const MapsPanel: React.FC = () => {
       {/* Load map button */}
       <button
         onClick={handleLoadMap}
-        disabled={loading || (activeProvider !== 'osm' && !providers.find(p => p.id === activeProvider)?.enabled)}
+        disabled={loading || (activeProvider !== 'osm' && activeProvider !== '2gis' && !providers.find(p => p.id === activeProvider)?.enabled)}
         className="w-full px-3 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 text-white rounded text-sm font-medium"
       >
         {loading ? 'Загрузка...' : `🗺️ Загрузить карту ${providers.find(p => p.id === activeProvider)?.name}`}

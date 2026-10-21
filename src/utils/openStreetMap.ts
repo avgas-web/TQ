@@ -158,7 +158,7 @@ export function getOSMTileUrl(
   zoom: number,
   x: number,
   y: number,
-  tileServer: 'osm' | 'opentopomap' | 'carto' = 'osm',
+  tileServer: 'osm' | 'opentopomap' | 'carto' | '2gis' = 'osm',
   style: TileStyle = 'scheme'
 ): string {
   // detectRetina: тайлы @2x доступны ТОЛЬКО у tile.openstreetmap.org и basemaps.cartocdn.com
@@ -168,6 +168,10 @@ export function getOSMTileUrl(
   const retina = typeof window !== 'undefined' && (window.devicePixelRatio || 1) >= 1.5;
   const at = retina ? '@2x' : '';
   switch (tileServer) {
+    case '2gis':
+      // Публичные тайловые серверы 2ГИС (sl.*.2gis.com) — стандартная схема,
+      // XYZ Web Mercator, нативный зум до 18. Ключ API не требуется.
+      return `https://tile-b01.2gis.com/tiles?x=${x}&y=${y}&z=${z}`;
     case 'opentopomap':
       return `https://tile.opentopomap.org/${Math.min(z, 17)}/${x}/${y}.png`;
     case 'carto':

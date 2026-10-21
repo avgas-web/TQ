@@ -22,7 +22,7 @@ const MAX_ZOOM = 19;
 const ROUTE_PALETTE = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#fb923c', '#38bdf8', '#e879f9'];
 
 /** Нативный max zoom тайловых серверов (выше НЕ поднимаемся — нет данных, только растяжение) */
-const NATIVE_MAX_BY_SERVER: Record<string, number> = { osm: 19, carto: 18, opentopomap: 17 };
+const NATIVE_MAX_BY_SERVER: Record<string, number> = { osm: 19, carto: 18, opentopomap: 17, '2gis': 18 };
 // Параметры аккуратной очереди загрузки тайлов (как на openstreetmap.org):
 // максимум параллельных загрузок и дебаунс новых волн во время жеста.
 const MAX_PARALLEL = 6;
@@ -306,7 +306,7 @@ const MapCanvas: React.FC = () => {
   // Только стандартная схема OSM (режимы «спутник/гибрид» удалены из приложения)
   type TileStyle = 'scheme';
   const tileStyle = 'scheme' as const satisfies TileStyle;
-  const tileServer: 'osm' | 'opentopomap' | 'carto' = project.openStreetMap?.tileServer ?? 'osm';
+  const tileServer: 'osm' | 'opentopomap' | 'carto' | '2gis' = project.openStreetMap?.tileServer ?? 'osm';
   // ЕДИНАЯ инвариантная привязка вида (см. комментарий над worldPxOf):
   //   zoom = z0 + log2(scale),  worldPx = canvasHeight · 2^zoom.
   const effZ0 = vs.z0 ?? ZOOM_REF;
@@ -1147,6 +1147,20 @@ const MapCanvas: React.FC = () => {
     const newOffsetY = fy - (fy - v.offsetY) * (newScale / v.scale);
     setViewState({ scale: newScale, offsetX: newOffsetX, offsetY: newOffsetY });
   }, [project.map, canvasSize, tileServer, setViewState]);
+
+  // ─── Мгновенное переключение подложки: при смене сервера тайлов (OSM → 2ГИС и
+  // обратно) НЕ нужно перезагружать страницу. Сбрасываем DOM-слой и кэш URL'ов,
+  // затем форсируем перерисовку тайлов для текущего вида.
+  useEffect(() => {
+    const el = tileLayerRef.current;
+    if (el) for (const img of tileElsRef.current.values()) img.remove();
+    tileElsRef.current.clear();
+    tileCache.current.clear();
+    tileQueueRef.current = [];
+    tilePending.current.clear();
+    setTilesVersion((v) => v + 1);
+    syncTileDom();
+  }, [tileServer, syncTileDom]);
 
   // Load map image when map data changes.
   // ВАЖНО: при активной тайловой подложке карта не обязана иметь растровое изображение —
@@ -2832,7 +2846,7 @@ const MapCanvas: React.FC = () => {
   const panelH = 260;
 
   return (
-    <div id="map-container" ref={containerRef} className="relative w-full h-full overflow-hidden bg-[#0f1729]">
+    <div id="map-container" ref={containerRef} data-testid="map-container" className="relative w-full h-full overflow-hidden bg-[#0f1729]">
       {/* Подложка OSM: DOM-слой настоящих <img>-тайлов (как на openstreetmap.org),
           positioned под canvas. Позиция/набор тайлов обновляются напрямую через
           transform/syncTileDom без React-рендера; pointer-events отключены — все

@@ -79,7 +79,7 @@ export interface MapState {
   calibration: { enabled: boolean; points: CalibrationPoint[] };
   googleMaps: { apiKey: string; enabled: boolean };
   yandexMaps: { apiKey: string; enabled: boolean };
-  openStreetMap: { enabled: boolean; tileServer: 'osm' | 'opentopomap' | 'carto' };
+  openStreetMap: { enabled: boolean; tileServer: 'osm' | 'opentopomap' | 'carto' | '2gis' };
   settings: ProjectSettings;
   _currentMapId?: string; // ID текущей карты в IndexedDB
   // UI-состояние карты
@@ -132,7 +132,7 @@ export interface MapActions {
   setYandexMapsApiKey: (apiKey: string) => void;
   toggleYandexMaps: (enabled: boolean) => void;
   toggleOpenStreetMap: (enabled: boolean) => void;
-  setOSMTileServer: (server: 'osm' | 'opentopomap' | 'carto') => void;
+  setOSMTileServer: (server: 'osm' | 'opentopomap' | 'carto' | '2gis') => void;
   setMapBounds: (bounds: MapBounds) => void;
   loadMap: (mapData: MapData) => void;
   loadMapWithStorage: (mapData: MapData) => Promise<void>;

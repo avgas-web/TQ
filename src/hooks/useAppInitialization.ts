@@ -10,16 +10,31 @@ import { useMapStore, invalidateZoneCache } from '../store/useMapStore';
 import { useMissionStore, scheduleRerouteAll } from '../store/useMissionStore';
 import { migrateLegacyStorage } from '../store/useStoreShim';
 
+/**
+ * Автозагрузка тайловой карты по умолчанию (OSM): если в хранилище нет ни
+ * растровой карты, ни активной тайловой подложки — создаём тайловую карту
+ * с дефолтным центром и включаем OSM. Это гарантирует, что при первом
+ * запуске (в т.ч. внутри Мастера миссий) карта грузится автоматически,
+ * а не остаётся белым экраном до ручного «Загрузить карту».
+ */
+export function ensureDefaultTileMap(): void {
+  const st = useMapStore.getState();
+  if (st.map) return; // уже есть растровая или тайловая карта
+  st.toggleOpenStreetMap(true);
+  st.setOSMTileServer(st.openStreetMap.tileServer ?? 'osm');
+  st.loadActiveTileMap({ lat: 55.7558, lng: 37.6173 }, 10);
+}
+
 let initialized = false;
 
 export function useAppInitialization(): void {
   // Стартовая инициализация: миграция хранилища → восстановление карты из
-  // IndexedDB (restoreMapFromStorage сам пересчитывает пиксели маршрутов).
+  // IndexedDB → автозагрузка OSM-подложки по умолчанию (см. ensureDefaultTileMap).
   useEffect(() => {
     if (initialized) return;
     initialized = true;
     migrateLegacyStorage();
-    void useMapStore.getState().restoreMapFromStorage();
+    void useMapStore.getState().restoreMapFromStorage().then(() => ensureDefaultTileMap());
   }, []);
 
   // Единственный владелец триггеров пакетной перестройки маршрутов:

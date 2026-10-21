@@ -60,7 +60,7 @@ export interface MapBounds {
   west: number;
 }
 
-export type MapProvider = 'local' | 'google' | 'yandex' | 'osm';
+export type MapProvider = 'local' | 'google' | 'yandex' | 'osm' | '2gis';
 
 export interface MapData {
   name: string;
@@ -110,7 +110,8 @@ export interface Project {
   };
   openStreetMap: {
     enabled: boolean;
-    tileServer: 'osm' | 'opentopomap' | 'carto';
+    /** Список серверов тайлов расширяется: к OSM/Carto/OpenTopo добавлен 2ГИС. */
+    tileServer: 'osm' | 'opentopomap' | 'carto' | '2gis';
   };
 }
 

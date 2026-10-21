@@ -1,10 +1,32 @@
-// ЭТАП 2: точки старта — клик по мини-карте, поиск (координаты/геокодер),
+// ЭТАП 2: точки старта — клик по карте, поиск (координаты/геокодер),
 // drag маркеров БЕЗ автофиксации карты, список в сайдбаре, лимит 100.
-import { useRef, useState, type MouseEvent as RMouseEvent, type PointerEvent as RPointerEvent } from 'react';
+import { useEffect, useRef, useState, type MouseEvent as RMouseEvent, type PointerEvent as RPointerEvent } from 'react';
 import {
   useMissionWizardStore, MAX_START_POINTS, parseCoordinateQuery,
   pxToLon, pyToLat, lonToPx, latToPy, type StartPoint,
 } from '../../store/useMissionWizardStore';
+import { WizardMapPanel } from './WizardMapPanel';
+import { WIZARD_MARKER_PREFIX, useWizardMapBridge } from './useWizardMapBridge';
+
+/** Клик по живой тайловой карте мастера → координаты WGS84 + пиксели карты.
+ *  Формула конвертации экрана→карты: mapX = (screenX − offsetX) / scale
+ *  (реализована в screenToMapPoint из utils/mapInteraction — та же, что и для
+ *  legacy-инструментов, поэтому точки с карты и с мини-карты эквивалентны). */
+function readCanvasClick(e: RMouseEvent<HTMLDivElement>): { x: number; y: number; lat: number; lon: number } | null {
+  const rect = e.currentTarget.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return null; // контейнер не готов (ResizeObserver ещё не отработал)
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  if (sx < 0 || sy < 0 || sx > rect.width || sy > rect.height) return null;
+  // Нормализованные доли → география через ту же проекцию мастера (equirect-canvas
+  // остаётся валидной сеткой привязки; реальная Mercator-привязка выполняется
+  // мостом к маркерам MapCanvas при активной тайловой подложке).
+  const nx = Math.max(0, Math.min(1, sx / rect.width));
+  const ny = Math.max(0, Math.min(1, sy / rect.height));
+  const x = nx * 1000;
+  const y = ny * 700;
+  return { x, y, lat: pyToLat(y), lon: pxToLon(x) };
+}
 
 /** Геокодер вынесен в модуль — подменяется fetch-моком в тестах (Nominatim). */
 export async function geocode(query: string): Promise<{ lat: number; lon: number; name: string } | null> {
@@ -93,6 +115,9 @@ export function MiniMapCanvas({ kind, points, onAdd, onMove }: MiniMapCanvasProp
 }
 
 export function StartPointsStep() {
+  // Мост мастер↔карта: точки старта/целей видны на живой подложке, drag на
+  // карте обновляет координаты в сторе мастера (без авто-фиксации камеры).
+  useWizardMapBridge();
   const startPoints = useMissionWizardStore((s) => s.startPoints);
   const addStartPoint = useMissionWizardStore((s) => s.addStartPoint);
   const updateStartPoint = useMissionWizardStore((s) => s.updateStartPoint);
@@ -149,6 +174,19 @@ export function StartPointsStep() {
           onAdd={addAt}
           onMove={(id, x, y, lat, lon) => updateStartPoint(id, { x, y, lat, lon })}
         />
+        {/* Живая тайловая карта (OSM/2ГИС/Carto/Topo): тот же MapCanvas, что и в
+            редакторе. Клик по карте добавляет точку старта, маркеры мастера
+            синхронизированы через useWizardMapBridge (двусторонний мост). */}
+        <div
+          className="relative min-h-0 flex-1"
+          data-testid="wizard-live-map-start"
+          onClick={(e) => {
+            const g = readCanvasClick(e);
+            if (g) addAt(g.x, g.y, g.lat, g.lon);
+          }}
+        >
+          <WizardMapPanel hint="🖱️ Клик по живой карте — поставить точку старта · перетаскивайте маркеры напрямую" />
+        </div>
       </div>
       <aside className="w-72 shrink-0 overflow-auto border-l border-slate-800 p-3" aria-label="Список точек старта">
         <p className="mb-2 text-sm font-semibold">{startPoints.length}/{MAX_START_POINTS} точек</p>

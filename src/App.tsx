@@ -1,5 +1,6 @@
-import React, { useEffect, useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import MapCanvas from './components/MapCanvas';
+import MapsPanel from './components/MapsPanel';
 import Toolbar from './components/Toolbar';
 import Sidebar from './components/Sidebar';
 import StatusBar from './components/StatusBar';
@@ -8,6 +9,31 @@ import { useStore } from './store/useStore';
 import { initOpenStreetMap } from './utils/openStreetMap';
 import { eventBus } from './utils/eventBus';
 import { useAppInitialization } from './hooks/useAppInitialization';
+
+/** Компактная панель выбора подложки для Мастера миссий (OSM по умолчанию,
+ *  Google/Яндекс — при наличии API-ключей, 2ГИС — без ключа). */
+const WizardMapsStrip: React.FC = () => {
+  const [open, setOpen] = useState<boolean>(() => localStorage.getItem('tq-wizard-maps-open') === '1');
+  return (
+    <div data-testid="wizard-maps-strip">
+      <button
+        type="button"
+        className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 border border-gray-600 rounded text-xs text-white"
+        onClick={() => {
+          setOpen((o) => { localStorage.setItem('tq-wizard-maps-open', o ? '0' : '1'); return !o; });
+        }}
+        title="Загрузка карт: OSM автоматически, Google/Яндекс по API-ключу, 2ГИС без ключа"
+      >
+        🗺️ Карты {open ? '▾' : '▸'}
+      </button>
+      {open && (
+        <div className="absolute left-2 top-full z-[999] mt-1 max-h-[70vh] w-80 overflow-y-auto rounded-lg border border-gray-600 bg-gray-900 p-2 shadow-2xl">
+          <MapsPanel />
+        </div>
+      )}
+    </div>
+  );
+};
 
 
 /**
@@ -215,9 +241,9 @@ const App: React.FC = () => {
   return (
     <div className={theme === "dark" ? "h-screen w-screen flex flex-col bg-gray-900 text-white overflow-hidden" : "h-screen w-screen flex flex-col bg-gray-100 text-gray-900 overflow-hidden"}>
       {/* Header */}
-      <div className={theme === "dark" ? "flex items-center px-3 py-1 bg-gray-900 border-b border-gray-700" : "flex items-center px-3 py-1 bg-white border-b border-gray-300"}>
+      <div className={(theme === "dark" ? "flex items-center px-3 py-1 bg-gray-900 border-b border-gray-700" : "flex items-center px-3 py-1 bg-white border-b border-gray-300") + " relative"}>
         <h1 className="text-sm font-bold text-cyan-400">
-          🎯 TotalQuadro Coordinate Marker
+          🎯 TotalQuadro Mission Planner
         </h1>
         <span className="ml-2 text-xs text-gray-500">v1.0</span>
         <button
@@ -231,6 +257,9 @@ const App: React.FC = () => {
         >
           {wizardMode ? '🧭 Мастер миссий' : '🗺️ Редактор'}
         </button>
+        {wizardMode && (
+          <span className="relative ml-2"><WizardMapsStrip /></span>
+        )}
         <div className="flex-1" />
         <div className="flex items-center gap-2">
           <input

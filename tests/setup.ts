@@ -9,6 +9,11 @@ const ctxStub = new Proxy({} as Record<string, unknown>, {
   get(target, prop: string) {
     if (prop in target) return target[prop];
     if (prop === 'canvas') return undefined;
+    // measureText обязан возвращать объект с числовыми метриками: компоненты
+    // карты пишут `ctx.measureText(txt).width` — undefined ломал бы рендер в jsdom.
+    if (prop === 'measureText') {
+      return () => ({ width: 42, actualBoundingBoxLeft: 0, actualBoundingBoxRight: 42 });
+    }
     // свойства-значения (fillStyle и т.п.) читаются как undefined — ок
     return (...args: unknown[]) => {
       void args;

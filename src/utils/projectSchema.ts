@@ -152,7 +152,7 @@ export const ProjectSchema = z.object({
     .default({ apiKey: '', enabled: false }),
   openStreetMap: z.object({
     enabled: z.boolean().default(false),
-    tileServer: z.enum(['osm', 'opentopomap', 'carto']).default('osm'),
+    tileServer: z.enum(['osm', 'opentopomap', 'carto', '2gis']).default('osm'),
   }).default({ enabled: false, tileServer: 'osm' }),
 });
 
