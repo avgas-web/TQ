@@ -37,6 +37,23 @@ button {
   transition: all 0.15s ease;
 }
 
+/* ─── MissionWizard: примитивы UI мастера планирования миссий ─── */
+.btn-primary {
+  @apply rounded bg-cyan-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-cyan-500 disabled:cursor-not-allowed disabled:opacity-40;
+}
+.btn-secondary {
+  @apply rounded border border-slate-600 bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-40;
+}
+.btn-danger {
+  @apply rounded bg-red-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-600;
+}
+.btn-sm {
+  @apply rounded px-2 py-1 text-xs font-semibold;
+}
+.input-dark {
+  @apply rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-slate-100 outline-none focus:border-cyan-400;
+}
+
 /* Selection color */
 ::selection {
   background-color: #0891b2;

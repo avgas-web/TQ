@@ -44,3 +44,6 @@ if (!('structuredClone' in globalThis)) {
 vi.stubGlobal('alert', () => undefined);
 vi.stubGlobal('confirm', () => true);
 vi.stubGlobal('prompt', () => null);
+// jest-dom: матчеры toBeDisabled/toBeInTheDocument и т.д.
+import '@testing-library/jest-dom/vitest';
+

@@ -1,7 +1,2 @@
+dist/
 node_modules/
-*.log
-*.tmp
-
-# build/test artifacts
-coverage/
-.tmp-tests/
