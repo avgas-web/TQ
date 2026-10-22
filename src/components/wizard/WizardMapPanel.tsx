@@ -85,17 +85,22 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
       {hint && (
         <div className="border-b border-slate-800 bg-slate-900 px-2 py-1 text-[11px] text-slate-300">{hint}</div>
       )}
-      {/* ФИКС «Не удалось определить размер карты»: раньше здесь был
-          style={{ height: '100%' }} — в flex-колонке мастера (этап →
-          wizard-live-map → panel) процентная высота НЕ разрешается, если у
-          родителя нет явной высоты: контейнер схлопывался в 0px, ResizeObserver
-          фиксировал нулевой размер и срабатывал circuit breaker размеров.
+      {/* ФИКС «Не удалось определить размер карты» (КОРЕНЬ): раньше здесь был
+          style={{ height: '100%' }} / класс h-full — в flex-колонке мастера
+          (main[overflow:hidden] → этап[h-full] → flex-1 колонка →
+          wizard-live-map[min-h-0 flex-1]) процентная высота НЕ разрешается,
+          если ни один предок не даёт ей базис в пикселях: контейнер
+          схлопывался в 0px, ResizeObserver фиксировал нулевой размер и
+          срабатывал circuit breaker размеров («карта не загружается»).
           В режиме планирования карта работает именно потому, что её контейнер
-          имеет ЯВНУЮ высоту в пикселях. Копируем тот же подход: явная
-          минимальная высота + flex-1 (растяжение на свободное место), без
-          зависимости от height:100%. */}
+          имеет ЯВНУЮ высоту в пикселях. Тот же подход, но надёжнее:
+          calc(100vh - Npx) — гарантированный ненулевой базис в ЛЮБОЙ среде
+          (браузер, jsdom/happy-dom с поддержкой vh), плюс flex-basis:auto,
+          чтобы панель реально получала эту высоту внутри flex-колонки, а не
+          схлопывалась до содержимого. */}
       <div
-        className="relative w-full min-h-[240px] flex-1 overflow-hidden"
+        className="relative w-full min-h-[280px] flex-1 basis-auto overflow-hidden"
+        style={{ height: 'calc(100vh - 320px)' }}
         data-testid="wizard-map-container"
       >
         <MapCanvas onMapLoaded={onMapLoaded} />
@@ -139,11 +144,14 @@ export function WizardMapPanel({ hint, onMapLoaded }: WizardMapPanelProps) {
   // ВЕСЬ экран и перекрывало данные этапов. Теперь панель встраивается в
   // поток страницы этапа мастера: вокруг неё остаётся свободное место для
   // списков точек, поиска и валидации; внутри — полноценная карта с панорамой
-  // и зумом (штатные жесты MapCanvas). Позиционирование relative + flex-1:
-  // высота растягивается на свободное место контейнера, но не вылезает за него.
+  // и зумом (штатные жесты MapCanvas). ФИКС «Не удалось определить размер
+  // карты»: убран h-full (процентная высота без пиксельного базиса у предков
+  // разрешалась в 0px) — панель теперь сама гарантирует себе ненулевую высоту
+  // через calc(100vh - Npx) внутреннего контейнера + min-h в пикселях.
   return (
     <div
-      className="relative flex h-full min-h-[280px] w-full flex-col overflow-hidden rounded-lg border border-cyan-700/60 bg-slate-950 shadow-lg"
+      className="relative flex min-h-[340px] w-full flex-1 basis-auto flex-col overflow-hidden rounded-lg border border-cyan-700/60 bg-slate-950 shadow-lg"
+      style={{ height: 'calc(100vh - 300px)' }}
       data-testid="wizard-map-panel"
     >
       <MapPanelBody hint={hint} onMapLoaded={onMapLoaded} />
