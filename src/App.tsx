@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import MapCanvas from './components/MapCanvas';
 import MapsPanel from './components/MapsPanel';
 import Toolbar from './components/Toolbar';
@@ -11,12 +11,46 @@ import { eventBus } from './utils/eventBus';
 import { useAppInitialization } from './hooks/useAppInitialization';
 
 /** Компактная панель выбора подложки для Мастера миссий (OSM по умолчанию,
- *  Google/Яндекс — при наличии API-ключей, 2ГИС — без ключа). */
+ *  Google/Яндекс — при наличии API-ключей, 2ГИС — без ключа).
+ *  ФИКС «полоса скрыта за строкой Далее»: выпадающий список рисовался через
+ *  absolute внутри header и перекрывался контентом мастера (этапы имеют
+ *  собственные stacking-контексты/z-index), а при низком окне — уезжал за
+ *  нижний край и перекрывался футером с кнопкой «Далее». Теперь панель —
+ *  position:fixed с координатами, рассчитанными от фактического положения
+ *  кнопки (getBoundingClientRect), и z-index выше всех слоёв приложения:
+ *  она полностью видна поверх мастера, включая область футера «Назад/Далее». */
 const WizardMapsStrip: React.FC = () => {
   const [open, setOpen] = useState<boolean>(() => localStorage.getItem('tq-wizard-maps-open') === '1');
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const [pos, setPos] = useState<{ top: number; left: number; maxHeight: number }>({ top: 0, left: 0, maxHeight: 0 });
+
+  const measure = useCallback(() => {
+    const el = btnRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const margin = 8;
+    const available = window.innerHeight - r.bottom - margin;
+    // Если под кнопкой не хватает места (низкое окно / пересечение с футером
+    // «Далее») — открываем панель вверх, в свободную область над шапкой.
+    const openUp = available < 240 && r.top > 240;
+    setPos(
+      openUp
+        ? { top: Math.max(margin, r.top - available - margin) + 0, left: Math.min(r.left, window.innerWidth - 336), maxHeight: r.top - margin * 2 }
+        : { top: r.bottom + 4, left: Math.min(r.left, window.innerWidth - 336), maxHeight: available },
+    );
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [open, measure]);
+
   return (
     <div data-testid="wizard-maps-strip">
       <button
+        ref={btnRef}
         type="button"
         className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 border border-gray-600 rounded text-xs text-white"
         onClick={() => {
@@ -27,7 +61,11 @@ const WizardMapsStrip: React.FC = () => {
         🗺️ Карты {open ? '▾' : '▸'}
       </button>
       {open && (
-        <div className="absolute left-2 top-full z-[999] mt-1 max-h-[70vh] w-80 overflow-y-auto rounded-lg border border-gray-600 bg-gray-900 p-2 shadow-2xl">
+        <div
+          data-testid="wizard-maps-dropdown"
+          className="fixed z-[9999] w-80 overflow-y-auto rounded-lg border border-gray-600 bg-gray-900 p-2 shadow-2xl"
+          style={{ top: pos.top, left: pos.left, maxHeight: Math.max(200, pos.maxHeight) }}
+        >
           <MapsPanel />
         </div>
       )}

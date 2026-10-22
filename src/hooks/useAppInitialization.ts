@@ -37,7 +37,11 @@ export function ensureDefaultTileMap(): void {
   if (st.map) return; // уже есть растровая или тайловая карта
   st.toggleOpenStreetMap(true);
   st.setOSMTileServer(st.openStreetMap.tileServer ?? 'osm');
-  st.loadActiveTileMap({ lat: 55.7558, lng: 37.6173 }, 10);
+  // ФИКСАЦИЯ НАД СПБ при автозагрузке — ЕДИНЫЙ путь для ВСЕХ режимов
+  // (редактор и мастер планирования миссий вызывают именно эту функцию).
+  // Раньше здесь стоял центр по умолчанию «Москва» (55.7558, 37.6173), из-за
+  // чего карта мастера открывалась не над СПб и расходилась с редактором.
+  st.loadActiveTileMap({ lat: 59.9398, lng: 30.3146 }, 10);
 }
 
 let initialized = false;
