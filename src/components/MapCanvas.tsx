@@ -2045,9 +2045,21 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     const fitKey = String(map.mapId || '') + ':' + (pts.length > 0 ? 'has' : 'empty');
     if (lastFitKeyRef.current === fitKey) return;
     lastFitKeyRef.current = fitKey;
+    // ── ФИКС «в РЕЖИМЕ МАСТЕРА КАРТА НЕ ВИДНА» (корень расхождения режимов) ──
+    // Для АКТИВНОЙ тайловой карты виртуальный растр = ПОЛНЫЙ МИР уровня z
+    // (width=height=256·2^z). Подгонка вида под bbox объектов на таком растре
+    // давала hFrac≈1e-4 → worldTarget≈vh·10⁴ → zoom клампился к MAX_ZOOM=19,
+    // а scale ≈ 3700 при мире z10. В редакторе этот битый вид маскировался
+    // широким окном и зеркалом 'tq-view'; в мастерской узкой панели карта
+    // «загружалась, но не была видна». Тайловая подложка сама покрывает весь
+    // мир — вписывать в неё объекты НЕ нужно: стартовая фиксация над СПб
+    // (эффект выше) и есть штатный вид обоих режимов. Растровые снимки
+    // (legacy-фото карты) вписываем по-прежнему.
+    const tilesActiveNow = !!project.settings?.tilesEnabled && !!map.bounds;
+    if (tilesActiveNow) return;
     const fit = fitViewToData(map.width, map.height, map.bounds, pts, canvasSize.width, canvasSize.height, viewRef.current?.z0);
     if (fit) setViewState(fit);
-  }, [project.routes, project.markers, mapLoaded, canvasSize.width, canvasSize.height, project.map?.bounds]);
+  }, [project.routes, project.markers, mapLoaded, canvasSize.width, canvasSize.height, project.map?.bounds, project.settings?.tilesEnabled]);
 
   // Convert screen coordinates to map coordinates (читаем вид из ref — стабильный колбэк)
   const screenToMap = useCallback((screenX: number, screenY: number): Point => {

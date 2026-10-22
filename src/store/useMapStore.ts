@@ -17,7 +17,7 @@ import type {
 /** Настройки карты/высот (подмножество Project['settings']). */
 export type ProjectSettings = Project['settings'];
 import { saveMapToIndexedDB, loadMapFromIndexedDB } from '../utils/storage';
-import { mercatorYToLat } from '../utils/googleMaps';
+import { mercatorYToLat, calculateBoundsFromCenter } from '../utils/googleMaps';
 import { sanitizeProjectData } from '../utils/projectSchema';
 
 const MIN_MAP_ZOOM_FLOOR = 6;
@@ -426,12 +426,24 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
   loadActiveTileMap: (center, zoom) => {
     const z = Math.max(MIN_MAP_ZOOM_FLOOR, Math.min(19, Math.round(zoom)));
     const worldPx = 256 * Math.pow(2, z);
+    // ── КЛЮЧЕВОЙ ФИКС «в редакторе карта видна, в мастера — нет» ────────────
+    // bounds = ОКНО ОБЗОКА вокруг запрошенного центра на зуме z (±полэкрана по
+    // X и ±половину по Y), а не весь мир. Раньше bounds хранил полный мир
+    // (west=-180…east=180): стартовая автоподгонка MapCanvas (fit-to-bounds)
+    // при узком контейнере давала zb≈3 → камера открывалась над Африкой/Атлан-
+    // тикой вместо СПб — «карта загрузилась, но её не видно». В редакторе тот
+    // же stale-вид маскировался широким окном и сохранённым зеркалом 'tq-view'.
+    // Теперь геометрия bounds согласована с виртуальным растром (pixel ⇔ доля
+    // bounds, линейная Mercator-привязка), и fit даёт ровно запрошенный z с
+    // центром в точке загрузки — одинаково в обоих режимах.
+    // Эталонное окно: 800×600 css px на зуме z (типовой контейнер карты мастера).
+    const viewBounds = calculateBoundsFromCenter(center, z, 800, 600);
     const mapData: MapData = {
       name: `Активная карта: ${center.lat.toFixed(5)}, ${center.lng.toFixed(5)} (z${z})`,
       width: worldPx,
       height: worldPx,
       dataUrl: '', // без фотографии — подложка грузится тайлами динамически
-      bounds: { west: -180, east: 180, north: mercatorYToLat(0), south: mercatorYToLat(1) },
+      bounds: viewBounds,
       source: 'osm',
     };
     set((state) => ({
