@@ -7,12 +7,13 @@ import {
 } from '../../store/useMissionWizardStore';
 import { WizardMapPanel } from './WizardMapPanel';
 import { WIZARD_MARKER_PREFIX, useWizardMapBridge } from './useWizardMapBridge';
+import { isMapReadyNow, useMapReadiness } from './mapReadiness';
 
 /** Клик по живой тайловой карте мастера → координаты WGS84 + пиксели карты.
  *  Формула конвертации экрана→карты: mapX = (screenX − offsetX) / scale
  *  (реализована в screenToMapPoint из utils/mapInteraction — та же, что и для
  *  legacy-инструментов, поэтому точки с карты и с мини-карты эквивалентны). */
-function readCanvasClick(e: RMouseEvent<HTMLDivElement>): { x: number; y: number; lat: number; lon: number } | null {
+export function readCanvasClick(e: RMouseEvent<HTMLDivElement>): { x: number; y: number; lat: number; lon: number } | null {
   const rect = e.currentTarget.getBoundingClientRect();
   if (rect.width === 0 || rect.height === 0) return null; // контейнер не готов (ResizeObserver ещё не отработал)
   const sx = e.clientX - rect.left;
@@ -124,6 +125,12 @@ export function StartPointsStep() {
   const removeStartPoint = useMissionWizardStore((s) => s.removeStartPoint);
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // ЖЁСТКОЕ ТРЕБОВАНИЕ: точки старта ставятся ТОЛЬКО на загруженную карту.
+  // MapCanvas публикует флаг готовности через onMapLoaded; до него клики по
+  // области карты игнорируются (без «слепых» точек в пустом поле), а поверх
+  // карты показывается оверлей с причиной и подсказкой.
+  const [mapLoaded, setMapLoaded] = useState(false);
+  const readiness = useMapReadiness(mapLoaded);
 
   const addAt = (x: number, y: number, lat: number, lon: number) =>
     addStartPoint({ name: `Старт ${startPoints.length + 1}`, lat, lon, x, y });
@@ -181,11 +188,28 @@ export function StartPointsStep() {
           className="relative min-h-0 flex-1"
           data-testid="wizard-live-map-start"
           onClick={(e) => {
+            if (!isMapReadyNow(mapLoaded)) return; // источник истины: карта не загружена — точки не ставим
             const g = readCanvasClick(e);
             if (g) addAt(g.x, g.y, g.lat, g.lon);
           }}
         >
-          <WizardMapPanel hint="🖱️ Клик по живой карте — поставить точку старта · перетаскивайте маркеры напрямую" />
+          <WizardMapPanel
+            hint={readiness.ready
+              ? '🖱️ Клик по живой карте — поставить точку старта · перетаскивайте маркеры напрямую'
+              : '⏳ Дождитесь загрузки карты — на пустом поле точки не ставятся'}
+            onMapLoaded={setMapLoaded}
+          />
+          {!readiness.ready && (
+            <div
+              role="alert"
+              data-testid="wizard-map-not-ready-overlay"
+              className="absolute inset-0 z-30 flex items-center justify-center bg-slate-950/70 p-4 text-center"
+            >
+              <p className="max-w-sm rounded-md border border-amber-500 bg-slate-900/95 px-3 py-2 text-xs text-amber-300">
+                ⏳ {readiness.reason ?? 'Карта загружается…'}
+              </p>
+            </div>
+          )}
         </div>
       </div>
       <aside className="w-72 shrink-0 overflow-auto border-l border-slate-800 p-3" aria-label="Список точек старта">

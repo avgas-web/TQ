@@ -14,6 +14,7 @@ import { AltitudeProfilesStep } from './AltitudeProfilesStep';
 import { ExportPreparationStep } from './ExportPreparationStep';
 import { MissionDeploymentStep } from './MissionDeploymentStep';
 import { ConfirmDialog, NextButton, StepIssues } from './shared';
+import { ensureDefaultTileMap } from '../../hooks/useAppInitialization';
 
 const STEP_COMPONENTS: Record<WizardStep, React.FC> = {
   'craft-selection': CraftSelectionStep,
@@ -33,6 +34,18 @@ export function MissionWizard() {
   const goToPreviousStep = useMissionWizardStore((s) => s.goToPreviousStep);
   const goToStep = useMissionWizardStore((s) => s.goToStep);
   const [pendingJump, setPendingJump] = useState<WizardStep | null>(null);
+
+  // АВТОЗАГРУЗКА КАРТЫ ПРИ ВХОДЕ В МАСТЕР (корневой фикс «точки на пустом
+  // поле без карты»): при монтировании мастера гарантируем наличие тайловой
+  // подложки — в продакшене это no-op (App/useAppInitialization уже загрузил
+  // OSM), а на standalone-экране/в тестах карта создаётся сама. Идемпотентно.
+  // Отложенный microtask нужен из-за async-гидрации zustand persist: синхронная
+  // загрузка на mount была бы перезаписана гидрацией через тик («карта
+  // исчезает»). Если гидрация ещё не завершена — ensureDefaultTileMap сам
+  // переносит создание карты в onFinishHydration (см. useAppInitialization).
+  useEffect(() => {
+    void Promise.resolve().then(() => ensureDefaultTileMap());
+  }, []);
 
   // Горячие клавиши Alt+← / Alt+→
   useEffect(() => {

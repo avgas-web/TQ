@@ -1,12 +1,15 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
 import { useStore, scheduleRerouteAll, getActiveZonesCached } from '../store/useStore';
+import { readProjectView, readProjectViewWithActions } from '../store/useStoreShim';
 import { useMissionStore } from '../store/useMissionStore';
 import { useFleetStore } from '../store/useFleetStore';
 import { isPointInsideAnyRestriction, distanceBetween } from '../utils/geometry';
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
 import { pixelToGeoExact, geoToPixelExact, routeLengthM, zonesCrossedBy, planPathAroundZones, smoothPolyline } from '../utils/routing';
-import { getOSMTileUrl, loadTileImage, abortTileImage } from '../utils/openStreetMap';
+import { getOSMTileUrl, startTileLoad, abortTileImage, type TileStyle, type TileLoadHandle } from '../utils/openStreetMap';
+import { useMapStore } from '../store/useMapStore';
+import { ensureDefaultTileMap } from '../hooks/useAppInitialization';
 import MiniMapPanel, { MiniOverlayLine, MiniOverlayPoint, type MiniZone } from './MiniMapPanel';
 import { zoomForGroundMpp, GROUND_MPP_1CM_2KM } from '../utils/pannelli';
 import { eventBus } from '../utils/eventBus';
@@ -97,14 +100,14 @@ function centerLatOf(bounds: { north: number; south: number }): number {
  * масштаб. Ограничение: целевой zoom держим в [MIN_ZOOM, MAX_ZOOM].
  */
 function fitViewToData(
-  mapW: number, mapH: number, bounds: { north: number; south: number },
-  pts: Point[], vw: number, vh: number
-): { scale: number; offsetX: number; offsetY: number } | null {
+  mapW: number, mapH: number, bounds: MapBounds,
+  pts: Point[], vw: number, vh: number, z0?: number
+): { scale: number; offsetX: number; offsetY: number; z0: number } | null {
   if (pts.length === 0 || mapW <= 0 || mapH <= 0) return null;
   // Пиксели объектов -> география через точную Mercator-привязку растра к bounds
   const north = bounds.north, south = bounds.south;
-  const east = (bounds as any).east ?? 180;
-  const west = (bounds as any).west ?? -180;
+  const east = bounds.east ?? 180;
+  const west = bounds.west ?? -180;
   const topY = latToMerc(north);
   const botY = latToMerc(south);
   const mercSpanY = Math.max(1e-12, botY - topY);   // высота мира (0..1) на всю карту
@@ -139,11 +142,19 @@ function fitViewToData(
   // влезает (ниже MIN_ZOOM опускаться нельзя): центрируем по минимуму и честно
   // показываем обрезку, вместо того чтобы искажать пропорции не-равномерным scale.
   const worldPx = Math.max(256, Math.min(worldTarget, 256 * Math.pow(2, zoom)));
-  const scale = worldPx / (vh * Math.pow(2, ZOOM_REF)); // scale относительно z0=ZOOM_REF
+  // ЕДИНАЯ инвариантная привязка вида: worldPx = vh · 2^(z0 + log2(scale)),
+  // где z0 передаётся вызывающим кодом из АКТУАЛЬНОГО viewState (см. worldPxOf).
+  // Раньше здесь жёстко подставлялся ZOOM_REF=14 (и тем более bounds.z0, которого
+  // в MapBounds нет), из-за чего fitToAll давал scale, который render-путь
+  // пересчитывал в ДРУГОЙ worldPx при z0≠14 — «компенсация» растягивала карту
+  // за пределы экрана, и тайлы улетали в бесконечную перезагрузку
+  // (зависание подложки при старте мастера с z0=3).
+  const baseZ0 = Number.isFinite(z0) ? (z0 as number) : ZOOM_REF;
+  const scale = worldPx / (vh * Math.pow(2, baseZ0)); // scale относительно z0
   // центр bbox в world-px -> смещение, чтобы центр оказался в центре экрана
   const cxW = ((minFx + maxFx) / 2) * worldPx;
   const cyW = ((minFy + maxFy) / 2) * worldPx;
-  return { scale, offsetX: vw / 2 - cxW, offsetY: vh / 2 - cyW };
+  return { scale, offsetX: vw / 2 - cxW, offsetY: vh / 2 - cyW, z0: baseZ0 };
 }
 
 /** Нормализованная Mercator Y широты (0..1) */
@@ -190,23 +201,140 @@ function distPxToPolyline(p: Point, pts: Point[]): number {
   return best;
 }
 
-const MapCanvas: React.FC = () => {
+export interface MapCanvasProps {
+  /** Публикует флаг фактической загрузки подложки (тайлы или растр) наружу —
+   *  Мастер блокирует постановку точек, пока карта не готова (mapReadiness). */
+  onMapLoaded?: (loaded: boolean) => void;
+}
+
+const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const mapImageRef = useRef<HTMLImageElement | null>(null);
   const isPanningRef = useRef(false); // без state — панорама не вызывает ре-рендер на каждый mousemove
   const panStartRef = useRef<Point>({ x: 0, y: 0 });
-  const [canvasSize, setCanvasSize] = useState({ width: 800, height: 600 });
+  // Начальные размеры НЕЛЬЗЯ задавать константой {800,600}: ResizeObserver
+  // в useEffect([setViewState]) при первом же observe() получает нативный вызов
+  // с фактическими размерами контейнера. Если они равны «выдуманному» дефолту
+  // (типично для панели Мастера высотой ровно 600px), ветка `h !== prev.height`
+  // не срабатывает, canvas-элементы инициализируются нулевыми clientWidth/Height
+  // (jsdom) или устаревшими размерами, а синхронизация тайлов уходит в вечный
+  // цикл «canvasSize меняется → renderTick → syncTileDom» — карта «вечно грузится».
+  // Дефолт 0,0 делает первый измеренный размер единственным источником истины.
+  const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
   const canvasSizeRef = useRef(canvasSize);
   useEffect(() => { canvasSizeRef.current = canvasSize; }, [canvasSize]);
   const [draggingMarker, setDraggingMarker] = useState<string | null>(null);
   const [mapLoaded, setMapLoaded] = useState(false);
+  // Публикация готовности карты наружу (Мастер: запрет точек на пустом поле).
+  // Колбэк читается через ref и вызывается СИНХРОННО в момент setMapLoaded —
+  // иначе при батчинге React (effect догоняет состояние только на следующем
+  // эффекте) мастер мог видеть устаревший флаг «карта не готова» после
+  // мгновенной загрузки подложки.
+  const onMapLoadedRef = useRef(onMapLoaded);
+  useEffect(() => { onMapLoadedRef.current = onMapLoaded; }, [onMapLoaded]);
+  // Зеркало текущего значения mapLoaded для идемпотентной публикации
+  // (см. publishMapLoaded): updater'ы setState не должны иметь сайд-эффектов.
+  const mapLoadedRef = useRef(false);
+  // Все отложенные публикационные таймеры — регистрируются, чтобы cleanup при
+  // размонтировании гарантированно гасил их (запрет «setState на unmounted»).
+  const timersRef = useRef<Set<number>>(new Set());
+  // Догоняющий эффект: если стор-источник истины изменился (map=null → false,
+  // загрузка подложки → true) вне явных вызовов publishMapLoaded из колбэков
+  // Image, локальный React-state и оверлей мастера синхронизируются на следующем
+  // рендере. Идемпотентность и вынос за render-фазу обеспечивает сам
+  // publishMapLoaded (таймер), поэтому здесь можно вызывать его напрямую.
+  // КОРНЕВОЙ ФИКС ВЕЧНОГО ОВЕРЛЕЯ ГОТОВНОСТИ: подписка НА ЗНАЧЕНИЕ флага
+  // (примитивный селектор — ре-рендер строго при смене mapLoaded). Прежняя
+  // догонялка без deps сравнивала ref со сторовым значением только на рендерах,
+  // инициированных РОДИТЕЛЯМИ: в jsdom/happy-dom rAF не дренажится, DOM-слой
+  // тайлов не создаёт React-рендера, и публикация готовности терялась —
+  // интеграционные тесты мастера висели до глобального timeout раннера.
+  const storeMapLoaded = useMapStore((s) => s.mapLoaded);
+  // КОРНЕВОЙ ФИКС TDZ-КРАША + ВЕЧНОГО ОВЕРЛЕЯ ГОТОВНОСТИ.
+  // «Cannot access 'publishMapLoaded' before initialization»: хук-эффект,
+  // вызывавший publishMapLoaded (объявлена ниже через const/useCallback),
+  // попадал в temporal dead zone → ReferenceError на первом же рендере.
+  // Прежний «ref с no-op заглушкой» маскировал проблему, но ломал саму
+  // синхронизацию: публикация наружу (onMapLoaded → setMapLoaded этапа)
+  // терялась, и оверлей мастера висел вечно даже после готовности стора.
+  // Теперь: локальный React-state и внешний колбэк обновляются ПРЯМО здесь
+  // (useCallback стабилен и к моменту запуска эффектов уже инициализирован;
+  // setState из effect-фазы легален и не вызывает React #127 — в отличие от
+  // вызова из updater'а во время render-фазы). Догонялка идемпотентна по
+  // mapLoadedRef, поэтому двойных обновлений нет.
+  useEffect(() => {
+    if (mapLoadedRef.current === storeMapLoaded) return;
+    mapLoadedRef.current = storeMapLoaded;
+    setMapLoaded(storeMapLoaded);
+    onMapLoadedRef.current?.(storeMapLoaded);
+  }, [storeMapLoaded]);
+  useEffect(() => () => {
+    for (const t of timersRef.current) window.clearTimeout(t);
+    timersRef.current.clear();
+  }, []);
+  const publishMapLoaded = useCallback((v: boolean): void => {
+    // КОРНЕВОЙ ФИКС РАЗГОНА ДВУХ ЭКЗЕМПЛЯРОВ КАРТЫ (React #127 в тестах
+    // готовности мастера): если значение совпадает с тем, что УЖЕ лежит в
+    // сторе-источнике истины, выходим ДО любых мутаций. Без этого guard'а два
+    // экземпляра MapCanvas (mini-подложка этапа + живая панель) в одной
+    // commit-фазе гоняли стор false→true→false… через подписку шима, и
+    // getSnapshot merged-агрегата выполнялся внутри активной render-фазы →
+    // «Should not already be working». Идемпотентность по стору полностью
+    // заменяет прежний ref-guard: ref обновляется только вместе со стадией 2.
+    if (useMapStore.getState().mapLoaded === v && mapLoadedRef.current === v) return;
+    // ВАЖНО (краш «Should not already be working» в RTL-тестах): колбэк
+    // наружу НЕЛЬЗЯ вызывать внутри updater'а setState — React выполняет
+    // updater синхронно во время рендера, а onMapLoaded делает flushSync
+    // из родительского компонента. flushSync внутри фазы рендера — прямой
+    // запуск второго конкурентного рендера → падение React DOM.
+    // Колбэк вызывается ПОСЛЕ постановки обновления: при первом значении
+    // состояние ещё не установлено и это безопасно (мы вне render-фазы),
+    // при повторных значениях эффект-дубликаты ниже не срабатывают.
+    // КОРНЕВОЙ ФИКС ЗАВИСАНИЯ ОВЕРЛЕЯ ГОТОВНОСТИ: при смене карты на
+    // «не готова» (map=null, выключение подложки, провайдер без ключа)
+    // сбрасываем ref немедленно. Иначе stale=true блокирует повторную
+    // публикацию true после быстрой перезагрузки (false→true в пределах
+    // одного macrotask), и оверлей «карта не загружена» зависал вечно.
+    if (!v) mapLoadedRef.current = false;
+    // ДВУХСТАДИЙНАЯ ПУБЛИКАЦИЯ (см. также useEffect-догонялку ниже).
+    // Стадия 1: СИНХРОННО обновляем стор-источник истины — decision-логика
+    // кликов мастера (isMapReadyNow) обязана видеть актуальный флаг сразу,
+    // независимо от того, успеет ли React перерендерить этап.
+    useMapStore.getState().publishMapLoaded(v);
+    // Идемпотентность по РЕАКТ-СОСТОЯНИЮ (mapLoadedRef): локальный state и
+    // внешний колбэк onMapLoaded двигаются стадией 2 — через таймер. Если бы
+    // оба шага выполнялись синхронно, сетевые onload-колбэки нескольких
+    // тайлов попадали бы в одну macrotask-задачу и второй вызов ставил
+    // setMapLoaded(true) ВНУТРИ активной render-фазы первого обновления →
+    // React #127 («Should not already be working»). Таймер выносит каждую
+    // следующую публикацию за пределы любой фазы рендера.
+    if (mapLoadedRef.current === v) return;
+    const t = window.setTimeout(() => {
+      timersRef.current.delete(t);
+      if (mapLoadedRef.current === v) return; // устарело (пришла противоположная публикация)
+      mapLoadedRef.current = v;
+      setMapLoaded(v);
+      // Стадия 2: публикация наружу родителю (этап мастера обновляет UI-оверлей).
+      onMapLoadedRef.current?.(v);
+    }, 0);
+    timersRef.current.add(t);
+  }, []);
   // Перетаскивание точки маршрута: id + индекс (для moveRoutePoint)
   const [draggingRoute, setDraggingRoute] = useState<{ routeId: string; index: number } | null>(null);
   // Popup по клику на объект (координаты, высота, расстояние)
   const [popup, setPopup] = useState<{ x: number; y: number; title: string; lines: string[] } | null>(null);
   // Кэш тайлов подложки: url -> изображение (или undefined при ошибке)
-  const tileCache = useRef<Map<string, HTMLImageElement | undefined>>(new Map());
+  const tileCache = useRef<Map<string, HTMLImageElement>>(new Map());
+  // CIRCUIT BREAKER загрузки тайлов (шаг П3 ТЗ): если запросы к CDN «молчат»
+  // (429-шторм, молчащий proxy), loadTileImage завершается по своему внутреннему
+  // таймауту, но синхронизация может бесконечно перепланировать pump(). Флаг
+  // «вечной загрузки» включает UI-оверлей с кнопкой «Попробовать снова», вместо
+  // зависшего спиннера. Сбрасывается при любом успешном кадре синхронизации.
+  const [tileLoadStalled, setTileLoadStalled] = useState(false);
+  // Счётчик принудительных повторных синхронизаций после «Попробовать снова»:
+  // меняет ссылку-зависимость и заставляет effect перезапустить pump().
+  const [tileRetryNonce, setTileRetryNonce] = useState(0);
   // DOM-слой подложки OSM (как на openstreetmap.org): настоящие <img>-тайлы в
   // <div>-обёртке ПОД canvas. Canvas рисует поверх них маршруты, зоны, маркеры и
   // прочие объекты по той же Mercator-привязке — привязка строгая и общая.
@@ -221,8 +349,46 @@ const MapCanvas: React.FC = () => {
   const TILE_CACHE_MAX = 1500;
   // Очередь щадящей загрузки тайлов: один общий список + счётчик активных загрузок
   const tileQueueRef = useRef<string[]>([]);
+  // ЗАГРУЗКИ В ПУТЕШЕСТВИИ (P0-фикс «зависание при загрузке карт»): каждая
+  // loadTileImage обязан регистрироваться здесь и сниматься в finally(). При
+  // размонтировании MapCanvas (быстрое переключение шагов Мастера) ВСЕ эти
+  // загрузки принудительно отменяются — иначе Image с выставленным src живёт
+  // до внутреннего таймаута (10 c), держит DOM-элементы и по завершении
+  // вызывал setState на unmounted-компоненте (утечка памяти + предупреждения
+  // React). Тест wizardFreeze проверяет именно этот инвариант.
+  // РЕЕСТР АКТИВНЫХ РУЧЕК ЗАГРУЗКИ (P0): startTileLoad возвращает handle с
+  // cancel(); при unmount/смене подложки перебираем реестр и отменяем КАЖДУЮ
+  // загрузку — промисы резолвятся в null немедленно, Image прерываются
+  // (abort), память не течёт. Именно это проверяет wizardFreeze.test.tsx.
+  const tileLoadHandlesRef = useRef<Set<TileLoadHandle>>(new Set());
   const activeTilesRef = useRef(0);
   const tileDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Все таймауты, поставленные из этого компонента (debounce синхронизации,
+  // pump очереди, circuit breaker размеров/загрузки). ОБЯЗАТЕЛЬНО очищаются в
+  // cleanup при размонтировании: переход между шагами Мастера монтирует/
+  // размонтирует карту многократно, а «сиротский» Timeout с setState на
+  // уже unmounted-компонент = утечка памяти и React-предупреждения.
+  const ownedTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+  const setOwnedTimeout = useCallback((fn: () => void, ms: number): ReturnType<typeof setTimeout> => {
+    const id = setTimeout(() => { ownedTimersRef.current.delete(id); fn(); }, ms);
+    ownedTimersRef.current.add(id);
+    return id;
+  }, []);
+  const clearOwnedTimeout = useCallback((id: ReturnType<typeof setTimeout> | null): void => {
+    if (id === null) return;
+    clearTimeout(id);
+    ownedTimersRef.current.delete(id);
+  }, []);
+  // Флаг «компонент смонтирован» — защита от setState на unmounted-компоненте.
+  // Промисы loadTileImage резолвятся ПОСЛЕ размонтирования (у тайлов нет
+  // встроенного таймаута в моках/медленных CDN), и их .then/.finally вызывали
+  // setTilesVersion/pump на уже удалённом дереве — React-предупреждения,
+  // повторные загрузки и утечки при быстром переключении шагов Мастера.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
   // Троттлинг обновления координат курсора в сторе (см. handleMouseMove)
   const lastCursorUpdateRef = useRef(0);
   // pending-загрузки тайлов: url -> промис (дедупликация — один запрос на тайл)
@@ -331,13 +497,15 @@ const MapCanvas: React.FC = () => {
     if (!el) return;
     const v = viewRef.current;
     const cs = canvasSizeRef.current;
-    const st = useStore.getState();
-    const mapBounds = st.project.map?.bounds;
-    const tilesOn = !!st.project.settings?.tilesEnabled && !!mapBounds;
+    // rAF/DOM-колбэк: читаем project безопасным читателем — сборка merged
+    // агрегата шима здесь вызывала бы getSnapshot в фазе рендера (React #127).
+    const st = readProjectView();
+    const mapBounds = st.map?.bounds;
+    const tilesOn = !!st.settings?.tilesEnabled && !!mapBounds;
     if (!tilesOn || !mapBounds || cs.height <= 0) { el.style.display = 'none'; return; }
     const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
     const zoom = clampZoom(zoomAtWorldPx(wp));
-    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[(st.project.openStreetMap?.tileServer as any) || 'osm'] ?? MAX_ZOOM);
+    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[(st.openStreetMap?.tileServer as any) || 'osm'] ?? MAX_ZOOM);
     const level = Math.max(MIN_ZOOM, Math.min(nativeMax, Math.round(zoom)));
     const n = Math.pow(2, level);
     // ── СТРОГАЯ привязка DOM-слоя к инварианту вида ───────────────────────────
@@ -350,7 +518,7 @@ const MapCanvas: React.FC = () => {
     // была полностью невидима. Теперь позиция выводится из единой формулы
     // экрана: screen = rasterPx·sPerPx + offset (то же affine-преобразование,
     // что использует канвас для объектов; см. geoToRaster/toScreen ниже).
-    const map = st.project.map!;
+    const map = st.map!;
     const lngSpan = Math.abs(mapBounds.east - mapBounds.west);
     const mercSpanY = Math.max(1e-12, latToMerc(mapBounds.south) - latToMerc(mapBounds.north));
     // Экранных px на один пиксель растра карты (привязка строго через bounds):
@@ -379,9 +547,10 @@ const MapCanvas: React.FC = () => {
   const syncTileDom = useCallback(() => {
     const el = tileLayerRef.current;
     if (!el) return;
-    const st = useStore.getState();
-    const mapBounds = st.project.map?.bounds;
-    const tilesOn = !!st.project.settings?.tilesEnabled && !!mapBounds;
+    // syncTileDom вызывается из rAF-колбэков — merged-агрегат шима здесь опасен.
+    const proj = readProjectView();
+    const mapBounds = proj.map?.bounds;
+    const tilesOn = !!proj.settings?.tilesEnabled && !!mapBounds;
     if (!tilesOn || !mapBounds) {
       for (const img of tileElsRef.current.values()) img.remove();
       tileElsRef.current.clear();
@@ -389,10 +558,10 @@ const MapCanvas: React.FC = () => {
     }
     const v = viewRef.current;
     const cs = canvasSizeRef.current;
-    if (cs.height <= 0) return;
+    if (!Number.isFinite(cs.width) || !Number.isFinite(cs.height) || cs.width <= 0 || cs.height <= 0) return;
     const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
     const zoom = clampZoom(zoomAtWorldPx(wp));
-    const server = (st.project.openStreetMap?.tileServer as any) || 'osm';
+    const server: 'osm' | 'opentopomap' | 'carto' | '2gis' = proj.openStreetMap?.tileServer ?? 'osm';
     const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[server] ?? MAX_ZOOM);
     const level = Math.max(MIN_ZOOM, Math.min(nativeMax, Math.round(zoom)));
     const n = Math.pow(2, level);
@@ -455,8 +624,16 @@ const MapCanvas: React.FC = () => {
           // Тайл больше не виден (ушёл с экрана) или уже загружен — пропускаем без запроса
           if (!imgEl || tilePending.current.has(u) || tileCache.current.has(u)) continue;
           activeTilesRef.current++;
-          const p = loadTileImage(u, 10000) // таймаут: зависший тайл не блокирует очередь
+          // P0-фикс «зависание/утечка при загрузке карт»: загрузка регистрируется
+          // в реестре in-flight (inFlightTileLoadsRef) и ПРИНУДИТЕЛЬНО отменяется
+          // через handle.cancel() при unmount / смене подложки. Раньше промис
+          // доживал до внутреннего 10-секундного таймаута, держал DOM-элементы
+          // размонтированного слоя и резолвился setState на unmounted-компоненте.
+          const handle: TileLoadHandle = startTileLoad(u, 10000); // таймаут: зависший тайл не блокирует очередь
+          tileLoadHandlesRef.current.add(handle);
+          const p = handle.done
             .then((loaded) => {
+              if (!mountedRef.current) return; // unmount — результат не нужен (см. cleanup)
               if (loaded) {
                 tileCache.current.set(u, loaded);
                 if (tileCache.current.size > TILE_CACHE_MAX) {
@@ -482,6 +659,8 @@ const MapCanvas: React.FC = () => {
               }
             })
             .finally(() => {
+              tileLoadHandlesRef.current.delete(handle);
+              if (!mountedRef.current) return; // cleanup уже сбросил очередь/pending
               tilePending.current.delete(u);
               activeTilesRef.current--;
               setTilesVersion((t2) => t2 + 1);
@@ -494,9 +673,31 @@ const MapCanvas: React.FC = () => {
       // Первая загрузка (покой) — старт немедленно; во время жеста — дебаунс,
       // чтобы быстро сменяемый вид не плодил лишних запросов к серверу.
       const idle = activeTilesRef.current === 0 && tilePending.current.size === 0;
-      tileDebounceRef.current = setTimeout(pump, idle ? 0 : TILE_DEBOUNCE_MS);
+      tileDebounceRef.current = setOwnedTimeout(pump, idle ? 0 : TILE_DEBOUNCE_MS);
+    } else if (tilePending.current.size === 0 && activeTilesRef.current === 0) {
+      // Нечего докачивать и nothing in-flight — подложка синхронна: «зависшая
+      // загрузка» сброшена (идемпотентно для React: false → false не ре-рендерит).
+      setTileLoadStalled(false);
     }
   }, [positionTileLayer]);
+
+  // CIRCUIT BREAKER «вечного спиннера»: если есть незавершённые загрузки тайлов
+  // дольше 5 секунд — это зависание CDN/очереди, а не нормальная работа. Лоадер
+  // принудительно снимается, показывается ошибка с кнопкой повтора (шаг П3 ТЗ).
+  useEffect(() => {
+    if (!tilesEnabled) return;
+    if (tilePending.current.size === 0 && activeTilesRef.current === 0) return;
+    const t = window.setTimeout(() => setTileLoadStalled(true), 5000);
+    return () => window.clearTimeout(t);
+  }, [tilesEnabled, tilesVersion, tileRetryNonce, canvasSize.width, canvasSize.height]);
+
+  // Принудительная перезагрузка подложки после circuit breaker («Попробовать
+  // снова»): сбрасываем залипшие pending-промисы и планируем новый pump().
+  useEffect(() => {
+    if (tileRetryNonce === 0) return;
+    tilePending.current.clear();
+    syncTileDom();
+  }, [tileRetryNonce, syncTileDom]);
 
   // Пересинхронизация DOM-слоя при смене вида (rAF-троттлинг), карты и настроек
   useEffect(() => {
@@ -521,7 +722,19 @@ const MapCanvas: React.FC = () => {
   // Все функции доступны ВО ВСЕХ ТРЁХ ОКНАХ. После ЗАПУСКА миссия передаётся
   // в дроны, и кнопка «🆕 Новая миссия» очищает данные для следующего полёта.
   // Рой дронов: у всех дронов один старт; общая цель ИЛИ индивидуальные цели.
-  const tripleMode = true;
+  // P0-фикс «зависание при загрузке карт»: в режиме МАСТЕРА миссий трёхоконный
+  // legacy-оверлей (три MiniMapPanel поверх основной карты) скрывается. Каждый
+  // MiniMapPanel независимо качает до 24 тайла через loadTileWithMirrors — это
+  // ~72 параллельных загрузки на экран, которые дублируют работу основной
+  // подложки MapCanvas. В Мастере они не нужны (там своя панель WizardMapPanel),
+  // а их фоновые загрузки вызывали краш/зависание при переключении шагов.
+  // Единственный источник истины о режиме UI — localStorage-ключ 'tq-ui-mode'
+  // (пишет App.tsx при переключении «Мастер миссий / Редактор»). Значение по
+  // умолчанию — мастер (всё, кроме явного 'legacy').
+  const [wizardActive] = useState<boolean>(
+    () => { try { return localStorage.getItem('tq-ui-mode') !== 'legacy'; } catch { return true; } },
+  );
+  const tripleMode = !wizardActive;
   // ─── Режимы работы с окнами (отдельные пункты меню):
   //  'restrictions' — Установка ограничений (клик по ЛЮБОЙ карте ставит зону);
   //  'route'        — Редактирование маршрута (добавление/перенос/удаление точек).
@@ -842,9 +1055,9 @@ const MapCanvas: React.FC = () => {
         const g = { lat: geo.lat, lng: geo.lng };
         setDroneGoals((prev) => { const n = [...prev]; n[activeUavRef.current] = g; return n; });
         setDroneGoalAt(activeUavRef.current, g); // store-first
-        const st = useStore.getState();
-        const map = st.project.map;
-        const r = (st.project.routes || [])[activeUavRef.current];
+        const st = readProjectViewWithActions();
+        const map = st.map;
+        const r = (st.routes || [])[activeUavRef.current];
         if (r && map?.bounds && r.points.length >= 2) {
           // пиксели — из точной гео-привязки текущего растра
           const px = geoToPixelExact(g.lat, g.lng, map.bounds, map.width, map.height);
@@ -915,8 +1128,8 @@ const MapCanvas: React.FC = () => {
     if (id.startsWith('drone-goal:')) {
       // удаление цели дрона = удаление последней путевой точки его маршрута
       const rid = id.slice('drone-goal:'.length);
-      const st = useStore.getState();
-      const r = (st.project.routes || []).find((rr) => rr.id === rid);
+      const st = readProjectViewWithActions();
+      const r = (st.routes || []).find((rr) => rr.id === rid);
       if (r && r.points.length > 0) st.removeRoutePoint(rid, r.points.length - 1);
     }
   }, [setSharedStartPoint, setSharedGoalPoint]);
@@ -938,10 +1151,10 @@ const MapCanvas: React.FC = () => {
     if (launchState !== 'idle') return;
     setLaunchState('uploading');
     useMissionStore.getState().beginProcessing();
-    const st = useStore.getState();
+    const st = readProjectViewWithActions();
     const mission = {
       start: startGeo, goal: goalGeo, sharedGoal, droneCount,
-      routes: (st.project.routes || []).filter((r) => r.visible !== false).map((r) => ({
+      routes: (st.routes || []).filter((r) => r.visible !== false).map((r) => ({
         id: r.id, name: r.name,
         waypoints: r.points.map((p) => ({ lat: p.lat, lng: p.lng })),
       })),
@@ -995,17 +1208,17 @@ const MapCanvas: React.FC = () => {
   // новой активной карты при включении режима — иначе объекты останутся в
   // пикселях старого растра и будут вне bounds («карты пустые»).
   const remapProjectToRaster = useCallback(() => {
-    const st = useStore.getState();
-    const map = st.project.map;
+    const st = readProjectView();
+    const map = st.map;
     if (!map?.bounds || map.width <= 0 || map.height <= 0) return;
     const b = map.bounds;
-    const routes = (st.project.routes || []).map((r) => ({
+    const routes = (st.routes || []).map((r) => ({
       ...r,
       points: r.points.map((p) => ({ ...p, ...geoToPixelExact(p.lat, p.lng, b, map.width, map.height) })),
     }));
-    const markers = st.project.markers.map((m) =>
+    const markers = st.markers.map((m) =>
       m.lat != null && m.lon != null ? { ...m, ...geoToPixelExact(m.lat, m.lon, b, map.width, map.height) } : m);
-    const restrictions = st.project.restrictions.map((r) => {
+    const restrictions = st.restrictions.map((r) => {
       if (r.points.length === 0) return r;
       const geoPts = r.points.map((p) => pixelToGeoExact(p, b, map.width, map.height));
       const pts = geoPts.map((g) => geoToPixelExact(g.lat, g.lng, b, map.width, map.height));
@@ -1030,19 +1243,33 @@ const MapCanvas: React.FC = () => {
   useEffect(() => {
     if (remapDoneRef.current) return;
     remapDoneRef.current = true;
-    const st = useStore.getState();
-    const tilesOn = !!st.project.settings?.tilesEnabled && !!st.project.map?.bounds;
-    if (!tilesOn) {
-      const cs = canvasSizeRef.current;
-      const v = viewRef.current;
-      const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
-      const latC = mercToLat((cs.height / 2 - v.offsetY) / wp);
-      const lngC = ((cs.width / 2 - v.offsetX) / wp) * 360 - 180;
-      const zNow = clampZoom(zoomAtWorldPx(wp));
-      st.loadActiveTileMap({ lat: latC, lng: lngC }, Math.round(Math.min(12, zNow)));
-    }
-    remapProjectToRaster();
-  }, [remapProjectToRaster]);
+    // КОРНЕВОЙ ФИКС краша «Should not already be working» (React #127):
+    // ensureDefaultTileMap синхронно вызывает setState(useMapStore), а zustand
+    // уведомляет подписчиков СРАЗУ — в том числе useSyncExternalStore-подписку
+    // шима, чей getSnapshot собирает merged-агрегат spread'ом внутри активной
+    // фазы commit → React падает с «performConcurrentWorkOnRoot: Should not
+    // already be working». Выносим автозагрузку за пределы render-фазы.
+    const t = window.setTimeout(() => {
+      // КОРНЕВОЙ ФИКС «призрачной карты» в тестах готовности: состояние читаем
+      // НАПРЯМУЮ из доменного useMapStore, а не через фасад readProjectView().
+      // Агрегат шима обновляется асинхронными подписками — сразу после
+      // синхронного setState({map:null}) из beforeEach он ещё показывал старую
+      // карту («tilesOn=true»), и MapCanvas не запускал автозагрузку. В итоге
+      // готовность включал другой экземпляр MapCanvas (следующего этапа),
+      // мутируя стор во время render-фазы текущего дерева → краш React #127
+      // («Should not already be working») и пропавший readiness-оверлей.
+      const st = useMapStore.getState();
+      const tilesOn = !!st.settings?.tilesEnabled && !!st.map?.bounds;
+      if (!tilesOn) {
+        // АВТОНОСНАЯ автозагрузка: MapCanvas гарантирует карту сам, независимо от
+        // того, смонтирован ли хук App/useAppInitialization (standalone-экраны,
+        // интеграционные тесты этапов). Путь один для всех: ensureDefaultTileMap
+        // идемпотентен и сам ждёт завершения async-гидрации persist.
+        ensureDefaultTileMap();
+      }
+    }, 0);
+    return () => window.clearTimeout(t);
+  }, []);
 
   // Клик по карте с активным выбором точки (Старт/Цель) — раньше других обработчиков
   useEffect(() => {
@@ -1051,8 +1278,8 @@ const MapCanvas: React.FC = () => {
     const onClick = (e: MouseEvent) => {
       const what = pickWhatRef.current;
       if (what === 'none') return;
-      const st = useStore.getState();
-      const map = st.project.map;
+      const st = readProjectView();
+      const map = st.map;
       if (!map?.bounds || map.width <= 0 || map.height <= 0) return;
       const r = canvas.getBoundingClientRect();
       const v = viewRef.current;
@@ -1174,6 +1401,11 @@ const MapCanvas: React.FC = () => {
     tileElsRef.current.clear();
     tileCache.current.clear();
     tileQueueRef.current = [];
+    // Отменяем активные загрузки при смене подложки (OSM → 2ГИС): старые URL'ы
+    // больше не нужны, а незакрытые Image держат соединения и память.
+    for (const h of tileLoadHandlesRef.current.values()) h.cancel();
+    tileLoadHandlesRef.current.clear();
+    activeTilesRef.current = 0;
     tilePending.current.clear();
     setTilesVersion((v) => v + 1);
     syncTileDom();
@@ -1186,21 +1418,71 @@ const MapCanvas: React.FC = () => {
     const tilesActive = !!project.settings?.tilesEnabled && !!project.map?.bounds;
     if (!project.map || !project.map.dataUrl) {
       mapImageRef.current = null;
-      setMapLoaded(tilesActive && !!project.map?.bounds);
+      publishMapLoaded(tilesActive && !!project.map?.bounds);
+      return;
+    }
+
+    // Legacy-подложка (статичная фотография карты): в режиме тайловой карты
+    // (OSM/Яндекс/Google/2ГИС — штатный путь мастера) эта картинка НЕ нужна.
+    // Если бы мы всё равно создавали new Image() с dataUrl, при моках Image без
+    // событий onload/onerror (тесты стабильности) счётчик активных загрузок
+    // рос бы даже при нулевом размере контейнера — ложные «утечки» и лишний
+    // трафик декодирования. Пропускаем загрузку полностью: тайловая подложка
+    // сама включает mapLoaded через ветку выше.
+    if (tilesActive) {
+      mapImageRef.current = null;
+      publishMapLoaded(true);
+      return;
+    }
+
+    // ГЕЙТ РАЗМЕРА (P0 «нулевые размеры»): загрузка растровой подложки стартует
+    // ТОЛЬКО когда контейнер реально измерен. При width/height === 0 (сломанный
+    // layout, display:none у родителя) Image не создаётся вообще — иначе тесты
+    // стабильности фиксировали бы ложные «утечки», а в проде такая картинка
+    // была бесполезна: canvas всё равно нечего рисовать. Как только ResizeObserver
+    // доставит ненулевые размеры, project.map?.bounds/this effect перезапустится
+    // через deps и загрузка начнётся штатно.
+    const cs = canvasSizeRef.current;
+    if (!(cs.width > 0 && cs.height > 0) || !Number.isFinite(cs.width) || !Number.isFinite(cs.height)) {
+      mapImageRef.current = null;
+      publishMapLoaded(false);
       return;
     }
 
     const img = new Image();
-    img.onload = () => {
-      mapImageRef.current = img;
-      setMapLoaded(true);
+    // ИСПРАВЛЕНИЕ УТЕЧКИ (P0 «зависания»): legacy-подложка раньше не имела ни
+    // таймаута, ни отмены. При быстром переключении шагов Мастера unmount не
+    // прерывал эту загрузку → in-flight <img> оставался живым навсегда
+    // (утечка памяти + setState на размонтированном компоненте). Теперь:
+    // settled-флаг (ровно один resolve), гарантированный abort в cleanup и
+    // принудительный finish по таймауту — «вечной загрузки» быть не может.
+    let settled = false;
+    let cancelled = false;
+    const finish = (ok: boolean): void => {
+      if (settled || cancelled) return;
+      settled = true;
+      window.clearTimeout(guardTimer);
+      img.onload = null;
+      img.onerror = null;
+      if (ok) {
+        mapImageRef.current = img;
+        publishMapLoaded(true);
+      } else {
+        abortTileImage(img);
+        console.error('Ошибка загрузки изображения карты');
+        // fallback-картинка не загрузилась — но активная тайловая карта всё равно работает
+        publishMapLoaded(!!project.settings?.tilesEnabled && !!project.map?.bounds);
+      }
     };
-    img.onerror = () => {
-      console.error('Ошибка загрузки изображения карты');
-      // fallback-картинка не загрузилась — но активная тайловая карта всё равно работает
-      setMapLoaded(tilesActive);
-    };
+    const guardTimer = window.setTimeout(() => finish(false), 12000);
+    img.onload = () => finish(true);
+    img.onerror = () => finish(false);
     img.src = project.map.dataUrl;
+    return () => {
+      cancelled = true;
+      window.clearTimeout(guardTimer);
+      abortTileImage(img);
+    };
   }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled]);
 
   // Resize observer: при изменении размера окна МАСШТАБ НЕ СБИВАЕТСЯ —
@@ -1263,29 +1545,115 @@ const MapCanvas: React.FC = () => {
     const container = containerRef.current;
     if (!container) return;
 
-    const observer = new ResizeObserver((entries) => {
-      // setViewState — стабильная ссылка zustand (не меняется между рендерами),
-      // поэтому её можно честно указать в зависимостях вместо заглушки exhaustive-deps.
-      const { setViewState } = useStore.getState();
-      for (const entry of entries) {
-        const w = entry.contentRect.width;
-        const h = entry.contentRect.height;
-        setCanvasSize((prev) => {
-          if (prev.width > 0 && prev.height > 0 && (w !== prev.width || h !== prev.height)) {
-            // инвариант вида: scale и z0 сохраняются, центр карты не «прыгает»
-            const v = viewRef.current;
-            setViewState({
-              offsetX: v.offsetX + (w - prev.width) / 2,
-              offsetY: v.offsetY + (h - prev.height) / 2,
-            });
-          }
-          return { width: w, height: h };
-        });
+    // Флаг монтирования: все асинхронные колбэки (ResizeObserver приходит через
+    // микротаск/кадр после observe()) обязаны проверять его — иначе setState на
+    // уже размонтированном компоненте при быстром переключении шагов Мастера.
+    let mounted = true;
+    // rAF-скобка для событий ResizeObserver: гарантирует ОДИН пересчёт размеров
+    // на кадр даже при серии resize-событий (запрет «RO loop» — callback больше
+    // не вызывает синхронный re-render внутри RO-колбэка).
+    let roRaf = 0;
+    const applySizes = (w: number, h: number): void => {
+      if (!mounted) return;
+      // ЖЁСТКАЯ ВАЛИДАЦИЯ РАЗМЕРОВ (шаг П1 ТЗ): NaN/отрицательные значения
+      // от битого contentRect игнорируются полностью — иначе worldPx становится
+      // NaN и вся математика тайлов зависает в бесконечном цикле перерисовок.
+      if (!Number.isFinite(w) || !Number.isFinite(h) || w < 0 || h < 0) return;
+      setCanvasSize((prev) => {
+        if (prev.width === w && prev.height === h) return prev; // нет изменения — нет ре-рендера
+        if (prev.width > 0 && prev.height > 0 && w > 0 && h > 0) {
+          // инвариант вида: scale и z0 сохраняются, центр карты не «прыгает»
+          const v = viewRef.current;
+          useStore.getState().setViewState({
+            offsetX: v.offsetX + (w - prev.width) / 2,
+            offsetY: v.offsetY + (h - prev.height) / 2,
+          });
+        }
+        return { width: w, height: h };
+      });
+    };
+
+    /** Синхронный замер контейнера с фолбэком на clientWidth/clientHeight. */
+    const measureContainer = (): { w: number; h: number } => {
+      const c = containerRef.current;
+      if (!c) return { w: 0, h: 0 };
+      const r = c.getBoundingClientRect();
+      const w = r.width > 0 ? r.width : c.clientWidth;
+      const h = r.height > 0 ? r.height : c.clientHeight;
+      return { w, h };
+    };
+
+    // ЦИКЛ КОНТРОЛЯ РАЗМЕРОВ (P0 «вечная загрузка при нулевом размере», шаг П3 ТЗ):
+    // layout может измениться ПОСЛЕ монтирования (display:none у родителя, нулевая
+    // flex-ветка мастера, поздний CSS). Раз в 500 мс сверяем факт с состоянием:
+    //   • размер появился → применяем его (карта стартует сама);
+    //   • размер пропал → гасим canvasSize: включается circuit breaker размеров
+    //     («Не удалось определить размер контейнера» + кнопка повтора), а ОЧЕРЕДЬ
+    //     ЗАГРУЗКИ ТАЙЛОВ ПРИНИМАТЕЛЬНО ОПУСТОШАЕТСЯ — новые Image не создаются
+    //     (запрет загрузки в невидимый слой = защита от NaN-математики и утечек).
+    // Интервал принадлежит этому же cleanup-эффекту → при unmount гарантированно
+    // снимается (ни одного «сиротского» setInterval между шагами Мастера).
+    const sizeWatchId = window.setInterval(() => {
+      if (!mounted) return;
+      const cur = canvasSizeRef.current;
+      const m = measureContainer();
+      if (m.w > 0 && m.h > 0) {
+        if (cur.width !== m.w || cur.height !== m.h) applySizes(m.w, m.h);
+      } else if (cur.width > 0 || cur.height > 0) {
+        applySizes(0, 0);
+        tileQueueRef.current.length = 0;
+        for (const hh of tileLoadHandlesRef.current.values()) hh.cancel();
+        tileLoadHandlesRef.current.clear();
+        activeTilesRef.current = 0;
+        tilePending.current.clear();
+        for (const imgEl of tileElsRef.current.values()) { abortTileImage(imgEl); imgEl.remove(); }
+        tileElsRef.current.clear();
       }
+    }, 500);
+
+    const observer = new ResizeObserver((entries) => {
+      if (roRaf) cancelAnimationFrame(roRaf);
+      roRaf = requestAnimationFrame(() => {
+        roRaf = 0;
+        if (!mounted) return;
+        for (const entry of entries) {
+          applySizes(entry.contentRect.width, entry.contentRect.height);
+        }
+      });
     });
+
+    // СИНХРОННЫЙ первичный замер ДО observe(): ResizeObserver доставляет первое
+    // событие только в следующем кадре, а в jsdom/happy-dom может не доставить
+    // никогда. Без этого canvasSize оставался {0,0}, загрузка тайлов не стартовала
+    // и лоадер висел вечно («карта грузится, но не видна»).
+    // requestAnimationFrame(RO-скобка) тоже откладывается на кадр — в тестовой
+    // среде (fake timers / отсутствие rAF-дренажа) размеры могли так и не
+    // примениться. Поэтому сразу после синхронного замера планируем ещё один
+    // микро-тик: к моменту проверки контейнер уже имеет измеренные размеры.
+    const rect = container.getBoundingClientRect();
+    const cw = rect.width > 0 ? rect.width : container.clientWidth;
+    const ch = rect.height > 0 ? rect.height : container.clientHeight;
+    // В тестовой среде размеры контейнера могут появиться ПОСЛЕ монтирования
+    // (патчинг getBoundingClientRect в RTL-тестах). Односложный rAF-отложенный
+    // повтор замера гарантирует, что canvasSize не останется {0,0} навечно —
+    // иначе включался бы circuit breaker размеров вместо реальной карты.
+    if (cw <= 0 || ch <= 0) {
+      requestAnimationFrame(() => {
+        if (!mounted) return;
+        const c = containerRef.current;
+        if (!c) return;
+        const r2 = c.getBoundingClientRect();
+        const w2 = r2.width > 0 ? r2.width : c.clientWidth;
+        const h2 = r2.height > 0 ? r2.height : c.clientHeight;
+        if (w2 > 0 && h2 > 0) applySizes(w2, h2);
+      });
+    }
+    if (cw > 0 && ch > 0) applySizes(cw, ch);
 
     observer.observe(container);
     return () => {
+      mounted = false;
+      if (roRaf) cancelAnimationFrame(roRaf);
       observer.disconnect();
       // ИСПРАВЛЕНИЕ утечки при переходе между шагами Мастера: очистка дебаунса
       // и незавершённых загрузок тайлов. Без этого pending-промисы держат ссылки
@@ -1293,6 +1661,11 @@ const MapCanvas: React.FC = () => {
       // unmount вызывал setTilesVersion на несмонтированном компоненте.
       if (tileDebounceRef.current) clearTimeout(tileDebounceRef.current);
       tileQueueRef.current.length = 0;
+      // P0: отменяем ВСЕ активные загрузки тайлов через реестр handles —
+      // иначе Image с выставленным src доживает до 10-секундного таймаута,
+      // держит DOM размонтированного слоя и резолвится на unmounted-компоненте.
+      for (const h of tileLoadHandlesRef.current.values()) h.cancel();
+      tileLoadHandlesRef.current.clear();
       for (const img of tileElsRef.current.values()) {
         abortTileImage(img);
         img.remove();
@@ -1443,7 +1816,7 @@ const MapCanvas: React.FC = () => {
     const fitKey = String(map.mapId || '') + ':' + (pts.length > 0 ? 'has' : 'empty');
     if (lastFitKeyRef.current === fitKey) return;
     lastFitKeyRef.current = fitKey;
-    const fit = fitViewToData(map.width, map.height, map.bounds, pts, canvasSize.width, canvasSize.height);
+    const fit = fitViewToData(map.width, map.height, map.bounds, pts, canvasSize.width, canvasSize.height, viewRef.current.z0);
     if (fit) setViewState(fit);
   }, [project.routes, project.markers, mapLoaded, canvasSize.width, canvasSize.height, project.map?.bounds]);
 
@@ -2901,6 +3274,58 @@ const MapCanvas: React.FC = () => {
           {fallbackMsg}
         </div>
       )}
+      {/* CIRCUIT BREAKER размеров (шаг П3 ТЗ): если за 5 секунд после монтирования
+          контейнер так и не получил валидные ненулевые размеры (display:none у
+          родителя, нулевая flex-ветка, сломанный layout) — это НЕ бесконечное
+          ожидание, а явная ошибка с кнопкой повторной замеры. Без этого лоадер
+          тайлов висел бы вечно («карта грузится, но не видна»). */}
+      {canvasSize.width <= 0 || canvasSize.height <= 0 ? (
+        <div
+          role="alert"
+          data-testid="map-size-error-overlay"
+          className="absolute inset-0 z-40 flex flex-col items-center justify-center gap-2 bg-slate-950/80 p-4 text-center"
+        >
+          <p className="text-sm text-amber-300">Не удалось определить размер контейнера карты</p>
+          <button
+            type="button"
+            data-testid="map-retry-measure"
+            className="rounded bg-cyan-600 px-3 py-1 text-xs font-bold text-white hover:bg-cyan-500"
+            onClick={() => {
+              const el = containerRef.current;
+              if (!el) return;
+              const r = el.getBoundingClientRect();
+              const w = r.width > 0 ? r.width : el.clientWidth;
+              const h = r.height > 0 ? r.height : el.clientHeight;
+              if (w > 0 && h > 0) setCanvasSize({ width: w, height: h });
+            }}
+          >
+            Попробовать снова
+          </button>
+        </div>
+      ) : null}
+      {/* CIRCUIT BREAKER «вечной загрузки тайлов» (шаг П3 ТЗ): если подложка не
+          догрузилась за 5 секунд — спиннер заменяется явной ошибкой с кнопкой
+          повтора, а не висит бесконечно. */}
+      {tilesEnabled && tileLoadStalled && canvasSize.width > 0 && canvasSize.height > 0 ? (
+        <div
+          role="alert"
+          data-testid="map-tile-stall-overlay"
+          className="absolute inset-x-0 top-12 z-40 mx-auto flex w-fit flex-col items-center gap-2 rounded-md bg-slate-950/90 border border-amber-500 p-3 text-center"
+        >
+          <p className="text-sm text-amber-300">Карты не загружаются: сервер тайлов не отвечает</p>
+          <button
+            type="button"
+            data-testid="map-retry-tiles"
+            className="rounded bg-cyan-600 px-3 py-1 text-xs font-bold text-white hover:bg-cyan-500"
+            onClick={() => {
+              setTileLoadStalled(false);
+              setTileRetryNonce((n) => n + 1);
+            }}
+          >
+            Попробовать снова
+          </button>
+        </div>
+      ) : null}
       <canvas
         ref={canvasRef}
         style={{

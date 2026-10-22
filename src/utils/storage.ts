@@ -94,6 +94,16 @@ export function safeSetItem(key: string, value: string): boolean {
  */
 export function initMapDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
+    // Graceful degradation в средах без IndexedDB (jsdom/happy-dom в тестах,
+    // приватные режимы некоторых браузеров): раньше обращение к глобальному
+    // indexedDB бросало ReferenceError СИНХРОННО внутри executor'а — часть
+    // вызывающих кодов не имела .catch и получала unhandled rejection
+    // («Ошибка очистки IndexedDB» в консоли/тестах). Теперь — явная ошибка,
+    // которую все вызывающие обрабатывают штатно.
+    if (typeof indexedDB === 'undefined') {
+      reject(new Error('IndexedDB недоступна в этой среде'));
+      return;
+    }
     const request = indexedDB.open(MAP_DB_NAME, 1);
     
     request.onerror = () => {

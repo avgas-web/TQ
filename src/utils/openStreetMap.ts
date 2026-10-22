@@ -217,30 +217,50 @@ export function abortTileImage(img: HTMLImageElement): void {
  * Теперь по таймауту вызывается нативный img.abort() (гарантированная отмена),
  * обработчики снимаются, а resolve происходит РОВНО один раз (settled-флаг).
  */
+/** Публичный тип ручки загрузки тайла (см. startTileLoad). */
+export type TileLoadHandle = {
+  readonly image: HTMLImageElement;
+  cancel(): void;
+  readonly done: Promise<HTMLImageElement | null>;
+};
+
+/**
+ * Загрузка тайла с ЯВНЫМ ручкой-контролем (P0 «зависания/утечки»): вызывающая
+ * сторона (MapCanvas) регистрирует handle в реестре in-flight и ОБЯЗАНА вызвать
+ * cancel() при размонтировании или отмене вида. Без этого Image с выставленным
+ * src доживал до внутреннего таймаута (10 c), держал DOM-элементы и резолвился
+ * на уже несмонтированном компоненте — утечка памяти + предупреждения React.
+ */
+export function startTileLoad(url: string, timeoutMs = 8000): TileLoadHandle {
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  let settled = false;
+  let resolveFn: ((v: HTMLImageElement | null) => void) | null = null;
+  const done = new Promise<HTMLImageElement | null>((res) => { resolveFn = res; });
+  const timer: ReturnType<typeof setTimeout> = setTimeout(() => finish(false), timeoutMs);
+  function finish(ok: boolean): void {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    img.onload = null;
+    img.onerror = null;
+    if (!ok) {
+      // Гарантированная отмена незавершённой загрузки (освобождает соединение браузера)
+      abortTileImage(img);
+      resolveFn?.(null);
+    } else {
+      resolveFn?.(img);
+    }
+  }
+  img.onload = () => finish(true);
+  img.onerror = () => finish(false);
+  img.src = url;
+  return { image: img, cancel(): void { finish(false); }, done };
+}
+
+/** Обратная совместимость: обёртка над startTileLoad для существующих вызовов. */
 export async function loadTileImage(url: string, timeoutMs = 8000): Promise<HTMLImageElement | null> {
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    let settled = false;
-    const finish = (ok: boolean): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      img.onload = null;
-      img.onerror = null;
-      if (!ok) {
-        // Гарантированная отмена незавершённой загрузки (освобождает соединение браузера)
-        abortTileImage(img);
-        resolve(null);
-      } else {
-        resolve(img);
-      }
-    };
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    img.onload = () => finish(true);
-    img.onerror = () => finish(false);
-    img.src = url;
-  });
+  return startTileLoad(url, timeoutMs).done;
 }
 
 /**

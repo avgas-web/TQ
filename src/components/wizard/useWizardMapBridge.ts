@@ -8,7 +8,7 @@
 // Обратный канал: drag маркера на карте → updateStartPoint/updateTargetPoint
 // в сторе мастера (с сохранением названия, без авто-фиксации камеры).
 import { useEffect } from 'react';
-import { useStore } from '../../store/useStore';
+import { useMapStore } from '../../store/useMapStore';
 import { useMissionWizardStore, type GeoPointData } from '../../store/useMissionWizardStore';
 import type { Marker } from '../../types';
 
@@ -33,10 +33,25 @@ function parseBinding(markerId: string): WizardBinding | null {
   return { kind, pointId: rest.slice(sep + 1) };
 }
 
-/** Прямой канал: точки мастера → маркеры карты (идемпотентная upsert-синхронизация). */
+/** Прямой канал: точки мастера → маркеры карты (идемпотентная upsert-синхронизация).
+ *  ВАЖНО (стабильность): синхронизация выполняется ВНЕ фазы рендера React —
+ *  через useEffect + queueMicrotask. Прямой вызов из тела компонента приводил
+ *  к setState(useMapStore) во время рендера другого компонента, что при
+ *  каскаде подписок zustand→shim→useSyncExternalStore вызывало конкурентный
+ *  рендер посреди рендера («Should not already be working», краш Wizard). */
 export function syncWizardMarkers(): void {
+  // КОРНЕВОЙ ФИКС КРАША «Should not already be working» (React error #127):
+  // фасад useStore.getState() возвращает merged-объект, при каждой сборке
+  // которго spread'ом раскрываются ВСЕ экшены доменных сторов. Spread
+  // zustand-стора вызывает его геттер `get`, то есть фактически
+  // useSyncExternalStore.getSnapshot() шима ПРЯМО В ФАЗЕ РЕНДЕРА другого
+  // компонента (queueMicrotask после setState в обработчике клика React ещё
+  // считает дерево). React трактует это как конкурентный рендер посреди
+  // рендера → «performConcurrentWorkOnRoot: Should not already be working».
+  // Мосту нужны только маркеры — читаем их напрямую из доменного useMapStore
+  // (единственный источник истины для project.markers), без сборки агрегата.
   const w = useMissionWizardStore.getState();
-  const map = useStore.getState();
+  const existingMarkers = useMapStore.getState().markers;
   const desired = new Map<string, Pick<Marker, 'name' | 'lat' | 'lon' | 'x' | 'y' | 'color'>>();
   for (const p of w.startPoints) {
     desired.set(`${WIZARD_MARKER_PREFIX}start:${p.id}`, { name: `▶ ${p.name}`, lat: p.lat, lon: p.lon, x: p.x, y: p.y, color: KIND_COLOR.start });
@@ -45,8 +60,8 @@ export function syncWizardMarkers(): void {
     desired.set(`${WIZARD_MARKER_PREFIX}target:${p.id}`, { name: `◎ ${p.name}`, lat: p.lat, lon: p.lon, x: p.x, y: p.y, color: KIND_COLOR.target });
   }
 
-  const existingIds = new Set(map.project.markers.map((m) => m.id));
-  let markers: Marker[] = map.project.markers.map((m) => {
+  const existingIds = new Set(existingMarkers.map((m) => m.id));
+  let markers: Marker[] = existingMarkers.map((m) => {
     const d = desired.get(m.id);
     // Обновляем только «наши» мастер-маркеры (позиция/имя могли измениться в мастере).
     return d ? { ...m, ...d } : m;
@@ -63,10 +78,12 @@ export function syncWizardMarkers(): void {
   // Удаляем только мастер-маркеры, исчезнувшие из мастера (точка удалена в UI).
   markers = markers.filter((m) => !parseBinding(m.id) || desired.has(m.id));
 
-  const changed = markers.length !== map.project.markers.length
-    || markers.some((m, i) => map.project.markers[i] !== m);
+  const changed = markers.length !== existingMarkers.length
+    || markers.some((m, i) => existingMarkers[i] !== m);
   if (changed) {
-    useStore.setState((cur) => ({ project: { ...cur.project, markers } }));
+    // Пишем напрямую в доменный useMapStore — без фасада useStore.setState,
+    // чей merged-снапшот снова вызвал бы getSnapshot шима в небезопасный момент.
+    useMapStore.setState({ markers });
   }
 }
 
@@ -76,16 +93,33 @@ export function syncWizardMarkers(): void {
  */
 export function useWizardMapBridge(): void {
   // Мастер → карта: при любом изменении точек мастера пересобираем маркеры.
+  // Вызов через queueMicrotask: подписка zustand может сработать синхронно
+  // внутри React-рендера (например, setState в обработчике клика), а мутация
+  // другого стора во время рендера вызывала конкурентный рендер и краш.
   useEffect(() => {
-    syncWizardMarkers();
-    return useMissionWizardStore.subscribe(() => syncWizardMarkers());
+    let cancelled = false;
+    const scheduleSync = (): void => {
+      if (cancelled) return;
+      queueMicrotask(() => {
+        if (!cancelled) syncWizardMarkers();
+      });
+    };
+    scheduleSync();
+    const unsub = useMissionWizardStore.subscribe(scheduleSync);
+    return () => {
+      cancelled = true;
+      unsub();
+    };
   }, []);
 
   // Карта → мастер: drag маркера на карте обновляет координаты точки мастера.
+  // Подписка напрямую на доменный useMapStore (см. комментарий в syncWizardMarkers):
+  // фасад useStore.subscribe передаёт merged-снапшот, сборка которого опасна
+  // внутри синхронного zustand-колбэка (getSnapshot в фазе рендера → React #127).
   useEffect(() => {
-    let prevMarkers = useStore.getState().project.markers;
-    return useStore.subscribe((state) => {
-      const next = state.project.markers;
+    let prevMarkers = useMapStore.getState().markers;
+    return useMapStore.subscribe((state) => {
+      const next = state.markers;
       if (next === prevMarkers) return;
       prevMarkers = next;
       const w = useMissionWizardStore.getState();

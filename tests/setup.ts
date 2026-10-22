@@ -45,6 +45,29 @@ if (!('structuredClone' in globalThis)) {
 }
 
 // IndexedDB нет в jsdom — storage-утилы должны тихо падать/fallback'ить.
+// ─── Полное отключение async-гидрации zustand persist в тестах ───
+// Глобальный singleton localStorage в jsdom живёт между тестами одного файла:
+// tq-* записи из предыдущего теста гидрируются асинхронно и перетирают
+// детерминированный setState следующего теста (источник последних падений).
+// getItem для ключей tq-* всегда возвращает null → rehydration нечего читать,
+// состояние сторов задаётся только явными setState/clearStorage в beforeEach.
+{
+  const realGetItem = localStorage.getItem.bind(localStorage);
+  const realSetItem = localStorage.setItem.bind(localStorage);
+  const realRemoveItem = localStorage.removeItem.bind(localStorage);
+  localStorage.getItem = (key: string): string | null => {
+    if (key.startsWith('tq-')) return null;
+    return realGetItem(key);
+  };
+  localStorage.setItem = (key: string, value: string): void => {
+    if (key.startsWith('tq-')) return; // persist-записи в тестах игнорируются
+    realSetItem(key, value);
+  };
+  localStorage.removeItem = (key: string): void => {
+    if (key.startsWith('tq-')) return;
+    realRemoveItem(key);
+  };
+}
 // alert/confirm/prompt в jsdom отсутствуют — React-код зовёт их напрямую.
 vi.stubGlobal('alert', () => undefined);
 vi.stubGlobal('confirm', () => true);

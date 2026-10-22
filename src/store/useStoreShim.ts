@@ -101,9 +101,29 @@ function buildSnapshot(): LegacySnapshot {
 let snapshot: LegacySnapshot = buildSnapshot();
 const listeners = new Set<() => void>();
 
-useMapStore.subscribe(() => emit());
-useMissionStore.subscribe(() => emit());
-useFleetStore.subscribe(() => emit());
+// КОРНЕВОЙ ФИКС «Should not already be working» (React error #127):
+// zustand колбэк subscribe() вызывается СИНХРОННО внутри set(). Если в этот
+// момент emit() оповещает useSyncExternalStore-подписчиков, React пытается
+// синхронно запустить конкурентный рендер ПРЯМО ПОСРЕДИ другого рендера/act() —
+// краш react-dom «performConcurrentWorkOnRoot». Откладываем рассылку слушателей
+// на микрозадание: сетевой порядок обновлений стора не нарушается (snapshot
+// перестраивается сразу), но React получает корректный асинхронный сигнал.
+let emitScheduled = false;
+function scheduleEmit(): void {
+  // Снапшот агрегата инвалидируем СРАЗУ (синхронно) — getState()/селекторы
+  // никогда не увидят stale-данные после мутации стора.
+  snapshot = buildSnapshot();
+  mergedCache = null;
+  if (emitScheduled) return;
+  emitScheduled = true;
+  queueMicrotask(() => {
+    emitScheduled = false;
+    listeners.forEach((l) => l());
+  });
+}
+useMapStore.subscribe(scheduleEmit);
+useMissionStore.subscribe(scheduleEmit);
+useFleetStore.subscribe(scheduleEmit);
 
 // ─── Миграция legacy persist (totalquadro-storage v2 → tq-map/tq-mission/tq-fleet) ──
 // Выполняется ОДИН раз при старте приложения (см. App.tsx): если новые ключи
@@ -257,6 +277,74 @@ function emit(): void {
   snapshot = buildSnapshot();
   mergedCache = null; // инвалидация кэша агрегата — перестроится при следующем чтении
   listeners.forEach((l) => l());
+}
+
+// ─── ПУБЛИЧНЫЙ БЕЗОПАСНЫЙ ЧИТАТЕЛЬ ПРОЕКТА (стабильность, P0-фикс крашей) ──
+// MapCanvas читает project в rAF-колбэках, обработчиках мыши и фазах React,
+// где вызов getSnapshot() шима запрещён (React error #127 «Should not already
+// be working»). Этот читатель НЕ собирает merged-агрегат (в нём spread'ом
+// раскрываются геттеры сторов → побочный getSnapshot), а строит только поле
+// `project` напрямую из доменных getState() — чистая операция без оповещений.
+export function readProjectView(): Project {
+  const m = useMapStore.getState();
+  const mi = useMissionStore.getState();
+  return {
+    version: '1.1',
+    projectName: projectNameRef.value,
+    createdAt: projectNameRef.createdAt,
+    updatedAt: projectNameRef.updatedAt,
+    map: m.map,
+    calibration: m.calibration,
+    restrictions: m.restrictions,
+    markers: m.markers,
+    routes: mi.routes,
+    importLists: mi.importLists,
+    layers: m.layers,
+    settings: m.settings,
+    googleMaps: m.googleMaps,
+    yandexMaps: m.yandexMaps,
+    openStreetMap: m.openStreetMap,
+  };
+}
+
+/**
+ * Расширенное чтение для MapCanvas: данные проекта + делегированные mutate-экшены
+ * маршрутов (moveRoutePoint/removeRoutePoint проходят через isProcessing-гард
+ * shimActions — блокировка мутаций во время аплоада сохраняется), а также
+ * актуальный снапшот проекта в поле `project` (для launchMission).
+ * Не собирает merged-агрегат (см. комментарий к readProjectView).
+ */
+export type ProjectViewWithActions = Project & {
+  moveRoutePoint: (id: string, index: number, p: Point) => void;
+  removeRoutePoint: (id: string, index: number) => void;
+  project: Project;
+};
+
+export function readProjectViewWithActions(): ProjectViewWithActions {
+  const base = readProjectView();
+  return {
+    ...base,
+    project: base,
+    moveRoutePoint: (id: string, index: number, p: Point) => {
+      // Фасад шима содержит guarded-обёртку (isProcessing-страж сохранён).
+      (shimActions as unknown as Record<string, (...a: unknown[]) => unknown>)
+        .moveRoutePoint(id, index, p);
+    },
+    removeRoutePoint: (id: string, index: number) => {
+      (shimActions as unknown as Record<string, (...a: unknown[]) => unknown>)
+        .removeRoutePoint(id, index);
+    },
+  };
+}
+
+/**
+ * Публичный сброс снапшота шима (используется useAppInitialization после
+ * async-операций: миграция, гидрация persist, восстановление карты из IndexedDB).
+ * Без этого facade getState()/селекторы продолжают отдавать stale-агрегат,
+ * построенный ДО внешних setState доменных сторов.
+ */
+export function syncShimSnapshot(): void {
+  emit();
 }
 
 const subscribeImpl = (listener: (s: LegacySnapshot, prev: LegacySnapshot) => void) => {

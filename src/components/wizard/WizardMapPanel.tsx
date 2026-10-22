@@ -5,10 +5,11 @@
 // подложки. Здесь мастер получает тот же MapCanvas: контейнер имеет явные
 // height:100%/flex:1 (ResizeObserver в MapCanvas инициализирует загрузку тайлов),
 // z-index слоя тайлов ниже canvas-оверлея объектов — конфликта нет.
-import React from 'react';
+import React, { useEffect } from 'react';
 import MapCanvas from '../MapCanvas';
 import { useStore } from '../../store/useStore';
 import { getProviderStatus, type TileProviderId } from '../../utils/mapProviders';
+import { ensureDefaultTileMap } from '../../hooks/useAppInitialization';
 
 const SERVER_LABELS: Record<'osm' | 'opentopomap' | 'carto' | '2gis', string> = {
   osm: '🌐 OSM',
@@ -63,11 +64,28 @@ const ProviderSwitcher: React.FC = () => {
 export interface WizardMapPanelProps {
   /** Подпись над картой (название этапа/инструмента). */
   hint?: string;
+  /** Публикует флаг фактической загрузки подложки наружу (см. mapReadiness). */
+  onMapLoaded?: (loaded: boolean) => void;
 }
 
-export function WizardMapPanel({ hint }: WizardMapPanelProps) {
+export function WizardMapPanel({ hint, onMapLoaded }: WizardMapPanelProps) {
   const project = useStore((s) => s.project);
   const status = getProviderStatus(project, (project.openStreetMap?.tileServer ?? 'osm') as TileProviderId);
+  // КОРНЕВОЙ ФИКС «вечного оверлея» на этапах мастера: панель карты сама
+  // гарантирует подложку при монтировании (идемпотентно — ensureDefaultTileMap
+  // выходит сразу, если map уже есть). Раньше автозагрузка вызывалась только
+  // из MissionWizard; при прямом монтировании этапа (TargetPointsStep в тестах,
+  // глубокие ссылки, будущие standalone-режимы) карта оставалась null и
+  // readiness-оверлей «Карта ещё не загружена» висел бесконечно.
+  useEffect(() => {
+    // setTimeout(0): ensureDefaultTileMap синхронно вызывает setState сторов;
+    // вызов напрямую из effect-фазы мог попадать в конкурентный рендер React
+    // (тот же класс краша #127, что лечился в MapCanvas). Таймер чистится в
+    // cleanup — при быстром размонтировании (переключение шагов) колбэк не
+    // выполнится на «мёртвом» дереве.
+    const t = window.setTimeout(() => { ensureDefaultTileMap(); }, 0);
+    return () => window.clearTimeout(t);
+  }, []);
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col rounded-lg border border-slate-800 bg-slate-950" data-testid="wizard-map-panel">
@@ -78,7 +96,7 @@ export function WizardMapPanel({ hint }: WizardMapPanelProps) {
       {/* Явные размеры контейнера обязательны: ResizeObserver внутри MapCanvas
           стартует загрузку тайлов только после получения ненулевых размеров. */}
       <div className="relative min-h-0 flex-1" style={{ height: '100%' }}>
-        <MapCanvas />
+        <MapCanvas onMapLoaded={onMapLoaded} />
         {!status.ready && (
           <div
             role="alert"
