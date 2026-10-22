@@ -35,7 +35,7 @@ export function mercToLat(y: number): number {
   return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
 }
 
-interface RawView { offsetX: number; offsetY: number; scale: number; z0?: number }
+interface RawView { offsetX: number; offsetY: number; scale: number; z0?: number; width?: number; height?: number }
 
 function readMirrorView(): RawView | null {
   try {
@@ -47,7 +47,14 @@ function readMirrorView(): RawView | null {
     const scale = Number(v.scale);
     // Санатор: один NaN делал все последующие вычисления NaN («точки в никуда»).
     if (!Number.isFinite(offsetX) || !Number.isFinite(offsetY) || !(scale > 0)) return null;
-    return { offsetX, offsetY, scale, z0: Number.isFinite(Number(v.z0)) ? Number(v.z0) : undefined };
+    const width = Number(v.width);
+    const height = Number(v.height);
+    return {
+      offsetX, offsetY, scale,
+      z0: Number.isFinite(Number(v.z0)) ? Number(v.z0) : undefined,
+      width: Number.isFinite(width) && width > 0 ? width : undefined,
+      height: Number.isFinite(height) && height > 0 ? height : undefined,
+    };
   } catch {
     return null;
   }
@@ -72,17 +79,24 @@ export function screenToGeo(
   fallback: GeoPick = { lat: 59.9398, lon: 30.3146 },
 ): GeoPick | null {
   const v = readMirrorView();
-  if (!v || !(canvasH > 0)) {
+  // ФИКС «Не удалось определить размер карты»: если контейнер мастера в данный
+  // момент имеет нулевую высоту (jsdom / поздний layout), берём базу из зеркала
+  // 'tq-view' — MapCanvas пишет туда фактические CSS-размеры канваса при каждой
+  // публикации вида. Это сохраняет СТРОГУЮ привязку клика к реальной подложке
+  // даже когда локальный замер недоступен.
+  const h = canvasH > 0 ? canvasH : (v?.height ?? 0);
+  if (!v || !(h > 0)) {
     // Нет сохранённого вида (первый кадр до любого жеста) — используем
     // дефолтный вид MapCanvas {offset:0, scale:1, z0:ZOOM_REF}: мир =
     // canvasH·2^14 px; клик по центру канваса даёт СПб-окрестности центра
     // карты — это всё ещё строгая формула, а не псевдо-поле.
-    const wp = worldPxOf(canvasH, 1, ZOOM_REF);
+    if (!(h > 0)) return null;
+    const wp = worldPxOf(h, 1, ZOOM_REF);
     const lon = (sx / wp) * 360 - 180;
     const lat = mercToLat(sy / wp);
     return Number.isFinite(lat) && Number.isFinite(lon) ? { lat, lon } : null;
   }
-  const wp = worldPxOf(canvasH, v.scale, v.z0 ?? ZOOM_REF);
+  const wp = worldPxOf(h, v.scale, v.z0 ?? ZOOM_REF);
   const lon = ((sx - v.offsetX) / wp) * 360 - 180;
   const lat = mercToLat((sy - v.offsetY) / wp);
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
