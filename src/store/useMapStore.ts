@@ -87,6 +87,8 @@ export interface MapState {
   viewState: ViewState;
   /** monotonic counter — bump on every setViewState (see selectViewForRender) */
   viewTick: number;
+  /** Флаг готовности тайловой подложки (публикуется MapCanvas синхронно). */
+  mapLoaded: boolean;
   cursorPosition: Point | null;
   isDrawing: boolean;
   drawingPoints: Point[];
@@ -102,6 +104,8 @@ export interface MapState {
 export interface MapActions {
   setTool: (tool: Tool) => void;
   setViewState: (viewState: Partial<ViewState>) => void;
+  /** Публикация готовности подложки (источник истины для Мастера). */
+  publishMapLoaded: (loaded: boolean) => void;
   setCursorPosition: (pos: Point | null) => void;
   setDrawing: (isDrawing: boolean) => void;
   addDrawingPoint: (point: Point) => void;
@@ -168,6 +172,11 @@ const initialMapState: MapState = {
   currentTool: 'pan',
   viewState: { offsetX: 0, offsetY: 0, scale: 1 },
   viewTick: 0,
+  // Флаг готовности тайловой подложки публикуется MapCanvas СИНХРОННО при
+  // любом изменении состояния карты (ready/not ready). Это источник истины
+  // для decision-логики (isMapReadyNow): React-state этапов обновляется
+  // асинхронно и мог давать stale-значение → точки ставились на пустое поле.
+  mapLoaded: false,
   cursorPosition: null,
   isDrawing: false,
   drawingPoints: [],
@@ -192,6 +201,15 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
     // гидрированный viewState (краш «viewState is not defined» на проде)
     viewTick: state.viewTick + 1,
   })),
+
+  publishMapLoaded: (loaded) => {
+    // Синхронная публикация флага готовности в стор. Используется MapCanvas
+    // КАЖДЫЙ раз при пересчёте состояния карты (в т.ч. false при map=null /
+    // выключенной подложке), поэтому не требует идемпотентного guard'а и
+    // исключает stale-состоянияdecision-логики Мастера (isMapReadyNow).
+    if (useMapStore.getState().mapLoaded === loaded) return;
+    useMapStore.setState({ mapLoaded: loaded });
+  },
 
   setCursorPosition: (pos) => set({ cursorPosition: pos }),
   setDrawing: (isDrawing) => set({ isDrawing }),
@@ -371,7 +389,16 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
   setYandexMapsApiKey: (apiKey) => set((state) => ({ yandexMaps: { ...state.yandexMaps, apiKey } })),
   toggleYandexMaps: (enabled) => set((state) => ({ yandexMaps: { ...state.yandexMaps, enabled } })),
   toggleOpenStreetMap: (enabled) => set((state) => ({ openStreetMap: { ...state.openStreetMap, enabled } })),
-  setOSMTileServer: (server) => set((state) => ({ openStreetMap: { ...state.openStreetMap, tileServer: server } })),
+  setOSMTileServer: (server) => {
+    set((state) => ({ openStreetMap: { ...state.openStreetMap, tileServer: server } }));
+    // КОРНЕВОЙ ФИКС «вечного оверлея» при смене провайдера: MapCanvas публикует
+    // mapLoaded в момент готовности подложки; при переключении на провайдера без
+    // API-ключа (Google/Яндекс) он НЕ перепубликует false — старый флаг true
+    // оставался бы в сторе и decision-логика мастера (isMapReadyNow) ставила бы
+    // точки поверх key-overlay. Сбрасываем флаг загрузки немедленно; MapCanvas
+    // восстановит его после фактической отрисовки тайлов нового провайдера.
+    if (get().mapLoaded) get().publishMapLoaded(false);
+  },
 
   setMapBounds: (bounds) => set((state) => ({
     map: state.map ? { ...state.map, bounds } : null,
@@ -456,7 +483,11 @@ export const useMapStore = create<MapStore>()(
       // первого notify) — компонент мог отрендериться с частично гидрированным
       // viewState («viewState is not defined»). viewTick форсирует notify.
       storage: createJSONStorage(() => localStorage),
-      partialize: (s): MapState => ({
+      // Сохраняемые поля = MapState минус транзиентные UI-флаги.
+      // mapLoaded НЕ гидрируется из localStorage: флаг публикуется MapCanvas
+      // только когда тайлы реально отрисованы (иначе после перезагрузки
+      // Мастер ложно считал бы карту готовой до первой загрузки).
+      partialize: (s): Omit<MapState, 'mapLoaded'> => ({
         // Не сохраняем map.dataUrl в localStorage — он слишком большой
         map: s.map ? { ...s.map, dataUrl: '' } : null,
         markers: s.markers,

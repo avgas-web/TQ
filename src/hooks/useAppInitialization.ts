@@ -8,7 +8,8 @@
 import { useEffect } from 'react';
 import { useMapStore, invalidateZoneCache } from '../store/useMapStore';
 import { useMissionStore, scheduleRerouteAll } from '../store/useMissionStore';
-import { migrateLegacyStorage } from '../store/useStoreShim';
+import { useFleetStore } from '../store/useFleetStore';
+import { syncShimSnapshot as rebuildShimSnapshot } from '../store/useStoreShim';
 
 /**
  * Автозагрузка тайловой карты по умолчанию (OSM): если в хранилище нет ни
@@ -19,6 +20,20 @@ import { migrateLegacyStorage } from '../store/useStoreShim';
  */
 export function ensureDefaultTileMap(): void {
   const st = useMapStore.getState();
+  // КОРНЕВОЙ ФИКС async-гонки persist: zustand v5 гидрирует стор из
+  // localStorage АСИНХРОННО (promise). Если Мастер/тест вызывает автозагрузку
+  // до завершения гидрации, стейт на момент вызова пустой — но через тик
+  // гидрация перезапишет его своим снапшотом и «съест» только что созданную
+  // карту (вечный оверлей «Карта ещё не загружена»). Поэтому при НЕзавершённой
+  // гидрации переносим запуск в onFinishHydration — ровно один раз, после
+  // которого стейт финален и повторных перезаписей не будет.
+  if (!useMapStore.persist.hasHydrated()) {
+    const unsub = useMapStore.persist.onFinishHydration(() => {
+      unsub();
+      ensureDefaultTileMap();
+    });
+    return;
+  }
   if (st.map) return; // уже есть растровая или тайловая карта
   st.toggleOpenStreetMap(true);
   st.setOSMTileServer(st.openStreetMap.tileServer ?? 'osm');
@@ -27,14 +42,86 @@ export function ensureDefaultTileMap(): void {
 
 let initialized = false;
 
+/**
+ * КОРНЕВОЙ ФИКС «stale snapshot» шима (useStoreShim): zustand persist
+ * гидрирует каждый доменный стор АСИНХРОННО (чтение localStorage — promise),
+ * а гидрация может произойти ПОСЛЕ любых setState (в т.ч. resetProject).
+ * До этого shim-агрегат (snapshot/mergedCache) перестраивался только при
+ * синхронных set() сторов — после async-гидрации фасад useStore продолжал
+ * отдавать устаревший снапшот («Сброс не удаляет данные», точки «воскресали»
+ * в UI, readiness-оверлей Мастера не реагировал на загрузку карты).
+ * Лечим причиной, а не симптомом: подписываемся на ГИДРАЦИЮ каждого persist-стора
+ * (onRehydrateStorage) + ставим safety-net подписку на любые изменения сторов —
+ * любая внешняя мутация вызывает emit() шима, пересобирая агрегат.
+ */
+let hydrationSyncInstalled = false;
+function installHydrationSync(): void {
+  if (hydrationSyncInstalled) return;
+  hydrationSyncInstalled = true;
+  let pending = false;
+  const reEmit = (): void => {
+    if (pending) return;
+    pending = true;
+    queueMicrotask(() => {
+      pending = false;
+      rebuildShimSnapshot();
+    });
+  };
+  // onFinishHydration вызывается внутри set() гидрации → повторный set
+  // запрещён; поэтому пересборка отложена в микрозадачу (re-entrancy guard).
+  for (const store of [useMapStore, useMissionStore, useFleetStore]) {
+    store.persist?.onFinishHydration?.(() => reEmit());
+  }
+  // Safety net: если persist-API недоступен (мок/старая версия), ловим любые
+  // внешние set() доменных сторов (например, async-гидрацию без middleware-колбэка).
+  useMapStore.subscribe(reEmit);
+  useMissionStore.subscribe(reEmit);
+  useFleetStore.subscribe(reEmit);
+}
+
+// Миграция legacy-хранилища + установка hydration-sync — однократные тяжёлые
+// шаги (идемпотентность через собственный guard installHydrationSync).
+let migrationDone = false;
+function migrateLegacyStorageOnce(): void {
+  if (migrationDone) return;
+  migrationDone = true;
+  import('../store/useStoreShim').then(({ migrateLegacyStorage }) => {
+    migrateLegacyStorage();
+    rebuildShimSnapshot(); // сбросить снапшот шима после миграции
+    installHydrationSync(); // реактивность на async-гидрацию persist
+  });
+}
+
 export function useAppInitialization(): void {
   // Стартовая инициализация: миграция хранилища → восстановление карты из
   // IndexedDB → автозагрузка OSM-подложки по умолчанию (см. ensureDefaultTileMap).
+  // ВАЖНО (корневой фикс remount-гонки): модульный флаг `initialized` больше НЕ
+  // блокирует эффект — при размонтировании/перемонтировании Мастера (смена шага,
+  // переход редактор↔мастер) загрузчик обязан запускаться заново, иначе карта
+  // остаётся null и readiness-оверлей висит вечно. Идемпотентность обеспечивает
+  // сам ensureDefaultTileMap (exit при st.map !== null / уже активном OSM), а
+  // тяжёлые шаги (миграция, гидрация) выполняются однократно через свои guards.
   useEffect(() => {
-    if (initialized) return;
-    initialized = true;
-    migrateLegacyStorage();
-    void useMapStore.getState().restoreMapFromStorage().then(() => ensureDefaultTileMap());
+    let cancelled = false;
+    const run = (): void => {
+      if (cancelled) return;
+      if (!initialized) {
+        initialized = true;
+        migrateLegacyStorageOnce();
+      }
+      void useMapStore.getState().restoreMapFromStorage().then(() => {
+        if (cancelled) return;
+        ensureDefaultTileMap();
+        rebuildShimSnapshot(); // карта из IndexedDB/persist видна фасаду немедленно
+      });
+    };
+    // setTimeout(0) — выход за пределы commit-фазы React (исключает setState
+    // во время рендера, краш React #127) и детерминированная отмена при unmount.
+    const timer = window.setTimeout(run, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, []);
 
   // Единственный владелец триггеров пакетной перестройки маршрутов:

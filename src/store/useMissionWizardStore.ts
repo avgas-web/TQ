@@ -453,16 +453,19 @@ export const useMissionWizardStore = create<MissionWizardState>()(
         }
         const clean = (p: { x: number; y: number }) =>
           zones.every((z) => !pointInPolygon(p.x, p.y, z.polygon));
+        // ЦИКЛ-ГАРД (шаг П3 ТЗ): перебор пар кандидатов строго ограничен —
+        // детерминированный выход даже при вырожденных полигонах NFZ.
+        const MAX_DETOUR_CANDIDATES = 12;
         const scored = candidates
           .filter(clean)
           .map((c) => ({ c, cost: Math.hypot(c.x - from.x, c.y - from.y) + Math.hypot(to.x - c.x, to.y - c.y) }))
           .sort((a, b) => a.cost - b.cost);
-        for (const { c } of scored.slice(0, 12)) {
+        for (const { c } of scored.slice(0, MAX_DETOUR_CANDIDATES)) {
           const leg1 = zones.every((z) => !segmentCrossesPolygon(from, c, z.polygon));
           const leg2 = zones.every((z) => !segmentCrossesPolygon(c, to, z.polygon));
           if (leg1 && leg2) return [from, c, to];
           // два промежуточных
-          for (const { c: c2 } of scored.slice(0, 12)) {
+          for (const { c: c2 } of scored.slice(0, MAX_DETOUR_CANDIDATES)) {
             if (
               zones.every((z) => !segmentCrossesPolygon(from, c, z.polygon)) &&
               zones.every((z) => !segmentCrossesPolygon(c, c2, z.polygon)) &&
@@ -520,7 +523,14 @@ export const useMissionWizardStore = create<MissionWizardState>()(
           : s.targetPoints.map((t) => ({ groupId: '', startPointId: s.startPoints[0]?.id ?? '', targetPointId: t.id }));
 
         const routes: CalculatedRoute[] = [];
-        for (const leg of legs) {
+        // ЦИКЛ-ГАРД (шаг П3 ТЗ): жёсткий лимит числа обрабатываемых рёбер.
+        // Даже при вырожденных данных (тысячи групп × назначений) расчёт
+        // завершается за конечное число итераций с warning'ом, а не вешает поток.
+        const MAX_ROUTE_LEGS = 10_000;
+        if (legs.length > MAX_ROUTE_LEGS) {
+          pushIssue({ step: 'nfz-and-routes', level: 'warning', message: `Слишком много сегментов маршрутов (${legs.length}). Рассчитаны первые ${MAX_ROUTE_LEGS}.` });
+        }
+        for (const leg of legs.slice(0, MAX_ROUTE_LEGS)) {
           const sp = s.startPoints.find((p) => p.id === leg.startPointId);
           const tp = s.targetPoints.find((p) => p.id === leg.targetPointId);
           if (!sp || !tp) continue;

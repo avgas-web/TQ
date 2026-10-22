@@ -4,7 +4,10 @@ import { useMemo, useState } from 'react';
 import {
   useMissionWizardStore, MAX_TARGET_POINTS, geoDistanceM, type TargetPoint,
 } from '../../store/useMissionWizardStore';
-import { MiniMapCanvas } from './StartPointsStep';
+import { MiniMapCanvas, readCanvasClick } from './StartPointsStep';
+import { WizardMapPanel } from './WizardMapPanel';
+import { isMapReadyNow, useMapReadiness } from './mapReadiness';
+import { useWizardMapBridge } from './useWizardMapBridge';
 
 export function TargetPointsStep() {
   const targetPoints = useMissionWizardStore((s) => s.targetPoints);
@@ -13,6 +16,11 @@ export function TargetPointsStep() {
   const updateTargetPoint = useMissionWizardStore((s) => s.updateTargetPoint);
   const removeTargetPoint = useMissionWizardStore((s) => s.removeTargetPoint);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Мост мастер↔карта: цели видны на живой подложке, drag обновляет координаты.
+  useWizardMapBridge();
+  // ЖЁСТКОЕ ТРЕБОВАНИЕ: цели ставятся ТОЛЬКО на загруженную карту (см. mapReadiness).
+  const [mapLoaded, setMapLoaded] = useState(false);
+  const readiness = useMapReadiness(mapLoaded);
 
   /** расстояние до ближайшего старта для каждой цели */
   const withDist = useMemo(() => {
@@ -55,6 +63,35 @@ export function TargetPointsStep() {
           onAdd={addAt}
           onMove={(id, x, y, lat, lon) => updateTargetPoint(id, { x, y, lat, lon })}
         />
+        {/* Живая тайловая карта: клик добавляет цель только когда подложка
+            реально загружена; до готовности — оверлей-заглушка блокирует клики. */}
+        <div
+          className="relative min-h-0 flex-1"
+          data-testid="wizard-live-map-target"
+          onClick={(e) => {
+            if (!isMapReadyNow(mapLoaded)) return; // источник истины: карта не загружена — точки не ставим
+            const g = readCanvasClick(e);
+            if (g) addAt(g.x, g.y, g.lat, g.lon);
+          }}
+        >
+          <WizardMapPanel
+            hint={readiness.ready
+              ? '🖱️ Клик по живой карте — поставить цель · перетаскивайте маркеры напрямую'
+              : '⏳ Дождитесь загрузки карты — на пустом поле цели не ставятся'}
+            onMapLoaded={setMapLoaded}
+          />
+          {!readiness.ready && (
+            <div
+              role="alert"
+              data-testid="wizard-map-not-ready-overlay-target"
+              className="absolute inset-0 z-30 flex items-center justify-center bg-slate-950/70 p-4 text-center"
+            >
+              <p className="max-w-sm rounded-md border border-amber-500 bg-slate-900/95 px-3 py-2 text-xs text-amber-300">
+                ⏳ {readiness.reason ?? 'Карта загружается…'}
+              </p>
+            </div>
+          )}
+        </div>
       </div>
       <aside className="w-80 shrink-0 overflow-auto border-l border-slate-800 p-3" aria-label="Список целей">
         <p className="mb-2 text-sm font-semibold">{targetPoints.length}/{MAX_TARGET_POINTS} целей</p>
