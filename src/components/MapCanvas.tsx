@@ -1864,8 +1864,13 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       const cur = canvasSizeRef.current;
       const m = measureContainer();
       if (m.w > 0 && m.h > 0) {
+        // Размер валидный: применяем при ЛЮБОМ расхождении с состоянием
+        // (в т.ч. когда состояние было {0,0} — карта стартует сама).
         if (cur.width !== m.w || cur.height !== m.h) applySizes(m.w, m.h);
       } else if (cur.width > 0 || cur.height > 0) {
+        // Размер пропал (display:none у родителя / нулевая flex-ветка):
+        // гасим canvasSize → circuit breaker размеров; очередь тайлов
+        // принудительно опустошается (запрет загрузки в невидимый слой).
         applySizes(0, 0);
         tileQueueRef.current.length = 0;
         for (const hh of tileLoadHandlesRef.current.values()) hh.cancel();
@@ -1874,6 +1879,15 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         tilePending.current.clear();
         for (const imgEl of tileElsRef.current.values()) { abortTileImage(imgEl); imgEl.remove(); }
         tileElsRef.current.clear();
+      } else {
+        // «СЛЕПОЕ ЗОНО» ФИКС: размер появился (или всё ещё нулевой), но ни
+        // один тайл не запрошен и состояние уже {0,0} — RO мог не прислать
+        // событие после смены layout. Принудительно применяем замер и
+        // поднимаем retryNonce: effect-очередь наполняется заново с нуля.
+        if (m.w > 0 && m.h > 0 && tileElsRef.current.size === 0 && tilePending.current.size === 0) {
+          applySizes(m.w, m.h);
+          setTileRetryNonce((n) => n + 1);
+        }
       }
     }, 500);
 
@@ -3626,12 +3640,21 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
             data-testid="map-retry-measure"
             className="rounded bg-cyan-600 px-3 py-1 text-xs font-bold text-white hover:bg-cyan-500"
             onClick={() => {
+              // ФИКС рабочего повтора: раньше кнопка только перерисовывала
+              // оверлей, но НЕ перезапускала очередь загрузки тайлов. Теперь:
+              // 1) синхронный замер контейнера (layout уже мог измениться);
+              // 2) сброс circuit breaker'а «вечной загрузки» тайлов;
+              // 3) bump tileRetryNonce → effect-очередь (зависит от nonce)
+              //    наполняет очередь тайлов заново с нуля.
               const el = containerRef.current;
-              if (!el) return;
-              const r = el.getBoundingClientRect();
-              const w = r.width > 0 ? r.width : el.clientWidth;
-              const h = r.height > 0 ? r.height : el.clientHeight;
-              if (w > 0 && h > 0) setCanvasSize({ width: w, height: h });
+              if (el) {
+                const r = el.getBoundingClientRect();
+                const w = r.width > 0 ? r.width : el.clientWidth;
+                const h = r.height > 0 ? r.height : el.clientHeight;
+                if (w > 0 && h > 0) setCanvasSize({ width: w, height: h });
+              }
+              setTileLoadStalled(false);
+              setTileRetryNonce((n) => n + 1);
             }}
           >
             Попробовать снова

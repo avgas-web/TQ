@@ -85,9 +85,20 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
       {hint && (
         <div className="border-b border-slate-800 bg-slate-900 px-2 py-1 text-[11px] text-slate-300">{hint}</div>
       )}
-      {/* Явные размеры контейнера обязательны: ResizeObserver внутри MapCanvas
-          стартует загрузку тайлов только после получения ненулевых размеров. */}
-      <div className="relative min-h-0 flex-1" style={{ height: '100%' }}>
+      {/* ФИКС «Не удалось определить размер карты» (мастер vs планирование):
+          раньше здесь был style={{ height: '100%' }} — в jsdom/happy-dom и при
+          незавершённом layout браузера процентная высота НЕ разрешается в
+          пиксели, getBoundingClientRect() возвращает 0, ResizeObserver не
+          стартует, и circuit breaker размеров показывает ошибку вместо карты.
+          В режиме планирования карта лежит в контейнере с ЯВНОЙ пиксельной
+          высотой — теперь то же самое здесь: абсолютное заполнение панели
+          (flex-1/min-h гарантируют ненулевые пиксели у родителя) + явный
+          inline-базис 320px на случай окружений без CSS-класса. */}
+      <div
+        data-testid="wizard-map-canvas-holder"
+        className="absolute inset-0 min-h-[280px]"
+        style={{ height: '320px' }}
+      >
         <MapCanvas onMapLoaded={onMapLoaded} />
         {!status.ready && (
           <div
@@ -133,7 +144,8 @@ export function WizardMapPanel({ hint, onMapLoaded }: WizardMapPanelProps) {
   // высота растягивается на свободное место контейнера, но не вылезает за него.
   return (
     <div
-      className="relative flex h-full min-h-[280px] w-full flex-col overflow-hidden rounded-lg border border-cyan-700/60 bg-slate-950 shadow-lg"
+      className="relative flex h-full min-h-[320px] w-full flex-col overflow-hidden rounded-lg border border-cyan-700/60 bg-slate-950 shadow-lg"
+      style={{ height: '320px' }}
       data-testid="wizard-map-panel"
     >
       <MapPanelBody hint={hint} onMapLoaded={onMapLoaded} />
