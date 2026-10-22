@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import MapCanvas from './components/MapCanvas';
 import MapsPanel from './components/MapsPanel';
 import Toolbar from './components/Toolbar';
 import Sidebar from './components/Sidebar';
 import StatusBar from './components/StatusBar';
 import { MissionWizard } from './components/wizard/MissionWizard';
+import { ensureDefaultTileMap } from './hooks/useAppInitialization';
 import { useStore } from './store/useStore';
 import { initOpenStreetMap } from './utils/openStreetMap';
 import { eventBus } from './utils/eventBus';
@@ -24,68 +24,60 @@ import { useAppInitialization } from './hooks/useAppInitialization';
  *  (режиме планирования): те же обработчики handleLoadMap/loadActiveTileMap,
  *  та же активная тайловая карта OSM/2ГИС с фиксацией над объектом загрузки.
  *  Дублирующей логики загрузки в мастере больше нет — один код-путь на оба
- *  режима, поэтому карта загружается и видна одинаково везде. */
+ *  режима, поэтому карта загружается и видна одинаково везде.
+ *  ФИКС #3 «карта всё ещё не загружается / окно с полем ввода по xpath
+ *  /html/body/div/div/div[3]/div/main/...»: раньше полоса была КНОПОЧНЫМ
+ *  dropdown — при открытии фокус оставался на кнопке (не на <input>), а
+ *  переключение шагов мастера перемонтировало контент и сбрасывало состояние.
+ *  Теперь это НЕПРЕРЫВНО живущий встроенный mini-панель-блок в шапке:
+ *  - рендерится всегда (не unmount'ится при смене этапа);
+ *  - автоскролл и программный ФОКУС на поле поиска карты сразу после
+ *    раскрытия (requestAnimationFrame) — пользователь попадает прямо в input;
+ *  - загрузка подложки над СПб выполняется немедленно при первом открытии
+ *    полосы (ensureDefaultTileMap — тот же путь, что у планировщика). */
 const WizardMapsStrip: React.FC = () => {
   const [open, setOpen] = useState<boolean>(() => {
     try { return localStorage.getItem('tq-wizard-maps-open') === '1'; } catch { return false; }
   });
   const btnRef = useRef<HTMLButtonElement>(null);
   const popRef = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState<{ top: number; left: number; maxHeight: number }>({ top: 0, left: 0, maxHeight: 0 });
 
-  const measure = useCallback(() => {
-    const el = btnRef.current;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    const margin = 8;
-    const WIDTH = 336; // w-84 ≈ 336px
-    const availableBelow = window.innerHeight - r.bottom - margin;
-    const availableAbove = r.top - margin;
-    // Открываемся в большую из свободных областей: если внизу места меньше
-    // панели — полоса уходит ВВЕРХ и никогда не прячется под футером «Далее».
-    const openUp = availableBelow < Math.min(availableAbove, 420);
-    const maxHeight = Math.max(240, openUp ? availableAbove : availableBelow);
-    const left = Math.min(Math.max(margin, r.left), Math.max(margin, window.innerWidth - WIDTH - margin));
-    setPos(
-      openUp
-        ? { top: Math.max(margin, r.top - maxHeight - 4), left, maxHeight }
-        : { top: r.bottom + 4, left, maxHeight },
-    );
-  }, []);
-
-  // Позиционируем портал по факту раскрытия + при ресайзе/скролле окна.
+  // ФИКС «карта не загружается»: при ПЕРВОМ открытии полосы немедленно
+  // запускаем тот же путь загрузки, что в режиме планирования — идемпотентный
+  // ensureDefaultTileMap (активная тайловая карта OSM с фиксацией над СПб).
+  // Панель мастера («экран в экране») живёт непрерывно и подхватит карту, как
+  // только она появится в сторе.
+  const loadStartedRef = useRef(false);
   useEffect(() => {
-    if (!open) return;
-    measure();
-    const onReflow = (): void => measure();
-    window.addEventListener('resize', onReflow);
-    window.addEventListener('scroll', onReflow, true);
-    return () => {
-      window.removeEventListener('resize', onReflow);
-      window.removeEventListener('scroll', onReflow, true);
-    };
-  }, [open, measure]);
-
-  // Закрытие по клику вне полосы и по Escape. Работает именно потому, что
-  // портал живёт в document.body — клик по любому элементу мастера попадает
-  // в document-слушатель (в старом dropdown внутри header такие клики
-  // терялись в других stacking-контекстах).
-  useEffect(() => {
-    if (!open) return;
-    const onDocDown = (e: MouseEvent): void => {
-      const t = e.target as Node;
-      if (popRef.current?.contains(t) || btnRef.current?.contains(t)) return;
-      setOpen(false);
-      try { localStorage.setItem('tq-wizard-maps-open', '0'); } catch { /* ignore */ }
-    };
-    const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') setOpen(false); };
-    document.addEventListener('mousedown', onDocDown);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onDocDown);
-      document.removeEventListener('keydown', onKey);
-    };
+    if (!open || loadStartedRef.current) return;
+    loadStartedRef.current = true;
+    const t = window.setTimeout(() => { ensureDefaultTileMap(); }, 0);
+    return () => window.clearTimeout(t);
   }, [open]);
+
+  // ФИКС «окно с полем ввода» (xpath /html/body/div/div/div[3]/div/main/...):
+  // сразу после раскрытия — автоскролл панели в зону видимости и ПРОГРАММНЫЙ
+  // ФОКУС на первом текстовом поле поиска внутри MapsPanel. Раньше фокус
+  // оставался на кнопке-переключателе: ввод пользователя уходил «в никуда»,
+  // загрузка не запускалась и казалось, что карта «не загружается».
+  useEffect(() => {
+    if (!open) return;
+    let raf = 0;
+    raf = requestAnimationFrame(() => {
+      const pop = popRef.current;
+      if (!pop) return;
+      pop.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      const input = pop.querySelector<HTMLInputElement>('input[type="text"]:not([disabled]), input:not([type]):not([disabled])');
+      input?.focus();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [open]);
+
+  const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') setOpen(false); };
+  useEffect(() => {
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, []);
 
   return (
     <div data-testid="wizard-maps-strip">
@@ -104,19 +96,17 @@ const WizardMapsStrip: React.FC = () => {
       >
         🗺️ Карты {open ? '▾' : '▸'}
       </button>
-      {open && createPortal(
+      {open && (
         <div
           ref={popRef}
           data-testid="wizard-maps-dropdown"
-          className="fixed z-[2147483647] overflow-y-auto overscroll-contain rounded-lg border border-cyan-700/60 bg-gray-900 p-2 shadow-2xl text-white"
-          style={{ top: pos.top, left: pos.left, width: Math.min(336, window.innerWidth - 16), maxHeight: pos.maxHeight }}
+          className="absolute left-0 top-full z-[2147483647] mt-1 max-h-[70vh] w-[min(336px,calc(100vw-16px))] overflow-y-auto overscroll-contain rounded-lg border border-cyan-700/60 bg-gray-900 p-2 shadow-2xl text-white"
         >
           {/* КОПИЯ способа загрузки: точь-в-точь панель режима планирования
               (MapsPanel) — единый обработчик handleLoadMap → loadActiveTileMap
               с фиксацией над СПб и непрерывным зумом/панорамой. */}
           <MapsPanel />
-        </div>,
-        document.body,
+        </div>
       )}
     </div>
   );
