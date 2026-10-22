@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import MapCanvas from './components/MapCanvas';
 import MapsPanel from './components/MapsPanel';
 import Toolbar from './components/Toolbar';
@@ -10,18 +11,26 @@ import { initOpenStreetMap } from './utils/openStreetMap';
 import { eventBus } from './utils/eventBus';
 import { useAppInitialization } from './hooks/useAppInitialization';
 
-/** Компактная панель выбора подложки для Мастера миссий (OSM по умолчанию,
- *  Google/Яндекс — при наличии API-ключей, 2ГИС — без ключа).
- *  ФИКС «полоса скрыта за строкой Далее»: выпадающий список рисовался через
- *  absolute внутри header и перекрывался контентом мастера (этапы имеют
- *  собственные stacking-контексты/z-index), а при низком окне — уезжал за
- *  нижний край и перекрывался футером с кнопкой «Далее». Теперь панель —
- *  position:fixed с координатами, рассчитанными от фактического положения
- *  кнопки (getBoundingClientRect), и z-index выше всех слоёв приложения:
- *  она полностью видна поверх мастера, включая область футера «Назад/Далее». */
+/** Компактная полоса загрузки карт для Мастера миссий.
+ *  ФИКС #1 «полоса скрыта за строкой „Далее“»: раньше это был выпадающий
+ *  dropdown (absolute/fixed от кнопки в шапке). Он перекрывался контентом
+ *  этапов мастера (у каждого этапа свой stacking-контекст), а при раскрытии
+ *  вниз уезжал за нижний край и накрывался футером «Назад/Далее».
+ *  Теперь полоса рендерится ЧЕРЕЗ PORTAL в document.body с собственным
+ *  stacking-контекстом и z-index выше всего интерфейса — её физически нечем
+ *  перекрыть, включая футер с кнопкой «Далее».
+ *  ФИКС #2 «копируем способ загрузки из режима планирования»: содержимое
+ *  полосы — ТОТ ЖЕ самый компонент MapsPanel, что используется в редакторе
+ *  (режиме планирования): те же обработчики handleLoadMap/loadActiveTileMap,
+ *  та же активная тайловая карта OSM/2ГИС с фиксацией над объектом загрузки.
+ *  Дублирующей логики загрузки в мастере больше нет — один код-путь на оба
+ *  режима, поэтому карта загружается и видна одинаково везде. */
 const WizardMapsStrip: React.FC = () => {
-  const [open, setOpen] = useState<boolean>(() => localStorage.getItem('tq-wizard-maps-open') === '1');
+  const [open, setOpen] = useState<boolean>(() => {
+    try { return localStorage.getItem('tq-wizard-maps-open') === '1'; } catch { return false; }
+  });
   const btnRef = useRef<HTMLButtonElement>(null);
+  const popRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ top: number; left: number; maxHeight: number }>({ top: 0, left: 0, maxHeight: 0 });
 
   const measure = useCallback(() => {
@@ -29,45 +38,85 @@ const WizardMapsStrip: React.FC = () => {
     if (!el) return;
     const r = el.getBoundingClientRect();
     const margin = 8;
-    const available = window.innerHeight - r.bottom - margin;
-    // Если под кнопкой не хватает места (низкое окно / пересечение с футером
-    // «Далее») — открываем панель вверх, в свободную область над шапкой.
-    const openUp = available < 240 && r.top > 240;
+    const WIDTH = 336; // w-84 ≈ 336px
+    const availableBelow = window.innerHeight - r.bottom - margin;
+    const availableAbove = r.top - margin;
+    // Открываемся в большую из свободных областей: если внизу места меньше
+    // панели — полоса уходит ВВЕРХ и никогда не прячется под футером «Далее».
+    const openUp = availableBelow < Math.min(availableAbove, 420);
+    const maxHeight = Math.max(240, openUp ? availableAbove : availableBelow);
+    const left = Math.min(Math.max(margin, r.left), Math.max(margin, window.innerWidth - WIDTH - margin));
     setPos(
       openUp
-        ? { top: Math.max(margin, r.top - available - margin) + 0, left: Math.min(r.left, window.innerWidth - 336), maxHeight: r.top - margin * 2 }
-        : { top: r.bottom + 4, left: Math.min(r.left, window.innerWidth - 336), maxHeight: available },
+        ? { top: Math.max(margin, r.top - maxHeight - 4), left, maxHeight }
+        : { top: r.bottom + 4, left, maxHeight },
     );
   }, []);
 
+  // Позиционируем портал по факту раскрытия + при ресайзе/скролле окна.
   useEffect(() => {
     if (!open) return;
     measure();
-    window.addEventListener('resize', measure);
-    return () => window.removeEventListener('resize', measure);
+    const onReflow = (): void => measure();
+    window.addEventListener('resize', onReflow);
+    window.addEventListener('scroll', onReflow, true);
+    return () => {
+      window.removeEventListener('resize', onReflow);
+      window.removeEventListener('scroll', onReflow, true);
+    };
   }, [open, measure]);
+
+  // Закрытие по клику вне полосы и по Escape. Работает именно потому, что
+  // портал живёт в document.body — клик по любому элементу мастера попадает
+  // в document-слушатель (в старом dropdown внутри header такие клики
+  // терялись в других stacking-контекстах).
+  useEffect(() => {
+    if (!open) return;
+    const onDocDown = (e: MouseEvent): void => {
+      const t = e.target as Node;
+      if (popRef.current?.contains(t) || btnRef.current?.contains(t)) return;
+      setOpen(false);
+      try { localStorage.setItem('tq-wizard-maps-open', '0'); } catch { /* ignore */ }
+    };
+    const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', onDocDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDocDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
 
   return (
     <div data-testid="wizard-maps-strip">
       <button
         ref={btnRef}
         type="button"
+        data-testid="wizard-maps-toggle"
         className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 border border-gray-600 rounded text-xs text-white"
         onClick={() => {
-          setOpen((o) => { localStorage.setItem('tq-wizard-maps-open', o ? '0' : '1'); return !o; });
+          setOpen((o) => {
+            try { localStorage.setItem('tq-wizard-maps-open', o ? '0' : '1'); } catch { /* ignore */ }
+            return !o;
+          });
         }}
-        title="Загрузка карт: OSM автоматически, Google/Яндекс по API-ключу, 2ГИС без ключа"
+        title="Загрузка карт: тот же путь, что в режиме планирования (OSM автоматически, Google/Яндекс по API-ключу, 2ГИС без ключа)"
       >
         🗺️ Карты {open ? '▾' : '▸'}
       </button>
-      {open && (
+      {open && createPortal(
         <div
+          ref={popRef}
           data-testid="wizard-maps-dropdown"
-          className="fixed z-[9999] w-80 overflow-y-auto rounded-lg border border-gray-600 bg-gray-900 p-2 shadow-2xl"
-          style={{ top: pos.top, left: pos.left, maxHeight: Math.max(200, pos.maxHeight) }}
+          className="fixed z-[2147483647] overflow-y-auto overscroll-contain rounded-lg border border-cyan-700/60 bg-gray-900 p-2 shadow-2xl text-white"
+          style={{ top: pos.top, left: pos.left, width: Math.min(336, window.innerWidth - 16), maxHeight: pos.maxHeight }}
         >
+          {/* КОПИЯ способа загрузки: точь-в-точь панель режима планирования
+              (MapsPanel) — единый обработчик handleLoadMap → loadActiveTileMap
+              с фиксацией над СПб и непрерывным зумом/панорамой. */}
           <MapsPanel />
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );
