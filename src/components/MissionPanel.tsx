@@ -63,7 +63,7 @@ const MissionPanel: React.FC = () => {
   };
 
   /** Демонстрация цикла управления из Блоков 2/6 на симуляторе DroneSim. */
-  const runSimCycle = async (): Promise<void> {
+  const runSimCycle = async (): Promise<void> => {
     const sim = new DroneSim('demo-uav', { lat: 59.93, lon: 30.33, batteryPct: 90 });
     const logs: string[] = [];
     try {
