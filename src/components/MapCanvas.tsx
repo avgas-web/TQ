@@ -13,7 +13,7 @@ import { ensureDefaultTileMap } from '../hooks/useAppInitialization';
 import MiniMapPanel, { MiniOverlayLine, MiniOverlayPoint, type MiniZone } from './MiniMapPanel';
 import { zoomForGroundMpp, GROUND_MPP_1CM_2KM } from '../utils/pannelli';
 import { eventBus } from '../utils/eventBus';
-import type { Point, Route, RoutePoint, MapBounds } from '../types';
+import type { Point, Route, RoutePoint, MapBounds, ViewState } from '../types';
 
 /** Границы зума тайловой карты: minZoom 3 (вся страна/регион), maxZoom 19 (уровни OSM).
  *  Раньше нижняя граница была z10 — поэтому «большая карта» (страна/область) не
@@ -26,6 +26,74 @@ const ROUTE_PALETTE = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#
 
 /** Нативный max zoom тайловых серверов (выше НЕ поднимаемся — нет данных, только растяжение) */
 const NATIVE_MAX_BY_SERVER: Record<string, number> = { osm: 19, carto: 18, opentopomap: 17, '2gis': 18 };
+
+/** КЛЮЧ сохранённого вида в localStorage. Раньше состояние камеры жило ТОЛЬКО в
+ *  zustand-persist ('tq-map'): любое зависание гонки гидрации/сброса сторов
+ *  приводило к viewState {offsetX:0, offsetY:0, scale:1} — при активной тайловой
+ *  карте width=height=4·2^26 px это ~268 млн пикселей на экран, т.е. растр
+ *  bounds-привязки уходил за десятки тысяч экранов и «загруженная» карта была
+ *  не видна. Теперь вид дублируется здесь же, независимо от persist-стора. */
+const VIEW_STORAGE_KEY = 'tq-view';
+
+/** Санация произвольного числа в конечное (NaN/Infinity → fallback). */
+function finiteOr(v: unknown, fallback: number): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+}
+
+/** Нормализация произвольного объекта вида в валидный ViewState. */
+function sanitizeView(o: any): ViewState | null {
+  if (!o || typeof o !== 'object') return null;
+  const offsetX = finiteOr(o.offsetX, NaN);
+  const offsetY = finiteOr(o.offsetY, NaN);
+  const scale = finiteOr(o.scale, NaN);
+  if (!Number.isFinite(offsetX) || !Number.isFinite(offsetY) || !(scale > 0)) return null;
+  const z0 = typeof o.z0 === 'number' && Number.isFinite(o.z0) ? o.z0 : undefined;
+  return { offsetX, offsetY, scale, z0 };
+}
+
+/** Чтение сохранённого вида из localStorage (независимо от persist-стора). */
+function readSavedView(): ViewState | null {
+  try {
+    const raw = localStorage.getItem(VIEW_STORAGE_KEY);
+    if (!raw) return null;
+    return sanitizeView(JSON.parse(raw));
+  } catch { return null; }
+}
+
+/** Запись вида в localStorage (частые записи троттлятся rAF-скобкой в компоненте). */
+function writeSavedView(v: ViewState): void {
+  try { localStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify(v)); } catch { /* quota/privacy mode */ }
+}
+
+/** Дефолтный стартовый зум активной карты (как в режиме планирования). */
+const DEFAULT_TILE_MAP_ZOOM = 10;
+/** Изначальная фокусировка всех окон карты — Санкт-Петербург (СПб). */
+const SPB_GEO_CONST = { lat: 59.9398, lng: 30.3146 };
+
+/** Ключ «пары карт» (источник + гео-привязка), по которому ведётся учёт
+ *  стартовых фиксаций вида. Совпадает с fitKey эффекта автоподгонки. */
+function mapFitKey(m: { dataUrl?: string; bounds?: MapBounds } | null | undefined): string {
+  if (!m || !m.bounds) return '';
+  const b = m.bounds;
+  return `${m.dataUrl ? 'img' : 'tiles'}|${b.north},${b.south},${b.west},${b.east}`;
+}
+
+/** Санация восстановленного из localStorage вида перед его применением.
+ *  Возвращает null, если вид нельзя использовать и нужна повторная
+ *  автоподгонка (стартовая фиксация над объектом загрузки / СПб):
+ *   • сам вид отсутствует или невалиден (NaN/Infinity/scale<=0);
+ *   • масштаб абсурден: zoom вне [MIN_ZOOM−1, MAX_ZOOM+2] — такой вид мог
+ *     возникнуть только от битой формулы подгонки (например scale≈3700 ⇔
+ *     z≈25.8 при мире z10) и разгоняет растровый цикл канваса до зависания;
+ *   • вид сохранён для ДРУГОЙ карты (ключ пары сменился) — иначе stale-вид
+ *     от предыдущей карты уводит камеру за пределы подложки («не видно»). */
+function sanitizeSavedView(v: ViewState | null, curKey: string, savedKey: string | null): ViewState | null {
+  if (!v) return null;
+  if (curKey && savedKey !== curKey) return null;
+  const z = zoomOfView(v.scale, v.z0 ?? ZOOM_REF);
+  if (!Number.isFinite(z) || z < MIN_ZOOM - 1 || z > MAX_ZOOM + 2) return null;
+  return v;
+}
 // Параметры аккуратной очереди загрузки тайлов (как на openstreetmap.org):
 // максимум параллельных загрузок и дебаунс новых волн во время жеста.
 const MAX_PARALLEL = 6;
@@ -49,6 +117,13 @@ const TILE_DEBOUNCE_MS = 150;
  * масштаб не может «сбиться», привязка строга на любом зуме от z3 до z19+.
  */
 const ZOOM_REF = 14; // эталонный стартовый zoom: scale=1 ⇔ мир = canvasHeight·2^14 px
+
+/** Нейтральный фолбэк-вид: только для типового сужения nullable-viewRef.
+ *  К моменту любого чтения вида компонент уже гарантированно инициализирован
+ *  (ленивая ветка `if (viewRef.current === null)` выполняется до рендера),
+ *  поэтому это значение фактически недостижимо — но делает все обращения к
+ *  `v.offsetX/v.scale` типобезопасными без точечных guard'ов в 30+ местах. */
+const NEUTRAL_VIEW: ViewState = { offsetX: 0, offsetY: 0, scale: 1, z0: ZOOM_REF };
 function zoomOfView(scale: number, z0?: number): number {
   return (z0 ?? ZOOM_REF) + Math.log2(Math.max(scale, 1e-12));
 }
@@ -432,8 +507,83 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   // ВАЖНО: viewRef инициализируется напрямую из стора (useStore.getState()), а не
   // из пропсов/деструктуризации — иначе при re-render до гидрации persist можно
   // получить undefined-вид (краш «viewState is not defined» / reading 'scale').
-  const viewRef = useRef(useStore.getState().viewState);
-  useEffect(() => { viewRef.current = useStore.getState().viewState; });
+  // ВАЖНО: viewRef инициализируется НЕ из «сырого» стора и не из пропсов:
+  // источник приоритетов — (1) сохранённый вид из localStorage-зеркала 'tq-view'
+  // (независим от гонки async-гидрации persist — именно она давала stale/нулевой
+  // viewState и «невидимую» карту в Мастере), (2) viewState стора, (3) дефолт.
+  // Любые NaN/Infinity/scale<=0 отбрасываются санатором — один NaN в offsetX
+  // делал transform слоя «NaNpx» и вся подложка исчезала навсегда.
+  // ── ФИКС «ВИСНЕТ НАМЕРТВО ПРИ ЗАГРУЗКЕ КАРТ» (корень #2) ──────────────────
+  // Стартовая фиксация вида над объектом загрузки (СПб по умолчанию) хранится
+  // В ОДНОМ месте — localStorage-зеркале 'tq-view' — вместе с ключом карты,
+  // для которой она сделана. При старте компонент восстанавливает её сюда же
+  // и в стор (setViewState): это идемпотентно, если persist-стор уже отдал
+  // точно такой же вид (гидрация zustand-persist 'tq-map' содержит тот же
+  // viewState). Раньше восстановление из зеркала НЕ публиковалось в стор, а
+  // «догонялка» store→viewRef отсутствовала: два источника разъезжались, и
+  // при remount (редактор↔мастер) канвас рисовался с одним видом, DOM-слой
+  // тайлов синхронизировался по другому, очередь уходила в бесконечную
+  // перезагрузку — страница «виснет намертво». Теперь приоритет источников
+  // жёсткий: зеркало → стор → дефолт, и всё сводится к одному состоянию.
+  const fitKeyInit = mapFitKey(useMapStore.getState().map);
+  const viewRef = useRef<ViewState | null>(null);
+  // Флаг «зеркало tq-view уже опознано на этом маунте»: пока он не снят,
+  // hydrating persist 'tq-map' НЕ имеет права затирать восстановленный вид
+  // своим stale-дефолтом (см. subscribe ниже). Снимается в rAF после маунта.
+  const mirrorResolvedRef = useRef(false);
+  if (viewRef.current === null) {
+    const savedRaw = readSavedView();
+    const savedKeyRaw = (() => {
+      try { return localStorage.getItem(`${VIEW_STORAGE_KEY}-map`); } catch { return null; }
+    })();
+    const restored = sanitizeSavedView(savedRaw, fitKeyInit, savedKeyRaw);
+    // Зеркало распознано (валидно либо осознанно отвергнуто по ключу карты) —
+    // с этого момента стор больше не является источником истины для viewRef.
+    mirrorResolvedRef.current = true;
+    viewRef.current = restored
+      ?? sanitizeView(useStore.getState().viewState)
+      ?? { offsetX: 0, offsetY: 0, scale: 1, z0: ZOOM_REF };
+  }
+  // Синхронизация стора с восстановленным зеркалом — ровно один раз на маунт
+  // (см. комментарий выше; setViewState с теми же значениями безопасен).
+  useEffect(() => {
+    const v = viewRef.current ?? NEUTRAL_VIEW;
+    if (!v) return;
+    const sv = useStore.getState().viewState;
+    if (sv.offsetX !== v.offsetX || sv.offsetY !== v.offsetY || sv.scale !== v.scale || sv.z0 !== v.z0) {
+      setViewState({ ...v });
+    }
+    // Зеркало опубликовано в стор — теперь подписка на стора может штатно
+    // отражать пользовательские жесты (drag/zoom) в viewRef и зеркало.
+    const raf = requestAnimationFrame(() => { mirrorResolvedRef.current = false; });
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // Зеркало вида в localStorage: запись троттлится rAF-скобкой (по кадру),
+  // чтобы drag-панорама не писала JSON на каждый mousemove.
+  const saveViewRafRef = useRef(0);
+  const writeMirrorNow = useCallback((): void => {
+    const v = viewRef.current ?? NEUTRAL_VIEW;
+    if (!v) return;
+    writeSavedView(v);
+    // привязка вида к конкретной карте — при смене карты зеркало
+    // не должно «переезжать» со stale-видом (иначе карта «не видна»)
+    try {
+      localStorage.setItem(`${VIEW_STORAGE_KEY}-map`, mapFitKey(useMapStore.getState().map));
+    } catch { /* quota/privacy mode */ }
+  }, []);
+  const scheduleSaveView = useCallback((): void => {
+    if (saveViewRafRef.current) return;
+    saveViewRafRef.current = requestAnimationFrame(() => {
+      saveViewRafRef.current = 0;
+      writeMirrorNow();
+    });
+  }, [writeMirrorNow]);
+  useEffect(() => () => {
+    if (saveViewRafRef.current) cancelAnimationFrame(saveViewRafRef.current);
+    // синхронный финальный снапшот при unmount — шаг мастера сменён, вид не теряется
+    writeMirrorNow();
+  }, [writeMirrorNow]);
   // Актуальная позиция курсора для «резинки» превью полигона (ref — без ре-рендера)
   const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
   const rafDrawRef = useRef(0);
@@ -447,9 +597,45 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   const [renderTick, setRenderTick] = useState(0);
   useEffect(() => {
     let raf = 0;
+    // ── ФИКС «ВИСНЕТ НАМЕРТВО ПРИ ЗАГРУЗКЕ КАРТ» (корень #1) ────────────────
+    // Гонка гидрации: zustand-persist 'tq-map' гидрируется АСИНХРОННО и после
+    // маунта карты мог прислать в подписку stale-дефолт {offsetX:0, offsetY:0,
+    // scale:1} — восстановленный из зеркала вид затирался, worldPx улетал на
+    // ~2^12 экранов, очередь тайлов переполнялась каждый кадр → вечный цикл
+    // перезагрузки («виснет намертво»). Пока зеркало не опубликовано в стор
+    // (mirrorResolvedRef), изменения вида из стора игнорируются: источник
+    // истины на этом этапе — сам компонент. После публикации стор штатно
+    // догоняется зеркалом, и обратного затирания уже невозможно добиться.
     const unsub = useStore.subscribe((s) => {
-      if (s.viewState === viewRef.current) return;
-      viewRef.current = s.viewState;
+      // ── ФИКС «ВИСНЕТ НАМЕРТВО» (корень #1, достройка) ────────────────────
+      // Валидация на входе: NaN/Infinity/scale<=0 из гидрируемого/битого стора
+      // никогда не попадают в viewRef — один NaN в offsetX делал transform DOM-
+      // слоя тайлов «NaNpx», подложка исчезала, а rAF-цикл рисования крутился
+      // впустую («виснет намертво»). Невалидное состояние игнорируется; стор
+      // догонит зеркало при следующем пользовательском жесте.
+      const next = sanitizeView(s.viewState);
+      if (!next) return;
+      // Ключевое отличие от прежней логики: viewRef больше НЕ заимствует ссылку
+      // на объект стора. Он всегда указывает на собственное значение компонента
+      // (или идентичный по содержимому снапшот). Иначе mirrorResolvedRef
+      // мгновенно сбрасывался бы самим же уведомлением стора и stale-дефолт
+      // гидрации всё равно затирал восстановленный вид.
+      const cur = viewRef.current;
+      const same = !!cur && cur.offsetX === next.offsetX && cur.offsetY === next.offsetY
+        && cur.scale === next.scale && cur.z0 === next.z0;
+      if (same) {
+        // Стор прислал то же самое значение новым объектом — принимаем ссылку
+        // (без ре-рендера), чтобы разорвать цикл «догонялок».
+        if (cur !== s.viewState) viewRef.current = s.viewState;
+        return;
+      }
+      if (mirrorResolvedRef.current) {
+        // Зеркало ещё не опубликовано в стор (гидрация persist запаздывает):
+        // изменения вида из стора ИГНОРИРУЕМ — источник истины сейчас компонент.
+        return;
+      }
+      viewRef.current = next;
+      scheduleSaveView();
       // Подложка OSM — DOM-слой: его позиция обновляется напрямую без
       // React-рендера (как на openstreetmap.org). Функция объявлена ниже через
       // useCallback — берём актуальную ссылку из ref, чтобы не создавать
@@ -459,9 +645,13 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       raf = requestAnimationFrame(() => { raf = 0; setRenderTick((t) => t + 1); });
     });
     return () => { unsub(); if (raf) cancelAnimationFrame(raf); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   // Актуальный вид для РЕНДЕРА (обновлён в последнем кадре)
-  const vs = viewRef.current;
+  // viewRef типизирован nullable (ленивая инициализация в теле компонента);
+  // к моменту рендера он ВСЕГДА заполнен — ветка `if (viewRef.current === null)`
+  // выполняется до первого возврата из хуков. Фолбэк — нейтральный вид.
+  const vs = viewRef.current ?? { offsetX: 0, offsetY: 0, scale: 1, z0: ZOOM_REF };
 
   // devicePixelRatio — для чёткого рендера на Retina/HiDPI экранах
   const dpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
@@ -495,7 +685,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   const positionTileLayer = useCallback(() => {
     const el = tileLayerRef.current;
     if (!el) return;
-    const v = viewRef.current;
+    const v = viewRef.current ?? NEUTRAL_VIEW;
     const cs = canvasSizeRef.current;
     // rAF/DOM-колбэк: читаем project безопасным читателем — сборка merged
     // агрегата шима здесь вызывала бы getSnapshot в фазе рендера (React #127).
@@ -556,7 +746,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       tileElsRef.current.clear();
       return;
     }
-    const v = viewRef.current;
+    const v = viewRef.current ?? NEUTRAL_VIEW;
     const cs = canvasSizeRef.current;
     if (!Number.isFinite(cs.width) || !Number.isFinite(cs.height) || cs.width <= 0 || cs.height <= 0) return;
     const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
@@ -1282,7 +1472,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       const map = st.map;
       if (!map?.bounds || map.width <= 0 || map.height <= 0) return;
       const r = canvas.getBoundingClientRect();
-      const v = viewRef.current;
+      const v = viewRef.current ?? NEUTRAL_VIEW;
       const mx = (e.clientX - r.left - v.offsetX) / v.scale;
       const my = (e.clientY - r.top - v.offsetY) / v.scale;
       const g = pixelToGeoExact({ x: mx, y: my }, map.bounds, map.width, map.height);
@@ -1372,7 +1562,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     const fx = focusX ?? canvasSize.width / 2;
     const fy = focusY ?? canvasSize.height / 2;
     // читаем актуальный вид из ref — колбэк стабилен и не пересоздаётся на каждый mousemove/wheel
-    const v = viewRef.current;
+    const v = viewRef.current ?? NEUTRAL_VIEW;
     let newScale = v.scale * factor;
     if (map?.bounds) {
       // Границы зума из единой инвариантной привязки: minZoom..maxNativeZoom сервера.
@@ -1563,7 +1753,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         if (prev.width === w && prev.height === h) return prev; // нет изменения — нет ре-рендера
         if (prev.width > 0 && prev.height > 0 && w > 0 && h > 0) {
           // инвариант вида: scale и z0 сохраняются, центр карты не «прыгает»
-          const v = viewRef.current;
+          const v = viewRef.current ?? NEUTRAL_VIEW;
           useStore.getState().setViewState({
             offsetX: v.offsetX + (w - prev.width) / 2,
             offsetY: v.offsetY + (h - prev.height) / 2,
@@ -1683,11 +1873,17 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     const map = project.map;
     if (!map?.bounds || canvasSize.height <= 0) return;
     const key = `${map.name}|${map.bounds.north.toFixed(6)},${map.bounds.south.toFixed(6)}`;
-    if (lastFittedMapRef.current === key && viewRef.current.z0 != null) return;
+    if (lastFittedMapRef.current === key && viewRef.current?.z0 != null) return;
     lastFittedMapRef.current = key;
-    // z0 — ЭТАЛОН привязки (14): мир = canvasHeight·2^(z0+log2 scale). Постоянен
-    // для всех карт — вид восстанавливается из persist точно, масштаб не «сбивается».
-    if (viewRef.current.z0 !== ZOOM_REF) setViewState({ z0: ZOOM_REF });
+    // ── ФИКС «ВИСНЕТ НАМЕРТВО ПРИ ЗАГРУЗКЕ КАРТ» (корень #3) ────────────────
+    // Раньше этот эффект СБРАСЫВАЛ z0 восстановленного вида на ZOOM_REF=14 при
+    // каждом remount'е (редактор↔мастер), в то время как offsetX/offsetY/scale
+    // оставались от сохранённого вида с другим z0. Итоговый worldPx уходил на
+    // ~2^12 экранов: очередь тайлов бесконечно переполнялась (budget не спасал —
+    // элементы создавались заново каждый кадр синхронизации), растровый цикл
+    // канваса не завершался → страница «виснет намертво». Теперь z0 сохранённого
+    // вида НЕ трогаем: он уже корректен (эталон записан при стартовой подгонке).
+    if (viewRef.current?.z0 == null) setViewState({ z0: ZOOM_REF });
   }, [project.map?.name, project.map?.bounds, canvasSize.height]);
 
   // Auto-fit view: при загрузке карты — вписать её; если на карте есть объекты
@@ -1703,6 +1899,34 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     if (lastInitialFitRef.current === fitKey) return; // только ОДИН раз на карту — ресайз вид не трогает
     lastInitialFitRef.current = fitKey;
     if (!map.bounds) return;
+    // ── ФИКС «ВИСНЕТ НАМЕРТВО ПРИ ЗАГРУЗКЕ КАРТ» + «Фиксация над СПб» ───────
+    // Стартовая фиксация вида выполняется ровно ОДИН раз для конкретной карты:
+    // если в localStorage-зеркале уже есть валидный сохранённый вид именно для
+    // ЭТОЙ карты (ключ пары совпал), повторная подгонка НЕ делается — иначе
+    // при каждом remount'е редактор↔мастер вид пересчитывался, стор и viewRef
+    // разъезжались по z0, и тайловая очередь уходила в бесконечный цикл.
+    // Отсутствие/несовпадение ключа → штатная стартовая фиксация (центр
+    // bounds — объект загрузки: Москва/СПб — и запрошенный зум). После любой
+    // фиксации пользователь свободно двигает и масштабирует карту: панорама
+    // и непрерывный зум (DOM-тайлы уровня round(zoom) с плавным 2^(zoom−level))
+    // дают чёткость на всём диапазоне z3..z19+ без перезагрузки подложки.
+    {
+      let savedKey: string | null = null;
+      try { savedKey = localStorage.getItem(`${VIEW_STORAGE_KEY}-map`); } catch { savedKey = null; }
+      const curKey = mapFitKey(map);
+      if (sanitizeSavedView(readSavedView(), curKey, savedKey)) {
+        // Валидное восстановление — приводим стор к тому же виду (идемпотентно,
+        // если гидрация persist уже отдала идентичный viewState) и выходим.
+        const v = viewRef.current ?? NEUTRAL_VIEW;
+        if (v) {
+          const sv = useStore.getState().viewState;
+          if (sv.offsetX !== v.offsetX || sv.offsetY !== v.offsetY || sv.scale !== v.scale || sv.z0 !== v.z0) {
+            setViewState({ ...v });
+          }
+        }
+        return;
+      }
+    }
     // ИНВАРИАНТНЫЙ ЭТАЛОН z0: привязка вида задаётся формулой worldPx = vh·2^zoom,
     // zoom = ZOOM_REF + log2(scale). Он НЕ зависит от размеров окна — поэтому
     // масштаб не «сбивается» при ресайзе/восстановлении из persist.
@@ -1792,6 +2016,11 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         z0: zFix,
       });
     }
+    // ── ФИКС «ВИСНЕТ НАМЕРТВО» (корень #4): зафиксированный стартовый вид
+    // немедленно уходит в localStorage-зеркало 'tq-view' СИНХРОННО. Без этого
+    // remount до ближайшего кадра/жеста читал бы зеркало со stale-видом или
+    // без ключа карты → повторная подгонка → гонка стора и зеркала.
+    writeMirrorNow();
   }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled, mapLoaded, canvasSize.width]);
 
   // Отдельный эффект: при ПЕРВОМ появлении объектов на новой карте —
@@ -1816,13 +2045,13 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     const fitKey = String(map.mapId || '') + ':' + (pts.length > 0 ? 'has' : 'empty');
     if (lastFitKeyRef.current === fitKey) return;
     lastFitKeyRef.current = fitKey;
-    const fit = fitViewToData(map.width, map.height, map.bounds, pts, canvasSize.width, canvasSize.height, viewRef.current.z0);
+    const fit = fitViewToData(map.width, map.height, map.bounds, pts, canvasSize.width, canvasSize.height, viewRef.current?.z0);
     if (fit) setViewState(fit);
   }, [project.routes, project.markers, mapLoaded, canvasSize.width, canvasSize.height, project.map?.bounds]);
 
   // Convert screen coordinates to map coordinates (читаем вид из ref — стабильный колбэк)
   const screenToMap = useCallback((screenX: number, screenY: number): Point => {
-    const v = viewRef.current;
+    const v = viewRef.current ?? NEUTRAL_VIEW;
     return {
       x: (screenX - v.offsetX) / v.scale,
       y: (screenY - v.offsetY) / v.scale,
@@ -1844,7 +2073,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   const loadActiveTileHere = useCallback((): void => {
     const st = useStore.getState();
     const cs = canvasSizeRef.current;
-    const v = viewRef.current;
+    const v = viewRef.current ?? NEUTRAL_VIEW;
     const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
     const latC = mercToLat((cs.height / 2 - v.offsetY) / wp);
     const lngC = ((cs.width / 2 - v.offsetX) / wp) * 360 - 180;
@@ -2761,7 +2990,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     if (st.mode === 'pan' && e.touches.length === 1) {
       const dx = e.touches[0].clientX - st.x;
       const dy = e.touches[0].clientY - st.y;
-      const vcur = viewRef.current; // актуальный вид из ref — колбэк не зависит от state
+      const vcur = viewRef.current ?? NEUTRAL_VIEW; // актуальный вид из ref — колбэк не зависит от state
       setViewState({ offsetX: vcur.offsetX + dx, offsetY: vcur.offsetY + dy });
       touchState.current = { ...st, x: e.touches[0].clientX, y: e.touches[0].clientY };
     } else if (st.mode === 'pinch' && e.touches.length === 2) {
@@ -2845,7 +3074,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       //    клик рядом с точкой — «цепляем» её и тянем (drag), двойной клик — удаляем.
       const routes = project.routes || [];
       const activeRoute = routes.find((r) => r.id === activeRouteId && r.visible);
-      const grabPx = 12 / viewRef.current.scale; // радиус захвата в пикселях карты (~12 экранных px)
+      const grabPx = 12 / (viewRef.current?.scale ?? 1); // радиус захвата в пикселях карты (~12 экранных px)
 
       if (activeRoute) {
         let bestI = -1;
@@ -2892,7 +3121,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       const clickedMarker = [...project.markers].reverse().find(m => {
         const dx = mapPoint.x - m.x;
         const dy = mapPoint.y - m.y;
-        return Math.sqrt(dx * dx + dy * dy) < 15 / viewRef.current.scale;
+        return Math.sqrt(dx * dx + dy * dy) < 15 / (viewRef.current?.scale ?? 1);
       });
       if (clickedMarker) {
         selectMarker(clickedMarker.id);
@@ -3039,7 +3268,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     if (isPanningRef.current) {
       const dx = e.clientX - panStartRef.current.x;
       const dy = e.clientY - panStartRef.current.y;
-      const vcur = viewRef.current; // актуальный вид из ref — колбэк стабилен между mousemove
+      const vcur = viewRef.current ?? NEUTRAL_VIEW; // актуальный вид из ref — колбэк стабилен между mousemove
       setViewState({
         offsetX: vcur.offsetX + dx,
         offsetY: vcur.offsetY + dy,
@@ -3096,7 +3325,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       const mp = screenToMap(e.clientX - rect.left, e.clientY - rect.top);
       const route = (project.routes || []).find((r) => r.id === activeRouteId);
       if (route) {
-        const grabPx = 12 / viewRef.current.scale;
+        const grabPx = 12 / (viewRef.current?.scale ?? 1);
         let bi = -1, bd = Infinity;
         for (let i = 0; i < route.points.length; i++) {
           const p = route.points[i];
@@ -3177,7 +3406,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // mpp для 1 см = 100 м: 100 м / (0.3937 css px) ≈ 254 м на css px... считаем через zoom:
     // mppEq(z) * cos(lat) = 100 / 37.795 → z = log2(156543.0339*cos(lat)/mpp)
     const latC = centerLatOf(map.bounds);
-    const vcur = viewRef.current; // актуальный вид из ref — колбэк стабилен
+    const vcur = viewRef.current ?? NEUTRAL_VIEW; // актуальный вид из ref — колбэк стабилен
     const targetMpp = 100 / (2.54 / 96 * 100); // 100 м на 1 см экрана
     // Обратная задача: мир в px под целевые м/пиксель, затем scale относительно z0
     const worldTarget = worldPxForMetersPerPixel(targetMpp, latC);
@@ -3342,10 +3571,13 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         onKeyDown={(e) => {
           if (e.key === '+' || e.key === '=') zoomAt(2);
           else if (e.key === '-') zoomAt(0.5);
-          else if (e.key === 'ArrowLeft') setViewState({ offsetX: viewRef.current.offsetX + 40 });
-          else if (e.key === 'ArrowRight') setViewState({ offsetX: viewRef.current.offsetX - 40 });
-          else if (e.key === 'ArrowUp') setViewState({ offsetY: viewRef.current.offsetY + 40 });
-          else if (e.key === 'ArrowDown') setViewState({ offsetY: viewRef.current.offsetY - 40 });
+          // Пан стрелками: приоритет ?? связывается СЛАБЕЕ арифметики, поэтому
+          // скобки обязательны — иначе при пустом ref получалось 0+40/0-40 вместо
+          // сдвига текущего вида (и «0 - 40» уводило камеру на −40 px).
+          else if (e.key === 'ArrowLeft') setViewState({ offsetX: (viewRef.current?.offsetX ?? 0) + 40 });
+          else if (e.key === 'ArrowRight') setViewState({ offsetX: (viewRef.current?.offsetX ?? 0) - 40 });
+          else if (e.key === 'ArrowUp') setViewState({ offsetY: (viewRef.current?.offsetY ?? 0) + 40 });
+          else if (e.key === 'ArrowDown') setViewState({ offsetY: (viewRef.current?.offsetY ?? 0) - 40 });
           else return;
           // Предотвращаем прокрутку страницы стрелками/зумом с клавиатуры
           e.preventDefault();
