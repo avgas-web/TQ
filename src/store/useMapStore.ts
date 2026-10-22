@@ -438,6 +438,14 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
       map: mapData,
       settings: { ...state.settings, tilesEnabled: true },
     }));
+    // ФИКС «ОТДЕЛЬНОЕ ОКНО КАРТЫ МАСТЕРА грузится, но долго не видно»:
+    // как только тайловая карта активирована, подложка физически существует —
+    // публикуем готовность СРАЗУ, не дожидаясь onload каждого <img>-тайла
+    // (в редакторе-планировщике тот же флаг ставится этим же путём). Иначе
+    // readiness-логика мастера блокировала карту/клики до прихода первого
+    // тайла с CDN, а при медленной сети оверлей «Карта ещё не загружена»
+    // висел бесконечно — «в мастерской карте ничего не видно».
+    get().publishMapLoaded(true);
     void import('./useMissionStore').then((m) => m.useMissionStore.getState().refreshAllRoutesAfterMapChange());
   },
 

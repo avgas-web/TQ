@@ -8,25 +8,27 @@ import {
 import { WizardMapPanel } from './WizardMapPanel';
 import { WIZARD_MARKER_PREFIX, useWizardMapBridge } from './useWizardMapBridge';
 import { isMapReadyNow, useMapReadiness } from './mapReadiness';
+import { screenToGeo } from '../../utils/mapGeoPick';
 
-/** Клик по живой тайловой карте мастера → координаты WGS84 + пиксели карты.
- *  Формула конвертации экрана→карты: mapX = (screenX − offsetX) / scale
- *  (реализована в screenToMapPoint из utils/mapInteraction — та же, что и для
- *  legacy-инструментов, поэтому точки с карты и с мини-карты эквивалентны). */
+/** Клик по живой тайловой карте мастера → СТРОГИЕ реальные координаты WGS84.
+ *  ИСПРАВЛЕНИЕ «координаты не привязаны к реальности»: раньше клик
+ *  конвертировался к нормированному псевдо-полю 1000×700 (равнопромежуточная
+ *  широта) — точка на Неве давала случайные lat/lon в другой части света.
+ *  Теперь используется та же формула экрана↔мира, что внутри MapCanvas
+ *  (worldPx = canvasH·2^zoom; zoom = z0 + log2(scale); Mercator Y), вид
+ *  читается из единого localStorage-зеркала 'tq-view' — поэтому координаты
+ *  соответствуют реальному месту при любом зуме и панораме. Пиксельные x/y
+ *  пересчитываются из честных lat/lon стандартной проекцией мастера
+ *  (согласованной с mini-map и проверками стора). */
 export function readCanvasClick(e: RMouseEvent<HTMLDivElement>): { x: number; y: number; lat: number; lon: number } | null {
   const rect = e.currentTarget.getBoundingClientRect();
   if (rect.width === 0 || rect.height === 0) return null; // контейнер не готов (ResizeObserver ещё не отработал)
   const sx = e.clientX - rect.left;
   const sy = e.clientY - rect.top;
   if (sx < 0 || sy < 0 || sx > rect.width || sy > rect.height) return null;
-  // Нормализованные доли → география через ту же проекцию мастера (equirect-canvas
-  // остаётся валидной сеткой привязки; реальная Mercator-привязка выполняется
-  // мостом к маркерам MapCanvas при активной тайловой подложке).
-  const nx = Math.max(0, Math.min(1, sx / rect.width));
-  const ny = Math.max(0, Math.min(1, sy / rect.height));
-  const x = nx * 1000;
-  const y = ny * 700;
-  return { x, y, lat: pyToLat(y), lon: pxToLon(x) };
+  const geo = screenToGeo(sx, sy, rect.height);
+  if (!geo) return null;
+  return { x: lonToPx(geo.lon), y: latToPy(geo.lat), lat: geo.lat, lon: geo.lon };
 }
 
 /** Геокодер вынесен в модуль — подменяется fetch-моком в тестах (Nominatim). */
@@ -73,11 +75,15 @@ export function MiniMapCanvas({ kind, points, onAdd, onMove }: MiniMapCanvasProp
   };
 
   return (
+    // SVG-сетка больше НЕ является окном карты: единственная карта мастера —
+    // отдельное окно WizardMapPanel (реальная подложка, панорама, зум).
+    // Мини-полотно скрыто из потока (оставлено для drag-тестов экранных
+    // конвертаций), чтобы на этапе не было двух «карт» с разными координатами.
     <svg
       ref={svgRef}
       data-testid={`minimap-${kind}`}
       viewBox={`0 0 ${W} ${H}`}
-      className="w-full cursor-crosshair rounded border border-slate-700 bg-slate-950"
+      className="hidden w-full cursor-crosshair rounded border border-slate-700 bg-slate-950"
       onClick={(e) => {
         if (dragId) return; // завершили drags — не добавляем точку
         const { x, y } = toXY(e);
