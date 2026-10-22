@@ -85,9 +85,19 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
       {hint && (
         <div className="border-b border-slate-800 bg-slate-900 px-2 py-1 text-[11px] text-slate-300">{hint}</div>
       )}
-      {/* Явные размеры контейнера обязательны: ResizeObserver внутри MapCanvas
-          стартует загрузку тайлов только после получения ненулевых размеров. */}
-      <div className="relative min-h-0 flex-1" style={{ height: '100%' }}>
+      {/* ФИКС «Не удалось определить размер карты»: раньше здесь был
+          style={{ height: '100%' }} — в flex-колонке мастера (этап →
+          wizard-live-map → panel) процентная высота НЕ разрешается, если у
+          родителя нет явной высоты: контейнер схлопывался в 0px, ResizeObserver
+          фиксировал нулевой размер и срабатывал circuit breaker размеров.
+          В режиме планирования карта работает именно потому, что её контейнер
+          имеет ЯВНУЮ высоту в пикселях. Копируем тот же подход: явная
+          минимальная высота + flex-1 (растяжение на свободное место), без
+          зависимости от height:100%. */}
+      <div
+        className="relative w-full min-h-[240px] flex-1 overflow-hidden"
+        data-testid="wizard-map-container"
+      >
         <MapCanvas onMapLoaded={onMapLoaded} />
         {!status.ready && (
           <div

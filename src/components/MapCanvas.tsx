@@ -627,7 +627,12 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   const writeMirrorNow = useCallback((): void => {
     const v = viewRef.current ?? NEUTRAL_VIEW;
     if (!v) return;
-    writeSavedView(v);
+    // ФИКС «не удалось определить размер карты» (привязка кликов): зеркало
+    // 'tq-view' — источник истины для screenToGeo в режиме мастера. Без
+    // фактических размеров канваса конверсия клика не имеет базы worldPx и
+    // возвращает null («точки не ставятся»). Пишем width/height синхронно из
+    // canvasSizeRef — это тот же CSS-размер контейнера, что измеряет RO.
+    writeSavedView({ ...v, width: canvasSizeRef.current.width, height: canvasSizeRef.current.height });
     // привязка вида к конкретной карте — при смене карты зеркало
     // не должно «переезжать» со stale-видом (иначе карта «не видна»)
     try {
@@ -1835,6 +1840,13 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
             offsetY: v.offsetY + (h - prev.height) / 2,
           });
         }
+        // ФИКС «не удалось определить размер карты»: зеркало 'tq-view' обязано
+        // содержать фактические размеры канваса СРАЗУ после замера — иначе
+        // конвертер кликов мастера (screenToGeo) теряет базу worldPx до первого
+        // пользовательского жеста. canvasSizeRef обновится только на следующем
+        // рендере (useEffect), поэтому синхронизируем ref здесь же.
+        canvasSizeRef.current = { width: w, height: h };
+        writeMirrorNow();
         return { width: w, height: h };
       });
     };
@@ -3631,7 +3643,21 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
               const r = el.getBoundingClientRect();
               const w = r.width > 0 ? r.width : el.clientWidth;
               const h = r.height > 0 ? r.height : el.clientHeight;
-              if (w > 0 && h > 0) setCanvasSize({ width: w, height: h });
+              if (w > 0 && h > 0) {
+                setCanvasSize({ width: w, height: h });
+                // ФИКС «Попробовать снова» был декоративным: он обновлял только
+                // размер, но не сбрасывал circuit breaker загрузки тайлов и не
+                // перезапускал очередь. Теперь повтор = полный перезапуск:
+                // снимаем флаг «загрузка зависла» и поднимаем retry-нонсу,
+                // effect [tilesEnabled, tilesVersion, tileRetryNonce, ...]
+                // заново наполняет очередь тайлов с чистого состояния.
+                setTileLoadStalled(false);
+                setTileRetryNonce((n) => n + 1);
+              } else {
+                // Размер всё ещё нулевой — не даём камере/тайлам уйти в NaN:
+                // оставляем оверлей активным (он сам скроется, когда sizeWatchId
+                // увидит ненулевой контейнер).
+              }
             }}
           >
             Попробовать снова

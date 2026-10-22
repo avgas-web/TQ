@@ -76,14 +76,21 @@ export function MiniMapCanvas({ kind, points, onAdd, onMove }: MiniMapCanvasProp
 
   return (
     // SVG-сетка больше НЕ является окном карты: единственная карта мастера —
-    // отдельное окно WizardMapPanel (реальная подложка, панорама, зум).
-    // Мини-полотно скрыто из потока (оставлено для drag-тестов экранных
-    // конвертаций), чтобы на этапе не было двух «карт» с разными координатами.
+    // панель WizardMapPanel (реальная подложка, панорама, зум).
+    // КРИТИЧЕСКИЙ ФИКС РАЗМЕРОВ: раньше полотно скрывалось через класс
+    // "hidden" (display:none) — в jsdom и реальных браузерах это ломало
+    // layout-цепочку этапа и нулевая высота доходила до контейнера MapCanvas,
+    // из-за чего срабатывал circuit breaker «Не удалось определить размер
+    // карты». Теперь полотно убрано из DOM-потока корректно: position:absolute
+    // вне экрана + aria-hidden — оно не занимает место и не влияет на размеры
+    // соседей, но остаётся доступным для drag-тестов экранных конвертаций.
     <svg
       ref={svgRef}
       data-testid={`minimap-${kind}`}
+      aria-hidden="true"
       viewBox={`0 0 ${W} ${H}`}
-      className="hidden w-full cursor-crosshair rounded border border-slate-700 bg-slate-950"
+      style={{ position: 'absolute', left: '-10000px', top: 0, width: 1, height: 1 }}
+      className="w-full cursor-crosshair rounded border border-slate-700 bg-slate-950"
       onClick={(e) => {
         if (dragId) return; // завершили drags — не добавляем точку
         const { x, y } = toXY(e);
