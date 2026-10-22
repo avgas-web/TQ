@@ -59,13 +59,24 @@ export function getActiveZonesCached(restrictions: Restriction[]): Restriction[]
  * с гарантированно числовыми полями; отсутствующее/битое z0 принудительно
  * помечается как undefined — все потребители вида трактуют undefined z0 как
  * эталонный ZOOM_REF (`z0 ?? ZOOM_REF`).
+ * ── ФИКС «ВИСНЕТ НАМЕРТВО» (санация битого localStorage) ────────────────────
+ * Если scale невалиден (<=0 / NaN / Infinity) или абсурден (вне [1e-6, 1e6] ⇔
+ * zoom ~[−7..+34]) — возвращаются NaN-маркеры вместо «почти валидных» дефолтов
+ * {offsetX:0, offsetY:0, scale:1}: такой вид заведомо непригоден, и потребители
+ * (sanitizeView в MapCanvas) обязаны отвергнуть его и включить СПб-фолбэк, а не
+ * молча принять stale-дефолт гидрации (именно он уводил камеру на ~2^12 экранов
+ * от подложки → вечная перезагрузка тайлов).
  */
 export function normalizeViewState(v: unknown): ViewState {
   const o = (v ?? {}) as Record<string, unknown>;
   const num = (x: unknown, dflt: number): number =>
     typeof x === 'number' && Number.isFinite(x) ? x : dflt;
   const z0 = typeof o.z0 === 'number' && Number.isFinite(o.z0) ? o.z0 : undefined;
-  return { offsetX: num(o.offsetX, 0), offsetY: num(o.offsetY, 0), scale: num(o.scale, 1), z0 };
+  const rawScale = typeof o.scale === 'number' ? o.scale : NaN;
+  if (!Number.isFinite(rawScale) || !(rawScale > 0) || rawScale < 1e-6 || rawScale > 1e6) {
+    return { offsetX: NaN, offsetY: NaN, scale: NaN, z0 };
+  }
+  return { offsetX: num(o.offsetX, 0), offsetY: num(o.offsetY, 0), scale: rawScale, z0 };
 }
 
 // ─── Типы стора ────────────────────────────────────────────────

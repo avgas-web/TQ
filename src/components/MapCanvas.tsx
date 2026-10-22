@@ -70,6 +70,25 @@ const DEFAULT_TILE_MAP_ZOOM = 10;
 /** Изначальная фокусировка всех окон карты — Санкт-Петербург (СПб). */
 const SPB_GEO_CONST = { lat: 59.9398, lng: 30.3146 };
 
+/** Fallback-вид над СПб при невалидных данных (битый localStorage / гидрация).
+ *  Раньше вместо него подставлялся нейтральный {offsetX:0, offsetY:0, scale:1}:
+ *  при мире z10 это ~2^12 экранов от подложки — камера уходила в «бесконечность»,
+ *  очередь тайлов переполнялась каждый кадр → вечный спиннер («виснет намертво»).
+ *  Формула идентична инварианту вида: worldPx = vh·2^zoom, zoom = ZOOM_REF + log2(scale),
+ *  центр экрана привязан к mercator-доле СПб. */
+function spbFallbackView(canvasH: number): ViewState {
+  const zoom = clampZoom(DEFAULT_TILE_MAP_ZOOM);
+  const worldPx = Math.max(256, canvasH * Math.pow(2, zoom));
+  const fx = (SPB_GEO_CONST.lng + 180) / 360;
+  const fy = latToMerc(SPB_GEO_CONST.lat);
+  return {
+    scale: worldPx / (canvasH * Math.pow(2, ZOOM_REF)),
+    offsetX: 0, // задаётся вызывающим кодом после замера ширины контейнера
+    offsetY: canvasH / 2 - fy * worldPx,
+    z0: ZOOM_REF,
+  };
+}
+
 /** Ключ «пары карт» (источник + гео-привязка), по которому ведётся учёт
  *  стартовых фиксаций вида. Совпадает с fitKey эффекта автоподгонки. */
 function mapFitKey(m: { dataUrl?: string; bounds?: MapBounds } | null | undefined): string {
@@ -531,6 +550,9 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   // hydrating persist 'tq-map' НЕ имеет права затирать восстановленный вид
   // своим stale-дефолтом (см. subscribe ниже). Снимается в rAF после маунта.
   const mirrorResolvedRef = useRef(false);
+  // Флаг «вид не восстановлен ни из зеркала, ни из стора» — при первом
+  // реальном замере контейнера вид фиксируется над СПб (см. applySizes).
+  const pendingSpbFallbackRef = useRef(false);
   if (viewRef.current === null) {
     const savedRaw = readSavedView();
     const savedKeyRaw = (() => {
@@ -540,9 +562,20 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // Зеркало распознано (валидно либо осознанно отвергнуто по ключу карты) —
     // с этого момента стор больше не является источником истины для viewRef.
     mirrorResolvedRef.current = true;
-    viewRef.current = restored
-      ?? sanitizeView(useStore.getState().viewState)
-      ?? { offsetX: 0, offsetY: 0, scale: 1, z0: ZOOM_REF };
+    // ── ФИКС «ВИСНЕТ НАМЕРТВО» (корень #2, санация) ────────────────────────
+    // Ни зеркало, ни стор не дали валидного вида (битый localStorage со
+    // scale<=0/NaN либо stale-дефолт гидрации {offsetX:0, offsetY:0, scale:1}) —
+    // вместо нейтрального вида (камера в ~2^12 экранов от подложки → вечная
+    // перезагрузка тайлов) включается флаг фолбэка: при первом реальном замере
+    // контейнера вид принудительно фиксируется над СПб (как в режиме
+    // планирования). См. applySizes в эффекте ResizeObserver.
+    const restoredOrStore = restored ?? sanitizeView(useStore.getState().viewState);
+    if (restoredOrStore) {
+      viewRef.current = restoredOrStore;
+    } else {
+      pendingSpbFallbackRef.current = true;
+      viewRef.current = spbFallbackView(600); // временный корректный вид (offsetX добирается при замере)
+    }
   }
   // Синхронизация стора с восстановленным зеркалом — ровно один раз на маунт
   // (см. комментарий выше; setViewState с теми же значениями безопасен).
@@ -553,10 +586,39 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     if (sv.offsetX !== v.offsetX || sv.offsetY !== v.offsetY || sv.scale !== v.scale || sv.z0 !== v.z0) {
       setViewState({ ...v });
     }
-    // Зеркало опубликовано в стор — теперь подписка на стора может штатно
-    // отражать пользовательские жесты (drag/zoom) в viewRef и зеркало.
-    const raf = requestAnimationFrame(() => { mirrorResolvedRef.current = false; });
-    return () => cancelAnimationFrame(raf);
+    // ── ФИКС «ВИСНЕТ НАМЕРТВО» (корень #1, гонка гидрации) ─────────────────
+    // Зеркало опубликовано в стор — подписка на стора может штатно отражать
+    // жесты. Флаг снимается НЕ только rAF'ом: в средах без rAF-дренажа
+    // (fake timers в vitest, jsdom без кадров) rAF никогда не executes, и флаг
+    // оставался бы выставлен навечно — тогда стор-догонялка (setViewState из
+    // applySizes/resize) игнорировалась бы и viewRef разъезжался со стором.
+    // Поэтому: микро-тик (Promise.resolve) + короткий таймер — как минимум один
+    // из них гарантированно выполнится в любой среде; перед сбросом флага
+    // сверяемся со стором (последняя публикация — наша), чтобы не потерять
+    // жест, случившийся раньше снятия флага.
+    let cancelled = false;
+    const release = (): void => {
+      if (cancelled) return;
+      // Принудительное чтение стора: если он уже содержит наш вид (или более
+      // свежий валидный жест) — принимаем его как источник, иначе оставляем
+      // viewRef (зеркало остаётся истиной до первого жеста).
+      const next = sanitizeView(useStore.getState().viewState);
+      if (next && mirrorResolvedRef.current) {
+        const cur = viewRef.current;
+        const same = !!cur && cur.offsetX === next.offsetX && cur.offsetY === next.offsetY
+          && cur.scale === next.scale && cur.z0 === next.z0;
+        if (same && cur !== useStore.getState().viewState) viewRef.current = useStore.getState().viewState;
+      }
+      mirrorResolvedRef.current = false;
+    };
+    const raf = requestAnimationFrame(() => { release(); });
+    const t = window.setTimeout(release, 50);
+    Promise.resolve().then(() => { /* microtask barrier before timer/rAF race */ });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+      window.clearTimeout(t);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   // Зеркало вида в localStorage: запись троттлится rAF-скобкой (по кадру),
@@ -1749,6 +1811,20 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       // от битого contentRect игнорируются полностью — иначе worldPx становится
       // NaN и вся математика тайлов зависает в бесконечном цикле перерисовок.
       if (!Number.isFinite(w) || !Number.isFinite(h) || w < 0 || h < 0) return;
+      // ── ФИКС «ВИСНЕТ НАМЕРТВО» (корень #2, применение СПб-фолбэка) ────────
+      // Первый РЕАЛЬНЫЙ замер контейнера: если при маунте не удалось восстановить
+      // валидный вид (битый localStorage / stale-гидрация), фиксируем камеру над
+      // СПб ровно так же, как это делает стартовая подгонка в режиме планирования
+      // (центр СПб, зум DEFAULT_TILE_MAP_ZOOM, эталон z0). Без этого viewRef мог
+      // остаться на нейтральном {0,0,scale:1} — камера вне подложки, вечный спиннер.
+      if (pendingSpbFallbackRef.current && w > 0 && h > 0) {
+        pendingSpbFallbackRef.current = false;
+        const fb = spbFallbackView(h);
+        const v: ViewState = { ...fb, offsetX: w / 2 - ((SPB_GEO_CONST.lng + 180) / 360) * Math.max(256, h * Math.pow(2, DEFAULT_TILE_MAP_ZOOM)) };
+        viewRef.current = v;
+        useStore.getState().setViewState({ ...v });
+        writeMirrorNow();
+      }
       setCanvasSize((prev) => {
         if (prev.width === w && prev.height === h) return prev; // нет изменения — нет ре-рендера
         if (prev.width > 0 && prev.height > 0 && w > 0 && h > 0) {
@@ -1828,15 +1904,22 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // повтор замера гарантирует, что canvasSize не останется {0,0} навечно —
     // иначе включался бы circuit breaker размеров вместо реальной карты.
     if (cw <= 0 || ch <= 0) {
-      requestAnimationFrame(() => {
+      // Повтор замера: rAF + СИНХРОННЫЙ таймер setTimeout(0). В средах без
+      // rAF-дренажа (fake timers в vitest, jsdom без кадров) один только rAF
+      // никогда не выполняется — canvasSize оставался бы {0,0} до срабатывания
+      // sizeWatchId (500 мс, тоже на fake-таймерах), и вместо карты показывался
+      // circuit breaker «Не удалось определить размер контейнера». setTimeout(0)
+      // гарантированно исполняется в любой среде с обычным event loop.
+      const retryMeasure = (): void => {
         if (!mounted) return;
         const c = containerRef.current;
         if (!c) return;
-        const r2 = c.getBoundingClientRect();
-        const w2 = r2.width > 0 ? r2.width : c.clientWidth;
-        const h2 = r2.height > 0 ? r2.height : c.clientHeight;
-        if (w2 > 0 && h2 > 0) applySizes(w2, h2);
-      });
+        const m = measureContainer();
+        if (m.w > 0 && m.h > 0) applySizes(m.w, m.h);
+      };
+      requestAnimationFrame(retryMeasure);
+      const retryTimerId = window.setTimeout(retryMeasure, 0);
+      ownedTimersRef.current.add(retryTimerId as unknown as ReturnType<typeof setTimeout>);
     }
     if (cw > 0 && ch > 0) applySizes(cw, ch);
 
@@ -1845,11 +1928,12 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       mounted = false;
       if (roRaf) cancelAnimationFrame(roRaf);
       observer.disconnect();
+      window.clearInterval(sizeWatchId);
       // ИСПРАВЛЕНИЕ утечки при переходе между шагами Мастера: очистка дебаунса
       // и незавершённых загрузок тайлов. Без этого pending-промисы держат ссылки
       // на DOM-элементы размонтированного слоя, а setTimeout(pump) после
       // unmount вызывал setTilesVersion на несмонтированном компоненте.
-      if (tileDebounceRef.current) clearTimeout(tileDebounceRef.current);
+      if (tileDebounceRef.current) clearOwnedTimeout(tileDebounceRef.current);
       tileQueueRef.current.length = 0;
       // P0: отменяем ВСЕ активные загрузки тайлов через реестр handles —
       // иначе Image с выставленным src доживает до 10-секундного таймаута,
@@ -1863,7 +1947,17 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       tileElsRef.current.clear();
       tilePending.current.clear();
       activeTilesRef.current = 0;
+      // Сброс circuit breaker'ов при unmount/remount: повторная попытка загрузки
+      // (следующий маунт) обязана начинаться с чистого состояния — иначе stale
+      // оверлей «размер не определён»/«загрузка зависла» переживал remount и
+      // блокировал реальную карту даже после появления корректных размеров.
+      setTileLoadStalled(false);
+      // Гарантированная очистка ВСЕХ таймеров, принадлежащих компоненту
+      // (debounce pump, retry-замер и т.д.) — ни одного «сиротского» setState.
+      for (const t of ownedTimersRef.current) clearTimeout(t);
+      ownedTimersRef.current.clear();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [setViewState]);
 
   // Стартовый zoom-инвариант z0: фиксируется ОДИН РАЗ на карту (не пересчитывается
