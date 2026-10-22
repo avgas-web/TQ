@@ -32,7 +32,9 @@ export function tileUrlTemplate(id: TileProviderId): string {
   switch (id) {
     case '2gis':
       // Публичные тайлы 2ГИС: стандартный XYZ Web Mercator, нативный зум до 18.
-      return 'https://tile-b01.2gis.com/tiles?x={x}&y={y}&z={z}';
+      // sl1 — рабочее зеркало; tile-b01 исключён (в ряде сетей его DNS не
+      // резолвится → ERR_NAME_NOT_RESOLVED и подложка молча не грузится).
+      return 'https://sl1.2gis.com/tiles?x={x}&y={y}&z={z}';
     case 'opentopomap':
       return 'https://tile.opentopomap.org/{z}/{x}/{y}.png';
     case 'carto':

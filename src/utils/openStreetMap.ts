@@ -9,6 +9,63 @@ const OSM_TILE_MIRRORS = [
   'https://c.tile.openstreetmap.org',
 ];
 
+/**
+ * Рабочие зеркала публичных тайлов 2ГИС. Хост `tile-b01.2gis.com` НЕ резолвится
+ * в ряде сетей (net::ERR_NAME_NOT_RESOLVED — DNS-блокировка/фильтр), из-за чего
+ * подложка «2ГИС» молча не загружалась вообще. sl{1..4}.2gis.com — те же публичные
+ * тайлы по стандартной XYZ-схеме; перебор зеркал даёт отказоустойчивость как у OSM.
+ * tile-b01 намеренно ИСКЛЮЧЁН из обхода ПОЛНОСТЬЮ (а не только после первого сбоя):
+ * при DNS-блокировке браузер сначала долгие секунды держит тайловый слот занятым
+ * ожиданием ответа DNS, и очередь загрузки («pump») встает — карта выглядит
+ * зависшей. Поэтому ни один запрос к tile-b01 не отправляется никогда.
+ */
+const TWO_GIS_TILE_MIRRORS = [
+  'https://sl1.2gis.com',
+  'https://sl2.2gis.com',
+  'https://sl3.2gis.com',
+  'https://sl4.2gis.com',
+];
+
+/**
+ * Кэш последнего успешно отдавшего тайл хоста 2ГИС: после определения живого
+ * зеркала все последующие тайлы идут сразу на него (без шторма DNS-ошибок).
+ */
+let twoGisWorkingHost: string | null = null;
+
+/**
+ * Приведение ЛЮБОГО 2ГИС-URL к живому зеркалу. Ключевой фикс шторма
+ * net::ERR_NAME_NOT_RESOLVED на tile-b01.2gis.com/tiles?x=..&y=..&z=..:
+ * URL с мёртвым хостом (старые сохранённые проекты, сторонние шаблоны,
+ * устаревшие сборки) переписывается на рабочий sl{1..4}.2gis.com ПЕРЕД
+ * любой загрузкой — включая присвоение `src` DOM-тайлу после успешной
+ * загрузки (иначе браузер повторно скачивал бы тайл уже с мёртвого хоста).
+ * Возвращает исходный URL, если он не относится к 2ГИС.
+ */
+export function normalizeTwoGisTileUrl(url: string): string {
+  if (!url.includes('2gis.com')) return url;
+  const m = url.match(/^https?:\/\/(?:tile-b01|sl[1-4])\.2gis\.com\/(.+)$/);
+  const pathAndQuery = m ? '/' + m[1] : (() => {
+    try { const u = new URL(url); return u.pathname + u.search; } catch { return null; }
+  })();
+  if (pathAndQuery === null) return url;
+  const host = twoGisWorkingHost ?? TWO_GIS_TILE_MIRRORS[0];
+  if (/^https?:\/\/sl[1-4]\.2gis\.com\//.test(url) && url.startsWith(host + '/')) return url;
+  return host + pathAndQuery;
+}
+
+/** Хосты 2ГИС в порядке приоритета: проверенный живой — первым. tile-b01 исключён. */
+function twoGisHostsOrdered(): string[] {
+  if (twoGisWorkingHost) {
+    return [twoGisWorkingHost, ...TWO_GIS_TILE_MIRRORS.filter((h) => h !== twoGisWorkingHost)];
+  }
+  return [...TWO_GIS_TILE_MIRRORS];
+}
+
+/** URL тайла 2ГИС на указанном хосте-зеркале (стандартная query-схема x/y/z). */
+function twoGisTileUrl(host: string, x: number, y: number, z: number): string {
+  return `${host}/tiles?x=${x}&y=${y}&z=${z}`;
+}
+
 /** Ограничение параллельных загрузок тайлов на один хост: браузер даёт ~6 соединений,
  *  сотни запросов без лимита = таймауты и «вечная загрузка» большой карты. */
 let tileActive = 0;
@@ -168,10 +225,18 @@ export function getOSMTileUrl(
   const retina = typeof window !== 'undefined' && (window.devicePixelRatio || 1) >= 1.5;
   const at = retina ? '@2x' : '';
   switch (tileServer) {
-    case '2gis':
-      // Публичные тайловые серверы 2ГИС (sl.*.2gis.com) — стандартная схема,
-      // XYZ Web Mercator, нативный зум до 18. Ключ API не требуется.
-      return `https://tile-b01.2gis.com/tiles?x=${x}&y=${y}&z=${z}`;
+    case '2gis': {
+      // Публичные тайловые серверы 2ГИС — стандартная схема XYZ Web Mercator,
+      // нативный зум до 18, ключ API не требуется. Хост tile-b01.2gis.com НЕ
+      // используется никогда: в ряде сетей его DNS не резолвится
+      // (net::ERR_NAME_NOT_RESOLVED), и каждый такой запрос надолго занимал
+      // слот очереди загрузки — карта «зависала» на полупустых тайлах.
+      // URL сразу строится на живом зеркале sl{1..4}.2gis.com: кэш рабочего
+      // хоста даёт один живой хост на сессию, loadTileWithMirrors при сбое
+      // перебирает остальные.
+      const host = twoGisWorkingHost ?? TWO_GIS_TILE_MIRRORS[0];
+      return twoGisTileUrl(host, x, y, z);
+    }
     case 'opentopomap':
       return `https://tile.opentopomap.org/${Math.min(z, 17)}/${x}/${y}.png`;
     case 'carto':
@@ -219,10 +284,124 @@ export function abortTileImage(img: HTMLImageElement): void {
  */
 /** Публичный тип ручки загрузки тайла (см. startTileLoad). */
 export type TileLoadHandle = {
-  readonly image: HTMLImageElement;
+  /** Актуальный <img> текущей попытки (перебираемые зеркала меняют его на лету). */
+  image: HTMLImageElement | null;
+  /** Отмена: немедленно завершает очередь (done→null) и обрывает активный img. */
   cancel(): void;
   readonly done: Promise<HTMLImageElement | null>;
 };
+
+/**
+ * Ручка-обёртка над перебором зеркал (loadTileWithMirrors) с гарантированной
+ * отменой в ЛЮБОЙ момент. Критично для теста «unmount отменяет ВСЕ in-flight
+ * загрузки»: cancel() обязан не только резолвить done(null) (освобождение слота
+ * очереди), но и вызывать abort()/сброс src у активного Image — иначе мок/браузер
+ * держит незавершённую загрузку («утечка»). Реализация: каждая попытка зеркала
+ * создаётся через startTileLoad, её handle пробрасывается в поля внешней ручки;
+ * cancel() между попытками помечает флаг и обрывает уже созданный img, а
+ * loadTileWithMirrorsSafe проверяет флаг перед каждой следующей попыткой.
+ */
+export function createCancellableMirrorLoad(url: string, timeoutMs: number): TileLoadHandle {
+  let cancelled = false;
+  let settled = false;
+  // Финал done() — через мутабельный бокс: замыкания в cancel()/async-ветке
+  // читают box.resolve, поэтому TS не может свести тип к never (в отличие от
+  // «let resolveFn … = null» с последующим присваиванием в Promise-executor).
+  const box: { resolve: ((v: HTMLImageElement | null) => void) | null } = { resolve: null };
+  const done = new Promise<HTMLImageElement | null>((res) => { box.resolve = res; });
+  const outer: TileLoadHandle = {
+    image: null,
+    cancel(): void {
+      if (cancelled || settled) return;
+      cancelled = true;
+      // Немедленный финал: очередь не ждёт ответа зеркал/таймаута.
+      settled = true;
+      const r = box.resolve;
+      if (r) r(null);
+      const img = outer.image;
+      if (img) abortTileImage(img);
+    },
+    done,
+  };
+  (async (): Promise<void> => {
+    const img = await loadTileWithMirrorsSafe(url, timeoutMs, () => cancelled, outer);
+    if (cancelled || settled) {
+      if (img) abortTileImage(img); // отменено во время последней попытки — освободить соединение
+      return;
+    }
+    settled = true;
+    outer.image = img ?? outer.image;
+    const r = box.resolve;
+    if (r) r(img);
+  })();
+  return outer;
+}
+
+/**
+ * То же, что loadTileWithMirrors, но с внешним флагом отмены и публикацией
+ * активного <img> в ручку вызывающей стороны (для гарантированного abort при
+ * unmount). Возвращает загруженный Image или null (все зеркала недоступны /
+ * отменено).
+ */
+async function loadTileWithMirrorsSafe(
+  url: string,
+  timeoutMs: number,
+  isCancelled: () => boolean,
+  outer: TileLoadHandle,
+): Promise<HTMLImageElement | null> {
+  const tryHost = async (candidate: string): Promise<HTMLImageElement | null> => {
+    if (isCancelled()) return null;
+    const h = startTileLoad(candidate, timeoutMs);
+    outer.image = h.image; // публикуем активный img — cancel() сможет его оборвать
+    const img = await h.done;
+    if (isCancelled()) {
+      if (img) abortTileImage(img);
+      return null;
+    }
+    return img;
+  };
+  const mOsm = url.match(/^https:\/\/(?:[abc]\.)?tile\.openstreetmap\.org\/(.+)$/);
+  if (mOsm) {
+    for (const host of OSM_TILE_MIRRORS) {
+      const img = await tryHost(host + '/' + mOsm[1]);
+      if (img) return img;
+      if (isCancelled()) return null;
+    }
+    return null;
+  }
+  const m2gis = url.match(/^https:\/\/(?:tile-b01|sl[1-4])\.2gis\.com\/(.+)$/);
+  if (m2gis) {
+    const pathAndQuery = '/' + m2gis[1];
+    for (const host of twoGisHostsOrdered()) {
+      const img = await tryHost(host + pathAndQuery);
+      if (img) {
+        twoGisWorkingHost = host; // живое зеркало закешировано
+        return img;
+      }
+      if (isCancelled()) return null;
+    }
+    return null;
+  }
+  // Прочие 2GIS-URL (сторонние шаблоны с '2gis.com' в адресе) — тоже через зеркала.
+  if (url.includes('2gis.com')) {
+    try {
+      const u = new URL(url);
+      const pathAndQuery = u.pathname + u.search;
+      for (const host of twoGisHostsOrdered()) {
+        const img = await tryHost(host + pathAndQuery);
+        if (img) {
+          twoGisWorkingHost = host;
+          return img;
+        }
+        if (isCancelled()) return null;
+      }
+      return null;
+    } catch {
+      /* невалидный URL — одиночная попытка ниже */
+    }
+  }
+  return tryHost(url);
+}
 
 /**
  * Загрузка тайла с ЯВНЫМ ручкой-контролем (P0 «зависания/утечки»): вызывающая
@@ -231,7 +410,11 @@ export type TileLoadHandle = {
  * src доживал до внутреннего таймаута (10 c), держал DOM-элементы и резолвился
  * на уже несмонтированном компоненте — утечка памяти + предупреждения React.
  */
-export function startTileLoad(url: string, timeoutMs = 8000): TileLoadHandle {
+export function startTileLoad(rawUrl: string, timeoutMs = 8000): TileLoadHandle {
+  // Защита от DNS-шторма: даже если URL пришёл с мёртвым хостом tile-b01.2gis.com
+  // (старый кэш/сохранённый проект/сторонний шаблон), запрос уходит на живое
+  // зеркало sl{1..4}. Для всех прочих провайдеров normalizeTwoGisTileUrl — no-op.
+  const url = normalizeTwoGisTileUrl(rawUrl);
   const img = new Image();
   img.crossOrigin = 'anonymous';
   let settled = false;
@@ -264,17 +447,62 @@ export async function loadTileImage(url: string, timeoutMs = 8000): Promise<HTML
 }
 
 /**
- * Тайл с перебором зеркал tile.openstreetmap.org (основной хост часто отдаёт
- * 429/таймауты под нагрузкой). Для URL других провайдеров — обычная загрузка.
+ * Загрузка тайла с перебором зеркал. Раньше поддерживались только зеркала OSM;
+ * хост 2ГИС tile-b01.2gis.com не резолвится в ряде сетей (ERR_NAME_NOT_RESOLVED),
+ * и подложка «2ГИС» молча не загружалась вообще. Теперь для URL 2ГИС перебираются
+ * рабочие зеркала sl{1..4}.2gis.com, а последний успешный хост кэшируется —
+ * остальные тайлы идут сразу на живой сервер без шторма DNS-ошибок.
  */
 export async function loadTileWithMirrors(url: string, timeoutMs = 8000): Promise<HTMLImageElement | null> {
-  const m = url.match(/^https:\/\/tile\.openstreetmap\.org\/(.+)$/);
-  if (!m) return loadTileImage(url, timeoutMs);
-  for (const host of OSM_TILE_MIRRORS) {
-    const img = await loadTileImage(host + '/' + m[1], timeoutMs);
-    if (img) return img;
+  const mOsm = url.match(/^https:\/\/(?:[abc]\.)?tile\.openstreetmap\.org\/(.+)$/);
+  if (mOsm) {
+    for (const host of OSM_TILE_MIRRORS) {
+      const img = await loadTileImage(host + '/' + mOsm[1], timeoutMs);
+      if (img) return img;
+    }
+    return null;
   }
-  return null;
+  const m2gis = url.match(/^https:\/\/(?:tile-b01|sl[1-4])\.2gis\.com\/(.+)$/);
+  if (m2gis) {
+    // Подстановка зеркала: путь+query сохраняются («/tiles?x=..&y=..&z=..»),
+    // меняется только хост. tile-b01 никогда не опрашивается (мёртвый DNS в
+    // ряде сетей блокировал слот очереди на секунды — «зависание» карты):
+    // обходим сразу живые зеркала sl{1..4} с кэшированием рабочего хоста.
+    const pathAndQuery = '/' + m2gis[1];
+    for (const host of twoGisHostsOrdered()) {
+      const img = await loadTileImage(host + pathAndQuery, timeoutMs);
+      if (img) {
+        twoGisWorkingHost = host; // живое зеркало закешировано
+        return img;
+      }
+    }
+    return null;
+  }
+  // Ключевое слово '2gis' в URL (например, query-параметр провайдера у сторонних
+  // шаблонов) тоже считаем тайлами 2ГИС: иначе запрос уходит напрямую в хост из
+  // URL без перебора зеркал и при недоступности DNS молча вешает слот очереди.
+  if (url.includes('2gis.com')) {
+    try {
+      const u = new URL(url);
+      const pathAndQuery = u.pathname + u.search;
+      for (const host of twoGisHostsOrdered()) {
+        const img = await loadTileImage(host + pathAndQuery, timeoutMs);
+        if (img) {
+          twoGisWorkingHost = host;
+          return img;
+        }
+      }
+      return null;
+    } catch {
+      /* невалидный URL — уходим в одиночную попытку ниже */
+    }
+  }
+  return loadTileImage(url, timeoutMs);
+}
+
+/** Отладочный/тестовый сброс кэша рабочего зеркала 2ГИС. */
+export function resetTwoGisMirrorCache(): void {
+  twoGisWorkingHost = null;
 }
 
 /**

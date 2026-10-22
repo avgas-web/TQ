@@ -7,7 +7,7 @@ import { isPointInsideAnyRestriction, distanceBetween } from '../utils/geometry'
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
 import { pixelToGeoExact, geoToPixelExact, routeLengthM, zonesCrossedBy, planPathAroundZones, smoothPolyline } from '../utils/routing';
-import { getOSMTileUrl, startTileLoad, abortTileImage, type TileStyle, type TileLoadHandle } from '../utils/openStreetMap';
+import { getOSMTileUrl, createCancellableMirrorLoad, abortTileImage, resetTwoGisMirrorCache, normalizeTwoGisTileUrl, type TileStyle, type TileLoadHandle } from '../utils/openStreetMap';
 import { useMapStore } from '../store/useMapStore';
 import { ensureDefaultTileMap } from '../hooks/useAppInitialization';
 import MiniMapPanel, { MiniOverlayLine, MiniOverlayPoint, type MiniZone } from './MiniMapPanel';
@@ -882,11 +882,18 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
           if (!imgEl || tilePending.current.has(u) || tileCache.current.has(u)) continue;
           activeTilesRef.current++;
           // P0-фикс «зависание/утечка при загрузке карт»: загрузка регистрируется
-          // в реестре in-flight (inFlightTileLoadsRef) и ПРИНУДИТЕЛЬНО отменяется
-          // через handle.cancel() при unmount / смене подложки. Раньше промис
-          // доживал до внутреннего 10-секундного таймаута, держал DOM-элементы
-          // размонтированного слоя и резолвился setState на unmounted-компоненте.
-          const handle: TileLoadHandle = startTileLoad(u, 10000); // таймаут: зависший тайл не блокирует очередь
+          // в реестре in-flight и ПРИНУДИТЕЛЬНО отменяется при unmount / смене
+          // подложки. Раньше промис доживал до внутреннего 10-секундного таймаута,
+          // держал DOM-элементы размонтированного слоя и резолвился setState на
+          // unmounted-компоненте.
+          // Фикс DNS-шторма (net::ERR_NAME_NOT_RESOLVED у tile-b01.2gis.com):
+          // тайлы грузятся через createCancellableMirrorLoad — при недоступности
+          // хоста выполняется перебор зеркал (OSM: a/b/c; 2ГИС: sl1..sl4) с
+          // кэшированием живого сервера, вместо бесконечных повторных запросов
+          // в мёртвый хост. cancel() ручки СИНХРОННО завершает очередь (done→null)
+          // И обрывает активный <img> зеркала (abortTileImage) — ни одна in-flight
+          // загрузка не доживает до таймаута после unmount (нет утечек DOM/соединений).
+          const handle: TileLoadHandle = createCancellableMirrorLoad(u, 10000); // таймаут: зависший тайл не блокирует очередь
           tileLoadHandlesRef.current.add(handle);
           const p = handle.done
             .then((loaded) => {
@@ -897,7 +904,10 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
                   const firstKey = tileCache.current.keys().next().value as string | undefined;
                   if (firstKey !== undefined) tileCache.current.delete(firstKey);
                 }
-                if (tileElsRef.current.get(u) === imgEl) imgEl.src = u;
+                // Фикс DNS-шторма: src присваивается через normalizeTwoGisTileUrl —
+                // при устаревшем/записном URL с мёртвым хостом tile-b01.2gis.com
+                // DOM-тайл повторно скачивался бы уже с живого зеркала sl{1..4}.
+                if (tileElsRef.current.get(u) === imgEl) imgEl.src = normalizeTwoGisTileUrl(u);
               } else {
                 // ИСПРАВЛЕНИЕ «краш/зависание при загрузке карт»: раньше в кэш
                 // писался undefined-запись, и DOM <img> получал src на тайл,
@@ -1664,6 +1674,10 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     tileLoadHandlesRef.current.clear();
     activeTilesRef.current = 0;
     tilePending.current.clear();
+    // При смене подложки сбрасываем кэш рабочего зеркала 2ГИС: он относится к
+    // прошлой сессии загрузки. tile-b01 не опрашивается никогда (мёртвый DNS в
+    // ряде сетей) — запросы сразу идут на живые sl{1..4}.
+    resetTwoGisMirrorCache();
     setTilesVersion((v) => v + 1);
     syncTileDom();
   }, [tileServer, syncTileDom]);
