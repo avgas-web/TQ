@@ -155,6 +155,18 @@ export function WizardMapPanel({ hint }: WizardMapPanelProps) {
       if (adoptLiveMapInto(host)) setAdopted(true);
     };
     tryAdopt();
+    // КОРНЕВОЙ ФИКС «карта не загружается в мастере»: при смене этапа React
+    // пересоздаёт DOM-узел хоста (новый пустой wizard-map-container), и этот
+    // effect обязан забрать живую карту СРАЗУ. Но adopt отсюда конкурировал с
+    // place() PersistentMap, которая вызывалась синхронно из MutationObserver
+    // прямо в момент нашей вставки — на «недостроенном» DOM она принимала
+    // неверное решение и уводила карту в невидимый слот навсегда (следующих
+    // мутаций не было). Теперь панель после своего монтирования эмитит явное
+    // событие 'tq:map-place-request', а PersistentMap обрабатывает его в
+    // микро-тик ПОСЛЕ завершения commit'а React — карта детерминированно
+    // занимает актуальный хост. Двойной adopt идемпотентен (appendChild того
+    // же узла = перестановка без remount).
+    window.dispatchEvent(new Event('tq:map-place-request'));
     if (typeof MutationObserver !== 'undefined') {
       const mo = new MutationObserver(tryAdopt);
       mo.observe(document.body, { childList: true, subtree: true });

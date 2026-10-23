@@ -2013,6 +2013,47 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     if (viewRef.current?.z0 == null) setViewState({ z0: ZOOM_REF });
   }, [project.map?.name, project.map?.bounds, canvasSize.height]);
 
+  // КОРНЕВОЙ ФИКС «редактор работает только после F5» + «карта не загружается
+  // в мастере»: живой узел #map-container переставляется (adopt) между хостами
+  // без remount React-поддерева. При переносе в нулевой/скрытый контейнер
+  // sizeWatchId глушил canvasSize и ОПУСТОШАЛ очередь тайлов; когда карта
+  // возвращалась в видимый слот, ResizeObserver откладывал событие на кадр
+  // (rAF-скобка), а в средах без дренажа кадров событие могло не прийти вовсе —
+  // состояние размеров залипало нулевым, загрузка тайлов не перезапускалась, и
+  // лишь принудительная перезагрузка страницы (F5) пересобирала всё с нуля.
+  // Теперь каждое изменение геометрии контейнера синхронизируется напрямую из
+  // rAF-цикла канваса (draw-цикл непрерывен, пока компонент жив): ненулевой
+  // замер немедленно применяет размеры → эффект загрузки тайлов перезапускается
+  // сам; нулевой замер корректно включает circuit breaker размеров.
+  // ВАЖНО: при переходе 0→ненулевой размер вид НЕ центрируется по дельте —
+  // это не реальный ресайз окна, а adopt-перенос живой карты между хостами
+  // (размеры хостов разные, камера та же). Принудительная фиксация вида над
+  // СПб выполняется ровно один раз на карту эффектом автоподгонки (fitView),
+  // как в режиме планирования; повторные переносы сохраняют пользовательскую
+  // панораму/зум без «прыжков» камеры.
+  useEffect(() => {
+    let raf = 0;
+    const tick = (): void => {
+      const el = containerRef.current;
+      if (el) {
+        const r = el.getBoundingClientRect();
+        const w = r.width > 0 ? r.width : el.clientWidth;
+        const h = r.height > 0 ? r.height : el.clientHeight;
+        const cur = canvasSizeRef.current;
+        if ((w > 0 && h > 0) && (cur.width !== w || cur.height !== h)) {
+          canvasSizeRef.current = { width: w, height: h };
+          setCanvasSize({ width: w, height: h });
+        } else if ((w <= 0 || h <= 0) && (cur.width > 0 || cur.height > 0)) {
+          canvasSizeRef.current = { width: 0, height: 0 };
+          setCanvasSize({ width: 0, height: 0 });
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
   // Auto-fit view: при загрузке карты — вписать её; если на карте есть объекты
   // (маршруты/маркеры/зоны) — автоматически масштабировать вид ПОД НИХ,
   // карта остаётся интерактивной (зум/панорама доступны всегда).

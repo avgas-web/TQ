@@ -138,6 +138,15 @@ const MapPlaceContext = React.createContext<{ wizardMode: boolean }>({ wizardMod
  * маркеров (useWizardMapBridge — теперь тоже ровно один экземпляр на уровне
  * App), маршруты/зоны редактора рисуются тем же канвасом → всё видно везде.
  */
+/** Хост единой карты для режима мастера (панель WizardMapPanel этапа). */
+export function getWizardMapHost(): HTMLElement | null {
+  return document.querySelector<HTMLElement>('[data-testid="wizard-map-container"]');
+}
+/** Хост единой карты для режима редактора (слот editor-map-slot). */
+export function getEditorMapHost(): HTMLElement | null {
+  return document.querySelector<HTMLElement>('[data-testid="editor-map-slot"]');
+}
+
 const PersistentMap: React.FC = () => {
   const slotRef = useRef<HTMLDivElement>(null);
   // Единственный экземпляр MapCanvas на всё приложение монтируется ЗДЕСЬ —
@@ -156,13 +165,39 @@ const PersistentMap: React.FC = () => {
 
   useEffect(() => {
     let cancelled = false;
+    // КОРНЕВОЙ ФИКС «карта не загружается в мастере / редактор оживает только
+    // после F5»: раньше place() работала ТОЛЬКО от событий MutationObserver на
+    // document.body. Но перенос живого узла #map-container между хостами через
+    // appendChild генерирует mutation-события асинхронно (микрозадачами), и
+    // наблюдатель вызывал place() ПРЯМО В МОМЕНТ чужой вставки — в этот момент
+    // React ещё не доделал собственный commit (новый хост этапа мог отсутство-
+    // вать, старый ещё не быть удалён). place() принимала неверное решение и
+    // прятала карту в невидимый резервный слот; следующих мутаций не происхо-
+    // дило → карта навсегда оставалась невидимой (мастер), либо не возвраща-
+    // лась в слот редактора (редактор «оживал» только после F5 — перезагрузка
+    // заново монтировала дерево и place() отрабатывала на тихом DOM).
+    // Теперь каждое изменение DOM ставит place() в ОТСРОЧЕННЫЙ микро-тик
+    // (Promise.resolve().then): он исполняется ПОСЛЕ завершения текущего
+    // commit-цикла React, когда разметка слотов уже актуальна. Плюс подписка
+    // на явные события 'tq:map-place-request' (эмитятся панелями сразу после
+    // их монтирования/смены этапа) — карта занимает хост детерминированно,
+    // независимо от порядка мутаций.
+    let scheduled = false;
+    const schedulePlace = (): void => {
+      if (scheduled || cancelled) return;
+      scheduled = true;
+      void Promise.resolve().then(() => {
+        scheduled = false;
+        if (!cancelled) place();
+      });
+    };
     const place = (): void => {
       if (cancelled) return;
       const live = getLiveMapContainer();
       if (!live) return;
       if (!wizardMode) {
         // Редактор: карта возвращается в штатный слот режима планирования.
-        const frame = document.querySelector('[data-testid="editor-map-slot"]');
+        const frame = getEditorMapHost();
         if (frame && live.parentElement !== frame) frame.appendChild(live);
         return;
       }
@@ -171,7 +206,7 @@ const PersistentMap: React.FC = () => {
       // монтирования с adopt-эффектом панели) — PersistentMap сам пристроит
       // живой узел в её контейнер wizard-map-container, иначе карта осталась
       // бы в невидимом резервном слоте → «загрузчик один, но карты нет».
-      const panelHost = document.querySelector<HTMLElement>('[data-testid="wizard-map-container"]');
+      const panelHost = getWizardMapHost();
       if (panelHost && live.parentElement !== panelHost) {
         panelHost.appendChild(live);
         return;
@@ -184,14 +219,23 @@ const PersistentMap: React.FC = () => {
       if (slot && !inWizardPanel && live.parentElement !== slot) slot.appendChild(live);
     };
     place();
+    schedulePlace(); // перепроверка после commit'а текущего кадра
+    window.addEventListener('tq:map-place-request', schedulePlace);
     // Если карта ещё не в DOM (первый тик) или её переставила панель мастера —
     // наблюдаем за DOM и возвращаем узел в актуальный слот режима.
     if (typeof MutationObserver !== 'undefined') {
-      const mo = new MutationObserver(() => place());
+      const mo = new MutationObserver(schedulePlace);
       mo.observe(document.body, { childList: true, subtree: true });
-      return () => { cancelled = true; mo.disconnect(); };
+      return () => {
+        cancelled = true;
+        mo.disconnect();
+        window.removeEventListener('tq:map-place-request', schedulePlace);
+      };
     }
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      window.removeEventListener('tq:map-place-request', schedulePlace);
+    };
   }, [wizardMode]);
 
   // КАРТА ЗАГРУЖАЕТСЯ СРАЗУ ПРИ ЗАПУСКЕ (требование): единый код-путь с
