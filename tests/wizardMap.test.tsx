@@ -75,9 +75,14 @@ describe('Карта внутри Мастера (WizardMapPanel + MapCanvas)', 
     expect(canvas!.getBoundingClientRect().height).toBeGreaterThan(0);
   });
 
-  it('панель подложек содержит 2ГИС; клик по «2ГИС» обновляет tileServer стора', async () => {
+  it('мастер фиксирует подложку OpenTopoMap (эталонный код), переключатель работает вручную', async () => {
     render(<MissionWizard />);
     await gotoStartPointsStep();
+
+    // При монтировании панели мастер устанавливает единственный эталонный слой.
+    await waitFor(() =>
+      expect(useMapStore.getState().openStreetMap.tileServer).toBe('opentopomap'),
+    );
 
     const btn = await screen.findByTestId('wizard-tiles-2gis');
     expect(btn.textContent).toContain('2ГИС');
@@ -92,7 +97,7 @@ describe('Карта внутри Мастера (WizardMapPanel + MapCanvas)', 
     );
   });
 
-  it('OSM активен по умолчанию при входе в мастер (автозагрузка подложки)', async () => {
+  it('автозагрузка подложки идемпотентна; мастер поверх неё ставит OpenTopoMap', async () => {
     // Корневая причина «белой карты» в мастере: useAppInitialization живёт только
     // в App.tsx, а тесты рендерят MissionWizard изолированно. В продакшене этот же
     // эффект гарантирует авто-OSM; здесь явно вызываем ensureDefaultTileMap() —
@@ -102,7 +107,10 @@ describe('Карта внутри Мастера (WizardMapPanel + MapCanvas)', 
     render(<MissionWizard />);
     await gotoStartPointsStep();
     await screen.findByTestId('wizard-map-panel');
-    expect(useMapStore.getState().openStreetMap.tileServer).toBe('osm');
+    // Эталонный загрузчик мастера: карта работает на OpenTopoMap (maxZoom 17).
+    await waitFor(() =>
+      expect(useMapStore.getState().openStreetMap.tileServer).toBe('opentopomap'),
+    );
     expect(useMapStore.getState().openStreetMap.enabled).toBe(true);
     // идемпотентность повторного вызова (не должен сбросить выбор пользователя)
     useMapStore.getState().setOSMTileServer('2gis');

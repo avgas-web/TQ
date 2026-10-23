@@ -12,11 +12,23 @@
 //  • панорама и непрерывный зум работают из коробки (drag/колесо в MapCanvas);
 //  • строгая гео-привязка: вид публикуется в localStorage-зеркало 'tq-view',
 //    клики этапов конвертируются utils/mapGeoPick по той же Mercator-формуле.
-import React, { useEffect } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import MapCanvas from '../MapCanvas';
 import { useStore } from '../../store/useStore';
 import { getProviderStatus, type TileProviderId } from '../../utils/mapProviders';
 import { ensureDefaultTileMap } from '../../hooks/useAppInitialization';
+import { screenToGeo } from '../../utils/mapGeoPick';
+import { findBuildingAt, buildingPopupHtml, type BuildingResult } from '../../utils/buildingLookup';
+
+/**
+ * Подложка режима мастера — ТОЧНО как в эталонном Leaflet-коде
+ * («Анализ рельефа и высоты зданий»): единственный слой OpenTopoMap,
+ * maxZoom 17, та же атрибуция.
+ */
+export const WIZARD_TILE_URL = 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png';
+export const WIZARD_TILE_MAX_ZOOM = 17;
+export const WIZARD_TILE_ATTRIBUTION =
+  'Map data: © OpenStreetMap contributors, SRTM | Map style: © OpenTopoMap (CC-BY-SA)';
 
 const SERVER_LABELS: Record<'osm' | 'opentopomap' | 'carto' | '2gis', string> = {
   osm: '🌐 OSM',
@@ -75,9 +87,64 @@ export interface WizardMapPanelProps {
   onMapLoaded?: (loaded: boolean) => void;
 }
 
-/** Внутренний контент карты: переключатель подложек + MapCanvas. */
+/**
+ * Режим мастера: карта работает ТОЧНО как в эталонном Leaflet-коде —
+ * единственный слой OpenTopoMap (maxZoom 17). Переключатель подложек
+ * остаётся для совместимости с тестами/редактором, но в мастере он
+ * форсирует opentopomap при монтировании панели.
+ */
 const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) => void }> = ({ hint, onMapLoaded }) => {
   const project = useStore((s) => s.project);
+
+  // ── Клик по карте = «умный поиск здания» (Overpass), как в эталоне ────────
+  const [statusMsg, setStatusMsg] = useState<string>('Готов. Кликните по карте, чтобы узнать высоту здания.');
+  const [popup, setPopup] = useState<{ x: number; y: number; html: string } | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  // Эталон: при монтировании мастер фиксирует подложку OpenTopoMap.
+  useEffect(() => {
+    if ((useStore.getState().project.openStreetMap?.tileServer ?? 'osm') !== 'opentopomap') {
+      useStore.getState().setOSMTileServer('opentopomap');
+    }
+  }, []);
+
+  /**
+   * map.on('click', ...) из эталона. Обработчик висит на контейнере карты
+   * в capture-фазе и конвертирует клик к реальной подложке той же строгой
+   * Mercator-формулой, что использует вся система гео-привязки мастера
+   * (utils/mapGeoPick.screenToGeo + зеркало вида 'tq-view').
+   */
+  const handleMapClick = useCallback(async (e: React.MouseEvent<HTMLDivElement>) => {
+    const el = containerRef.current;
+    if (!el) return;
+    // Эталон: клик по интерактивному объекту маршрута не запускает поиск.
+    const target = e.target as HTMLElement | null;
+    if (target && typeof target.className === 'string' && target.className.includes('leaflet-interactive')) return;
+    // Не перехватываем клики по попапу/статусной строке/попаданию в UI поверх карты.
+    if (target && target.closest('[data-wizard-map-ui]')) return;
+
+    const r = el.getBoundingClientRect();
+    const geo = screenToGeo(e.clientX - r.left, e.clientY - r.top, r.height);
+    if (!geo) return;
+    const { lat, lon } = geo;
+
+    setStatusMsg('🔍 Поиск здания в этой точке...');
+    setPopup(null);
+
+    const res: BuildingResult = await findBuildingAt(lat, lon);
+    if (res.kind === 'found') {
+      setPopup({
+        x: e.clientX - r.left,
+        y: e.clientY - r.top,
+        html: buildingPopupHtml(res.building),
+      });
+      setStatusMsg(`🏢 Здание найдено: высота ${res.building.heightStr}`);
+    } else if (res.kind === 'not-found') {
+      setStatusMsg('❌ Здание в этой точке не найдено. Попробуйте кликнуть ближе к центру строения.');
+    } else {
+      setStatusMsg('⚠️ Не удалось связаться с сервером OSM. Попробуйте позже.');
+    }
+  }, []);
   const status = getProviderStatus(project, (project.openStreetMap?.tileServer ?? 'osm') as TileProviderId);
   return (
     <>
@@ -102,8 +169,19 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
         className="relative w-full min-h-[280px] flex-1 basis-auto overflow-hidden"
         style={{ height: 'calc(100vh - 320px)' }}
         data-testid="wizard-map-container"
+        onClickCapture={handleMapClick}
       >
         <MapCanvas onMapLoaded={onMapLoaded} />
+        {/* Попап здания (аналог L.popup().setLatLng().openOn(map) из эталона) */}
+        {popup && (
+          <div
+            data-wizard-map-ui
+            data-testid="wizard-building-popup"
+            className="absolute z-30 rounded-md border border-slate-300 bg-white px-3 py-2 shadow-lg"
+            style={{ left: Math.min(popup.x + 8, 9999), top: Math.max(popup.y - 12, 4) }}
+            dangerouslySetInnerHTML={{ __html: popup.html }}
+          />
+        )}
         {!status.ready && (
           <div
             role="alert"
@@ -113,6 +191,14 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
             <p className="max-w-sm text-sm text-amber-300">⚠️ {status.message}</p>
           </div>
         )}
+      </div>
+      {/* Статус-бар — эквивалент setStatus() из эталонного кода */}
+      <div
+        data-wizard-map-ui
+        data-testid="wizard-map-statusbar"
+        className="border-t border-slate-800 bg-slate-900 px-2 py-1 text-[11px] text-slate-300"
+      >
+        {statusMsg}
       </div>
     </>
   );
