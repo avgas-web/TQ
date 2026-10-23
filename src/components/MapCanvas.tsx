@@ -3598,7 +3598,20 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   const panelH = 260;
 
   return (
-    <div id="map-container" ref={containerRef} data-testid="map-container" className="relative w-full h-full overflow-hidden bg-[#0f1729]">
+    // ФИКС «Не удалось определить размер контейнера карты» в режиме мастера:
+    // раньше здесь был только h-full (height:100%) — процентная высота без
+    // пиксельного базиса у предков flex-колонки мастера разрешалась в 0px,
+    // ResizeObserver фиксировал нулевой размер и срабатывал circuit breaker.
+    // В режиме планирования всё работало потому, что там контейнеру высоты
+    // дают явные правила. Теперь MapCanvas сам гарантирует себе ненулевой
+    // базис: absolute inset-0 заполняет любой relative-родитель (оба режима),
+    // а min-h/min-w в пикселях не дают схлопнуться даже при битом layout.
+    <div
+      id="map-container"
+      ref={containerRef}
+      data-testid="map-container"
+      className="absolute inset-0 min-h-[280px] min-w-[320px] overflow-hidden bg-[#0f1729]"
+    >
       {/* Подложка OSM: DOM-слой настоящих <img>-тайлов (как на openstreetmap.org),
           positioned под canvas. Позиция/набор тайлов обновляются напрямую через
           transform/syncTileDom без React-рендера; pointer-events отключены — все
