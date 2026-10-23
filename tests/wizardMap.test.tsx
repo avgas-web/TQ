@@ -61,7 +61,61 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('Карта внутри Мастера (WizardMapPanel + MapCanvas)', () => {
+/** Тестовый двойник единого загрузчика: в продакшене единственный MapCanvas
+ *  живёт непрерывно на уровне App (<PersistentMap />), а мастер переставляет
+ *  его живой DOM-узел (#map-container) в панель этапа adopt-вставкой (без
+ *  remount React → тайлы/вид не сбрасываются). В юнит-тестах MissionWizard
+ *  рендерится изолированно (без App), поэтому здесь монтируется ровно ОДНА
+ *  копия настоящего MapCanvas — того же компонента, что в редакторе. */
+vi.mock('../src/components/wizard/WizardMapPanel', async () => {
+  const ReactMod = await import('react');
+  const actual = await vi.importActual<typeof import('../src/components/wizard/WizardMapPanel')>(
+    '../src/components/wizard/WizardMapPanel',
+  );
+  const MapCanvasMod = await import('../src/components/MapCanvas');
+  const MapCanvas = MapCanvasMod.default;
+  const useStoreMod = await import('../src/store/useStore');
+  const prov = await import('../src/utils/mapProviders');
+  const TestPanel: React.FC<{ hint?: string }> = ({ hint }) => {
+    const project = useStoreMod.useStore((s) => s.project);
+    const status = prov.getProviderStatus(
+      project,
+      (project.openStreetMap?.tileServer ?? 'osm') as Parameters<typeof prov.getProviderStatus>[1],
+    );
+    return ReactMod.createElement(
+      'div',
+      {
+        'data-testid': 'wizard-map-panel',
+        className: 'relative flex min-h-[340px] w-full flex-col overflow-hidden',
+        style: { height: 'calc(100vh - 300px)' },
+      },
+      ReactMod.createElement(actual.ProviderSwitcher),
+      hint ? ReactMod.createElement('div', { className: 'hint' }, hint) : null,
+      ReactMod.createElement(
+        'div',
+        {
+          'data-testid': 'wizard-map-container',
+          className: 'relative w-full min-h-[280px] flex-1 overflow-hidden',
+          style: { height: 'calc(100vh - 320px)' },
+        },
+        ReactMod.createElement(MapCanvas, {}),
+        !status.ready &&
+          ReactMod.createElement(
+            'div',
+            { role: 'alert', 'data-testid': 'wizard-map-key-overlay', className: 'overlay' },
+            String(status.message),
+          ),
+      ),
+    );
+  };
+  return {
+    ...actual,
+    WizardMapPanel: TestPanel,
+    default: TestPanel,
+  };
+});
+
+describe('Карта внутри Мастера (единый MapCanvas + adopt-панель)', () => {
   it('на этапе точек старта рендерится canvas карты с ненулевыми размерами', async () => {
     render(<MissionWizard />);
     await gotoStartPointsStep();

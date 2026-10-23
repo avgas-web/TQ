@@ -966,10 +966,17 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     syncTileDom();
   }, [tileRetryNonce, syncTileDom]);
 
+  // ТОКЕН АКТИВАЦИИ КАРТЫ (useMapStore.tileLoadNonce): bump при каждой
+  // loadActiveTileMap — гарантирует пробуждение очереди тайлов ЕДИНОГО
+  // MapCanvas даже если ResizeObserver молчит (нулевой/скрытый контейнер,
+  // тестовые окружения без rAF). Синхронизация DOM-слоя ниже также зависит от
+  // nonce, поэтому pump() планируется автоматически при каждом изменении.
+  const tileLoadNonce = useMapStore((s) => s.tileLoadNonce);
+
   // Пересинхронизация DOM-слоя при смене вида (rAF-троттлинг), карты и настроек
   useEffect(() => {
     syncTileDom();
-  }, [renderTick, tilesEnabled, tileServer, project.map?.bounds, canvasSize, syncTileDom]);
+  }, [renderTick, tilesEnabled, tileServer, project.map?.bounds, canvasSize, tileLoadNonce, syncTileDom]);
 
   // Геолокация пользователя (по требованию — кнопка 📍)
   const locateUser = useCallback(() => {

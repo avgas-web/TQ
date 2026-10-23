@@ -7,7 +7,7 @@ import {
 import { MiniMapCanvas, readCanvasClick } from './StartPointsStep';
 import { WizardMapPanel } from './WizardMapPanel';
 import { isMapReadyNow, useMapReadiness } from './mapReadiness';
-import { useWizardMapBridge } from './useWizardMapBridge';
+import { useMapStore } from '../../store/useMapStore';
 
 export function TargetPointsStep() {
   const targetPoints = useMissionWizardStore((s) => s.targetPoints);
@@ -16,11 +16,20 @@ export function TargetPointsStep() {
   const updateTargetPoint = useMissionWizardStore((s) => s.updateTargetPoint);
   const removeTargetPoint = useMissionWizardStore((s) => s.removeTargetPoint);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  // Мост мастер↔карта: цели видны на живой подложке, drag обновляет координаты.
-  useWizardMapBridge();
-  // ЖЁСТКОЕ ТРЕБОВАНИЕ: цели ставятся ТОЛЬКО на загруженную карту (см. mapReadiness).
-  const [mapLoaded, setMapLoaded] = useState(false);
-  const readiness = useMapReadiness(mapLoaded);
+  // Мост мастер↔карта живёт НЕПРЕРЫВНО на уровне App (<PersistentMap />) —
+  // единый для обоих режимов. Этапы мастера больше НЕ вызывают
+  // useWizardMapBridge(): при adopt-архитектуре (один MapCanvas на все режимы)
+  // дублирование моста на каждом этапе создавало бы двойные подписки и гонки
+  // синхронизации маркеров.
+  // Живая тайловая карта: ЕДИНЫЙ загрузчик (тот же MapCanvas, что в редакторе —
+  // см. PersistentMap в App.tsx). Клик добавляет цель только когда подложка
+  // реально загружена; до готовности — оверлей-заглушка блокирует клики.
+  // Готовность берётся СИНХРОННО из картографического стора (useMapStore.mapLoaded),
+  // а не из локального React-стейпа через onMapLoaded-колбэк панели: панель больше
+  // не монтирует свой MapCanvas, поэтому колбэк не публиковал бы флаг → вечный
+  // оверлей «карта загружается» и заблокированные клики в мастере.
+  const storeMapLoaded = useMapStore((s) => s.mapLoaded);
+  const readiness = useMapReadiness(storeMapLoaded);
 
   /** расстояние до ближайшего старта для каждой цели */
   const withDist = useMemo(() => {
@@ -69,7 +78,7 @@ export function TargetPointsStep() {
           className="relative min-h-0 flex-1"
           data-testid="wizard-live-map-target"
           onClick={(e) => {
-            if (!isMapReadyNow(mapLoaded)) return; // источник истины: карта не загружена — точки не ставим
+            if (!isMapReadyNow(storeMapLoaded)) return; // источник истины: карта не загружена — точки не ставим
             const g = readCanvasClick(e);
             if (g) addAt(g.x, g.y, g.lat, g.lon);
           }}
@@ -78,7 +87,6 @@ export function TargetPointsStep() {
             hint={readiness.ready
               ? '🖱️ Клик по живой карте — поставить цель · перетаскивайте маркеры напрямую'
               : '⏳ Дождитесь загрузки карты — на пустом поле цели не ставятся'}
-            onMapLoaded={setMapLoaded}
           />
           {!readiness.ready && (
             <div
