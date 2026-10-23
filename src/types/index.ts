@@ -1,4 +1,8 @@
 // Типы для TotalQuadro Coordinate Marker
+import type { WorkingTileLayerId } from '../utils/openStreetMap';
+
+/** Идентификатор активной подложки: рабочие XYZ-слои эталона без ключей + legacy-алиасы. */
+export type TileServerId = 'osm' | 'opentopomap' | 'carto' | '2gis' | WorkingTileLayerId;
 
 export interface Point {
   x: number;
@@ -110,8 +114,9 @@ export interface Project {
   };
   openStreetMap: {
     enabled: boolean;
-    /** Список серверов тайлов расширяется: к OSM/Carto/OpenTopo добавлен 2ГИС. */
-    tileServer: 'osm' | 'opentopomap' | 'carto' | '2gis';
+    /** Единый набор подложек (редактор и мастер): рабочие XYZ-слои эталона
+     *  без ключей + legacy-алиасы ('osm' → Esri улицы, '2gis' → OSM France). */
+    tileServer: TileServerId;
   };
 }
 

@@ -129,20 +129,22 @@ describe('Карта внутри Мастера (единый MapCanvas + adopt
     expect(canvas!.getBoundingClientRect().height).toBeGreaterThan(0);
   });
 
-  it('панель подложек содержит 2ГИС; клик по «2ГИС» обновляет tileServer стора', async () => {
+  it('панель подложек содержит рабочие слои эталона; клик обновляет tileServer стора', async () => {
     render(<MissionWizard />);
     await gotoStartPointsStep();
 
-    const btn = await screen.findByTestId('wizard-tiles-2gis');
-    expect(btn.textContent).toContain('2ГИС');
+    // Единый набор (редактор = мастер): Esri улицы/спутник, OSM France std/hot,
+    // OSM Germany, OpenTopoMap, CyclOSM — все без ключей.
+    const btn = await screen.findByTestId('wizard-tiles-osm-fr-standard');
+    expect(btn.textContent).toContain('OSM');
     fireEvent.click(btn);
     await waitFor(() =>
-      expect(useMapStore.getState().openStreetMap.tileServer).toBe('2gis'),
+      expect(useMapStore.getState().openStreetMap.tileServer).toBe('osm-fr-standard'),
     );
-    // возврат к OSM — регрессия дефолтного провайдера не сломана
-    fireEvent.click(screen.getByTestId('wizard-tiles-osm'));
+    // возврат к дефолтному рабочему слою — регрессия не сломана
+    fireEvent.click(screen.getByTestId('wizard-tiles-esri-streets'));
     await waitFor(() =>
-      expect(useMapStore.getState().openStreetMap.tileServer).toBe('osm'),
+      expect(useMapStore.getState().openStreetMap.tileServer).toBe('esri-streets'),
     );
   });
 
