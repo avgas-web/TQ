@@ -63,7 +63,7 @@ const ProviderSwitcher: React.FC = () => {
               ? 'bg-cyan-600 font-bold text-white'
               : 'bg-slate-800 text-slate-300 hover:bg-slate-700')
           }
-          title={id === '2gis' ? 'Публичные тайлы 2ГИС, API-ключ не требуется' : undefined}
+          title={id === '2gis' ? 'Подложка Esri Streets (публичные тайлы 2ГИС закрыты — DNS не резолвится), API-ключ не требуется' : undefined}
         >
           {SERVER_LABELS[id]}
         </button>

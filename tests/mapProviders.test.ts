@@ -44,12 +44,13 @@ describe('mapProviders: дефолты стора', () => {
 });
 
 describe('mapProviders: URL-шаблоны тайлов', () => {
-  it('2gis использует XYZ-протокол tile-b01.2gis.com с x/y/z', () => {
+  it('2gis рендерит рабочую подложку Esri (tile-b01.2gis.com не резолвится)', () => {
     const t = tileUrlTemplate('2gis');
-    expect(t).toContain('2gis.com');
-    expect(t).toContain('x={x}');
-    expect(t).toContain('y={y}');
-    expect(t).toContain('z={z}');
+    expect(t).not.toContain('2gis.com');
+    expect(t).toContain('server.arcgisonline.com');
+    expect(t).toContain('{z}');
+    expect(t).toContain('{x}');
+    expect(t).toContain('{y}');
   });
 
   it('osm — дефолтный шаблон openstreetmap.org (регрессия не сломана)', () => {

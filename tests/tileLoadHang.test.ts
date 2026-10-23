@@ -71,7 +71,7 @@ describe('loadTileImage — защита от зависания загрузк�
 
   it('успешная загрузка резолвится изображением и снимает таймер', async () => {
     vi.stubGlobal('Image', OkImage);
-    const p = loadTileImage('https://tile-b01.2gis.com/tiles?x=1&y=1&z=10', 8000);
+    const p = loadTileImage('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/10/1/1', 8000);
     await vi.advanceTimersByTimeAsync(5);
     const img = await p;
     expect(img).not.toBeNull();

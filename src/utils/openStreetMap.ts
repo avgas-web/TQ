@@ -169,9 +169,12 @@ export function getOSMTileUrl(
   const at = retina ? '@2x' : '';
   switch (tileServer) {
     case '2gis':
-      // Публичные тайловые серверы 2ГИС (sl.*.2gis.com) — стандартная схема,
-      // XYZ Web Mercator, нативный зум до 18. Ключ API не требуется.
-      return `https://tile-b01.2gis.com/tiles?x=${x}&y=${y}&z=${z}`;
+      // ИСПРАВЛЕНИЕ net::ERR_NAME_NOT_RESOLVED: хост tile-b01.2gis.com более не
+      // резолвится (публичный тайловый сервис 2ГИС закрыт), и каждый запрос тайла
+      // падал в консоль с ошибкой DNS. Слой «2ГИС» сохранён в UI для совместимости,
+      // но физически рендерит стабильную бесплатную подложку Esri World Street Map
+      // (нативный зум 19 — см. NATIVE_MAX_BY_SERVER). Ключ API не требуется.
+      return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/${z}/${y}/${x}`;
     case 'opentopomap':
       return `https://tile.opentopomap.org/${Math.min(z, 17)}/${x}/${y}.png`;
     case 'carto':

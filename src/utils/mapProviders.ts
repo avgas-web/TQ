@@ -31,8 +31,9 @@ export function providerRequiresKey(id: TileProviderId): boolean {
 export function tileUrlTemplate(id: TileProviderId): string {
   switch (id) {
     case '2gis':
-      // Публичные тайлы 2ГИС: стандартный XYZ Web Mercator, нативный зум до 18.
-      return 'https://tile-b01.2gis.com/tiles?x={x}&y={y}&z={z}';
+      // Хост tile-b01.2gis.com не резолвится (ERR_NAME_NOT_RESOLVED) — слой «2ГИС»
+      // рендерит бесплатную подложку Esri World Street Map (без ключа), как в getOSMTileUrl.
+      return 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}';
     case 'opentopomap':
       return 'https://tile.opentopomap.org/{z}/{x}/{y}.png';
     case 'carto':
