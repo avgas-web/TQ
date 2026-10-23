@@ -6,9 +6,10 @@ import {
   pxToLon, pyToLat, lonToPx, latToPy, type StartPoint,
 } from '../../store/useMissionWizardStore';
 import { WizardMapPanel } from './WizardMapPanel';
-import { WIZARD_MARKER_PREFIX, useWizardMapBridge } from './useWizardMapBridge';
+import { WIZARD_MARKER_PREFIX } from './useWizardMapBridge';
 import { isMapReadyNow, useMapReadiness } from './mapReadiness';
 import { screenToGeo } from '../../utils/mapGeoPick';
+import { useMapStore } from '../../store/useMapStore';
 
 /** Клик по живой тайловой карте мастера → СТРОГИЕ реальные координаты WGS84.
  *  ИСПРАВЛЕНИЕ «координаты не привязаны к реальности»: раньше клик
@@ -129,9 +130,11 @@ export function MiniMapCanvas({ kind, points, onAdd, onMove }: MiniMapCanvasProp
 }
 
 export function StartPointsStep() {
-  // Мост мастер↔карта: точки старта/целей видны на живой подложке, drag на
-  // карте обновляет координаты в сторе мастера (без авто-фиксации камеры).
-  useWizardMapBridge();
+  // Мост мастер↔карта живёт НЕПРЕРЫВНО на уровне App (<PersistentMap />) —
+  // единый для обоих режимов: точки старта/целей видны на живой подложке и в
+  // редакторе, drag маркера обновляет координаты в сторе мастера. Этапы больше
+  // НЕ вызывают useWizardMapBridge() — при adopt-архитектуре (один MapCanvas
+  // на все режимы) это дублировало бы подписки и гонки синхронизации.
   const startPoints = useMissionWizardStore((s) => s.startPoints);
   const addStartPoint = useMissionWizardStore((s) => s.addStartPoint);
   const updateStartPoint = useMissionWizardStore((s) => s.updateStartPoint);
@@ -139,11 +142,12 @@ export function StartPointsStep() {
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   // ЖЁСТКОЕ ТРЕБОВАНИЕ: точки старта ставятся ТОЛЬКО на загруженную карту.
-  // MapCanvas публикует флаг готовности через onMapLoaded; до него клики по
-  // области карты игнорируются (без «слепых» точек в пустом поле), а поверх
-  // карты показывается оверлей с причиной и подсказкой.
-  const [mapLoaded, setMapLoaded] = useState(false);
-  const readiness = useMapReadiness(mapLoaded);
+  // Готовность читается СИНХРОННО из картографического стора (mapLoaded
+  // публикует единый MapCanvas через publishMapLoaded) — локальный React-стейт
+  // через onMapLoaded-колбэк больше не используется: панель мастера НЕ монтирует
+  // свою копию карты (загрузчик один на оба режима, см. PersistentMap в App).
+  const storeMapLoaded = useMapStore((s) => s.mapLoaded);
+  const readiness = useMapReadiness(storeMapLoaded);
 
   const addAt = (x: number, y: number, lat: number, lon: number) =>
     addStartPoint({ name: `Старт ${startPoints.length + 1}`, lat, lon, x, y });
@@ -201,7 +205,7 @@ export function StartPointsStep() {
           className="relative min-h-0 flex-1"
           data-testid="wizard-live-map-start"
           onClick={(e) => {
-            if (!isMapReadyNow(mapLoaded)) return; // источник истины: карта не загружена — точки не ставим
+            if (!isMapReadyNow(storeMapLoaded)) return; // источник истины: карта не загружена — точки не ставим
             const g = readCanvasClick(e);
             if (g) addAt(g.x, g.y, g.lat, g.lon);
           }}
@@ -210,7 +214,6 @@ export function StartPointsStep() {
             hint={readiness.ready
               ? '🖱️ Клик по живой карте — поставить точку старта · перетаскивайте маркеры напрямую'
               : '⏳ Дождитесь загрузки карты — на пустом поле точки не ставятся'}
-            onMapLoaded={setMapLoaded}
           />
           {!readiness.ready && (
             <div

@@ -5,6 +5,8 @@ import Toolbar from './components/Toolbar';
 import Sidebar from './components/Sidebar';
 import StatusBar from './components/StatusBar';
 import { MissionWizard } from './components/wizard/MissionWizard';
+import { getLiveMapContainer } from './components/wizard/WizardMapPanel';
+import { useWizardMapBridge } from './components/wizard/useWizardMapBridge';
 import { ensureDefaultTileMap } from './hooks/useAppInitialization';
 import { useStore } from './store/useStore';
 import { initOpenStreetMap } from './utils/openStreetMap';
@@ -49,11 +51,11 @@ const WizardMapsStrip: React.FC = () => {
   // только она появится в сторе.
   const loadStartedRef = useRef(false);
   useEffect(() => {
-    if (!open || loadStartedRef.current) return;
+    if (loadStartedRef.current) return;
     loadStartedRef.current = true;
     const t = window.setTimeout(() => { ensureDefaultTileMap(); }, 0);
     return () => window.clearTimeout(t);
-  }, [open]);
+  }, []);
 
   // ФИКС «окно с полем ввода» (xpath /html/body/div/div/div[3]/div/main/...):
   // сразу после раскрытия — автоскролл панели в зону видимости и ПРОГРАММНЫЙ
@@ -112,6 +114,114 @@ const WizardMapsStrip: React.FC = () => {
   );
 };
 
+
+/** Контекст размещения единой карты: PersistentMap должен перекладывать
+ * живой узел карты при смене режима, для чего ему нужен актуальный
+ * wizardMode из состояния App (а не из localStorage напрямую). */
+const MapPlaceContext = React.createContext<{ wizardMode: boolean }>({ wizardMode: true });
+
+/**
+ * ЕДИНЫЙ ЗАГРУЗЧИК КАРТ (требование: «загрузчик один — тот, что в редакторе,
+ * и работает одновременно в редакторе и мастере; все точки и маршруты
+ * просматриваются в обоих режимах»).
+ *
+ * Корень прежней проблемы: в мастере жил ВТОРОЙ экземпляр MapCanvas
+ * (WizardMapPanel), который на каждом переключении шага перемонтировался,
+ * заново качал тайлы, конфликтовал с первым за зеркало вида 'tq-view' и
+ * очередь загрузки — отсюда «карта не загружается / виснет» именно в мастере.
+ * Теперь MapCanvas монтируется РОВНО ОДНА ЖИЗНЬ (непрерывно, независимо от
+ * режима и шага мастера) и загружает подложку сразу при запуске приложения.
+ * Мастер использует ЕГО ЖЕ карту: живой DOM-узел '#map-container'
+ * переставляется (adoptappendChild — без remount React) из скрытого каркаса
+ * мастера в панель этапа WizardMapPanel; при возврате в редактор узел
+ * возвращается в слот редактора. Точки мастера синхронизируются в общий стор
+ * маркеров (useWizardMapBridge — теперь тоже ровно один экземпляр на уровне
+ * App), маршруты/зоны редактора рисуются тем же канвасом → всё видно везде.
+ */
+const PersistentMap: React.FC = () => {
+  const slotRef = useRef<HTMLDivElement>(null);
+  // Единственный экземпляр MapCanvas на всё приложение монтируется ЗДЕСЬ —
+  // непрерывно, независимо от режима и шага мастера. Его живой DOM-узел
+  // '#map-container' затем переставляется (adopt) в слот редактора или в
+  // панель этапа мастера; сам React-поддерево никогда не перемонтируется,
+  // поэтому тайлы, вид и очередь загрузки не сбрасываются при переключениях.
+  const mapLoadedNoticeRef = useRef<(loaded: boolean) => void>(() => undefined);
+  // Источник истины режима — состояние App (wizardMode прокидывается через
+  // MapPlaceContext ниже): localStorage обновляется синхронно с кликом, но
+  // DOM-разметка слотов меняется только после ре-рендера React.
+  const wizardMode = React.useContext(MapPlaceContext).wizardMode;
+  // Единый мост мастер↔карта живёт непрерывно здесь (этапы мастера больше
+  // НЕ вызывают useWizardMapBridge — иначе подписки дублировались бы).
+  useWizardMapBridge();
+
+  useEffect(() => {
+    let cancelled = false;
+    const place = (): void => {
+      if (cancelled) return;
+      const live = getLiveMapContainer();
+      if (!live) return;
+      if (!wizardMode) {
+        // Редактор: карта возвращается в штатный слот режима планирования.
+        const frame = document.querySelector('[data-testid="editor-map-slot"]');
+        if (frame && live.parentElement !== frame) frame.appendChild(live);
+        return;
+      }
+      // Мастер: приоритет — видимая панель этапа ("экран в экране"). Если она
+      // смонтирована и НЕ приняла карту к себе (этап без карты либо гонка
+      // монтирования с adopt-эффектом панели) — PersistentMap сам пристроит
+      // живой узел в её контейнер wizard-map-container, иначе карта осталась
+      // бы в невидимом резервном слоте → «загрузчик один, но карты нет».
+      const panelHost = document.querySelector<HTMLElement>('[data-testid="wizard-map-container"]');
+      if (panelHost && live.parentElement !== panelHost) {
+        panelHost.appendChild(live);
+        return;
+      }
+      // Если панели этапа сейчас НЕТ в DOM (свернута или этап без карты) —
+      // держим её в невидимом корне-слоте, чтобы экземпляр никогда не
+      // оставался «без дома» (не перемонтируется → тайлы/вид не сбрасываются).
+      const slot = slotRef.current;
+      const inWizardPanel = live.closest('[data-testid="wizard-map-panel"]');
+      if (slot && !inWizardPanel && live.parentElement !== slot) slot.appendChild(live);
+    };
+    place();
+    // Если карта ещё не в DOM (первый тик) или её переставила панель мастера —
+    // наблюдаем за DOM и возвращаем узел в актуальный слот режима.
+    if (typeof MutationObserver !== 'undefined') {
+      const mo = new MutationObserver(() => place());
+      mo.observe(document.body, { childList: true, subtree: true });
+      return () => { cancelled = true; mo.disconnect(); };
+    }
+    return () => { cancelled = true; };
+  }, [wizardMode]);
+
+  // КАРТА ЗАГРУЖАЕТСЯ СРАЗУ ПРИ ЗАПУСКЕ (требование): единый код-путь с
+  // режимом планирования — ensureDefaultTileMap сам ждёт onFinishHydration
+  // zustand-persist (иначе гидрация затёр бы созданную карту) и загружает
+  // подложку над СПб (59.9398, 30.3146, z10) независимо от того, в каком
+  // режиме открыто приложение. Идемпотентно: при уже существующей карте — no-op.
+  useEffect(() => {
+    ensureDefaultTileMap();
+  }, []);
+
+  // Каркас-владелец: невидимый резервный слот + ЕДИНСТВЕННЫЙ MapCanvas.
+  // Когда панель этапа мастера приняла карту (или редактор показал свой слот),
+  // place() переставит живой узел '#map-container' туда; здесь React-поддерево
+  // канваса живёт непрерывно — его DOM «живёт» лишь до первой доступной точки
+  // прикрепления, сам компонент НИКОГДА не перемонтируется.
+  return (
+    <>
+      <div
+        ref={slotRef}
+        data-testid="persistent-map-root-slot"
+        className="pointer-events-none absolute h-px w-px overflow-hidden opacity-0"
+        aria-hidden="true"
+      >
+        {/* Единственный экземпляр загрузчика карт на всё приложение. */}
+        <MapCanvas onMapLoaded={(loaded) => mapLoadedNoticeRef.current(loaded)} />
+      </div>
+    </>
+  );
+};
 
 /**
  * Тост-уведомление об ошибках хранилища (quota-exceeded и т.п.).
@@ -385,14 +495,19 @@ const App: React.FC = () => {
 
       {wizardMode ? (
         <div className="flex-1 min-h-0 overflow-hidden">
+          {/* Скрытый каркас непрерывной карты: в режиме мастера живой DOM-узел
+              PersistentMap переставлён (adopt) в панель этапа, поэтому здесь
+              остаётся только пустой каркас того же React-поддерева. */}
           <MissionWizard />
         </div>
       ) : (
       /* Main content: desktop — 2 колонки; mobile — вертикально, карта 300–400 px + панель */
       <div className={"flex-1 flex overflow-hidden relative " + (isMobile ? "flex-col" : "flex-row")}>
-        {/* Canvas */}
-        <div className={isMobile ? "relative w-full shrink-0" : "flex-1 relative"} style={isMobile ? { height: 350 } : undefined}>
-          <MapCanvas />
+        {/* Canvas: НЕПРЕРЫВНЫЙ ЕДИНЫЙ экземпляр карты (см. PersistentMap) —
+            здесь он пристроен в свой штатный слот редактора. */}
+        <div className={isMobile ? "relative w-full shrink-0" : "flex-1 relative"} style={isMobile ? { height: 350 } : undefined} data-testid="editor-map-slot">
+          {/* Слот редактора пуст: живой узел единого MapCanvas будет
+              переставлён (adopt) сюда PersistentMap в режиме планирования. */}
 
           {/* Help overlay */}
           {!project.map && (
@@ -424,6 +539,14 @@ const App: React.FC = () => {
       )}
 
       {!wizardMode && <StatusBar />}
+
+      {/* ЕДИНЫЙ ЗАГРУЗЧИК КАРТ: рендерится ВСЕГДА (независимо от режима и
+          шага мастера) — единственный экземпляр MapCanvas на всё приложение.
+          В редакторе живой узел карты стоит в слоте editor-map-slot (см.
+          place()); в мастере он переставлён (adopt) в панель этапа. */}
+      <MapPlaceContext.Provider value={{ wizardMode }}>
+        <PersistentMap />
+      </MapPlaceContext.Provider>
 
       <StorageToast />
     </div>

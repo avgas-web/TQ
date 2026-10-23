@@ -100,6 +100,10 @@ export interface MapState {
   viewTick: number;
   /** Флаг готовности тайловой подложки (публикуется MapCanvas синхронно). */
   mapLoaded: boolean;
+  /** Monotonic counter — bump при каждой активации тайловой карты. Гарантирует,
+   *  что очередь загрузки тайлов в ЕДИНОМ MapCanvas проснётся даже если его
+   *  ResizeObserver молчит (нулевые/скрытые контейнеры, тесты без rAF). */
+  tileLoadNonce: number;
   cursorPosition: Point | null;
   isDrawing: boolean;
   drawingPoints: Point[];
@@ -188,6 +192,7 @@ const initialMapState: MapState = {
   // для decision-логики (isMapReadyNow): React-state этапов обновляется
   // асинхронно и мог давать stale-значение → точки ставились на пустое поле.
   mapLoaded: false,
+  tileLoadNonce: 0,
   cursorPosition: null,
   isDrawing: false,
   drawingPoints: [],
@@ -469,6 +474,12 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
     // тайла с CDN, а при медленной сети оверлей «Карта ещё не загружена»
     // висел бесконечно — «в мастерской карте ничего не видно».
     get().publishMapLoaded(true);
+    // ТОКЕН ЗАГРУЗКИ: гарантированно будит очередь докачки тайлов в ЕДИНОМ
+    // MapCanvas даже если его ResizeObserver молчит (jsdom/тесты) или канвас
+    // ещё не пристроен к видимому контейнеру. Без этого загрузка стартовала
+    // только из RO-колбэка → в изолированных тестах и на «нулевых размерах»
+    // карта никогда не докачивалась («не удалось определить размер карты»).
+    set((state) => ({ tileLoadNonce: state.tileLoadNonce + 1 }));
     void import('./useMissionStore').then((m) => m.useMissionStore.getState().refreshAllRoutesAfterMapChange());
   },
 
@@ -518,7 +529,7 @@ export const useMapStore = create<MapStore>()(
       // mapLoaded НЕ гидрируется из localStorage: флаг публикуется MapCanvas
       // только когда тайлы реально отрисованы (иначе после перезагрузки
       // Мастер ложно считал бы карту готовой до первой загрузки).
-      partialize: (s): Omit<MapState, 'mapLoaded'> => ({
+      partialize: (s): Omit<MapState, 'mapLoaded' | 'tileLoadNonce'> => ({
         // Не сохраняем map.dataUrl в localStorage — он слишком большой
         map: s.map ? { ...s.map, dataUrl: '' } : null,
         markers: s.markers,

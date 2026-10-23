@@ -73,6 +73,56 @@ afterEach(() => {
 });
 
 describe('wizardFreeze — защита от зависаний в Мастере', () => {
+  /** Тестовый двойник единого загрузчика (см. также wizardMap.test.tsx):
+   *  в продакшене единственный MapCanvas живёт непрерывно на уровне App
+   *  (<PersistentMap />) и переставляется (adopt) в панель этапа мастера без
+   *  remount React. В изолированных RTL-тестах App нет, поэтому здесь
+   *  монтируется ровно ОДНА копия настоящего MapCanvas — того же компонента,
+   *  что в редакторе; cleanup/unmount-логика канваса проверяется реальная. */
+  vi.mock('../src/components/wizard/WizardMapPanel', async () => {
+    const ReactMod = await import('react');
+    const actual = await vi.importActual<typeof import('../src/components/wizard/WizardMapPanel')>(
+      '../src/components/wizard/WizardMapPanel',
+    );
+    const MapCanvasMod = await import('../src/components/MapCanvas');
+    const MapCanvas = MapCanvasMod.default;
+    const useStoreMod = await import('../src/store/useStore');
+    const prov = await import('../src/utils/mapProviders');
+    const TestPanel: React.FC<{ hint?: string }> = ({ hint }) => {
+      const project = useStoreMod.useStore((s) => s.project);
+      const status = prov.getProviderStatus(
+        project,
+        (project.openStreetMap?.tileServer ?? 'osm') as Parameters<typeof prov.getProviderStatus>[1],
+      );
+      return ReactMod.createElement(
+        'div',
+        {
+          'data-testid': 'wizard-map-panel',
+          className: 'relative flex min-h-[340px] w-full flex-col overflow-hidden',
+          style: { height: 'calc(100vh - 300px)' },
+        },
+        ReactMod.createElement(actual.ProviderSwitcher),
+        hint ? ReactMod.createElement('div', { className: 'hint' }, hint) : null,
+        ReactMod.createElement(
+          'div',
+          {
+            'data-testid': 'wizard-map-container',
+            className: 'relative w-full min-h-[280px] flex-1 overflow-hidden',
+            style: { height: 'calc(100vh - 320px)' },
+          },
+          ReactMod.createElement(MapCanvas, {}),
+          !status.ready &&
+            ReactMod.createElement(
+              'div',
+              { role: 'alert', 'data-testid': 'wizard-map-key-overlay', className: 'overlay' },
+              String(status.message),
+            ),
+        ),
+      );
+    };
+    return { ...actual, WizardMapPanel: TestPanel, default: TestPanel };
+  });
+
   it('нулевые размеры контейнера: без краша, вместо вечной загрузки — явная ошибка с кнопкой повтора', async () => {
     vi.stubGlobal('ResizeObserver', SilentROShim);
     vi.stubGlobal('Image', TrackedImage);
