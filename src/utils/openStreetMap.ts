@@ -345,18 +345,60 @@ export interface OsmGeocodeResult {
  * Геокодирование адреса через Nominatim (OSM).
  * Возвращает различимый статус, чтобы UI не смешивал «не найдено» и «сервис недоступен».
  */
+/**
+ * Fallback-геокодер Photon (photon.komoot.io) — по эталонному Leaflet-приложению
+ * «Карта — рабочие слои без ключей»: если все зеркала Nominatim недоступны
+ * (network/http), пробуем Photon. Возвращает 'not_found' при пустом ответе,
+ * 'network' при сбое/отмене.
+ */
+async function photonGeocode(
+  address: string,
+  signal?: AbortSignal,
+): Promise<{ point: { lat: number; lng: number } | null; kind: 'ok' | 'not_found' | NominatimErrorKind }> {
+  const ctrl = new AbortController();
+  const abortOuter = () => ctrl.abort();
+  signal?.addEventListener('abort', abortOuter);
+  const timer = setTimeout(() => ctrl.abort(), 12000);
+  try {
+    const url = `https://photon.komoot.io/api/?${new URLSearchParams({ q: address, limit: '1', lang: 'ru' })}`;
+    const res = await fetch(url, { signal: ctrl.signal, headers: { Accept: 'application/json' } });
+    if (!res.ok) return { point: null, kind: 'http' };
+    const json = await res.json();
+    const feat = json?.features?.[0];
+    const coords = feat?.geometry?.coordinates;
+    if (!Array.isArray(coords)) return { point: null, kind: 'not_found' };
+    const [lng, lat] = coords.map(Number);
+    if (!isFinite(lat) || !isFinite(lng)) return { point: null, kind: 'not_found' };
+    return { point: { lat, lng }, kind: 'ok' };
+  } catch {
+    return { point: null, kind: 'network' };
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abortOuter);
+  }
+}
+
 export async function osmGeocode(address: string, signal?: AbortSignal): Promise<OsmGeocodeResult> {
   const { data, kind } = await fetchNominatimJson(
     '/search',
     `q=${encodeURIComponent(address)}&limit=1`,
     signal,
   );
-  if (kind !== 'ok') return { point: null, kind };
-  const first = Array.isArray(data) ? data[0] : null;
-  const lat = first ? parseFloat(first.lat) : NaN;
-  const lng = first ? parseFloat(first.lon) : NaN;
-  if (!isFinite(lat) || !isFinite(lng)) return { point: null, kind: 'not_found' };
-  return { point: { lat, lng }, kind: 'ok' };
+  if (kind === 'not_found') return { point: null, kind: 'not_found' };
+  if (kind === 'ok') {
+    const first = Array.isArray(data) ? data[0] : null;
+    const lat = first ? parseFloat(first.lat) : NaN;
+    const lng = first ? parseFloat(first.lon) : NaN;
+    if (!isFinite(lat) || !isFinite(lng)) return { point: null, kind: 'not_found' };
+    return { point: { lat, lng }, kind: 'ok' };
+  }
+  // Nominatim и все его зеркала недоступны (network/http) — fallback на Photon,
+  // как в эталоне. Если Photon тоже недоступен — возвращаем исходную ошибку.
+  if (signal?.aborted) return { point: null, kind };
+  const fb = await photonGeocode(address, signal);
+  if (fb.kind === 'ok') return { point: fb.point, kind: 'ok' };
+  if (fb.kind === 'not_found') return { point: null, kind: 'not_found' };
+  return { point: null, kind };
 }
 
 /**
