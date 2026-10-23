@@ -336,47 +336,57 @@ const MapsPanel: React.FC = () => {
 
       {/* API Key section */}
       {activeProvider === 'google' && (
-        <div>
+        <form
+          onSubmit={(e) => { e.preventDefault(); handleSaveGoogleApiKey(); }}
+          autoComplete="off"
+        >
           <label className="text-xs text-gray-400 block mb-1">API ключ Google Maps</label>
           <div className="flex gap-1">
             <input
               type="password"
+              name="google-maps-key"
+              autoComplete="new-password"
               value={googleApiKey}
               onChange={(e) => setGoogleApiKey(e.target.value)}
               placeholder="Введите API ключ"
               className="flex-1 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white placeholder-gray-500"
             />
             <button
-              onClick={handleSaveGoogleApiKey}
+              type="submit"
               disabled={loading}
               className="px-3 py-1 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white rounded text-xs"
             >
               {loading ? '...' : 'OK'}
             </button>
           </div>
-        </div>
+        </form>
       )}
 
       {activeProvider === 'yandex' && (
-        <div>
+        <form
+          onSubmit={(e) => { e.preventDefault(); handleSaveYandexApiKey(); }}
+          autoComplete="off"
+        >
           <label className="text-xs text-gray-400 block mb-1">API ключ Яндекс.Карт</label>
           <div className="flex gap-1">
             <input
               type="password"
+              name="yandex-maps-key"
+              autoComplete="new-password"
               value={yandexApiKey}
               onChange={(e) => setYandexApiKey(e.target.value)}
               placeholder="Введите API ключ"
               className="flex-1 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white placeholder-gray-500"
             />
             <button
-              onClick={handleSaveYandexApiKey}
+              type="submit"
               disabled={loading}
               className="px-3 py-1 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white rounded text-xs"
             >
               {loading ? '...' : 'OK'}
             </button>
           </div>
-        </div>
+        </form>
       )}
 
       {activeProvider === 'osm' && (
