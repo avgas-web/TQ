@@ -43,24 +43,33 @@ describe('mapProviders: дефолты стора', () => {
   });
 });
 
-describe('mapProviders: URL-шаблоны тайлов', () => {
-  it('2gis использует XYZ-протокол tile-b01.2gis.com с x/y/z', () => {
+describe('mapProviders: URL-шаблоны тайлов (единый загрузчик — рабочие слои эталона без ключей)', () => {
+  it('2gis разворачивается в рабочий слой эталона (OSM France) без мёртвого 2gis.com', () => {
+    // Регрессия DNS-шторма ERR_NAME_NOT_RESOLVED (PR #111): tile-b01.2gis.com
+    // больше не используется нигде, включая шаблоны диагностики.
     const t = tileUrlTemplate('2gis');
-    expect(t).toContain('2gis.com');
-    expect(t).toContain('x={x}');
-    expect(t).toContain('y={y}');
-    expect(t).toContain('z={z}');
+    expect(t).not.toContain('2gis.com');
+    expect(t).toContain('tile.openstreetmap.fr');
+    expect(t).toContain('{x}');
+    expect(t).toContain('{y}');
+    expect(t).toContain('{z}');
   });
 
-  it('osm — дефолтный шаблон openstreetmap.org (регрессия не сломана)', () => {
-    expect(tileUrlTemplate('osm')).toContain('tile.openstreetmap.org/{z}/{x}/{y}');
+  it('osm — дефолтный шаблон Esri World_Street_Map (эталон «работает всегда»)', () => {
+    const t = tileUrlTemplate('osm');
+    expect(t).toContain('server.arcgisonline.com');
+    expect(t).toContain('World_Street_Map');
+    expect(t).toContain('{z}');
+    expect(t).toContain('{x}');
+    expect(t).toContain('{y}');
   });
 
   it('google/yandex/opentopomap/carto имеют собственные шаблоны', () => {
     expect(tileUrlTemplate('google')).toContain('google.com');
     expect(tileUrlTemplate('yandex')).toMatch(/webmap|yandex/);
     expect(tileUrlTemplate('opentopomap')).toContain('opentopomap');
-    expect(tileUrlTemplate('carto')).toContain('cartocdn');
+    // carto → OSM France HOT (замена блокируемого basemaps.cartocdn.com)
+    expect(tileUrlTemplate('carto')).toContain('tile.openstreetmap.fr/hot');
   });
 });
 

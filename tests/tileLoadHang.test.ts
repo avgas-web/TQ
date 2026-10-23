@@ -89,15 +89,16 @@ describe('loadTileImage — защита от зависания загрузк�
 });
 
 // ═══════════════════════════════════════════════════════════════
-// Регрессия «ERR_NAME_NOT_RESOLVED у tile-b01.2gis.com»:
-// loadTileWithMirrors обязан для URL 2ГИС перебирать рабочие зеркала
-// sl{1..4}.2gis.com и кэшировать живой хост (без шторма запросов в
-// мёртвый DNS-хост). Раньше использовался единственный tile-b01 —
-// при его недоступности подложка «2ГИС» молча не загружалась вообще.
+// Регрессия «ERR_NAME_NOT_RESOLVED / таймауты у 2ГИС»: ДОМЕН ПОЛНОСТЬЮ
+// ВЫВЕДЕН ИЗ ЗАГРУЗКИ. По консоль-логам пользователя недоступны ВСЕ хосты:
+// tile-b01.2gis.com (DNS-блокировка) и зеркала sl{1..4}.2gis.com (таймауты).
+// loadTileWithMirrors/loadTileImage обязаны НИКОГДА не обращаться к 2gis.com,
+// а сразу грузить рабочий слой эталона «без ключей» (Esri World_Street_Map).
 // ═══════════════════════════════════════════════════════════════
-describe('loadTileWithMirrors — зеркала 2ГИС при недоступном tile-b01', () => {
-  /** Мок Image, запоминающий все запрошенные src; падает по onerror для
-   * мёртвого хоста tile-b01, успешно грузится с sl*.2gis.com. */
+describe('2ГИС полностью выведен из загрузки — карты грузятся через рабочие слои эталона', () => {
+  /** Мок Image, записывающий все запрошенные src; падает по onerror для
+   * любого хоста 2gis.com (имитация ERR_NAME_NOT_RESOLVED/таймаутов сети),
+   * успешно грузится для прочих (эталонных) хостов. */
   class TwoGisImage {
     static srcs: string[] = [];
     crossOrigin = '';
@@ -105,7 +106,7 @@ describe('loadTileWithMirrors — зеркала 2ГИС при недоступ
     onerror: (() => void) | null = null;
     set src(v: string) {
       TwoGisImage.srcs.push(v);
-      if (v.includes('tile-b01')) setTimeout(() => this.onerror?.(), 0);
+      if (v.includes('2gis.com')) setTimeout(() => this.onerror?.(), 0);
       else setTimeout(() => this.onload?.(), 0);
     }
     get src(): string { return ''; }
@@ -122,36 +123,43 @@ describe('loadTileWithMirrors — зеркала 2ГИС при недоступ
     vi.unstubAllGlobals();
   });
 
-  it('перебирает зеркала sl*.2gis.com, пока одно не ответит', async () => {
+  it('tile-b01 переписывается на рабочий слой эталона (OSM France, как алиас 2gis) без единого запроса к 2gis.com', async () => {
     vi.stubGlobal('Image', TwoGisImage);
     const p = loadTileWithMirrors('https://tile-b01.2gis.com/tiles?x=511&y=340&z=10', 1000);
     for (let i = 0; i < 30; i++) await vi.advanceTimersByTimeAsync(10);
     const img = await p;
     expect(img).not.toBeNull();
-    // tile-b01 при ERR_NAME_NOT_RESOLVED больше НЕ опрашивается первым:
-    // сразу идём на живые зеркала sl{1..4} (нет шторма DNS-ошибок в консоли)
-    expect(TwoGisImage.srcs[0]).toMatch(/sl[1-4]\.2gis\.com\/tiles\?x=511&y=340&z=10/);
-    expect(TwoGisImage.srcs.some((s) => s.includes('tile-b01'))).toBe(false);
+    // Ключевая регрессия: ни одного запроса к ЛЮБОМУ хосту 2gis.com
+    // (ни tile-b01, ни sl1..sl4) — раньше шторм ERR_NAME_NOT_RESOLVED/таймаутов
+    // вешал очередь загрузки и карта оставалась пустой.
+    expect(TwoGisImage.srcs.every((s) => !s.includes('2gis.com'))).toBe(true);
+    // Единая схема разворота с реестром провайдеров: '2gis' → OSM France
+    // standard (тот же улично-топографический стиль). Раньше здесь стоял
+    // Esri Streets — один сохранённый проект рисовал разные подложки в
+    // редакторе и мастере, а кэш тайлов промахивался по URL.
+    expect(TwoGisImage.srcs[0]).toContain('tile.openstreetmap.fr/osmfr');
+    // Те же тайловые координаты сохранены (XYZ-схема {z}/{x}/{y}.png)
+    expect(TwoGisImage.srcs[0]).toMatch(/\/10\/511\/340\.png$/);
   });
 
-  it('кэширует рабочий хост: следующий тайл идёт сразу на живое зеркало', async () => {
+  it('зеркала sl*.2gis.com тоже гасятся — домен недоступен целиком', async () => {
     vi.stubGlobal('Image', TwoGisImage);
-    const first = loadTileWithMirrors('https://tile-b01.2gis.com/tiles?x=1&y=1&z=10', 1000);
+    const first = loadTileWithMirrors('https://sl2.2gis.com/tiles?x=1&y=1&z=10', 1000);
     for (let i = 0; i < 30; i++) await vi.advanceTimersByTimeAsync(10);
     await first;
     TwoGisImage.srcs = [];
-    const second = loadTileWithMirrors('https://tile-b01.2gis.com/tiles?x=2&y=2&z=10', 1000);
+    const second = loadTileWithMirrors('https://sl3.2gis.com/tiles?x=2&y=2&z=10', 1000);
     for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(10);
     await second;
     expect(TwoGisImage.srcs.length).toBe(1);
-    expect(TwoGisImage.srcs[0]).toMatch(/sl[1-4]\.2gis\.com/);
-    expect(TwoGisImage.srcs[0]).not.toContain('tile-b01');
+    expect(TwoGisImage.srcs[0]).not.toContain('2gis.com');
+    expect(TwoGisImage.srcs[0]).toContain('tile.openstreetmap.fr/osmfr');
   });
 
-  it('регрессия ERR_NAME_NOT_RESOLVED шторма: ни один тайл не уходит в tile-b01', async () => {
+  it('регрессия шторма из консоли: 10 тайлов подряд — ноль запросов к 2gis.com', async () => {
     vi.stubGlobal('Image', TwoGisImage);
-    // Десятый тайл подряд — как в браузере при недоступном DNS-хосте:
-    // раньше каждый тайл сначала падал на tile-b01 (шторм ошибок в консоли).
+    // Десятый тайл подряд — как в браузере пользователя при недоступном DNS-хосте:
+    // раньше каждый тайл падал на tile-b01/sl* (шторм ошибок, пустая карта).
     const urls = Array.from({ length: 10 }, (_, i) =>
       `https://tile-b01.2gis.com/tiles?x=${i}&y=${i}&z=10`);
     for (const u of urls) {
@@ -159,16 +167,16 @@ describe('loadTileWithMirrors — зеркала 2ГИС при недоступ
       for (let i = 0; i < 30; i++) await vi.advanceTimersByTimeAsync(10);
       await p;
     }
-    expect(TwoGisImage.srcs.every((s) => /sl[1-4]\.2gis\.com/.test(s))).toBe(true);
-    expect(TwoGisImage.srcs.some((s) => s.includes('tile-b01'))).toBe(false);
+    expect(TwoGisImage.srcs.every((s) => !s.includes('2gis.com'))).toBe(true);
+    expect(TwoGisImage.srcs.every((s) => s.includes('tile.openstreetmap.fr'))).toBe(true);
   });
 });
 
 // ═══════════════════════════════════════════════════════════════
-// Финальный барьер DNS-шторма: normalizeTwoGisTileUrl обязан
-// переписывать ЛЮБОЙ входящий 2ГИС-URL (в т.ч. с мёртвым хостом
-// tile-b01 — старые сохранённые проекты, кэш, сторонние шаблоны) на
-// живое зеркало sl{1..4}. Это закрывает последний путь, которым
+// Финальный барьер: normalizeTwoGisTileUrl обязан переписывать ЛЮБОЙ
+// входящий 2ГИС-URL (мёртвый tile-b01, таймаотящие sl1..4, сторонние
+// шаблоны, старые сохранённые проекты) на URL рабочего слоя ЭТАЛОНА с
+// теми же тайловыми координатами. Это закрывает последний путь, которым
 // битый хост мог попасть в img.src браузера (net::ERR_NAME_NOT_RESOLVED).
 // ═══════════════════════════════════════════════════════════════
 describe('normalizeTwoGisTileUrl — санация 2ГИС-URL перед любой загрузкой', () => {
@@ -193,16 +201,18 @@ describe('normalizeTwoGisTileUrl — санация 2ГИС-URL перед лю�
     vi.useRealTimers();
   });
 
-  it('loadTileImage с URL tile-b01 реально запрашивает живое зеркало sl*', async () => {
+  it('loadTileImage с URL tile-b01 реально запрашивает рабочий слой эталона (OSM France)', async () => {
     vi.stubGlobal('Image', SrcImage);
     const p = loadTileImage('https://tile-b01.2gis.com/tiles?x=0&y=0&z=4', 5000);
     await vi.advanceTimersByTimeAsync(10);
     await expect(p).resolves.not.toBeNull();
     expect(SrcImage.srcs.length).toBe(1);
-    // Ключевая регрессия: ни одного запроса к tile-b01.x — даже при прямом
+    // Ключевая регрессия: ни одного запроса к 2gis.com — даже при прямом
     // вызове loadTileImage/startTileLoad с битым хостом (шторм из консоли).
-    expect(SrcImage.srcs[0]).toMatch(/^https:\/\/sl[1-4]\.2gis\.com\/tiles\?x=0&y=0&z=4$/);
-    expect(SrcImage.srcs[0]).not.toContain('tile-b01');
+    expect(SrcImage.srcs[0]).not.toContain('2gis.com');
+    // Единая схема разворота '2gis' → OSM France standard (как в реестре
+    // провайдеров) — XYZ-схема {z}/{x}/{y}.png, поддомен a для x+y=0.
+    expect(SrcImage.srcs[0]).toMatch(/^https:\/\/a\.tile\.openstreetmap\.fr\/osmfr\/4\/0\/0\.png$/);
   });
 
   it('OSM/прочие URL не затрагиваются (no-op)', () => {
@@ -212,10 +222,17 @@ describe('normalizeTwoGisTileUrl — санация 2ГИС-URL перед лю�
       .toBe('https://basemaps.cartocdn.com/dark_all/10/1/1.png');
   });
 
-  it('сторонний шаблон с 2gis.com в адресе тоже ведётся на зеркала', () => {
+  it('сторонний шаблон с 2gis.com в адресе тоже ведётся на рабочий слой эталона', () => {
     const out = normalizeTwoGisTileUrl('https://cdn.example.ru/2gis.com/tiles?x=7&y=8&z=9');
-    expect(out).toMatch(/^https:\/\/sl[1-4]\.2gis\.com\//);
-    expect(out).not.toContain('tile-b01');
-    expect(out).toContain('/tiles?x=7&y=8&z=9'); // путь+query сохранены
+    expect(out).not.toContain('2gis.com');
+    // '2gis' → OSM France standard (единая схема с реестром провайдеров);
+    // поддомен для x+y=15 → (15)%3=0 → 'a'; XYZ-схема {z}/{x}/{y}.png.
+    expect(out).toContain('tile.openstreetmap.fr/osmfr');
+    expect(out).toMatch(/\/9\/7\/8\.png$/); // те же тайловые координаты x=7,y=8,z=9
+  });
+
+  it('2ГИС-URL без узнаваемой XYZ-схемы гасится прозрачным пикселем (в сеть не уходит)', () => {
+    const out = normalizeTwoGisTileUrl('https://tile-b01.2gis.com/some/other/path');
+    expect(out.startsWith('data:image/png')).toBe(true);
   });
 });

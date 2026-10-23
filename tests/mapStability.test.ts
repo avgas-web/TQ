@@ -55,12 +55,16 @@ describe('mapStability — circuit breakers загрузки тайлов', () =
     expect(result).toBeNull();
   });
 
-  it('2ГИС использует отдельный XYZ-шаблон тайлов (не OSM)', () => {
+  it('2ГИС заменён рабочим слоем эталона (OSM France) — без мёртвого 2gis.com', () => {
+    // Регрессия DNS-шторма: tile-b01.2gis.com не резолвится (ERR_NAME_NOT_RESOLVED),
+    // поэтому алиас '2gis' разворачивается в рабочий слой эталона «без ключей».
     const url2gis = getOSMTileUrl(10, 511, 340, '2gis', 'scheme');
     const urlOsm = getOSMTileUrl(10, 511, 340, 'osm', 'scheme');
-    expect(url2gis).toContain('2gis.com');
-    expect(url2gis).not.toBe(urlOsm);
-    expect(url2gis).toMatch(/x=511|\/511\//);
+    expect(url2gis).not.toContain('2gis.com');
+    expect(url2gis).toContain('tile.openstreetmap.fr'); // OSM France standard
+    expect(url2gis).toMatch(/\/10\/511\/340\.png$/);     // XYZ-схема {z}/{x}/{y}
+    expect(urlOsm).toContain('arcgisonline.com');        // Esri World_Street_Map («работает всегда»)
+    expect(url2gis).not.toBe(urlOsm);                    // разные слои — разные URL
   });
 
   it('провайдер по умолчанию — osm, подложка включена (автозагрузка без ключей)', () => {

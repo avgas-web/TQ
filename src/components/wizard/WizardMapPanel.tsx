@@ -18,13 +18,22 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useStore } from '../../store/useStore';
 import { getProviderStatus, type TileProviderId } from '../../utils/mapProviders';
+import {
+  WORKING_TILE_LAYERS,
+  resolveWorkingLayer,
+  type WorkingTileLayerId,
+} from '../../utils/mapProviders';
 import { ensureDefaultTileMap } from '../../hooks/useAppInitialization';
 
-const SERVER_LABELS: Record<'osm' | 'opentopomap' | 'carto' | '2gis', string> = {
-  osm: '🌐 OSM',
-  '2gis': '🧭 2ГИС',
-  opentopomap: '⛰ Topo',
-  carto: '💡 Light',
+/** Эмодзи-префиксы к названиям рабочих слоёв эталона (без ключей). */
+const LAYER_ICONS: Record<WorkingTileLayerId, string> = {
+  'esri-streets': '🌐',
+  'esri-satellite': '🛰',
+  'osm-fr-standard': '🧭',
+  'osm-fr-hot': '💡',
+  'osm-de': '🇩🇪',
+  opentopomap: '⛰',
+  cyclosm: '🚴',
 };
 
 /** Панель переключения бесплатных XYZ-подложек + статус ключевых провайдеров. */
@@ -41,21 +50,23 @@ export const ProviderSwitcher: React.FC = () => {
 
   return (
     <div className="flex items-center gap-1 border-b border-slate-800 bg-slate-950 px-2 py-1" data-testid="wizard-map-providers">
-      {(Object.keys(SERVER_LABELS) as Array<keyof typeof SERVER_LABELS>).map((id) => (
+      {/* Единый набор рабочих слоёв эталона (без ключей) — те же id, что в
+          редакторе (MapsPanel): один загрузчик, одна подложка на оба режима. */}
+      {WORKING_TILE_LAYERS.map((layer) => (
         <button
-          key={id}
+          key={layer.id}
           type="button"
-          data-testid={`wizard-tiles-${id}`}
-          onClick={() => setOSMTileServer(id)}
+          data-testid={`wizard-tiles-${layer.id}`}
+          onClick={() => setOSMTileServer(layer.id)}
           className={
             'rounded px-2 py-0.5 text-[11px] transition ' +
-            (tileServer === id
+            (resolveWorkingLayer(tileServer) === layer.id
               ? 'bg-cyan-600 font-bold text-white'
               : 'bg-slate-800 text-slate-300 hover:bg-slate-700')
           }
-          title={id === '2gis' ? 'Публичные тайлы 2ГИС, API-ключ не требуется' : undefined}
+          title={`${layer.name} — рабочий слой без API-ключа`}
         >
-          {SERVER_LABELS[id]}
+          {LAYER_ICONS[layer.id]} {layer.name.replace(/ —.*$/, '').replace(/\(.*\)/, '').trim()}
         </button>
       ))}
       <span className="ml-auto flex gap-2 text-[10px]">

@@ -11,7 +11,7 @@ import { v4 as uuidv4 } from 'uuid';
 import type {
   Project,
   Marker, Restriction, Layer, ViewState, MapData, Point,
-  CalibrationPoint, MapBounds, Tool,
+  CalibrationPoint, MapBounds, Tool, TileServerId,
 } from '../types';
 
 /** Настройки карты/высот (подмножество Project['settings']). */
@@ -90,7 +90,7 @@ export interface MapState {
   calibration: { enabled: boolean; points: CalibrationPoint[] };
   googleMaps: { apiKey: string; enabled: boolean };
   yandexMaps: { apiKey: string; enabled: boolean };
-  openStreetMap: { enabled: boolean; tileServer: 'osm' | 'opentopomap' | 'carto' | '2gis' };
+  openStreetMap: { enabled: boolean; tileServer: TileServerId };
   settings: ProjectSettings;
   _currentMapId?: string; // ID текущей карты в IndexedDB
   // UI-состояние карты
@@ -151,7 +151,7 @@ export interface MapActions {
   setYandexMapsApiKey: (apiKey: string) => void;
   toggleYandexMaps: (enabled: boolean) => void;
   toggleOpenStreetMap: (enabled: boolean) => void;
-  setOSMTileServer: (server: 'osm' | 'opentopomap' | 'carto' | '2gis') => void;
+  setOSMTileServer: (server: TileServerId) => void;
   setMapBounds: (bounds: MapBounds) => void;
   loadMap: (mapData: MapData) => void;
   loadMapWithStorage: (mapData: MapData) => Promise<void>;

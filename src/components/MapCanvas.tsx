@@ -8,12 +8,13 @@ import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
 import { pixelToGeoExact, geoToPixelExact, routeLengthM, zonesCrossedBy, planPathAroundZones, smoothPolyline } from '../utils/routing';
 import { getOSMTileUrl, createCancellableMirrorLoad, abortTileImage, resetTwoGisMirrorCache, normalizeTwoGisTileUrl, type TileStyle, type TileLoadHandle } from '../utils/openStreetMap';
+import { resolveWorkingLayer } from '../utils/mapProviders';
 import { useMapStore } from '../store/useMapStore';
 import { ensureDefaultTileMap } from '../hooks/useAppInitialization';
 import MiniMapPanel, { MiniOverlayLine, MiniOverlayPoint, type MiniZone } from './MiniMapPanel';
 import { zoomForGroundMpp, GROUND_MPP_1CM_2KM } from '../utils/pannelli';
 import { eventBus } from '../utils/eventBus';
-import type { Point, Route, RoutePoint, MapBounds, ViewState } from '../types';
+import type { Point, Route, RoutePoint, MapBounds, ViewState, TileServerId } from '../types';
 
 /** Границы зума тайловой карты: minZoom 3 (вся страна/регион), maxZoom 19 (уровни OSM).
  *  Раньше нижняя граница была z10 — поэтому «большая карта» (страна/область) не
@@ -24,8 +25,16 @@ const MAX_ZOOM = 19;
 /** Палитра цветов маршрутов (повторяется циклически при большом числе маршрутов) */
 const ROUTE_PALETTE = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#fb923c', '#38bdf8', '#e879f9'];
 
-/** Нативный max zoom тайловых серверов (выше НЕ поднимаемся — нет данных, только растяжение) */
-const NATIVE_MAX_BY_SERVER: Record<string, number> = { osm: 19, carto: 18, opentopomap: 17, '2gis': 18 };
+/** Нативный max zoom тайловых серверов (выше НЕ поднимаемся — нет данных, только растяжение).
+ *  Значения взяты 1-в-1 из рабочего эталона (Leaflet «рабочие слои без ключей»):
+ *  Esri 19, OSM France 19, OSM Germany 18, OpenTopoMap 17, CyclOSM 20. Legacy-алиасы
+ *  ('osm' → Esri улицы, '2gis' → OSM France, 'carto' → OSM France HOT) наследуют
+ *  максимум целевого слоя. */
+const NATIVE_MAX_BY_SERVER: Record<string, number> = {
+  osm: 19, carto: 19, opentopomap: 17, '2gis': 19,
+  'esri-streets': 19, 'esri-satellite': 19, 'osm-fr-standard': 19, 'osm-fr-hot': 19,
+  'osm-de': 18, cyclosm: 19,
+};
 
 /** КЛЮЧ сохранённого вида в localStorage. Раньше состояние камеры жило ТОЛЬКО в
  *  zustand-persist ('tq-map'): любое зависание гонки гидрации/сброса сторов
@@ -165,7 +174,7 @@ function worldPxForMetersPerPixel(mpp: number, latRef: number): number {
 /** Границы scale для minZoom..maxNativeZoom (не выше нативного уровня сервера) */
 function scaleBoundsForZooms(canvasH: number, z0: number | undefined, server: string): { min: number; max: number } {
   void canvasH; // границы задаются zoom'ом, а не размером окна — scale относительна z0=14
-  const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[server] ?? MAX_ZOOM);
+  const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[resolveWorkingLayer(server)] ?? MAX_ZOOM);
   return {
     min: Math.pow(2, MIN_ZOOM - (z0 ?? ZOOM_REF)),
     max: Math.pow(2, nativeMax - (z0 ?? ZOOM_REF)),
@@ -729,7 +738,10 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   // Только стандартная схема OSM (режимы «спутник/гибрид» удалены из приложения)
   type TileStyle = 'scheme';
   const tileStyle = 'scheme' as const satisfies TileStyle;
-  const tileServer: 'osm' | 'opentopomap' | 'carto' | '2gis' = project.openStreetMap?.tileServer ?? 'osm';
+  const tileServer: TileServerId = project.openStreetMap?.tileServer ?? 'osm';
+  // Нативный максимум ВЫБРАННОГО рабочего слоя (legacy-алиасы разворачиваются
+  // через resolveWorkingLayer — единая точка истины для редактора и мастера).
+  const nativeMaxTile = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[resolveWorkingLayer(tileServer)] ?? MAX_ZOOM);
   // ЕДИНАЯ инвариантная привязка вида (см. комментарий над worldPxOf):
   //   zoom = z0 + log2(scale),  worldPx = canvasHeight · 2^zoom.
   const effZ0 = vs.z0 ?? ZOOM_REF;
@@ -762,7 +774,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     if (!tilesOn || !mapBounds || cs.height <= 0) { el.style.display = 'none'; return; }
     const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
     const zoom = clampZoom(zoomAtWorldPx(wp));
-    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[(st.openStreetMap?.tileServer as any) || 'osm'] ?? MAX_ZOOM);
+    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[resolveWorkingLayer(st.openStreetMap?.tileServer)] ?? MAX_ZOOM);
     const level = Math.max(MIN_ZOOM, Math.min(nativeMax, Math.round(zoom)));
     const n = Math.pow(2, level);
     // ── СТРОГАЯ привязка DOM-слоя к инварианту вида ───────────────────────────
@@ -818,8 +830,8 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     if (!Number.isFinite(cs.width) || !Number.isFinite(cs.height) || cs.width <= 0 || cs.height <= 0) return;
     const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
     const zoom = clampZoom(zoomAtWorldPx(wp));
-    const server: 'osm' | 'opentopomap' | 'carto' | '2gis' = proj.openStreetMap?.tileServer ?? 'osm';
-    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[server] ?? MAX_ZOOM);
+    const server: TileServerId = proj.openStreetMap?.tileServer ?? 'osm';
+    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[resolveWorkingLayer(server)] ?? MAX_ZOOM);
     const level = Math.max(MIN_ZOOM, Math.min(nativeMax, Math.round(zoom)));
     const n = Math.pow(2, level);
     // World-пиксели ВЫБРАННОГО уровня: та же формула привязки, что у объектов

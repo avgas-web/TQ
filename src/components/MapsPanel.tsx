@@ -3,7 +3,9 @@ import { useStore } from '../store/useStore';
 import { loadGoogleMapsApi, geocodeAddress, loadStaticMap, isGoogleMapsLoaded } from '../utils/googleMaps';
 import { loadYandexMapsApi, yandexGeocode, loadYandexStaticMap, isYandexMapsLoaded } from '../utils/yandexMaps';
 import { osmGeocode, loadOSMStaticMap } from '../utils/openStreetMap';
-import type { MapProvider } from '../types';
+import { WORKING_TILE_LAYERS, resolveWorkingLayer } from '../utils/mapProviders';
+import type { WorkingTileLayerId } from '../utils/openStreetMap';
+import type { MapProvider, TileServerId } from '../types';
 
 const MapsPanel: React.FC = () => {
   const [activeProvider, setActiveProvider] = useState<MapProvider>('google');
@@ -13,8 +15,11 @@ const MapsPanel: React.FC = () => {
   const [zoomInput, setZoomInput] = useState('15');
   const [googleMapType, setGoogleMapType] = useState<'roadmap' | 'satellite' | 'hybrid' | 'terrain'>('satellite');
   const [yandexMapType, setYandexMapType] = useState<'map' | 'satellite' | 'hybrid'>('satellite');
-  type TileServerId = 'osm' | 'opentopomap' | 'carto' | '2gis';
-  const [osmTileServer, setOsmTileServer] = useState<TileServerId>('osm');
+  // Единый загрузчик карт (редактор + мастер): подложка выбирается из списка
+  // РАБОЧИХ слоёв эталона «без ключей» (Esri/OSM France/OSM Germany/OpenTopoMap/
+  // CyclOSM). Локальный тип больше не сужается до legacy-алиасов — используется
+  // общий TileServerId из ../types.
+  const [osmTileServer, setOsmTileServer] = useState<TileServerId>('esri-streets');
   const [widthInput, setWidthInput] = useState('2048');
   const [heightInput, setHeightInput] = useState('2048');
   const [loading, setLoading] = useState(false);
@@ -222,11 +227,13 @@ const MapsPanel: React.FC = () => {
           source: 'yandex',
         });
       } else if (activeProvider === '2gis') {
-        // ЗАГРУЗКА КАРТ 2ГИС: публичные тайловые серверы sl/tile-b01.2gis.com,
-        // API ключ НЕ требуется. Тайлсервер фиксируется в сторе, после чего
-        // создается активная тайловая карта с той же строгой Mercator-привязкой,
-        // что и OSM — точки/маршруты ставятся по реальным координатам.
-        setOSMTileServer('2gis');
+        // ВКЛАДКА «2ГИС» → РАБОЧИЙ СЛОЙ ЭТАЛОНА: мёртвый tile-b01.2gis.com
+        // (ERR_NAME_NOT_RESOLVED, DNS-шторм) полностью выведен из загрузки.
+        // Теперь это тот же единый загрузчик, что и в редакторе: подложка —
+        // OSM France standard (стиль 1-в-1 как у 2ГИС, без ключей), активная
+        // тайловая карта со строгой Mercator-привязкой — точки/маршруты
+        // просматриваются в обоих режимах одинаково.
+        setOSMTileServer('osm-fr-standard');
         const geoRes = await osmGeocode(addressInput);
         geoResult = geoRes.point;
         if (!geoResult) {
@@ -237,10 +244,10 @@ const MapsPanel: React.FC = () => {
         loadActiveTileMap(geoResult, zoom);
         useStore.setState((cur) => ({
           project: cur.project.map
-            ? { ...cur.project, map: { ...cur.project.map, source: '2gis' } }
+            ? { ...cur.project, map: { ...cur.project.map, source: 'osm' } }
             : cur.project,
         }));
-        setSuccess('Карта 2ГИС загружена: доступен зум и панорама, привязка к координатам строгая.');
+        setSuccess('Карта загружена (рабочий слой OSM France вместо 2ГИС): доступен зум и панорама, привязка к координатам строгая.');
         return;
       } else if (activeProvider === 'osm') {
         // ПРОСТАЯ ЗАГРУЗКА KAK НА OPENSTREETMAP.ORG: вместо «фотографии»-стоп-кадра
@@ -257,22 +264,14 @@ const MapsPanel: React.FC = () => {
         }
 
         loadActiveTileMap(geoResult, zoom);
-        // При выборе сервера тайлов «2ГИС» на вкладке OSM подложка мгновенно
-        // переключается на tiles 2gis (effect в MapCanvas сбрасывает кэш тайлов).
-        // Источник карты помечаем для бейджа/статистики.
-        if (osmTileServer === '2gis') {
-          useStore.setState((cur) => ({
-            project: cur.project.map
-              ? { ...cur.project, map: { ...cur.project.map, source: '2gis' } }
-              : cur.project,
-          }));
-        } else {
-          useStore.setState((cur) => ({
-            project: cur.project.map
-              ? { ...cur.project, map: { ...cur.project.map, source: 'osm' } }
-              : cur.project,
-          }));
-        }
+        // Единый загрузчик: источник всегда 'osm' (активная тайловая карта).
+        // Legacy-алиас '2gis' разворачивается в рабочий слой OSM France —
+        // бейдж/статистика больше не ссылаются на мёртвый tile-b01.2gis.com.
+        useStore.setState((cur) => ({
+          project: cur.project.map
+            ? { ...cur.project, map: { ...cur.project.map, source: 'osm' } }
+            : cur.project,
+        }));
 
         // Снимок-подложка для OSM НЕ загружается: активная тайловая карта уже
         // является основной подложкой (как на openstreetmap.org). Фоновый big-PNG
@@ -381,9 +380,9 @@ const MapsPanel: React.FC = () => {
 
       {activeProvider === 'osm' && (
         <div>
-          <label className="text-xs text-gray-400 block mb-1">Сервер тайлов</label>
+          <label className="text-xs text-gray-400 block mb-1">Стиль подложки (рабочие слои без ключей)</label>
           <select
-            value={osmTileServer}
+            value={resolveWorkingLayer(osmTileServer)}
             onChange={(e) => {
               const value = e.target.value as TileServerId;
               setOsmTileServer(value);
@@ -391,12 +390,13 @@ const MapsPanel: React.FC = () => {
             }}
             className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white"
           >
-            <option value="osm">OpenStreetMap</option>
-            <option value="2gis">2ГИС (без API ключа)</option>
-            <option value="opentopomap">OpenTopoMap</option>
-            <option value="carto">CartoDB Light</option>
+            {/* Единый набор для редактора и мастера — 1-в-1 как в рабочем
+                эталоне «Карта — рабочие слои без ключей» (Leaflet). */}
+            {WORKING_TILE_LAYERS.map((layer) => (
+              <option key={layer.id} value={layer.id}>{layer.name}</option>
+            ))}
           </select>
-          <p className="text-xs text-green-400 mt-2">✓ OSM активен (не требует API ключа)</p>
+          <p className="text-xs text-green-400 mt-2">✓ Все слои бесплатны и не требуют API ключа</p>
         </div>
       )}
 
@@ -461,7 +461,7 @@ const MapsPanel: React.FC = () => {
           )}
           {activeProvider === 'osm' && (
             <select
-              value={osmTileServer}
+              value={resolveWorkingLayer(osmTileServer)}
               onChange={(e) => {
                 const value = e.target.value as TileServerId;
                 setOsmTileServer(value);
@@ -469,10 +469,9 @@ const MapsPanel: React.FC = () => {
               }}
               className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white"
             >
-              <option value="osm">OSM Standard</option>
-              <option value="2gis">2ГИС</option>
-              <option value="opentopomap">Topo</option>
-              <option value="carto">Light</option>
+              {WORKING_TILE_LAYERS.map((layer) => (
+                <option key={layer.id} value={layer.id}>{layer.name}</option>
+              ))}
             </select>
           )}
         </div>

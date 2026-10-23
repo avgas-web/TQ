@@ -1,5 +1,185 @@
 // Утилиты для работы с OpenStreetMap
 import { calculateBoundsFromCenter, latToMercatorY } from './googleMaps';
+import type { TileServerId } from '../types';
+
+/**
+ * Разрешение legacy-алиасов подложек в рабочие слои эталона. Реализация —
+ * в mapProviders.resolveWorkingLayer; связь односторонняя: mapProviders
+ * импортирует ЭТОТ модуль (WORKING_TILE_LAYERS и т.д.), а здесь алиасы
+ * разворачиваются локальной таблицей (без цикла импортов). Таблица обязана
+ * оставаться синхронной resolveWorkingLayer в mapProviders.ts.
+ */
+const LEGACY_ALIAS_TO_WORKING_LAYER: Record<'osm' | '2gis' | 'carto' | 'opentopomap', WorkingTileLayerId> = {
+  osm: 'esri-streets',      // Esri World_Street_Map — «работает всегда» (эталон)
+  '2gis': 'osm-fr-standard',// замена мёртвого tile-b01.2gis.com (DNS-шторм, PR #111)
+  carto: 'osm-fr-hot',      // светлый «light» стиль без блокируемого cartocdn
+  opentopomap: 'opentopomap',
+};
+function resolveWorkingLayer(id: unknown): WorkingTileLayerId {
+  if (isWorkingTileLayerId(id)) return id;
+  if (id === 'osm' || id === '2gis' || id === 'carto' || id === 'opentopomap') {
+    return LEGACY_ALIAS_TO_WORKING_LAYER[id];
+  }
+  return DEFAULT_WORKING_LAYER;
+}
+
+/**
+ * Рабочие XYZ-зеркала OpenStreetMap, проверенные на доступность БЕЗ ключей и
+ * без DNS-блокировок. Основной пул tile.openstreetmap.org в ряде сетей отдаёт
+ * 429/ERR_CONNECTION_TIMED_OUT, а tile-b01.2gis.com — ERR_NAME_NOT_RESOLVED
+ * (см. TwoGis ниже). Список взят из заведомо рабочего эталона (Leaflet-приложение):
+ *  - Esri World_Street_Map / World_Imagery — самые стабильные, работают всегда;
+ *  - OSM France ({s}=a/b/c) и OSM Germany — независимые серверы OSM-сообщества,
+ *    не делят лимиты основного tile.openstreetmap.org;
+ *  - OpenTopoMap / CyclOSM — тематические подложки без ключей.
+ * Порядок = приоритет: первый хост дефолтный, остальные подключаются
+ * автоматически при сбоях (watchLayerErrors-логика перебора зеркал).
+ */
+export const OSM_WORKING_HOSTS = {
+  esriStreets: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile',
+  esriImagery: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile',
+  osmFrSub: ['a', 'b', 'c'] as const,
+  /**
+   * ВАЖНО (регрессия «{s} залипает в URL → тайлы не грузятся»): базы хранятся
+   * БЕЗ метки '{s}' в хосте. Метка внутри hostname ломает и `new URL()`
+   * (валидация address-URI), и строковый `.replace('{s}', …)` в некоторых
+   * окружениях — итог: запрос на https://a.tile.openstreetmap.fr/osmfr/{s}/3/0/0.png
+   * (404 на каждый тайл). Поддомен подставляется функцией workingLayerHost()
+   * конкатенацией, а не replace'ом.
+   */
+  osmFrBase: 'https://.tile.openstreetmap.fr/osmfr',
+  osmFrHotBase: 'https://.tile.openstreetmap.fr/hot',
+  osmDe: 'https://tile.openstreetmap.de',
+  opentopoBase: 'https://.tile.opentopomap.org',
+  cyclosmBase: 'https://.tile-cyclosm.openstreetmap.fr/cyclosm',
+} as const;
+
+/** Хост рабочего слоя с детерминированным поддоменом {a,b,c} (как subdomains:'abc' в эталоне). */
+function workingLayerHost(base: string, id: WorkingTileLayerId, x: number, y: number): string {
+  if (!workingLayerUsesSubdomain(id)) return base;
+  const sub = pickOsmFrSubdomain(x, y);
+  // base вида 'https://.tile…' — вставляем поддомен сразу после '://'.
+  return `${base.slice(0, base.indexOf('//') + 2)}${sub}${base.slice(base.indexOf('//') + 2)}`;
+}
+
+/**
+ * Идентификаторы рабочих подложек эталонного Leaflet-приложения
+ * («Карта — рабочие слои без ключей»): все они бесплатны и НЕ требуют API-ключей.
+ * Встроены вместо OSM/2ГИС как единый набор слоёв для обоих режимов
+ * (редактор и мастер используют один и тот же загрузчик MapCanvas).
+ */
+export type WorkingTileLayerId =
+  | 'esri-streets'
+  | 'esri-satellite'
+  | 'osm-fr-standard'
+  | 'osm-fr-hot'
+  | 'osm-de'
+  | 'opentopomap'
+  | 'cyclosm';
+
+/** Метаданные слоя для UI-селектора (порядок = как в эталоне). */
+export interface WorkingTileLayerMeta {
+  id: WorkingTileLayerId;
+  name: string;
+  attribution: string;
+  /** Нативный максимум зума (сверх — тайлов нет; MapCanvas включает overzoom). */
+  maxNativeZoom: number;
+}
+
+const OSM_ATTR = '© OpenStreetMap contributors';
+const ESRI_ATTR = 'Tiles © Esri';
+
+export const WORKING_TILE_LAYERS: readonly WorkingTileLayerMeta[] = [
+  { id: 'esri-streets', name: 'Esri — улицы', attribution: ESRI_ATTR, maxNativeZoom: 19 },
+  { id: 'esri-satellite', name: 'Esri — спутник', attribution: ESRI_ATTR, maxNativeZoom: 19 },
+  { id: 'osm-fr-standard', name: 'OSM France (стандарт)', attribution: `${OSM_ATTR} | OSM France`, maxNativeZoom: 19 },
+  { id: 'osm-fr-hot', name: 'OSM France (гуманитарный)', attribution: `${OSM_ATTR} | HOT France`, maxNativeZoom: 19 },
+  { id: 'osm-de', name: 'OSM Germany', attribution: `${OSM_ATTR} | OSM Germany`, maxNativeZoom: 18 },
+  { id: 'opentopomap', name: 'OpenTopoMap', attribution: `${OSM_ATTR} | OpenTopoMap (CC-BY-SA)`, maxNativeZoom: 17 },
+  { id: 'cyclosm', name: 'CyclOSM', attribution: `${OSM_ATTR} | CyclOSM`, maxNativeZoom: 19 },
+] as const;
+
+/** Дефолтная подложка эталона — самая стабильная («работает всегда»). */
+export const DEFAULT_WORKING_LAYER: WorkingTileLayerId = 'esri-streets';
+
+export function isWorkingTileLayerId(v: unknown): v is WorkingTileLayerId {
+  return typeof v === 'string' && WORKING_TILE_LAYERS.some((l) => l.id === v);
+}
+
+/**
+ * Построение URL тайла по схеме слоя. Схемы точь-в-точь как в рабочем эталоне:
+ *  - Esri: {z}/{y}/{x} (без расширения);
+ *  - прочие XYZ: {z}/{x}/{y}.png.
+ */
+export function workingLayerTileUrl(id: WorkingTileLayerId, x: number, y: number, zRaw: number): string {
+  switch (id) {
+    case 'esri-streets': {
+      const z = Math.min(Math.max(zRaw, 0), 19);
+      return `${OSM_WORKING_HOSTS.esriStreets}/${z}/${y}/${x}`;
+    }
+    case 'esri-satellite': {
+      const z = Math.min(Math.max(zRaw, 0), 19);
+      return `${OSM_WORKING_HOSTS.esriImagery}/${z}/${y}/${x}`;
+    }
+    case 'osm-fr-standard': {
+      const z = Math.min(Math.max(zRaw, 0), 19);
+      return `${workingLayerHost(OSM_WORKING_HOSTS.osmFrBase, id, x, y)}/${z}/${x}/${y}.png`;
+    }
+    case 'osm-fr-hot': {
+      const z = Math.min(Math.max(zRaw, 0), 19);
+      return `${workingLayerHost(OSM_WORKING_HOSTS.osmFrHotBase, id, x, y)}/${z}/${x}/${y}.png`;
+    }
+    case 'osm-de': {
+      const z = Math.min(Math.max(zRaw, 0), 18);
+      return `${OSM_WORKING_HOSTS.osmDe}/${z}/${x}/${y}.png`;
+    }
+    case 'opentopomap': {
+      const z = Math.min(Math.max(zRaw, 0), 17);
+      return `${workingLayerHost(OSM_WORKING_HOSTS.opentopoBase, id, x, y)}/${z}/${x}/${y}.png`;
+    }
+    case 'cyclosm': {
+      const z = Math.min(Math.max(zRaw, 0), 19);
+      return `${workingLayerHost(OSM_WORKING_HOSTS.cyclosmBase, id, x, y)}/${z}/${x}/${y}.png`;
+    }
+  }
+}
+
+/**
+ * Публичный доступ к детерминированному выбору поддомена слоя — используется
+ * fillWorkingLayerUrlTemplate в mapProviders для консистентности шаблонов.
+ */
+export function workingLayerSubdomain(id: WorkingTileLayerId, x: number, y: number): string {
+  if (!workingLayerUsesSubdomain(id)) return '';
+  return pickOsmFrSubdomain(x, y);
+}
+
+function workingLayerUsesSubdomain(id: WorkingTileLayerId): boolean {
+  return id === 'osm-fr-standard' || id === 'osm-fr-hot' || id === 'opentopomap' || id === 'cyclosm';
+}
+
+/** Детерминированный выбор поддомена {a,b,c} (как subdomains:'abc' в эталоне). */
+function pickOsmFrSubdomain(x: number, y: number): 'a' | 'b' | 'c' {
+  const subs = OSM_WORKING_HOSTS.osmFrSub;
+  return subs[(Math.abs(x) + Math.abs(y)) % subs.length];
+}
+
+/** Запасные рабочие хосты того же стиля для отказоустойчивости (эталон watchTileErrors). */
+function workingLayerFallbackIds(id: WorkingTileLayerId): WorkingTileLayerId[] {
+  switch (id) {
+    case 'esri-streets': return ['osm-fr-standard', 'osm-de'];
+    case 'esri-satellite': return ['osm-fr-standard', 'osm-de'];
+    case 'osm-fr-standard': return ['osm-de', 'esri-streets'];
+    case 'osm-fr-hot': return ['osm-de', 'esri-streets'];
+    case 'osm-de': return ['osm-fr-standard', 'esri-streets'];
+    case 'opentopomap': return ['osm-fr-standard', 'esri-streets'];
+    case 'cyclosm': return ['osm-fr-standard', 'esri-streets'];
+  }
+}
+
+/** Полный URL-кандидаты для перебора при сбое основного слоя. */
+export function workingLayerFallbackUrls(id: WorkingTileLayerId, x: number, y: number, z: number): string[] {
+  return workingLayerFallbackIds(id).map((alt) => workingLayerTileUrl(alt, x, y, z));
+}
 
 /** Зеркала тайлового сервера tile.openstreetmap.org (перебираются при ошибках/таймаутах) */
 const OSM_TILE_MIRRORS = [
@@ -10,61 +190,44 @@ const OSM_TILE_MIRRORS = [
 ];
 
 /**
- * Рабочие зеркала публичных тайлов 2ГИС. Хост `tile-b01.2gis.com` НЕ резолвится
- * в ряде сетей (net::ERR_NAME_NOT_RESOLVED — DNS-блокировка/фильтр), из-за чего
- * подложка «2ГИС» молча не загружалась вообще. sl{1..4}.2gis.com — те же публичные
- * тайлы по стандартной XYZ-схеме; перебор зеркал даёт отказоустойчивость как у OSM.
- * tile-b01 намеренно ИСКЛЮЧЁН из обхода ПОЛНОСТЬЮ (а не только после первого сбоя):
- * при DNS-блокировке браузер сначала долгие секунды держит тайловый слот занятым
- * ожиданием ответа DNS, и очередь загрузки («pump») встает — карта выглядит
- * зависшей. Поэтому ни один запрос к tile-b01 не отправляется никогда.
- */
-const TWO_GIS_TILE_MIRRORS = [
-  'https://sl1.2gis.com',
-  'https://sl2.2gis.com',
-  'https://sl3.2gis.com',
-  'https://sl4.2gis.com',
-];
-
-/**
- * Кэш последнего успешно отдавшего тайл хоста 2ГИС: после определения живого
- * зеркала все последующие тайлы идут сразу на него (без шторма DNS-ошибок).
- */
-let twoGisWorkingHost: string | null = null;
-
-/**
- * Приведение ЛЮБОГО 2ГИС-URL к живому зеркалу. Ключевой фикс шторма
- * net::ERR_NAME_NOT_RESOLVED на tile-b01.2gis.com/tiles?x=..&y=..&z=..:
- * URL с мёртвым хостом (старые сохранённые проекты, сторонние шаблоны,
- * устаревшие сборки) переписывается на рабочий sl{1..4}.2gis.com ПЕРЕД
- * любой загрузкой — включая присвоение `src` DOM-тайлу после успешной
- * загрузки (иначе браузер повторно скачивал бы тайл уже с мёртвого хоста).
- * Возвращает исходный URL, если он не относится к 2ГИС.
+ * Санация УСТАРЕВШИХ 2ГИС-URL (полный вывод домена из загрузки).
+ * По конSOLE-логам пользователя было установлено: ВСЕ хосты 2ГИС недоступны —
+ *   - tile-b01.2gis.com → net::ERR_NAME_NOT_RESOLVED (DNS-блокировка, PR #111);
+ *   - sl{1..4}.2gis.com → таймауты/ошибки соединения (не резолвятся либо
+ *     блокируются сетью/файрволом) — даже после перебора зеркал карта в
+ *     мастере оставалась пустой.
+ * Поэтому 2ГИС заменён рабочими слоями эталонного Leaflet-приложения
+ * («Карта — рабочие слои без ключей»: Esri World_Street_Map / OSM France),
+ * которые грузятся всегда и без API-ключей. Любая ссылка вида
+ * https://{tile-b01|sl1..4}.2gis.com/tiles?x=..&y=..&z=.. (старые сохранённые
+ * проекты, кэш, сторонние шаблоны) ПЕРЕПИСЫВАЕТСЯ на URL рабочего слоя ЭТАЛОНА
+ * с теми же тайловыми координатами — до любой загрузки и до присвоения img.src.
+ * Ни один запрос к 2gis.com не отправляется никогда.
  */
 export function normalizeTwoGisTileUrl(url: string): string {
   if (!url.includes('2gis.com')) return url;
-  const m = url.match(/^https?:\/\/(?:tile-b01|sl[1-4])\.2gis\.com\/(.+)$/);
-  const pathAndQuery = m ? '/' + m[1] : (() => {
-    try { const u = new URL(url); return u.pathname + u.search; } catch { return null; }
-  })();
-  if (pathAndQuery === null) return url;
-  const host = twoGisWorkingHost ?? TWO_GIS_TILE_MIRRORS[0];
-  if (/^https?:\/\/sl[1-4]\.2gis\.com\//.test(url) && url.startsWith(host + '/')) return url;
-  return host + pathAndQuery;
-}
-
-/** Хосты 2ГИС в порядке приоритета: проверенный живой — первым. tile-b01 исключён. */
-function twoGisHostsOrdered(): string[] {
-  if (twoGisWorkingHost) {
-    return [twoGisWorkingHost, ...TWO_GIS_TILE_MIRRORS.filter((h) => h !== twoGisWorkingHost)];
+  // Схема 2ГИС: /tiles?x=..&y=..&z=..
+  const m = url.match(/[?&]x=(\d+)[&]y=(\d+)[&]z=(\d+)/);
+  if (m) {
+    const x = Number(m[1]);
+    const y = Number(m[2]);
+    const z = Number(m[3]);
+    if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+      // Единая схема разворота с реестром провайдеров: алиас '2gis' → OSM France
+      // standard (тот же улично-топографический стиль). Раньше здесь жёстко
+      // стоял Esri Streets — из-за этого один сохранённый проект рисовал разные
+      // подложки в редакторе (OSM France) и мастере (Esri), а кэш тайлов
+      // промахивался по URL.
+      return workingLayerTileUrl(LEGACY_ALIAS_TO_WORKING_LAYER['2gis'], x, y, z);
+    }
   }
-  return [...TWO_GIS_TILE_MIRRORS];
+  // Прочие 2ГИС-ссылки без узнаваемой XYZ-схемы гасим полностью: возвращаем
+  // прозрачный 1×1 PNG (data-URI), чтобы битый хост не попал в сеть вообще.
+  return TRANSPARENT_TILE_DATA_URI;
 }
 
-/** URL тайла 2ГИС на указанном хосте-зеркале (стандартная query-схема x/y/z). */
-function twoGisTileUrl(host: string, x: number, y: number, z: number): string {
-  return `${host}/tiles?x=${x}&y=${y}&z=${z}`;
-}
+const TRANSPARENT_TILE_DATA_URI =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
 
 /** Ограничение параллельных загрузок тайлов на один хост: браузер даёт ~6 соединений,
  *  сотни запросов без лимита = таймауты и «вечная загрузка» большой карты. */
@@ -209,46 +372,86 @@ export async function osmReverseGeocode(lat: number, lng: number, signal?: Abort
 export type TileStyle = 'scheme' | 'satellite' | 'hybrid';
 
 /**
- * Получение URL тайла OSM
+ * Получение URL тайла OSM.
+ *
+ * ЕДИНЫЙ ЗАГРУЗЧИК КАРТ (редактор + мастер): функция принимает ЛЮБОЙ
+ * идентификатор подложки (`TileServerId`: legacy-алиасы 'osm'|'2gis'|'carto'
+ * и прямые id рабочих слоёв эталона) и всегда возвращает URL РАБОЧЕГО слоя
+ * из эталонного Leaflet-приложения «Карта — рабочие слои без ключей».
+ *  - 'osm'   → Esri World_Street_Map (стабильнее tile.openstreetmap.org,
+ *              который в ряде сетей отдаёт 429/таймауты и вешает очередь);
+ *  - '2gis'  → OSM France standard (замена мёртвого tile-b01.2gis.com:
+ *              ERR_NAME_NOT_RESOLVED ловил DNS-шторм — см. PR #111);
+ *  - 'carto' → OSM France HOT (тот же светлый «light» стиль);
+ *  - прямые id ('esri-streets', 'esri-satellite', 'osm-fr-standard',
+ *    'osm-fr-hot', 'osm-de', 'opentopomap', 'cyclosm') → соответствующий
+ *    слой эталона 1-в-1 (схемы {z}/{y}/{x} для Esri, {z}/{x}/{y}.png для XYZ).
+ * Разрешение алиасов — resolveWorkingLayer (mapProviders), единая точка истины
+ * для MapCanvas/MiniMapPanel/store/селекторов обоих режимов.
  */
 export function getOSMTileUrl(
   zoom: number,
   x: number,
   y: number,
-  tileServer: 'osm' | 'opentopomap' | 'carto' | '2gis' = 'osm',
+  tileServer: TileServerId = 'osm',
   style: TileStyle = 'scheme'
 ): string {
-  // detectRetina: тайлы @2x доступны ТОЛЬКО у tile.openstreetmap.org и basemaps.cartocdn.com
-  // (макс. уровень их нативного зума — 19). Esri World_Imagery отдаёт 512-px тайлы без @2x,
-  // opentopomap — только до z17. maxNativeZoom учитывается вызывающим кодом.
-  const z = Math.min(Math.max(zoom, 0), 19);
-  const retina = typeof window !== 'undefined' && (window.devicePixelRatio || 1) >= 1.5;
-  const at = retina ? '@2x' : '';
-  switch (tileServer) {
-    case '2gis': {
-      // Публичные тайловые серверы 2ГИС — стандартная схема XYZ Web Mercator,
-      // нативный зум до 18, ключ API не требуется. Хост tile-b01.2gis.com НЕ
-      // используется никогда: в ряде сетей его DNS не резолвится
-      // (net::ERR_NAME_NOT_RESOLVED), и каждый такой запрос надолго занимал
-      // слот очереди загрузки — карта «зависала» на полупустых тайлах.
-      // URL сразу строится на живом зеркале sl{1..4}.2gis.com: кэш рабочего
-      // хоста даёт один живой хост на сессию, loadTileWithMirrors при сбое
-      // перебирает остальные.
-      const host = twoGisWorkingHost ?? TWO_GIS_TILE_MIRRORS[0];
-      return twoGisTileUrl(host, x, y, z);
-    }
-    case 'opentopomap':
-      return `https://tile.opentopomap.org/${Math.min(z, 17)}/${x}/${y}.png`;
-    case 'carto':
-      if (style === 'satellite' || style === 'hybrid')
-        return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
-      return `https://basemaps.cartocdn.com/dark_all${at}/${z}/${x}/${y}.png`;
-    case 'osm':
-    default:
-      if (style === 'satellite' || style === 'hybrid')
-        return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
-      return `https://tile.openstreetmap.org/${z}/${x}/${y}${at}.png`;
+  // Прямые id рабочих слоёв эталона и legacy-алиасы — единая точка разворота
+  // (resolveWorkingLayer): любой TileServerId даёт URL рабочего слоя без ключей.
+  if (isWorkingTileLayerId(tileServer)) {
+    return workingLayerTileUrl(tileServer, x, y, zoom);
   }
+  if ((tileServer === 'carto' || tileServer === 'osm') && (style === 'satellite' || style === 'hybrid')) {
+    // спутник/гибрид (удалённые из UI режимы) — Esri Imagery
+    return workingLayerTileUrl('esri-satellite', x, y, zoom);
+  }
+  return workingLayerTileUrl(resolveWorkingLayer(tileServer), x, y, zoom);
+}
+
+/**
+ * Запасные рабочие XYZ-хосты для подложки «osm» (порядок = приоритет):
+ * Esri World_Imagery → OSM France → OSM Germany → tile{a,b,c}.openstreetmap.org.
+ * Все хосты — без ключей, из заведомо рабочего эталона. Возвращает [] для URL
+ * чужих схем (2ГИС и т.п. — у них собственные зеркала).
+ */
+export function osmFallbackHosts(primaryUrl: string): string[] {
+  let u: URL;
+  try { u = new URL(primaryUrl); } catch { return []; }
+  const mEsri = u.pathname.match(/^\/ArcGIS\/rest\/services\/(.+)\/MapServer\/tile\/(\d+)\/(\d+)\/(\d+)$/);
+  if (mEsri) {
+    const [, svc, zs, a, b] = mEsri;
+    // Esri-шаблон идёт в порядке {z}/{y}/{x} — сохраняем его как есть.
+    // Порядок зеркал = эталонный приоритет рабочих слоёв: сначала НЕзависимые
+    // серверы OSM-сообщества (OSM France → OSM Germany), затем альтернативный
+    // Esri-сервис (тот же хост, при DNS-блокировке arcgisonline бесполезен),
+    // и лишь потом старый пул tile.openstreetmap.org.
+    const altSvc = svc === 'World_Street_Map' ? 'World_Imagery' : 'World_Street_Map';
+    // ВАЖНО (регрессия «не удалось определить размер»/белая карта): если среди
+    // зеркал есть URL с ЛЮБЫМ поддоменом, совпадающим с поддоменом primary
+    // (например, osm-fr-standard даёт a. для primary a.tile.openstreetmap.de),
+    // браузер отдампитит весь хост и перебор зеркал не спасёт. Поэтому
+    // независимые OSM-серверы идут ВТОРЫМИ, а первым — альтернативный Esri
+    // (тот же стабильный хост эталона, всегда резолвится там, где работает primary).
+    const out: string[] = [
+      `${OSM_WORKING_HOSTS.esriStreets.replace('World_Street_Map', altSvc)}/${zs}/${a}/${b}`,
+      workingLayerTileUrl('osm-fr-standard', Number(b), Number(a), Number(zs)),
+      `${OSM_WORKING_HOSTS.osmDe}/${zs}/${b}/${a}.png`,
+      ...OSM_TILE_MIRRORS.map((h) => `${h}/${zs}/${b}/${a}.png`),
+    ];
+    return out.filter((x) => x !== primaryUrl);
+  }
+  const mXyz = u.pathname.match(/\/(\d+)\/(\d+)\/(\d+)(?:\.png)?$/);
+  if (mXyz) {
+    const [, zs, xs, ys] = mXyz;
+    const out: string[] = [
+      `${OSM_WORKING_HOSTS.esriStreets}/${zs}/${ys}/${xs}`,
+      workingLayerTileUrl('osm-fr-standard', Number(xs), Number(ys), Number(zs)),
+      `${OSM_WORKING_HOSTS.osmDe}/${zs}/${xs}/${ys}.png`,
+      ...OSM_TILE_MIRRORS.map((h) => `${h}/${zs}/${xs}/${ys}.png`),
+    ];
+    return out.filter((x) => x !== primaryUrl);
+  }
+  return [];
 }
 
 /**
@@ -369,38 +572,49 @@ async function loadTileWithMirrorsSafe(
     }
     return null;
   }
-  const m2gis = url.match(/^https:\/\/(?:tile-b01|sl[1-4])\.2gis\.com\/(.+)$/);
-  if (m2gis) {
-    const pathAndQuery = '/' + m2gis[1];
-    for (const host of twoGisHostsOrdered()) {
-      const img = await tryHost(host + pathAndQuery);
-      if (img) {
-        twoGisWorkingHost = host; // живое зеркало закешировано
-        return img;
-      }
-      if (isCancelled()) return null;
-    }
-    return null;
-  }
-  // Прочие 2GIS-URL (сторонние шаблоны с '2gis.com' в адресе) — тоже через зеркала.
+  // ФИКС «карта не загружается» (консоль пользователя): ВСЕ хосты 2ГИС
+  // недоступны — tile-b01.2gis.com отдаёт net::ERR_NAME_NOT_RESOLVED, а
+  // зеркала sl{1..4}.2gis.com таймаутят/блокируются сетью. Любой 2ГИС-URL
+  // переписывается normalizeTwoGisTileUrl на рабочий слой эталона
+  // (Esri World_Street_Map / OSM France) ЕЩЁ до входа сюда (см. startTileLoad),
+  // поэтому ни одного сетевого запроса к 2gis.com не происходит никогда.
+  // Если же такой URL всё-таки долетел (сторонний вызов в обход startTileLoad) —
+  // гасим его сразу, без обращения к мёртвым хостам.
   if (url.includes('2gis.com')) {
-    try {
-      const u = new URL(url);
-      const pathAndQuery = u.pathname + u.search;
-      for (const host of twoGisHostsOrdered()) {
-        const img = await tryHost(host + pathAndQuery);
-        if (img) {
-          twoGisWorkingHost = host;
-          return img;
-        }
-        if (isCancelled()) return null;
-      }
-      return null;
-    } catch {
-      /* невалидный URL — одиночная попытка ниже */
-    }
+    return tryHost(normalizeTwoGisTileUrl(url));
   }
-  return tryHost(url);
+  const primary = await tryHost(url);
+  if (primary) return primary;
+  if (isCancelled()) return null;
+  // Деградация на список ЗАВЕДОМО РАБОЧИХ независимых XYZ-зеркал (эталон):
+  // Esri Imagery → OSM France → OSM Germany → tile*.openstreetmap.org.
+  if (osmFallbackHosts(url).length > 0) {
+    return tryOsmFallbacksSafe(url, isCancelled, outer, timeoutMs);
+  }
+  return null;
+}
+
+/**
+ * Деградация для «osm»-подложки: если основной хост (Esri World_Street_Map) или
+ * любой бесплатный XYZ-хост отдал ошибку/таймаут, пробуем остальные ЗАВЕДОМО
+ * РАБОЧИЕ зеркала из рабочего эталона (OSM France → OSM Germany → tile*.openstreetmap.org).
+ * Возвращает null только когда все кандидаты недоступны.
+ */
+async function tryOsmFallbacksSafe(
+  url: string,
+  isCancelled: () => boolean,
+  outer: TileLoadHandle,
+  timeoutMs: number,
+): Promise<HTMLImageElement | null> {
+  for (const candidate of osmFallbackHosts(url)) {
+    if (isCancelled()) return null;
+    const h = startTileLoad(candidate, timeoutMs);
+    outer.image = h.image; // публикуем активный img — cancel() сможет его оборвать
+    const img = await h.done;
+    if (img) return img;
+    if (isCancelled()) return null;
+  }
+  return null;
 }
 
 /**
@@ -411,9 +625,11 @@ async function loadTileWithMirrorsSafe(
  * на уже несмонтированном компоненте — утечка памяти + предупреждения React.
  */
 export function startTileLoad(rawUrl: string, timeoutMs = 8000): TileLoadHandle {
-  // Защита от DNS-шторма: даже если URL пришёл с мёртвым хостом tile-b01.2gis.com
-  // (старый кэш/сохранённый проект/сторонний шаблон), запрос уходит на живое
-  // зеркало sl{1..4}. Для всех прочих провайдеров normalizeTwoGisTileUrl — no-op.
+  // Финальный барьер «карта не загружается»: ЛЮБОЙ URL с 2gis.com (мёртвый
+  // tile-b01 → ERR_NAME_NOT_RESOLVED, таймаотящие sl{1..4}, старые кэши и
+  // сохранённые проекты) переписывается на рабочий слой эталона без ключей
+  // (Esri World_Street_Map) ПЕРЕД сетью. Для всех прочих провайдеров
+  // normalizeTwoGisTileUrl — no-op.
   const url = normalizeTwoGisTileUrl(rawUrl);
   const img = new Image();
   img.crossOrigin = 'anonymous';
@@ -447,13 +663,16 @@ export async function loadTileImage(url: string, timeoutMs = 8000): Promise<HTML
 }
 
 /**
- * Загрузка тайла с перебором зеркал. Раньше поддерживались только зеркала OSM;
- * хост 2ГИС tile-b01.2gis.com не резолвится в ряде сетей (ERR_NAME_NOT_RESOLVED),
- * и подложка «2ГИС» молча не загружалась вообще. Теперь для URL 2ГИС перебираются
- * рабочие зеркала sl{1..4}.2gis.com, а последний успешный хост кэшируется —
- * остальные тайлы идут сразу на живой сервер без шторма DNS-ошибок.
+ * Загрузка тайла с перебором зеркал. Раньше для URL 2ГИС перебирались зеркала
+ * sl{1..4}.2gis.com; по консоль-логам пользователя выяснено, что НЕДОСТУПНЫ
+ * ВСЕ хосты 2ГИС (tile-b01 → ERR_NAME_NOT_RESOLVED, sl1..4 → таймауты/блокировки).
+ * Теперь ЛЮБОЙ 2ГИС-URL перед любой сетевой операцией переписывается
+ * normalizeTwoGisTileUrl на рабочий слой эталона «без ключей» (Esri Streets),
+ * и запрос к 2gis.com не отправляется никогда — карта грузится всегда.
  */
 export async function loadTileWithMirrors(url: string, timeoutMs = 8000): Promise<HTMLImageElement | null> {
+  // Санация 2ГИС-URL выполняется в startTileLoad (ниже по стеку) — здесь лишь
+  // ранний выход для прямых вызовов с мёртвым хостом, чтобы не держать слот.
   const mOsm = url.match(/^https:\/\/(?:[abc]\.)?tile\.openstreetmap\.org\/(.+)$/);
   if (mOsm) {
     for (const host of OSM_TILE_MIRRORS) {
@@ -462,47 +681,31 @@ export async function loadTileWithMirrors(url: string, timeoutMs = 8000): Promis
     }
     return null;
   }
-  const m2gis = url.match(/^https:\/\/(?:tile-b01|sl[1-4])\.2gis\.com\/(.+)$/);
-  if (m2gis) {
-    // Подстановка зеркала: путь+query сохраняются («/tiles?x=..&y=..&z=..»),
-    // меняется только хост. tile-b01 никогда не опрашивается (мёртвый DNS в
-    // ряде сетей блокировал слот очереди на секунды — «зависание» карты):
-    // обходим сразу живые зеркала sl{1..4} с кэшированием рабочего хоста.
-    const pathAndQuery = '/' + m2gis[1];
-    for (const host of twoGisHostsOrdered()) {
-      const img = await loadTileImage(host + pathAndQuery, timeoutMs);
-      if (img) {
-        twoGisWorkingHost = host; // живое зеркало закешировано
-        return img;
-      }
-    }
-    return null;
-  }
-  // Ключевое слово '2gis' в URL (например, query-параметр провайдера у сторонних
-  // шаблонов) тоже считаем тайлами 2ГИС: иначе запрос уходит напрямую в хост из
-  // URL без перебора зеркал и при недоступности DNS молча вешает слот очереди.
-  if (url.includes('2gis.com')) {
-    try {
-      const u = new URL(url);
-      const pathAndQuery = u.pathname + u.search;
-      for (const host of twoGisHostsOrdered()) {
-        const img = await loadTileImage(host + pathAndQuery, timeoutMs);
-        if (img) {
-          twoGisWorkingHost = host;
-          return img;
-        }
+  // ФИКС «карта не загружается» по аналогии с рабочим эталоном: при сбое
+  // основного бесплатного хоста (Esri Streets/Imagery, OSM France/Hot/
+  // Germany, OpenTopoMap, CyclOSM) перебираем СПИСОК ЗАВЕДОМО РАБОЧИХ
+  // независимых зеркал вместо возврата пустого тайла.
+  const fb = osmFallbackHosts(url);
+  if (fb.length > 0) {
+    return loadTileImage(url, timeoutMs).then(async (img) => {
+      if (img) return img;
+      for (const candidate of fb) {
+        const alt = await loadTileImage(candidate, timeoutMs);
+        if (alt) return alt;
       }
       return null;
-    } catch {
-      /* невалидный URL — уходим в одиночную попытку ниже */
-    }
+    });
   }
   return loadTileImage(url, timeoutMs);
 }
 
-/** Отладочный/тестовый сброс кэша рабочего зеркала 2ГИС. */
+/**
+ * Совместимость: кэш рабочих зеркал 2ГИС удалён (домен полностью выведен из
+ * загрузки — все 2ГИС-URL санируются в рабочие слои эталона). Функция оставлена
+ * как no-op, чтобы не ломать существующие вызовы/тесты.
+ */
 export function resetTwoGisMirrorCache(): void {
-  twoGisWorkingHost = null;
+  /* no-op */
 }
 
 /**
