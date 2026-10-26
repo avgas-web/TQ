@@ -53,15 +53,20 @@ describe('mapProviders: URL-шаблоны тайлов', () => {
     expect(t).toContain('{y}');
   });
 
-  it('osm — дефолтный шаблон openstreetmap.org (регрессия не сломана)', () => {
-    expect(tileUrlTemplate('osm')).toContain('tile.openstreetmap.org/{z}/{x}/{y}');
+  it('osm — по аудиту рендерит Esri Streets (tile.openstreetmap.org даёт 403 с github.io)', () => {
+    const t = tileUrlTemplate('osm');
+    expect(t).not.toContain('tile.openstreetmap.org');
+    expect(t).toContain('server.arcgisonline.com');
   });
 
   it('google/yandex/opentopomap/carto имеют собственные шаблоны', () => {
     expect(tileUrlTemplate('google')).toContain('google.com');
     expect(tileUrlTemplate('yandex')).toMatch(/webmap|yandex/);
     expect(tileUrlTemplate('opentopomap')).toContain('opentopomap');
-    expect(tileUrlTemplate('carto')).toContain('cartocdn');
+    // Carto требует API-ключ (пункт B аудита) → шаблон указывает на рабочий OSM France
+    const carto = tileUrlTemplate('carto');
+    expect(carto).not.toContain('cartocdn');
+    expect(carto).toContain('openstreetmap.fr');
   });
 });
 

@@ -27,7 +27,12 @@ export function providerRequiresKey(id: TileProviderId): boolean {
   return id === 'google' || id === 'yandex';
 }
 
-/** URL-шаблон тайлов провайдера (для тестов и диагностики). */
+/** URL-шаблон тайлов провайдера (для тестов и диагностики).
+ *  ВНИМАНИЕ: это legacy-реестр для оценок готовности; РЕАЛЬНАЯ загрузка тайлов
+ *  идёт через openStreetMap.getOSMTileUrl/normalizeTileServer, где по аудиту
+ *  audit/index.fixed.html запрещены tile.openstreetmap.org (403 по Referer для
+ *  github.io) и basemaps.cartocdn.com (требует ключ). Шаблоны ниже — канонические
+ *  URL провайдеров, но osm/carto при рендере нормализуются в рабочие зеркала. */
 export function tileUrlTemplate(id: TileProviderId): string {
   switch (id) {
     case '2gis':
@@ -37,14 +42,17 @@ export function tileUrlTemplate(id: TileProviderId): string {
     case 'opentopomap':
       return 'https://tile.opentopomap.org/{z}/{x}/{y}.png';
     case 'carto':
-      return 'https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png';
+      // Carto требует API-ключ (пункт B аудита) → при рендере нормализуется в OSM France.
+      return 'https://a.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png';
     case 'google':
       return 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}';
     case 'yandex':
       return 'https://core-jan-dev.webvisor.icu.ru/webmap/{z}/{y}/{x}.png';
     case 'osm':
     default:
-      return 'https://tile.openstreetmap.org/{z}/{x}/{y}{r}.png';
+      // tile.openstreetmap.org отдаёт 403 по Referer с github.io → при рендере
+      // нормализуется в Esri World Street Map (стиль по умолчанию аудита).
+      return 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}';
   }
 }
 
