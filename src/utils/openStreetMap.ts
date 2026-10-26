@@ -224,7 +224,44 @@ export interface OsmGeocodeResult {
 }
 
 /**
- * Геокодирование адреса через Nominatim (OSM).
+ * Запрос к Photon (https://photon.komoot.io) — резервному геокодеру по аудиту
+ * audit/index.fixed.html (пункт D: «основной Nominatim с обязательным fallback на
+ * Photon при любой ошибке fetch»). Без ключей, HTTPS, CORS открыт.
+ * Возвращает первую точку GeoJSON или null. Ошибки глотаются (вызывающий код сам
+ * решает, что показывать пользователю).
+ */
+async function fetchPhotonPoint(query: string, outerSignal?: AbortSignal): Promise<{ lat: number; lng: number } | null> {
+  if (outerSignal?.aborted) return null;
+  const ctrl = new AbortController();
+  const abortOuter = () => ctrl.abort();
+  outerSignal?.addEventListener('abort', abortOuter);
+  // По аудиту: таймаут 8 секунд.
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const url = `https://photon.komoot.io/api/?${new URLSearchParams({ q: query, limit: '1', lang: 'ru' })}`;
+    const response = await fetch(url, { signal: ctrl.signal });
+    if (!response.ok) return null;
+    const json: any = await response.json();
+    const feature = json?.features?.[0];
+    const coords = feature?.geometry?.coordinates;
+    if (!Array.isArray(coords)) return null;
+    const [lng, lat] = coords.map((v: unknown) => Number(v));
+    if (!isFinite(lat) || !isFinite(lng)) return null;
+    return { lat, lng };
+  } catch {
+    return null; // сеть/таймаут/отмена — считаем «резервный тоже недоступен»
+  } finally {
+    clearTimeout(timer);
+    outerSignal?.removeEventListener('abort', abortOuter);
+  }
+}
+
+/**
+ * Геокодирование адреса через Nominatim (OSM) с ОБЯЗАТЕЛЬНЫМ fallback на Photon
+ * (audit/index.fixed.html, пункт D). При сетевой/HTTP-ошибке всех зеркал Nominatim
+ * делаем один запрос к Photon — только если он тоже неудачен, возвращаем исходную
+ * ошибку («нет соединения с геокодером»). «not_found» от Nominatim fallback НЕ
+ * триггерит (адрес реально отсутствует, а сервис жив).
  * Возвращает различимый статус, чтобы UI не смешивал «не найдено» и «сервис недоступен».
  */
 export async function osmGeocode(address: string, signal?: AbortSignal): Promise<OsmGeocodeResult> {
@@ -233,12 +270,18 @@ export async function osmGeocode(address: string, signal?: AbortSignal): Promise
     `q=${encodeURIComponent(address)}&limit=1`,
     signal,
   );
-  if (kind !== 'ok') return { point: null, kind };
-  const first = Array.isArray(data) ? data[0] : null;
-  const lat = first ? parseFloat(first.lat) : NaN;
-  const lng = first ? parseFloat(first.lon) : NaN;
-  if (!isFinite(lat) || !isFinite(lng)) return { point: null, kind: 'not_found' };
-  return { point: { lat, lng }, kind: 'ok' };
+  if (kind === 'ok') {
+    const first = Array.isArray(data) ? data[0] : null;
+    const lat = first ? parseFloat(first.lat) : NaN;
+    const lng = first ? parseFloat(first.lon) : NaN;
+    if (!isFinite(lat) || !isFinite(lng)) return { point: null, kind: 'not_found' };
+    return { point: { lat, lng }, kind: 'ok' };
+  }
+  if (kind === 'not_found') return { point: null, kind: 'not_found' };
+  // Сервисная ошибка (network/http) — fallback на Photon.
+  const photon = await fetchPhotonPoint(address, signal);
+  if (photon) return { point: photon, kind: 'ok' };
+  return { point: null, kind };
 }
 
 /**
