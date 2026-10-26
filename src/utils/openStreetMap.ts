@@ -148,14 +148,29 @@ export function initOpenStreetMap(): Promise<void> {
   });
 }
 
-// Зеркала Nominatim. Публичный nominatim.openstreetmap.org часто недоступен из ряда
-// сетей/регионов (ERR_CONNECTION_TIMED_OUT) и жёстко лимитирует запросы, поэтому
-// перебираем несколько инстансов с таймаутом и вежливым паузированием.
+// Инстансы Nominatim. Публичный nominatim.openstreetmap.org часто недоступен из ряда
+// сетей/регионов (net::ERR_CONNECTION_TIMED_OUT) и жёстко лимитирует запросы, поэтому
+// он идёт ПОСЛЕДНИМ: сначала независимые зеркала. Если все инстансы упали —
+// включается fallback на Photon (см. osmGeocode).
 const NOMINATIM_HOSTS = [
-  'https://nominatim.openstreetmap.org',
-  'https://nominatim.mapnik.us',
-  'https://nominatim.private.coffee',
+  'https://nominatim.openstreetmap.fr', // independent OSM-France instance
+  'https://nominatim.othercodefor.com', // independent Code for America instance
+  'https://nominatim.openstreetmap.org', // основной — в конце (самый блокируемый)
 ];
+
+// Кэш живых хостов: упавшие по сети/таймауту исключаются из ротации на 5 минут,
+// чтобы каждый новый поиск не тратил секунды на заведомо мёртвые зеркала.
+const hostHealth = new Map<string, number>(); // host -> timestamp «считать мёртвым до»
+const DEAD_HOST_TTL_MS = 5 * 60 * 1000;
+function isHostDead(host: string): boolean {
+  const until = hostHealth.get(host);
+  if (!until) return false;
+  if (Date.now() >= until) {
+    hostHealth.delete(host);
+    return false;
+  }
+  return true;
+}
 
 // Локальная очередь «не чаще 1 запроса в секунду» — требование usage policy Nominatim.
 // Резервирование момента выполнения синхронно (до await) исключает «шторм» из
@@ -172,10 +187,13 @@ function reserveNominatimSlot(): Promise<void> {
 export type NominatimErrorKind = 'network' | 'http';
 
 /**
- * Запрос к Nominatim с перебором зеркал, таймаутом и повтором.
- * Возвращает [данные, kind] где kind='ok'|'not_found'|'network'|'http' —
- * вызывающий код различает «сервис недоступен», «адрес не найден» и HTTP-ошибку.
- * Поддерживает внешний AbortController для отмены (уход пользователя, новый запрос).
+ * Запрос к Nominatim с перебором зеркал, таймаутом и одним повтором.
+ * Возвращает kind='ok'|'not_found'|'network'|'http' — вызывающий код различает
+ * «сервис недоступен», «адрес не найден» и HTTP-ошибку.
+ * Таймаут 8 с (по аудиту): при недоступном хосте браузер сам выдаёт
+ * ERR_CONNECTION_TIMED_OUT раньше — это штатная ситуация, ловится и ведёт к
+ * следующему зеркалу / Photon.
+ * Поддерживает внешний AbortSignal для отмены (уход пользователя, новый запрос).
  * Ошибки внешних серверов не пишутся в console.error — это штатная ситуация,
  * вызывающий код показывает пользователю понятное сообщение.
  */
@@ -188,17 +206,17 @@ async function fetchNominatimJson(
   for (let round = 0; round < 2; round++) {
     for (let i = 0; i < NOMINATIM_HOSTS.length; i++) {
       if (outerSignal?.aborted) return { data: null, kind: 'network' };
-      const host = NOMINATIM_HOSTS[(i + round) % NOMINATIM_HOSTS.length];
+      const host = NOMINATIM_HOSTS[i];
+      if (isHostDead(host)) continue; // известное мёртвое зеркало — не ждём таймаута
       await reserveNominatimSlot();
       if (outerSignal?.aborted) return { data: null, kind: 'network' };
       const ctrl = new AbortController();
       const abortOuter = () => ctrl.abort();
       outerSignal?.addEventListener('abort', abortOuter);
-      const timer = setTimeout(() => ctrl.abort(), 12000);
+      const timer = setTimeout(() => ctrl.abort(), 8000);
       try {
         const response = await fetch(`${host}${path}?format=json&${params}`, {
           signal: ctrl.signal,
-          headers: { Accept: 'application/json' },
         });
         if (response.status === 429 || response.status >= 500) {
           sawHttpError = true;
@@ -206,16 +224,21 @@ async function fetchNominatimJson(
         }
         if (!response.ok) return { data: null, kind: 'http' };
         const json = await response.json();
+        hostHealth.delete(host); // хост жив — снимаем метку, если была
         return { data: json, kind: Array.isArray(json) && json.length === 0 ? 'not_found' : 'ok' };
       } catch {
-        /* сеть/таймаут/отмена — следующее зеркало */
+        hostHealth.set(host, Date.now() + DEAD_HOST_TTL_MS); // сеть/таймаут — временно исключаем
       } finally {
         clearTimeout(timer);
         outerSignal?.removeEventListener('abort', abortOuter);
       }
     }
-    // после первого раунда — короткая пауза перед повтором
-    if (round === 0) await new Promise((res) => setTimeout(res, 1000));
+    // после первого раунда — короткая пауза перед повтором (разрешаем retry даже
+    // для помеченных мёртвыми: возможно, это был единичный таймаут)
+    if (round === 0) {
+      hostHealth.clear();
+      await new Promise((res) => setTimeout(res, 500));
+    }
   }
   return { data: null, kind: sawHttpError ? 'http' : 'network' };
 }

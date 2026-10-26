@@ -170,8 +170,45 @@ describe('Этап 3 UI — StartPointsStep', () => {
     fireEvent.change(input, { target: { value: 'Москва, Красная площадь' } });
     fireEvent.click(screen.getByRole('button', { name: 'Найти' }));
     await waitFor(() => expect(st().startPoints).toHaveLength(1));
-    expect(fetchMock.mock.calls[0][0]).toContain('nominatim.openstreetmap.org');
-    expect(st().startPoints[0].name).toContain('Красная площадь');
+    // Первый запрос — зеркало Nominatim (не основной блокируемый хост).
+    expect(fetchMock.mock.calls[0][0]).toContain('nominatim');
+    vi.unstubAllGlobals();
+  });
+
+  it('при недоступности Nominatim поиск падает на Photon (fallback)', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url).includes('photon.komoot.io')) {
+        return { ok: true, json: async () => ({ features: [{ geometry: { coordinates: [37.6208, 55.7539] } }] }) };
+      }
+      throw new TypeError('network down'); // все зеркала Nominatim недоступны
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<MissionWizard />);
+    const input = screen.getByLabelText('Поиск точки старта');
+    fireEvent.change(input, { target: { value: 'Москва, Красная площадь' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Найти' }));
+    // Очередь Nominatim «1 запрос/с» + ротация зеркал: успех Photon наступает
+    // через ~6–7 с реального времени — ждём с запасом.
+    await waitFor(() => expect(st().startPoints).toHaveLength(1), { timeout: 15000 });
+    const p = st().startPoints[0];
+    expect(p.lat).toBeCloseTo(55.7539, 3);
+    expect(p.lon).toBeCloseTo(37.6208, 3);
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('photon.komoot.io'))).toBe(true);
+    vi.unstubAllGlobals();
+  });
+
+  it('при недоступных геокодерах показывается статус-ошибка, точка НЕ добавляется', async () => {
+    const fetchMock = vi.fn(async () => { throw new TypeError('network down'); });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<MissionWizard />);
+    const input = screen.getByLabelText('Поиск точки старта');
+    fireEvent.change(input, { target: { value: 'Что-то' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Найти' }));
+    await waitFor(() =>
+      expect(screen.getByText(/Геокодер недоступен/)).toBeInTheDocument(),
+      { timeout: 15000 },
+    );
+    expect(st().startPoints).toHaveLength(0);
     vi.unstubAllGlobals();
   });
 

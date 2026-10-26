@@ -9,6 +9,7 @@ import { WizardMapPanel } from './WizardMapPanel';
 import { WIZARD_MARKER_PREFIX, useWizardMapBridge } from './useWizardMapBridge';
 import { isMapReadyNow, useMapReadiness } from './mapReadiness';
 import { screenToGeo } from '../../utils/mapGeoPick';
+import { osmGeocode } from '../../utils/openStreetMap';
 
 /** Клик по живой тайловой карте мастера → СТРОГИЕ реальные координаты WGS84.
  *  ИСПРАВЛЕНИЕ «координаты не привязаны к реальности»: раньше клик
@@ -31,22 +32,29 @@ export function readCanvasClick(e: RMouseEvent<HTMLDivElement>): { x: number; y:
   return { x: lonToPx(geo.lon), y: latToPy(geo.lat), lat: geo.lat, lon: geo.lon };
 }
 
-/** Геокодер вынесен в модуль — подменяется fetch-моком в тестах (Nominatim). */
-export async function geocode(query: string): Promise<{ lat: number; lon: number; name: string } | null> {
-  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(query)}`;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    const data: unknown = await res.json();
-    if (!Array.isArray(data) || data.length === 0) return null;
-    const first = data[0] as { lat?: string; lon?: string; display_name?: string };
-    const lat = Number(first.lat);
-    const lon = Number(first.lon);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-    return { lat, lon, name: first.display_name ?? query };
-  } catch {
-    return null;
-  }
+/** Результат поиска для UI: точка либо различимая причина отказа. */
+export type GeocodeOutcome =
+  | { point: { lat: number; lon: number; name: string } }
+  | { kind: 'not_found' | 'network' | 'http' };
+
+/**
+ * Геокодер мастера вынесен в модуль — подменяется fetch-моком в тестах.
+ * Исправление net::ERR_CONNECTION_TIMED_OUT: раньше был ЖЁСТКО зашит единственный
+ * https://nominatim.openstreetmap.org (без таймаута и fallback) — при блокировке /
+ * недоступности хоста из сети пользователя поиск умирал. Теперь переиспользуется
+ * osmGeocode из utils/openStreetMap: ротация зеркал Nominatim (8 с таймаут, отмена
+ * через AbortController) + обязательный fallback на Photon (photon.komoot.io).
+ */
+export async function geocode(query: string): Promise<GeocodeOutcome> {
+  const res = await osmGeocode(query);
+  if (res.point) return { point: { lat: res.point.lat, lon: res.point.lng, name: query } };
+  return { kind: res.kind === 'not_found' ? 'not_found' : 'network' };
+}
+
+/** Понятное сообщение о неудаче поиска: различаем «не найдено» и «сервисы недоступны». */
+export function searchFailMessage(kind: 'not_found' | 'network' | 'http', query: string): string {
+  if (kind === 'not_found') return `Место «${query.slice(0, 60)}» не найдено. Уточните адрес или введите координаты «широта, долгота».`;
+  return 'Геокодер недоступен (нет соединения с Nominatim/Photon). Проверьте сеть и повторите поиск.';
 }
 
 export interface MiniMapCanvasProps {
@@ -137,6 +145,8 @@ export function StartPointsStep() {
   const updateStartPoint = useMissionWizardStore((s) => s.updateStartPoint);
   const removeStartPoint = useMissionWizardStore((s) => s.removeStartPoint);
   const [query, setQuery] = useState('');
+  // Понятная ошибка поиска в статус-строке (без alert, без фантомных точек).
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   // ЖЁСТКОЕ ТРЕБОВАНИЕ: точки старта ставятся ТОЛЬКО на загруженную карту.
   // MapCanvas публикует флаг готовности через onMapLoaded; до него клики по
@@ -161,12 +171,17 @@ export function StartPointsStep() {
     }
     if (!query.trim()) return;
     const geo = await geocode(query);
-    if (!geo) {
-      useMissionWizardStore.getState().runValidationAndPublish();
-      addStartPoint({ name: '__invalid__', lat: NaN, lon: NaN, x: 0, y: 0 }); // триггерит ошибку формата
+    if ('kind' in geo) {
+      // Раньше сюда вставлялась фантомная точка с NaN-координатами («__invalid__»),
+      // чтобы через валидатор показать ошибку формата. Это путало пользователя
+      // (ошибка «Невалидные координаты» при недоступности геокодера). Теперь —
+      // честное сообщение: не найдено vs сервис недоступен (все зеркала Nominatim
+      // и Photon упали).
+      setSearchError(searchFailMessage(geo.kind, query));
       return;
     }
-    addStartPoint({ name: geo.name.slice(0, 40), lat: geo.lat, lon: geo.lon, x: lonToPx(geo.lon), y: latToPy(geo.lat) });
+    setSearchError(null);
+    addStartPoint({ name: geo.point.name.slice(0, 40), lat: geo.point.lat, lon: geo.point.lon, x: lonToPx(geo.point.lon), y: latToPy(geo.point.lat) });
     setQuery('');
   };
 
@@ -188,6 +203,11 @@ export function StartPointsStep() {
           />
           <button type="button" className="btn-secondary" onClick={() => void doSearch()}>Найти</button>
         </div>
+        {searchError && (
+          <div role="status" aria-live="polite" className="rounded bg-red-900/60 px-2 py-1 text-xs text-red-200">
+            {searchError}
+          </div>
+        )}
         <MiniMapCanvas
           kind="start"
           points={startPoints}
