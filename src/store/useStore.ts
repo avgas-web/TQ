@@ -18,6 +18,8 @@ import { geoToPixelFromBounds, calculateBoundsFromCenter, latToMercatorY, mercat
 import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, geoToPixelExact, smoothPolyline, routeLengthM, requiredAbsFromZones } from '../utils/routing';
 import { fetchElevations, computeRouteAltitude } from '../utils/elevation';
 import type { ElevationPoint } from '../utils/elevation';
+import { normalizeTileServer, DEFAULT_TILE_SERVER, TILE_PROVIDERS } from '../utils/openStreetMap';
+import type { TileServerId } from '../utils/openStreetMap';
 import type { RouteShape, RangeLimitMode, ImportPoint, ImportLists } from '../types';
 
 const MIN_MAP_ZOOM_FLOOR = 6;
@@ -451,7 +453,9 @@ interface AppState {
   setYandexMapsApiKey: (apiKey: string) => void;
   toggleYandexMaps: (enabled: boolean) => void;
   toggleOpenStreetMap: (enabled: boolean) => void;
-  setOSMTileServer: (server: 'osm' | 'opentopomap' | 'carto') => void;
+  /** Стиль подложки — рабочий тайловый провайдер без API-ключей
+   *  (реестр TILE_PROVIDERS в utils/openStreetMap.ts, аудит audit/index.fixed.html). */
+  setOSMTileServer: (server: TileServerId) => void;
   loadMapWithStorage: (mapData: MapData) => Promise<void>;
   /** Активная тайловая карта без снимка: центр (lat/lng) + зум 10..19 */
   loadActiveTileMap: (center: { lat: number; lng: number }, zoom: number) => void;
@@ -497,7 +501,8 @@ const defaultProject: Project = {
   },
   openStreetMap: {
     enabled: false,
-    tileServer: 'osm',
+    // Стиль по умолчанию — Esri World Street Map (audit/index.fixed.html, пункт B)
+    tileServer: DEFAULT_TILE_SERVER,
   },
 };
 
@@ -1504,7 +1509,8 @@ export const useStore = create<AppState>()(
       setOSMTileServer: (server) => set((state) => ({
         project: {
           ...state.project,
-          openStreetMap: { ...state.project.openStreetMap, tileServer: server },
+          // Сохраняем нормализованный id рабочего провайдера (защита от legacy-значений)
+          openStreetMap: { ...state.project.openStreetMap, tileServer: normalizeTileServer(server) },
           updatedAt: new Date().toISOString(),
         },
       })),
@@ -1649,8 +1655,13 @@ export const useStore = create<AppState>()(
         if (persistedState.project && !persistedState.project.openStreetMap) {
           persistedState.project.openStreetMap = {
             enabled: false,
-            tileServer: 'osm',
+            tileServer: DEFAULT_TILE_SERVER,
           };
+        }
+        // Миграция legacy-стилей подложки ('osm'/'carto' → рабочие серверы из аудита)
+        if (persistedState.project?.openStreetMap) {
+          persistedState.project.openStreetMap.tileServer =
+            normalizeTileServer(persistedState.project.openStreetMap.tileServer);
         }
         // Миграция для старых проектов без calibration
         if (persistedState.project && !persistedState.project.calibration) {

@@ -1,13 +1,114 @@
 // Утилиты для работы с OpenStreetMap
 import { calculateBoundsFromCenter, latToMercatorY } from './googleMaps';
 
-/** Зеркала тайлового сервера tile.openstreetmap.org (перебираются при ошибках/таймаутах) */
-const OSM_TILE_MIRRORS = [
-  'https://tile.openstreetmap.org',
-  'https://a.tile.openstreetmap.org',
-  'https://b.tile.openstreetmap.org',
-  'https://c.tile.openstreetmap.org',
+/* ============================================================
+   ТАЙЛОВЫЕ СЕРВЕРЫ — по аудиту audit/index.fixed.html:
+   tile.openstreetmap.org и Carto (basemaps.cartocdn.com) УДАЛЕНЫ
+   намеренно: основной OSM отдаёт 403 по Referer/User-Agent для
+   github.io, Carto требует ключ. Оставлены только HTTPS-серверы
+   без API-ключа, не блокирующие github.io:
+   Esri World Street Map (стиль по умолчанию), Esri World Imagery,
+   OSM France (osmfr/hot), OSM Germany, OpenTopoMap, CyclOSM.
+   maxZoom/maxNativeZoom и attribution заданы для каждого слоя.
+   ============================================================ */
+
+export type TileServerId =
+  | 'esri'          // Esri World Street Map — самый стабильный, стиль по умолчанию
+  | 'esri-sat'      // Esri World Imagery (спутник)
+  | 'osmfr'         // OSM France (стандартная схема)
+  | 'hot'           // OSM France (гуманитарный HOT)
+  | 'osmde'         // OSM Germany
+  | 'opentopomap'   // OpenTopoMap (топографический)
+  | 'cyclosm';      // CyclOSM (велосипедный)
+
+export interface TileProviderInfo {
+  /** Человекочитаемое название стиля (для UI) */
+  label: string;
+  /** Нативный максимум тайлов (выше — только растяжение, не поднимаемся) */
+  maxNativeZoom: number;
+  /** Верхняя граница зума в UI */
+  maxZoom: number;
+  attribution: string;
+}
+
+const OSM_ATTR = '© OpenStreetMap contributors';
+
+export const TILE_PROVIDERS: Record<TileServerId, TileProviderInfo> = {
+  esri:        { label: 'Esri — улицы (стабильный)', maxNativeZoom: 19, maxZoom: 19, attribution: 'Tiles © Esri' },
+  'esri-sat':  { label: 'Esri — спутник',            maxNativeZoom: 19, maxZoom: 19, attribution: 'Tiles © Esri' },
+  osmfr:       { label: 'OSM France (стандарт)',     maxNativeZoom: 19, maxZoom: 19, attribution: `${OSM_ATTR} | OSM France` },
+  hot:         { label: 'OSM France (гуманитарный)', maxNativeZoom: 19, maxZoom: 19, attribution: `${OSM_ATTR} | HOT France` },
+  osmde:       { label: 'OSM Germany',               maxNativeZoom: 17, maxZoom: 18, attribution: `${OSM_ATTR} | OSM Germany` },
+  opentopomap: { label: 'OpenTopoMap',               maxNativeZoom: 17, maxZoom: 17, attribution: `${OSM_ATTR} | OpenTopoMap (CC-BY-SA)` },
+  cyclosm:     { label: 'CyclOSM',                   maxNativeZoom: 19, maxZoom: 20, attribution: `${OSM_ATTR} | CyclOSM` },
+};
+
+/** Порядок стилей в выпадающих списках UI */
+export const TILE_SERVER_ORDER: TileServerId[] = ['esri', 'esri-sat', 'osmfr', 'hot', 'osmde', 'opentopomap', 'cyclosm'];
+
+/** Стиль подложки по умолчанию — Esri World Street Map (пункт B аудита) */
+export const DEFAULT_TILE_SERVER: TileServerId = 'esri';
+
+/** Нормализация значения из стора/импорта/старых сохранений → рабочий провайдер.
+ *  Legacy-значения ('osm', 'carto') маппятся на совместимые рабочие серверы:
+ *  'osm' → Esri Street (та же «уличная схема», z19), 'carto' → OSM France. */
+export function normalizeTileServer(v: unknown): TileServerId {
+  if (typeof v === 'string' && (v in TILE_PROVIDERS)) return v as TileServerId;
+  if (v === 'carto') return 'osmfr';
+  return DEFAULT_TILE_SERVER; // 'osm' и всё неизвестное
+}
+
+/** Зеркала-фоллбэки для Esri (при недоступности одного хоста). */
+const ESRI_MIRRORS = [
+  'https://server.arcgisonline.com',
+  'https://services.arcgisonline.com',
 ];
+
+/** URL тайла для любого рабочего провайдера (без нормализации зума вызывающим кодом). */
+function tileUrlFor(server: TileServerId, z: number, x: number, y: number): string {
+  switch (server) {
+    case 'esri':        return esriUrl(ESRI_MIRRORS[0], 'World_Street_Map', z, x, y);
+    case 'esri-sat':    return esriUrl(ESRI_MIRRORS[0], 'World_Imagery', z, x, y);
+    case 'osmfr':       return `https://a.tile.openstreetmap.fr/osmfr/${z}/${x}/${y}.png`;
+    case 'hot':         return `https://a.tile.openstreetmap.fr/hot/${z}/${x}/${y}.png`;
+    case 'osmde':       return `https://tile.openstreetmap.de/${z}/${x}/${y}.png`;
+    case 'opentopomap': return `https://a.tile.opentopomap.org/${z}/${x}/${y}.png`;
+    case 'cyclosm':     return `https://a.tile-cyclosm.openstreetmap.fr/cyclosm/${z}/${x}/${y}.png`;
+    default:            return esriUrl(ESRI_MIRRORS[0], 'World_Street_Map', z, x, y);
+  }
+}
+
+/** URL тайла для Esri-провайдеров с перебором зеркал */
+function esriUrl(host: string, service: string, z: number, x: number, y: number): string {
+  return `${host}/ArcGIS/rest/services/${service}/MapServer/tile/${z}/${y}/${x}`; // у Esri порядок z/y/x
+}
+
+/** Все варианты URL одного тайла (зеркала) — пустой массив, если сервер не Esri */
+export function getTileUrlVariants(
+  zoom: number, x: number, y: number,
+  tileServer: TileServerId = DEFAULT_TILE_SERVER,
+): string[] {
+  const z = Math.min(Math.max(Math.round(zoom), 0), 19);
+  if (tileServer === 'esri')
+    return ESRI_MIRRORS.map((h) => esriUrl(h, 'World_Street_Map', z, x, y));
+  if (tileServer === 'esri-sat')
+    return ESRI_MIRRORS.map((h) => esriUrl(h, 'World_Imagery', z, x, y));
+  return [];
+}
+
+/** Варианты URL одного тайла для ЛЮБОГО рабочего провайдера (Esri — с зеркалами).
+ *  Отдача выше maxNativeZoom («как Leaflet»: ближайший нативный уровень + растяжение)
+ *  остаётся на стороне вызывающего кода. */
+export function getTileUrlVariantsFor(
+  server: TileServerId | 'osm' | 'carto',
+  zoom: number, x: number, y: number,
+): string[] {
+  const s = normalizeTileServer(server);
+  const z = Math.min(Math.max(Math.round(zoom), 0), 19);
+  if (s === 'esri') return ESRI_MIRRORS.map((h) => esriUrl(h, 'World_Street_Map', z, x, y));
+  if (s === 'esri-sat') return ESRI_MIRRORS.map((h) => esriUrl(h, 'World_Imagery', z, x, y));
+  return [tileUrlFor(s, z, x, y)];
+}
 
 /** Ограничение параллельных загрузок тайлов на один хост: браузер даёт ~6 соединений,
  *  сотни запросов без лимита = таймауты и «вечная загрузка» большой карты. */
@@ -152,34 +253,25 @@ export async function osmReverseGeocode(lat: number, lng: number, signal?: Abort
 export type TileStyle = 'scheme' | 'satellite' | 'hybrid';
 
 /**
- * Получение URL тайла OSM
+ * Получение URL тайла для выбранного рабочего провайдера (все — HTTPS, без ключей).
+ * tileServer принимает и legacy-значения ('osm', 'carto') — они нормализуются
+ * через normalizeTileServer в рабочие серверы из audit/index.fixed.html.
+ * Порядок аргументов в URL соответствует каждому провайдеру (у Esri — z/y/x).
  */
 export function getOSMTileUrl(
   zoom: number,
   x: number,
   y: number,
-  tileServer: 'osm' | 'opentopomap' | 'carto' = 'osm',
-  style: TileStyle = 'scheme'
+  tileServer: TileServerId | 'osm' | 'carto' = DEFAULT_TILE_SERVER,
+  _style: TileStyle = 'scheme'
 ): string {
-  // detectRetina: тайлы @2x доступны ТОЛЬКО у tile.openstreetmap.org и basemaps.cartocdn.com
-  // (макс. уровень их нативного зума — 19). Esri World_Imagery отдаёт 512-px тайлы без @2x,
-  // opentopomap — только до z17. maxNativeZoom учитывается вызывающим кодом.
-  const z = Math.min(Math.max(zoom, 0), 19);
-  const retina = typeof window !== 'undefined' && (window.devicePixelRatio || 1) >= 1.5;
-  const at = retina ? '@2x' : '';
-  switch (tileServer) {
-    case 'opentopomap':
-      return `https://tile.opentopomap.org/${Math.min(z, 17)}/${x}/${y}.png`;
-    case 'carto':
-      if (style === 'satellite' || style === 'hybrid')
-        return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
-      return `https://basemaps.cartocdn.com/dark_all${at}/${z}/${x}/${y}.png`;
-    case 'osm':
-    default:
-      if (style === 'satellite' || style === 'hybrid')
-        return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
-      return `https://tile.openstreetmap.org/${z}/${x}/${y}${at}.png`;
-  }
+  const server = normalizeTileServer(tileServer);
+  // Нативный максимум берётся из реестра провайдеров — выше не поднимаемся
+  // (нет данных, только растяжение). Общий потолок сетки — z19.
+  const nativeMax = TILE_PROVIDERS[server].maxNativeZoom;
+  const z = Math.min(Math.max(Math.round(zoom), 0), 19);
+  const zc = Math.min(z, nativeMax);
+  return tileUrlFor(server, zc, x, y);
 }
 
 /**
@@ -190,22 +282,53 @@ export async function loadTileImage(url: string, timeoutMs = 8000): Promise<HTML
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
-    const timer = setTimeout(() => { img.src = ''; resolve(null); }, timeoutMs);
-    img.onload = () => { clearTimeout(timer); resolve(img); };
-    img.onerror = () => { clearTimeout(timer); resolve(null); };
+    const timer = setTimeout(() => { img.src = ''; noteTileError(url); resolve(null); }, timeoutMs);
+    img.onload = () => { clearTimeout(timer); noteTileSuccess(); resolve(img); };
+    img.onerror = () => { clearTimeout(timer); noteTileError(url); resolve(null); };
     img.src = url;
   });
 }
 
+/* ===== C. Учёт ошибок тайлов (аналог tileerror-наблюдателя из аудита) =====
+   Каждая неудачная загрузка/таймаут увеличивает счётчик, каждая успешная —
+   обнуляет его. При ≥3 ошибках подряд UI (MapCanvas) показывает понятное
+   предупреждение «Слой недоступен, попробуйте другой стиль» и индикатор
+   состояния слоя; alert() не используется. */
+let tileErrorCount = 0;
+const tileErrorListeners = new Set<(n: number) => void>();
+
+export function getTileErrorCount(): number { return tileErrorCount; }
+
+export function onTileError(cb: (n: number) => void): () => void {
+  tileErrorListeners.add(cb);
+  return () => { tileErrorListeners.delete(cb); };
+}
+
+function noteTileError(url: string): void {
+  tileErrorCount++;
+  tileErrorListeners.forEach((cb) => { try { cb(tileErrorCount); } catch { /* слушатель не должен ломать загрузку */ } });
+  // Единичные ошибки внешних серверов — штатная ситуация: только console.warn,
+  // без console.error (не засоряем консоль и не пугаем пользователя).
+  if (tileErrorCount <= 5) console.warn('Не удалось загрузить тайл:', url);
+}
+
+function noteTileSuccess(): void {
+  if (tileErrorCount !== 0) {
+    tileErrorCount = 0; // авто-возврат в состояние «ок» после первой удачи
+    tileErrorListeners.forEach((cb) => { try { cb(0); } catch { /* noop */ } });
+  }
+}
+
 /**
- * Тайл с перебором зеркал tile.openstreetmap.org (основной хост часто отдаёт
- * 429/таймауты под нагрузкой). Для URL других провайдеров — обычная загрузка.
+ * Тайл с перебором зеркал: для Esri — server/services.arcgisonline.com
+ * (основной хост иногда отдаёт 5xx под нагрузкой). Для URL других провайдеров —
+ * обычная загрузка. Зеркала tile.openstreetmap.org УДАЛЕНЫ (403 по Referer).
  */
 export async function loadTileWithMirrors(url: string, timeoutMs = 8000): Promise<HTMLImageElement | null> {
-  const m = url.match(/^https:\/\/tile\.openstreetmap\.org\/(.+)$/);
+  const m = url.match(/^https:\/\/(server|services)\.arcgisonline\.com\/(.+)$/);
   if (!m) return loadTileImage(url, timeoutMs);
-  for (const host of OSM_TILE_MIRRORS) {
-    const img = await loadTileImage(host + '/' + m[1], timeoutMs);
+  for (const host of ESRI_MIRRORS) {
+    const img = await loadTileImage(`${host}/${m[2]}`, timeoutMs);
     if (img) return img;
   }
   return null;
@@ -249,7 +372,7 @@ export async function loadOSMStaticMap(
   zoom: number,
   width: number,
   height: number,
-  tileServer: 'osm' | 'opentopomap' | 'carto' = 'osm'
+  tileServer: TileServerId | 'osm' | 'carto' = DEFAULT_TILE_SERVER
 ): Promise<{ dataUrl: string; bounds: { north: number; south: number; east: number; west: number } }> {
   console.log(`Загрузка карты OSM: сервер=${tileServer}, центр=(${center.lat}, ${center.lng}), зум=${zoom}, размер=${width}x${height}`);
   

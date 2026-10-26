@@ -110,7 +110,9 @@ export interface Project {
   };
   openStreetMap: {
     enabled: boolean;
-    tileServer: 'osm' | 'opentopomap' | 'carto';
+    /** Рабочие тайловые серверы без API-ключей (см. TILE_PROVIDERS в utils/openStreetMap.ts).
+     *  Значения legacy ('osm', 'carto') нормализуются normalizeTileServer() при чтении. */
+    tileServer?: string;
   };
 }
 

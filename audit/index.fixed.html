@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- ВАЖНО: не добавлять meta-referrer со значением "noreferrer" —
+     это ломает загрузку тайлов OSM-серверов, проверяющих Referer -->
+<title>Карта — рабочие слои без ключей</title>
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='45' fill='%23111c33' stroke='%2338bdf8' stroke-width='8'/%3E%3C/svg%3E">
+
+<link rel="stylesheet" crossorigin="anonymous"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=">
+
+<style>
+  :root {
+    --panel: #111c33; --panel-2: #182642; --border: #263a5f;
+    --text: #e6edf7; --muted: #8ba0c4; --accent: #38bdf8;
+    --danger: #f87171; --ok: #4ade80; --warn: #fbbf24;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #app { display: flex; height: 100vh; overflow: hidden; }
+
+  #panel {
+    width: 340px; flex: 0 0 340px; background: var(--panel); color: var(--text);
+    display: flex; flex-direction: column; border-right: 1px solid var(--border);
+    transition: margin-left .25s ease; overflow: hidden;
+  }
+  #panel h1 { font-size: 16px; margin: 0; padding: 16px; border-bottom: 1px solid var(--border); }
+  #panel h1 span { color: var(--accent); }
+
+  .block { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+  label.small { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+
+  .search-row { display: flex; gap: 8px; }
+  input[type="text"], select {
+    width: 100%; padding: 9px 11px; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; font-size: 14px; outline: none;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+
+  button {
+    cursor: pointer; font: inherit; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px;
+    transition: .15s; white-space: nowrap;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: var(--accent); color: #06121f; border-color: var(--accent); font-weight: 600; }
+  button.danger:hover { border-color: var(--danger); color: var(--danger); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+
+  .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+  #status { font-size: 12px; margin-top: 8px; min-height: 16px; color: var(--muted); line-height: 1.4; word-break: break-word; }
+  #status.ok { color: var(--ok); }
+  #status.warn { color: var(--warn); }
+  #status.err { color: var(--danger); }
+
+  /* Индикатор состояния активного слоя */
+  #layer-indicator {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12px; color: var(--muted); margin-top: 8px;
+  }
+  #layer-indicator .dot {
+    width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto;
+    background: var(--muted); transition: background .2s;
+  }
+  #layer-indicator.loading .dot { background: var(--warn); animation: pulse 1s infinite; }
+  #layer-indicator.ok .dot { background: var(--ok); }
+  #layer-indicator.err .dot { background: var(--danger); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+
+  #results { list-style: none; margin: 0; padding: 0; max-height: 190px; overflow-y: auto; }
+  #results li { padding: 9px 10px; font-size: 13px; border: 1px solid transparent; border-radius: 8px; cursor: pointer; color: var(--muted); }
+  #results li:hover { background: var(--panel-2); border-color: var(--border); color: var(--text); }
+
+  .list-head { display: flex; justify-content: space-between; align-items: center; }
+  .list-head h2 { font-size: 13px; margin: 0; color: var(--muted); font-weight: 600; text-transform: uppercase; }
+
+  #points { list-style: none; margin: 10px 0 0; padding: 0; max-height: 320px; overflow-y: auto; }
+  #points li { display: flex; align-items: center; gap: 8px; padding: 8px; border-radius: 8px; font-size: 13px; border: 1px solid transparent; }
+  #points li:hover { background: var(--panel-2); border-color: var(--border); }
+  #points .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); flex: 0 0 auto; }
+  #points .info { flex: 1; min-width: 0; cursor: pointer; }
+  #points .name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #points .coords { display: block; font-size: 11px; color: var(--muted); font-family: ui-monospace, monospace; }
+  #points .coords:hover { color: var(--accent); }
+  #points .del { background: none; border: none; color: var(--muted); font-size: 18px; line-height: 1; padding: 2px 6px; border-radius: 6px; }
+  #points .del:hover { color: var(--danger); background: rgba(248,113,113,.1); }
+  .empty { color: var(--muted); font-size: 13px; padding: 6px 0; }
+
+  #map { flex: 1; height: 100%; background: #e8eef7; }
+
+  .coord-control { background: rgba(17,28,51,.92); color: var(--text); padding: 6px 10px; border-radius: 8px; font-size: 12px; font-family: ui-monospace, monospace; border: 1px solid var(--border); }
+
+  #menu-btn { display: none; position: absolute; z-index: 1000; top: 12px; left: 12px; width: 42px; height: 42px; font-size: 20px; padding: 0; border-radius: 10px; background: var(--panel); box-shadow: 0 2px 10px rgba(0,0,0,.4); }
+
+  .leaflet-popup-content b { font-size: 14px; }
+  .leaflet-popup-content .muted { color: #64748b; font-size: 12px; font-family: ui-monospace, monospace; }
+  .popup-del { margin-top: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; border-radius: 6px; }
+  .popup-del:hover { background: #fecaca; color: #991b1b; }
+
+  /* Аварийный экран, если Leaflet не загрузился (CDN/SRI/офлайн) */
+  #boot-error {
+    display: none; position: fixed; inset: 0; z-index: 2000;
+    background: var(--panel); color: var(--text);
+    align-items: center; justify-content: center; text-align: center; padding: 24px;
+  }
+  #boot-error.show { display: flex; }
+  #boot-error .card { max-width: 480px; }
+  #boot-error h2 { color: var(--danger); margin-top: 0; }
+  #boot-error p { color: var(--muted); line-height: 1.5; font-size: 14px; }
+
+  @media (max-width: 820px) {
+    #panel { position: absolute; z-index: 900; height: 100%; margin-left: -340px; box-shadow: 4px 0 24px rgba(0,0,0,.5); }
+    body.panel-open #panel { margin-left: 0; }
+    #menu-btn { display: block; }
+  }
+</style>
+</head>
+<body>
+
+<div id="boot-error" role="alert">
+  <div class="card">
+    <h2>⚠ Карта не загрузилась</h2>
+    <p id="boot-error-text">Библиотека Leaflet не была загружена с CDN. Проверьте интернет-соединение
+       или откройте страницу повторно (без блокировщиков скриптов).</p>
+    <button id="boot-retry-btn" aria-label="Перезагрузить страницу">↻ Перезагрузить</button>
+  </div>
+</div>
+
+<div id="app">
+  <button id="menu-btn" title="Меню" aria-label="Открыть/закрыть панель управления">☰</button>
+
+  <aside id="panel" aria-label="Панель управления картой">
+    <h1>🗺 Карта <span>OpenStreetMap</span></h1>
+
+    <div class="block">
+      <label class="small" for="search">Поиск места или адреса</label>
+      <div class="search-row">
+        <input type="text" id="search" placeholder="Например: Красная площадь, Москва" autocomplete="off"
+               aria-label="Строка поиска адреса">
+        <button class="primary" id="search-btn" aria-label="Выполнить поиск">Найти</button>
+      </div>
+      <div id="status" role="status" aria-live="polite"></div>
+      <ul id="results" aria-label="Результаты поиска"></ul>
+    </div>
+
+    <div class="block">
+      <label class="small" for="base">Стиль подложки</label>
+      <select id="base" aria-label="Выбор стиля карты-подложки"></select>
+      <div id="layer-indicator" aria-live="polite">
+        <span class="dot" aria-hidden="true"></span><span id="layer-indicator-text">Слой: ожидание</span>
+      </div>
+    </div>
+
+    <div class="block">
+      <label class="small">Действия</label>
+      <div class="btn-grid">
+        <button id="locate-btn" aria-label="Определить моё местоположение">📍 Где я</button>
+        <button id="fit-btn" aria-label="Показать все мои точки">🎯 К точкам</button>
+        <button id="export-btn" aria-label="Экспорт точек в GeoJSON">⬇ Экспорт</button>
+        <button id="import-btn" aria-label="Импорт точек из GeoJSON">⬆ Импорт</button>
+        <button id="clear-btn" class="danger" aria-label="Удалить все точки">🗑 Очистить</button>
+        <button id="help-btn" aria-label="Справка по приложению">ℹ Помощь</button>
+      </div>
+      <input type="file" id="import-file" accept=".geojson,.json,application/geo+json,application/json" hidden aria-label="Файл GeoJSON для импорта">
+    </div>
+
+    <div class="block" style="flex:1; overflow:auto;">
+      <div class="list-head"><h2>Мои точки (<span id="count">0</span>)</h2></div>
+      <ul id="points" aria-label="Список сохранённых точек"></ul>
+      <div class="empty" id="empty-hint">Кликните по карте, чтобы добавить точку.</div>
+    </div>
+  </aside>
+
+  <div id="map" role="application" aria-label="Интерактивная карта"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
+
+<script>
+(() => {
+'use strict';
+
+/* ===== H. Проверка загрузки Leaflet с CDN (не пустой экран при ошибке) ===== */
+function showBootError(text) {
+  const box = document.getElementById('boot-error');
+  const t = document.getElementById('boot-error-text');
+  if (t && text) t.textContent = text;
+  box.classList.add('show');
+  const retry = document.getElementById('boot-retry-btn');
+  if (retry) retry.addEventListener('click', () => location.reload());
+}
+if (typeof L === 'undefined' || typeof L.map !== 'function') {
+  showBootError('Библиотека Leaflet не загрузилась с unpkg.com. Возможные причины: нет сети, ' +
+                'блокировщик запросов к unpkg.com, повреждение файла по SRI-хэшу. ' +
+                'Про вкладку Network в DevTools и перезагрузите страницу.');
+  return; // дальше код IIFE не выполняется — никаких «L is not defined»
+}
+
+const $ = id => document.getElementById(id);
+const statusEl = $('status');
+const resultsEl = $('results');
+const pointsEl = $('points');
+const countEl = $('count');
+const emptyEl = $('empty-hint');
+
+function setStatus(text, kind) {
+  statusEl.textContent = text || '';
+  statusEl.className = kind || '';
+}
+function uid() {
+  return (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : 'id-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+/* ===== G. localStorage — безопасная обёртка (Safari ITP / приватный режим) ===== */
+let storageWarned = false;
+function safeStorageGet(key) {
+  try { return localStorage.getItem(key); }
+  catch (_) { warnOnceAboutStorage(); return null; }
+}
+function safeStorageSet(key, value) {
+  try { localStorage.setItem(key, value); return true; }
+  catch (_) { warnOnceAboutStorage(); return false; }
+}
+function warnOnceAboutStorage() {
+  if (storageWarned) return;
+  storageWarned = true;
+  setStatus('⚠ Браузер запретил локальное хранилище — точки не будут сохраняться между сессиями.', 'warn');
+}
+
+/* ===== Состояние ===== */
+const STORAGE_KEY = 'osm-app-v3';
+function loadState() {
+  const raw = safeStorageGet(STORAGE_KEY);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (_) { return null; }
+}
+const saved = loadState();
+
+/* ===== E. Иконки Leaflet по умолчанию — явные CDN-пути по HTTPS =====
+   (по умолчанию Leaflet вычисляет путь относительно страницы и ломает маркеры
+   на нестандартных base path, включая подпути GitHub Pages и file://) */
+L.Icon.Default.mergeOptions({
+  iconUrl:        'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+  iconRetinaUrl:  'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
+  shadowUrl:      'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png'
+});
+
+/* ===== Карта ===== */
+const map = L.map('map', { zoomControl: false }).setView(
+  saved?.view ? [saved.view.lat, saved.view.lng] : [55.7558, 37.6173],
+  saved?.view?.zoom ?? 12
+);
+L.control.zoom({ position: 'bottomright' }).addTo(map);
+L.control.scale({ imperial: false, position: 'bottomright' }).addTo(map);
+
+/* =========================================================
+   B. ПОДЛОЖКИ — HTTPS, без API-ключей, не блокируют github.io
+   (tile.openstreetmap.org и Carto удалены намеренно)
+   ========================================================= */
+const OSM_ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+const ESRI_ATTR = 'Tiles &copy; Esri';
+
+const baseLayers = {
+  // Стиль по умолчанию — самый стабильный
+  'Esri — улицы': L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 19, maxNativeZoom: 19, attribution: ESRI_ATTR
+    }),
+  'Esri — спутник': L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 19, maxNativeZoom: 19, attribution: ESRI_ATTR
+    }),
+
+  'OSM France (стандарт)': L.tileLayer(
+    'https://{s}.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png', {
+      maxZoom: 19, maxNativeZoom: 19, subdomains: 'abc', attribution: OSM_ATTR + ' | OSM France'
+    }),
+  'OSM France (гуманитарный)': L.tileLayer(
+    'https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png', {
+      maxZoom: 19, maxNativeZoom: 19, subdomains: 'abc', attribution: OSM_ATTR + ' | HOT France'
+    }),
+
+  'OSM Germany': L.tileLayer(
+    'https://tile.openstreetmap.de/{z}/{x}/{y}.png', {
+      maxZoom: 18, maxNativeZoom: 17, attribution: OSM_ATTR + ' | OSM Germany'
+    }),
+
+  'OpenTopoMap': L.tileLayer(
+    'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+      maxZoom: 17, maxNativeZoom: 17, subdomains: 'abc',
+      attribution: OSM_ATTR + ' | <a href="https://opentopomap.org">OpenTopoMap</a> (CC-BY-SA)'
+    }),
+
+  'CyclOSM': L.tileLayer(
+    'https://{s}.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png', {
+      maxZoom: 20, maxNativeZoom: 19, subdomains: 'abc',
+      attribution: OSM_ATTR + ' | CyclOSM'
+    })
+};
+
+/* ===== C. Обработка ошибок тайлов + индикатор состояния слоя ===== */
+const layerIndicator = $('layer-indicator');
+const layerIndicatorText = $('layer-indicator-text');
+
+function setLayerState(kind, text) {
+  layerIndicator.className = kind;          // loading | ok | err | '' 
+  layerIndicatorText.textContent = text;
+}
+
+// глобальный счётчик ошибок текущего активного слоя + авто-возврат в «ок»
+let activeErrCount = 0;
+let lastTileOkAt = 0;
+
+function attachTileWatch(layer, name) {
+  let totalErrors = 0;
+  let warned = false;
+
+  layer.on('tileerror', (e) => {
+    totalErrors++;
+    if (currentBase === name) {
+      activeErrCount++;
+      if (activeErrCount >= 3 && !warned) {
+        warned = true;
+        setLayerState('err', `Слой «${name}» недоступен`);
+        setStatus(`⚠ Слой «${name}»: тайлы не загружаются (${totalErrors}). Попробуйте другой стиль.`, 'warn');
+      } else if (activeErrCount > 0 && activeErrCount < 3) {
+        setLayerState('loading', `Слой «${name}»: проблемы с тайлами (${activeErrCount})`);
+      }
+    }
+  });
+
+  layer.on('tileload', () => {
+    lastTileOkAt = Date.now();
+    if (currentBase === name) {
+      activeErrCount = 0;
+      warned = false;
+      setLayerState('ok', `Слой «${name}» загружен`);
+    }
+  });
+
+  layer.on('load', () => {
+    if (currentBase === name) setLayerState('ok', `Слой «${name}» загружен`);
+  });
+}
+Object.entries(baseLayers).forEach(([name, layer]) => attachTileWatch(layer, name));
+
+// Если после ошибок тайлы снова начали грузиться — сбрасываем счётчик
+setInterval(() => {
+  if (activeErrCount > 0 && lastTileOkAt && Date.now() - lastTileOkAt < 4000) {
+    activeErrCount = 0;
+    setLayerState('ok', `Слой «${currentBase}» загружен`);
+  }
+}, 3000);
+
+const baseSelect = $('base');
+Object.keys(baseLayers).forEach(name => {
+  const opt = document.createElement('option');
+  opt.value = name;
+  opt.textContent = name;
+  baseSelect.appendChild(opt);
+});
+
+let currentBase = (saved?.base && baseLayers[saved.base]) ? saved.base : 'Esri — улицы';
+baseSelect.value = currentBase;
+setLayerState('loading', `Слой «${currentBase}» загружается…`);
+baseLayers[currentBase].addTo(map);
+
+baseSelect.addEventListener('change', () => {
+  const next = baseSelect.value;
+  if (!baseLayers[next] || next === currentBase) return;
+  map.removeLayer(baseLayers[currentBase]);
+  currentBase = next;
+  activeErrCount = 0;
+  setLayerState('loading', `Слой «${currentBase}» загружается…`);
+  baseLayers[currentBase].addTo(map);
+  setStatus(`Стиль: ${currentBase}`, 'ok');
+  saveState();
+});
+
+/* ===== Координаты курсора ===== */
+const CoordControl = L.Control.extend({
+  options: { position: 'bottomleft' },
+  onAdd() {
+    const div = L.DomUtil.create('div', 'coord-control');
+    div.setAttribute('aria-hidden', 'true');
+    div.textContent = 'Наведите курсор на карту';
+    this._div = div;
+    return div;
+  },
+  update(text) { if (this._div) this._div.textContent = text; }
+});
+const coordControl = new CoordControl().addTo(map);
+map.on('mousemove', e => {
+  const { lat, lng } = e.latlng;
+  coordControl.update(`Ш: ${lat.toFixed(5)}, Д: ${lng.toFixed(5)}`);
+});
+map.getContainer().addEventListener('mouseleave', () =>
+  coordControl.update('Наведите курсор на карту'));
+
+/* ===== Точки ===== */
+let points = [];
+
+function popupHtml(p) {
+  return `<div>
+    <b>${escapeHtml(p.name)}</b><br>
+    <span class="muted">${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}</span><br>
+    <button class="popup-del" data-id="${p.id}" aria-label="Удалить точку ${escapeHtml(p.name)}">Удалить точку</button>
+  </div>`;
+}
+
+function createMarker(p) {
+  const marker = L.marker([p.lat, p.lng], {
+    draggable: true, bubblingMouseEvents: false,
+    alt: p.name, title: p.name, keyboard: true
+  }).addTo(map);
+  marker.bindPopup(popupHtml(p));
+
+  marker.on('dragend', () => {
+    const ll = marker.getLatLng();
+    p.lat = ll.lat; p.lng = ll.lng;
+    marker.setPopupContent(popupHtml(p));
+    renderList(); saveState();
+  });
+
+  marker.on('popupopen', () => {
+    const el = marker.getPopup()?.getElement();
+    if (!el) return;
+    el.querySelectorAll('.popup-del').forEach(btn => {
+      btn.addEventListener('click', ev => { ev.preventDefault(); removePoint(p.id); }, { once: true });
+    });
+  });
+
+  p.marker = marker;
+  return marker;
+}
+
+function addPoint(latlng, name) {
+  const p = {
+    id: uid(),
+    lat: +latlng.lat,
+    lng: +latlng.lng,
+    name: name || `Точка ${points.length + 1}`,
+    marker: null
+  };
+  createMarker(p);
+  points.push(p);
+  renderList(); saveState();
+  return p;
+}
+
+function removePoint(id) {
+  const i = points.findIndex(p => p.id === id);
+  if (i === -1) return;
+  const [p] = points.splice(i, 1);
+  map.removeLayer(p.marker);
+  renderList(); saveState();
+}
+
+function clearPoints() {
+  if (!points.length) { setStatus('Точек нет — очищать нечего', 'warn'); return; }
+  if (!confirm(`Удалить все точки (${points.length})?`)) return;
+  points.forEach(p => map.removeLayer(p.marker));
+  points = [];
+  renderList(); saveState();
+  setStatus('Все точки удалены', 'ok');
+}
+
+/* ===== Список точек ===== */
+function renderList() {
+  pointsEl.innerHTML = '';
+  countEl.textContent = points.length;
+  emptyEl.style.display = points.length ? 'none' : 'block';
+
+  points.forEach(p => {
+    const li = document.createElement('li');
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    dot.setAttribute('aria-hidden', 'true');
+
+    const info = document.createElement('div');
+    info.className = 'info';
+    info.title = 'Перелететь к точке';
+
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = p.name;
+
+    const coords = document.createElement('span');
+    coords.className = 'coords';
+    coords.textContent = `${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}`;
+    coords.title = 'Скопировать координаты';
+    coords.addEventListener('click', ev => {
+      ev.stopPropagation();
+      const text = `${p.lat}, ${p.lng}`;
+      // clipboard API требует secure context; fallback через execCommand
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(
+          () => setStatus('Координаты скопированы', 'ok'),
+          () => setStatus('Не удалось скопировать', 'warn')
+        );
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        let ok = false;
+        try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
+        ta.remove();
+        setStatus(ok ? 'Координаты скопированы' : 'Копирование недоступно в этом контексте', ok ? 'ok' : 'warn');
+      }
+    });
+
+    info.append(name, coords);
+    info.addEventListener('click', () => {
+      map.flyTo([p.lat, p.lng], Math.max(map.getZoom(), 16), { duration: 0.8 });
+      p.marker.openPopup();
+      closePanelOnMobile();
+    });
+
+    const del = document.createElement('button');
+    del.className = 'del';
+    del.title = 'Удалить';
+    del.setAttribute('aria-label', `Удалить точку ${p.name}`);
+    del.textContent = '×';
+    del.addEventListener('click', () => removePoint(p.id));
+
+    li.append(dot, info, del);
+    pointsEl.appendChild(li);
+  });
+}
+
+/* ===== Клик по карте ===== */
+map.on('click', e => addPoint(e.latlng));
+
+/* ===== D. Поиск: Nominatim → Photon, AbortController 8с, без кастомных заголовков ===== */
+async function fetchJsonWithTimeout(url, timeoutMs = 8000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal }); // БЕЗ custom headers — не провоцируем CORS-preflight
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function geocodeNominatim(q) {
+  const url = 'https://nominatim.openstreetmap.org/search?' + new URLSearchParams({
+    q, format: 'json', limit: '6', 'accept-language': 'ru'
+  });
+  const data = await fetchJsonWithTimeout(url);
+  return data.map(it => ({
+    name: it.display_name,
+    lat: parseFloat(it.lat),
+    lng: parseFloat(it.lon)
+  }));
+}
+async function geocodePhoton(q) {
+  const url = 'https://photon.komoot.io/api/?' + new URLSearchParams({ q, limit: '6', lang: 'ru' });
+  const data = await fetchJsonWithTimeout(url);
+  return (data.features || []).map(f => {
+    const prop = f.properties || {};
+    const [lng, lat] = f.geometry.coordinates;
+    const label = [prop.name, prop.street, prop.city, prop.state, prop.country].filter(Boolean).join(', ');
+    return { name: label || 'Без названия', lat, lng };
+  });
+}
+
+const searchInput = $('search');
+const searchBtn = $('search-btn');
+
+async function doSearch() {
+  const q = searchInput.value.trim();
+  resultsEl.innerHTML = '';
+  if (!q) { setStatus('Введите запрос', 'warn'); return; }
+
+  setStatus('Поиск…');
+  searchBtn.disabled = true;
+
+  let results = null;
+  let usedFallback = false;
+  try {
+    results = await geocodeNominatim(q);
+  } catch (e1) {
+    console.warn('Nominatim недоступен, пробуем Photon:', e1 && e1.message);
+    setStatus('Nominatim недоступен, пробую резервный геокодер…', 'warn');
+    usedFallback = true;
+    try {
+      results = await geocodePhoton(q);
+    } catch (e2) {
+      console.warn('Photon тоже недоступен:', e2 && e2.message);
+      setStatus('⚠ Поиск недоступен: оба геокодера (Nominatim, Photon) не отвечают. Проверьте сеть и повторите.', 'err');
+      searchBtn.disabled = false;
+      return;
+    }
+  }
+  searchBtn.disabled = false;
+
+  if (!results || !results.length) { setStatus('Ничего не найдено', 'warn'); return; }
+  setStatus(`Найдено: ${results.length}${usedFallback ? ' (резервный геокодер — Photon)' : ''}`, 'ok');
+
+  results.forEach(item => {
+    const li = document.createElement('li');
+    li.textContent = item.name;
+    li.title = 'Перелететь и добавить точку';
+    li.setAttribute('role', 'button');
+    li.setAttribute('tabindex', '0');
+    const choose = () => {
+      map.flyTo([item.lat, item.lng], 16, { duration: 1.2 });
+      addPoint({ lat: item.lat, lng: item.lng }, item.name.split(',')[0]);
+      resultsEl.innerHTML = '';
+      setStatus('Точка добавлена', 'ok');
+      closePanelOnMobile();
+    };
+    li.addEventListener('click', choose);
+    li.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); choose(); } });
+    resultsEl.appendChild(li);
+  });
+}
+
+searchBtn.addEventListener('click', doSearch);
+searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
+
+/* ===== F. Геолокация ===== */
+let locationLayer = null;
+let locateTimer = null;
+
+$('locate-btn').addEventListener('click', () => {
+  const btn = $('locate-btn');
+
+  if (!('geolocation' in navigator)) {
+    setStatus('⚠ Браузер не поддерживает геолокацию', 'err');
+    return;
+  }
+  if (!window.isSecureContext) {
+    setStatus('⚠ Геолокация недоступна: страница открыта в небезопасном контексте. ' +
+              'Работает только по HTTPS, на http://localhost или при открытии файла напрямую (file://).', 'warn');
+    return;
+  }
+
+  setStatus('Определение местоположения…');
+  btn.disabled = true;
+
+  // Собственный вызов navigator.geolocation с полным контролем ошибок и таймаутом
+  // (надёжнее map.locate: у map.locate нельзя задать корректный timeout для positionTimeout)
+  const geoPromise = new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(resolve, reject, {
+      enableHighAccuracy: true,
+      timeout: 10000,
+      maximumAge: 30000
+    });
+  });
+
+  const hardTimeout = new Promise((_, reject) => {
+    locateTimer = setTimeout(() => reject({ code: 3, message: 'Превышено время ожидания ответа от службы геолокации.' }), 12000);
+  });
+
+  Promise.race([geoPromise, hardTimeout]).then(pos => {
+    const lat = pos.coords.latitude, lng = pos.coords.longitude, acc = pos.coords.accuracy;
+    map.flyTo([lat, lng], Math.max(map.getZoom(), 16), { duration: 1.0 });
+
+    if (locationLayer) map.removeLayer(locationLayer);
+    locationLayer = L.layerGroup([
+      L.circle([lat, lng], { radius: acc, weight: 1, color: '#38bdf8', fillOpacity: 0.12 }),
+      L.circleMarker([lat, lng], { radius: 6, color: '#fff', weight: 2, fillColor: '#38bdf8', fillOpacity: 1 })
+        .bindPopup(`Вы здесь<br><span class="muted">точность ±${Math.round(acc)} м</span>`)
+    ]).addTo(map);
+
+    setStatus(`Позиция определена (±${Math.round(acc)} м) — точка не создана, нажмите «+» на карте, если нужно сохранить`, 'ok');
+  }).catch(err => {
+    const codes = {
+      1: 'Доступ к геолокации запрещён. Разрешите определение местоположения в настройках сайта и повторите.',
+      2: 'Позиция недоступна: нет GPS-сигнала или данные о местоположении не получены. Попробуйте позже.',
+      3: 'Превышено время ожидания ответа. Проверьте разрешение для сайта и повторите попытку.'
+    };
+    const msg = codes[err && err.code] || ('Неизвестная ошибка геолокации' + (err && err.message ? ': ' + err.message : '.'));
+    setStatus('⚠ ' + msg, 'err'); // не блокируем UI — просто статус
+  }).finally(() => {
+    clearTimeout(locateTimer);
+    btn.disabled = false;
+  });
+});
+
+/* ===== Экспорт / импорт ===== */
+$('export-btn').addEventListener('click', () => {
+  if (!points.length) { setStatus('Нет точек для экспорта', 'warn'); return; }
+  const fc = {
+    type: 'FeatureCollection',
+    features: points.map(p => ({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [p.lng, p.lat] },
+      properties: { name: p.name }
+    }))
+  };
+  const blob = new Blob([JSON.stringify(fc, null, 2)], { type: 'application/geo+json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'my-points.geojson';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  setStatus('GeoJSON сохранён', 'ok');
+});
+
+const importFile = $('import-file');
+$('import-btn').addEventListener('click', () => importFile.click());
+importFile.addEventListener('change', () => {
+  const file = importFile.files && importFile.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const data = JSON.parse(reader.result);
+      const features = data.type === 'FeatureCollection' ? data.features : data.type === 'Feature' ? [data] : [];
+      let added = 0;
+      features.forEach(f => {
+        if (!f || f.type !== 'Feature') return;
+        const geom = f.geometry;
+        if (!geom || geom.type !== 'Point') return;
+        const [lng, lat] = geom.coordinates;
+        if (typeof lat !== 'number' || typeof lng !== 'number') return;
+        addPoint({ lat, lng }, (f.properties && f.properties.name) || 'Импорт');
+        added++;
+      });
+      setStatus(added ? `Импортировано точек: ${added}` : 'В файле нет точечных объектов', added ? 'ok' : 'warn');
+    } catch (e) {
+      setStatus('⚠ Ошибка чтения GeoJSON: ' + e.message, 'err');
+    } finally { importFile.value = ''; }
+  };
+  reader.onerror = () => setStatus('⚠ Не удалось прочитать файл', 'err');
+  reader.readAsText(file);
+});
+
+/* ===== Прочее ===== */
+$('clear-btn').addEventListener('click', clearPoints);
+$('fit-btn').addEventListener('click', () => {
+  if (!points.length) { setStatus('Нет точек', 'warn'); return; }
+  if (points.length === 1) { map.flyTo([points[0].lat, points[0].lng], 16, { duration: 0.8 }); return; }
+  const group = L.featureGroup(points.map(p => p.marker));
+  map.flyToBounds(group.getBounds().pad(0.15), { duration: 0.8 });
+});
+
+$('help-btn').addEventListener('click', () => {
+  alert(
+    'Как пользоваться:\n\n' +
+    '• Клик по карте — добавить точку\n' +
+    '• Маркер можно перетаскивать\n' +
+    '• Клик по точке в списке — перелёт к ней\n' +
+    '• Клик по координатам — копирование\n' +
+    '• × в списке или кнопка в попапе — удалить\n' +
+    '• Поиск — по адресам (Nominatim, fallback Photon)\n' +
+    '• «Где я» — геолокация (нужен HTTPS или file://)\n' +
+    '• Экспорт / Импорт — GeoJSON\n' +
+    '• Всё сохраняется в localStorage браузера'
+  );
+});
+
+/* ===== Мобильная панель ===== */
+const menuBtn = $('menu-btn');
+menuBtn.addEventListener('click', () => {
+  document.body.classList.toggle('panel-open');
+  setTimeout(() => map.invalidateSize(), 260);
+});
+function closePanelOnMobile() {
+  if (window.matchMedia('(max-width: 820px)').matches) {
+    document.body.classList.remove('panel-open');
+    setTimeout(() => map.invalidateSize(), 260);
+  }
+}
+window.addEventListener('resize', () => map.invalidateSize());
+
+/* ===== Сохранение состояния (G: try/catch внутри safeStorageSet) ===== */
+function saveState() {
+  safeStorageSet(STORAGE_KEY, JSON.stringify({
+    points: points.map(p => ({ id: p.id, lat: p.lat, lng: p.lng, name: p.name })),
+    view: { lat: map.getCenter().lat, lng: map.getCenter().lng, zoom: map.getZoom() },
+    base: currentBase
+  }));
+}
+
+/* ===== Восстановление точек ===== */
+(saved?.points || []).forEach(p => {
+  if (typeof p.lat !== 'number' || typeof p.lng !== 'number') return;
+  const pt = { id: p.id || uid(), lat: p.lat, lng: p.lng, name: p.name || 'Точка', marker: null };
+  createMarker(pt);
+  points.push(pt);
+});
+renderList();
+
+map.on('moveend', saveState);
+map.on('zoomend', saveState);
+
+if (!saved) setStatus('Кликните по карте, чтобы добавить первую точку');
+
+})();
+</script>
+
+</body>
+</html>
