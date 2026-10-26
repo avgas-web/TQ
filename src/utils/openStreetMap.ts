@@ -264,7 +264,11 @@ async function fetchPhotonPoint(query: string, outerSignal?: AbortSignal): Promi
   // По аудиту: таймаут 8 секунд.
   const timer = setTimeout(() => ctrl.abort(), 8000);
   try {
-    const url = `https://photon.komoot.io/api/?${new URLSearchParams({ q: query, limit: '1', lang: 'ru' })}`;
+    // ВАЖНО: Photon НЕ поддерживает lang=ru (возвращает HTTP 400 «Language is not
+    // supported. Supported are: default, de, en, fr» — проверено живым запросом).
+    // Поэтому параметр lang не передаём вовсе: сервер отдаёт результаты на языке
+    // страны поиска (для русскоязычных адресов — кириллицу), что нам и нужно.
+    const url = `https://photon.komoot.io/api/?${new URLSearchParams({ q: query, limit: '1' })}`;
     const response = await fetch(url, { signal: ctrl.signal });
     if (!response.ok) return null;
     const json: any = await response.json();
