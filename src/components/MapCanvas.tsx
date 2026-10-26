@@ -1979,7 +1979,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
 
     // ЦИКЛ КОНТРОЛЯ РАЗМЕРОВ (P0 «вечная загрузка при нулевом размере», шаг П3 ТЗ):
     // layout может измениться ПОСЛЕ монтирования (display:none у родителя, нулевая
-    // flex-ветка мастера, поздний CSS). Раз в 500 мс сверяем факт с состоянием:
+    // flex-ветка мастера, поздний CSS). Каждые 250 мс сверяем факт с состоянием:
     //   • размер появился → применяем его (карта стартует сама);
     //   • размер пропал → гасим canvasSize: включается circuit breaker размеров
     //     («Не удалось определить размер контейнера» + кнопка повтора), а ОЧЕРЕДЬ
@@ -1987,23 +1987,49 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     //     (запрет загрузки в невидимый слой = защита от NaN-математики и утечек).
     // Интервал принадлежит этому же cleanup-эффекту → при unmount гарантированно
     // снимается (ни одного «сиротского» setInterval между шагами Мастера).
+    // ВАЖНО: цикл работает ВСЁ время жизни компонента (не только первые секунды):
+    // именно он автоматически убирает оверлей «Не удалось определить размер
+    // контейнера карты», как только layout восстановился (конец анимации шага
+    // мастера, разворот панели, поворот экрана) — без нажатия «Попробовать снова».
+    let zeroStreak = 0; // подряд идущие замеры 0×0 (для диагностического лога)
     const sizeWatchId = window.setInterval(() => {
       if (!mounted) return;
       const cur = canvasSizeRef.current;
       const m = measureContainer();
       if (m.w > 0 && m.h > 0) {
+        if (zeroStreak >= 4) {
+          console.warn('[MapCanvas] размеры контейнера восстановлены после серии нулевых замеров:',
+            { wasZeroForMs: zeroStreak * 250, now: `${m.w}×${m.h}` });
+        }
+        zeroStreak = 0;
         if (cur.width !== m.w || cur.height !== m.h) applySizes(m.w, m.h);
-      } else if (cur.width > 0 || cur.height > 0) {
-        applySizes(0, 0);
-        tileQueueRef.current.length = 0;
-        for (const hh of tileLoadHandlesRef.current.values()) hh.cancel();
-        tileLoadHandlesRef.current.clear();
-        activeTilesRef.current = 0;
-        tilePending.current.clear();
-        for (const imgEl of tileElsRef.current.values()) { abortTileImage(imgEl); imgEl.remove(); }
-        tileElsRef.current.clear();
+      } else {
+        zeroStreak++;
+        // Диагностика корня ошибки «Не удалось определить размер контейнера
+        // карты»: после ~1 с непрерывных нулевых замеров выводим во временную
+        // консоль причины (display:none / схлопнутый flex-родитель / отсутствие
+        // пиксельного базиса высоты у предков #map-container).
+        if (zeroStreak === 4) {
+          const c = containerRef.current;
+          const parentHidden = !!(c && (getComputedStyle(c).display === 'none'
+            || (c.parentElement && getComputedStyle(c.parentElement).display === 'none')));
+          console.warn('[MapCanvas] контейнер карты имеет нулевой размер ≥1 с.',
+            'Возможные причины: display:none у родителя; схлопнутый flex-элемент;',
+            'у предков нет пиксельного базиса высоты (h-full без height у root).',
+            { displayNone: parentHidden, rect: c?.getBoundingClientRect().toJSON?.() ?? null });
+        }
+        if (cur.width > 0 || cur.height > 0) {
+          applySizes(0, 0);
+          tileQueueRef.current.length = 0;
+          for (const hh of tileLoadHandlesRef.current.values()) hh.cancel();
+          tileLoadHandlesRef.current.clear();
+          activeTilesRef.current = 0;
+          tilePending.current.clear();
+          for (const imgEl of tileElsRef.current.values()) { abortTileImage(imgEl); imgEl.remove(); }
+          tileElsRef.current.clear();
+        }
       }
-    }, 500);
+    }, 250);
 
     const observer = new ResizeObserver((entries) => {
       if (roRaf) cancelAnimationFrame(roRaf);
@@ -2032,12 +2058,20 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // повтор замера гарантирует, что canvasSize не останется {0,0} навечно —
     // иначе включался бы circuit breaker размеров вместо реальной карты.
     if (cw <= 0 || ch <= 0) {
-      // Повтор замера: rAF + СИНХРОННЫЙ таймер setTimeout(0). В средах без
-      // rAF-дренажа (fake timers в vitest, jsdom без кадров) один только rAF
+      // Повтор замера: rAF + серия СИНХРОННЫХ таймеров setTimeout(0). В средах
+      // без rAF-дренажа (fake timers в vitest, jsdom без кадров) один только rAF
       // никогда не выполняется — canvasSize оставался бы {0,0} до срабатывания
-      // sizeWatchId (500 мс, тоже на fake-таймерах), и вместо карты показывался
+      // sizeWatchId (250 мс, тоже на fake-таймерах), и вместо карты показывался
       // circuit breaker «Не удалось определить размер контейнера». setTimeout(0)
       // гарантированно исполняется в любой среде с обычным event loop.
+      // Фикс ошибки «Не удалось определить размер контейнера карты» при РЕАЛЬНОМ
+      // layout: высота flex-ветки мастера разрешается браузером ПОСЛЕ первого
+      // paint (поздний CSS, анимация шага, пересчёт vh-мобильной адресной строки),
+      // поэтому одного тика недостаточно — делаем несколько отложенных повторов
+      // (~до 1.3 с). Как только появился ненулевой базис — применяем размеры и
+      // карта стартует сама, оверлей с кнопкой «Попробовать снова» показывается
+      // только если layout реально сломан (размер так и не появился).
+      const retryDelaysMs = [0, 60, 180, 400, 700, 1300];
       const retryMeasure = (): void => {
         if (!mounted) return;
         const c = containerRef.current;
@@ -2046,8 +2080,10 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         if (m.w > 0 && m.h > 0) applySizes(m.w, m.h);
       };
       requestAnimationFrame(retryMeasure);
-      const retryTimerId = window.setTimeout(retryMeasure, 0);
-      ownedTimersRef.current.add(retryTimerId as unknown as ReturnType<typeof setTimeout>);
+      for (const d of retryDelaysMs) {
+        const retryTimerId = window.setTimeout(retryMeasure, d);
+        ownedTimersRef.current.add(retryTimerId as unknown as ReturnType<typeof setTimeout>);
+      }
     }
     if (cw > 0 && ch > 0) applySizes(cw, ch);
 
