@@ -90,7 +90,9 @@ export interface MapState {
   calibration: { enabled: boolean; points: CalibrationPoint[] };
   googleMaps: { apiKey: string; enabled: boolean };
   yandexMaps: { apiKey: string; enabled: boolean };
-  openStreetMap: { enabled: boolean; tileServer: 'osm' | 'opentopomap' | 'carto' | '2gis' };
+  /** tileServer — рабочий id из TILE_PROVIDERS либо legacy-значение ('osm', 'carto', '2gis');
+   *  при чтении нормализуется normalizeTileServer() (тип string — для совместимости со старыми проектами). */
+  openStreetMap: { enabled: boolean; tileServer?: string };
   settings: ProjectSettings;
   _currentMapId?: string; // ID текущей карты в IndexedDB
   // UI-состояние карты
@@ -147,7 +149,9 @@ export interface MapActions {
   setYandexMapsApiKey: (apiKey: string) => void;
   toggleYandexMaps: (enabled: boolean) => void;
   toggleOpenStreetMap: (enabled: boolean) => void;
-  setOSMTileServer: (server: 'osm' | 'opentopomap' | 'carto' | '2gis') => void;
+  /** Принимает как рабочие id из TILE_PROVIDERS (esri, osmfr, …), так и legacy
+   *  ('osm', 'carto', '2gis') — MapCanvas нормализует их normalizeTileServer(). */
+  setOSMTileServer: (server: string) => void;
   setMapBounds: (bounds: MapBounds) => void;
   loadMap: (mapData: MapData) => void;
   loadMapWithStorage: (mapData: MapData) => Promise<void>;

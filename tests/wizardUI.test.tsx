@@ -167,9 +167,12 @@ describe('Этап 3 UI — TargetPointsStep', () => {
   it('цель рядом со стартом (<50 м) даёт warning в DOM', async () => {
     render(<MissionWizard />);
     st().addTargetPoint({ name: 'Ц', lat: 55.00001, lon: 37.00001, x: 100, y: 100 });
-    await waitFor(() =>
-      expect(screen.getByRole('status').textContent).toContain('слишком близко к точке старта'),
-    );
+    await waitFor(() => {
+      // В DOM теперь два role="status": баннер шага (StepIssues) и индикатор
+      // состояния слоя подложки (пункт C аудита) — ищем текст среди всех.
+      const statuses = screen.getAllByRole('status').map((el) => el.textContent ?? '');
+      expect(statuses.join(' ')).toContain('слишком близко к точке старта');
+    });
   });
 });
 

@@ -110,8 +110,10 @@ export interface Project {
   };
   openStreetMap: {
     enabled: boolean;
-    /** Список серверов тайлов расширяется: к OSM/Carto/OpenTopo добавлен 2ГИС. */
-    tileServer: 'osm' | 'opentopomap' | 'carto' | '2gis';
+    /** Рабочие тайловые серверы без API-ключей (см. TILE_PROVIDERS в utils/openStreetMap.ts).
+     *  Значения legacy ('osm', 'carto', '2gis') нормализуются normalizeTileServer()
+     *  при чтении — тип остаётся строкой для совместимости со старыми проектами. */
+    tileServer?: string;
   };
 }
 

@@ -152,7 +152,10 @@ export const ProjectSchema = z.object({
     .default({ apiKey: '', enabled: false }),
   openStreetMap: z.object({
     enabled: z.boolean().default(false),
-    tileServer: z.enum(['osm', 'opentopomap', 'carto', '2gis']).default('osm'),
+    // Рабочие id из TILE_PROVIDERS (esri, esri-sat, osmfr, hot, osmde, opentopomap,
+    // cyclosm) + legacy ('osm', 'carto', '2gis') — normalizeTileServer() приведёт
+    // неизвестное/legacy к рабочему серверу при чтении.
+    tileServer: z.string().default('osm'),
   }).default({ enabled: false, tileServer: 'osm' }),
 });
 

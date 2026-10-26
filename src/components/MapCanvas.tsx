@@ -7,7 +7,11 @@ import { isPointInsideAnyRestriction, distanceBetween } from '../utils/geometry'
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
 import { pixelToGeoExact, geoToPixelExact, routeLengthM, zonesCrossedBy, planPathAroundZones, smoothPolyline } from '../utils/routing';
-import { getOSMTileUrl, startTileLoad, abortTileImage, type TileStyle, type TileLoadHandle } from '../utils/openStreetMap';
+import {
+  getOSMTileUrl, startTileLoad, abortTileImage, loadTileWithMirrors,
+  normalizeTileServer, TILE_PROVIDERS, onTileError, getTileErrorCount,
+  type TileStyle, type TileLoadHandle, type TileServerId,
+} from '../utils/openStreetMap';
 import { useMapStore } from '../store/useMapStore';
 import { ensureDefaultTileMap } from '../hooks/useAppInitialization';
 import MiniMapPanel, { MiniOverlayLine, MiniOverlayPoint, type MiniZone } from './MiniMapPanel';
@@ -24,8 +28,16 @@ const MAX_ZOOM = 19;
 /** Палитра цветов маршрутов (повторяется циклически при большом числе маршрутов) */
 const ROUTE_PALETTE = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#fb923c', '#38bdf8', '#e879f9'];
 
-/** Нативный max zoom тайловых серверов (выше НЕ поднимаемся — нет данных, только растяжение) */
-const NATIVE_MAX_BY_SERVER: Record<string, number> = { osm: 19, carto: 18, opentopomap: 17, '2gis': 18 };
+/** Нативный max zoom рабочих тайловых серверов (выше НЕ поднимаемся — нет данных,
+ *  только растяжение). Реестр по аудиту audit/index.fixed.html: tile.openstreetmap.org
+ *  и Carto удалены; legacy-значения ('osm', 'carto', '2gis') сохраняются как
+ *  совместимость со старыми проектами. */
+const NATIVE_MAX_BY_SERVER: Record<string, number> = {
+  ...Object.fromEntries(
+    Object.entries(TILE_PROVIDERS).map(([id, p]) => [id, p.maxNativeZoom]),
+  ) as Record<string, number>,
+  osm: 19, carto: 18, '2gis': 19, // legacy-алиасы (нормализуются normalizeTileServer)
+};
 
 /** КЛЮЧ сохранённого вида в localStorage. Раньше состояние камеры жило ТОЛЬКО в
  *  zustand-persist ('tq-map'): любое зависание гонки гидрации/сброса сторов
@@ -455,6 +467,19 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   // загрузку — промисы резолвятся в null немедленно, Image прерываются
   // (abort), память не течёт. Именно это проверяет wizardFreeze.test.tsx.
   const tileLoadHandlesRef = useRef<Set<TileLoadHandle>>(new Set());
+  /** Зеркало Esri (services.arcgisonline.com) с регистрацией ручки в том же
+   *  in-flight-реестре: при неудаче основного хоста пробуем зеркало, но и эту
+   *  загрузку обязан отменить cleanup при unmount (P0-инвариант wizardFreeze). */
+  const loadEsriMirrorByHandle = useCallback((u: string): Promise<HTMLImageElement | null> => {
+    const m = u.match(/^https:\/\/server\.arcgisonline\.com\/(.+)$/);
+    if (!m) return Promise.resolve(null);
+    const h = startTileLoad(`https://services.arcgisonline.com/${m[1]}`, 10000);
+    tileLoadHandlesRef.current.add(h);
+    return h.done.then((img) => {
+      tileLoadHandlesRef.current.delete(h);
+      return img;
+    });
+  }, []);
   const activeTilesRef = useRef(0);
   const tileDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Все таймауты, поставленные из этого компонента (debounce синхронизации,
@@ -488,6 +513,13 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   // pending-загрузки тайлов: url -> промис (дедупликация — один запрос на тайл)
   const tilePending = useRef<Map<string, Promise<void>>>(new Map());
   const [tilesVersion, setTilesVersion] = useState(0);
+  // Состояние тайлового загрузчика для индикатора слоя (пункт C аудита):
+  // 'loading' — есть активные загрузки, 'ok' — тайлы грузятся штатно,
+  // 'err' — ≥3 ошибок подряд («Слой недоступен, попробуйте другой стиль»).
+  type LayerLoadState = 'loading' | 'ok' | 'err';
+  const [layerLoadState, setLayerLoadState] = useState<LayerLoadState>('ok');
+  const layerLoadStateRef = useRef<LayerLoadState>('ok');
+  const tileWarnedRef = useRef(false);
   // Геолокация пользователя
   const [userPos, setUserPos] = useState<{ lat: number; lng: number; acc: number } | null>(null);
 
@@ -516,6 +548,45 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     removeRoutePoint,
     setActiveRoute,
   } = useStore();
+
+  // Рабочий тайловый провайдер без API-ключей (реестр TILE_PROVIDERS, аудит
+  // audit/index.fixed.html): legacy 'osm'/'carto' нормализуются в Esri/OSM France.
+  const tileServer: TileServerId = normalizeTileServer(project.openStreetMap?.tileServer);
+
+  // ===== Индикатор состояния слоя (пункт C аудита) + реакция на смену стиля =====
+  // Подписка на счётчик ошибок загрузки (аналог tileerror в Leaflet-аудите):
+  // n>=3 → предупреждение без alert(); n===0 (первый успех) → авто-возврат «ок».
+  useEffect(() => {
+    const handler = (n: number) => {
+      if (n >= 3) {
+        tileWarnedRef.current = true;
+        layerLoadStateRef.current = 'err';
+        setLayerLoadState('err');
+      } else if (n === 0) {
+        tileWarnedRef.current = false;
+        layerLoadStateRef.current = 'ok';
+        setLayerLoadState('ok');
+      }
+    };
+    const off = onTileError(handler);
+    // Состояние загрузчика при подписке (иначе индикатор «ошибка» виден только
+    // после нового события, а не сразу после перерисовки компонента)
+    handler(getTileErrorCount());
+    return off;
+  }, []);
+  // При смене стиля подложки сбрасываем предупреждение об ошибках и читаем
+  // актуальное состояние загрузчика (счётчик общий для всех провайдеров).
+  useEffect(() => {
+    tileWarnedRef.current = false;
+    const n = getTileErrorCount();
+    if (n >= 3) {
+      layerLoadStateRef.current = 'err';
+      setLayerLoadState('err');
+    } else {
+      layerLoadStateRef.current = 'ok';
+      setLayerLoadState('ok');
+    }
+  }, [tileServer]);
 
   // ===== viewTick: троттлинг перерисовки канваса (rAF) =====
   // viewState обновляется на каждое движение мыши. Реакция на него идёт НЕ через
@@ -727,9 +798,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   // Кэш тайлов, дозагрузка при изменении вида; maxNativeZoom — выше не растягиваем.
   const tilesEnabled = !!project.settings?.tilesEnabled && !!project.map?.bounds;
   // Только стандартная схема OSM (режимы «спутник/гибрид» удалены из приложения)
-  type TileStyle = 'scheme';
-  const tileStyle = 'scheme' as const satisfies TileStyle;
-  const tileServer: 'osm' | 'opentopomap' | 'carto' | '2gis' = project.openStreetMap?.tileServer ?? 'osm';
+  const tileStyle: TileStyle = 'scheme';
   // ЕДИНАЯ инвариантная привязка вида (см. комментарий над worldPxOf):
   //   zoom = z0 + log2(scale),  worldPx = canvasHeight · 2^zoom.
   const effZ0 = vs.z0 ?? ZOOM_REF;
@@ -762,7 +831,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     if (!tilesOn || !mapBounds || cs.height <= 0) { el.style.display = 'none'; return; }
     const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
     const zoom = clampZoom(zoomAtWorldPx(wp));
-    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[(st.openStreetMap?.tileServer as any) || 'osm'] ?? MAX_ZOOM);
+    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[normalizeTileServer(st.openStreetMap?.tileServer)] ?? MAX_ZOOM);
     const level = Math.max(MIN_ZOOM, Math.min(nativeMax, Math.round(zoom)));
     const n = Math.pow(2, level);
     // ── СТРОГАЯ привязка DOM-слоя к инварианту вида ───────────────────────────
@@ -818,7 +887,8 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     if (!Number.isFinite(cs.width) || !Number.isFinite(cs.height) || cs.width <= 0 || cs.height <= 0) return;
     const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
     const zoom = clampZoom(zoomAtWorldPx(wp));
-    const server: 'osm' | 'opentopomap' | 'carto' | '2gis' = proj.openStreetMap?.tileServer ?? 'osm';
+    // Рабочий провайдер из стора (Esri по умолчанию; legacy 'osm'/'carto'/'2gis' нормализуется)
+    const server: TileServerId = normalizeTileServer(proj.openStreetMap?.tileServer);
     const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[server] ?? MAX_ZOOM);
     const level = Math.max(MIN_ZOOM, Math.min(nativeMax, Math.round(zoom)));
     const n = Math.pow(2, level);
@@ -882,13 +952,16 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
           if (!imgEl || tilePending.current.has(u) || tileCache.current.has(u)) continue;
           activeTilesRef.current++;
           // P0-фикс «зависание/утечка при загрузке карт»: загрузка регистрируется
-          // в реестре in-flight (inFlightTileLoadsRef) и ПРИНУДИТЕЛЬНО отменяется
+          // в реестре in-flight (tileLoadHandlesRef) и ПРИНУДИТЕЛЬНО отменяется
           // через handle.cancel() при unmount / смене подложки. Раньше промис
           // доживал до внутреннего 10-секундного таймаута, держал DOM-элементы
           // размонтированного слоя и резолвился setState на unmounted-компоненте.
+          // Зеркала Esri + учёт ошибок (аналог tileerror из аудита) — внутри
+          // loadTileImage/startTileLoad (noteTileError/noteTileSuccess).
           const handle: TileLoadHandle = startTileLoad(u, 10000); // таймаут: зависший тайл не блокирует очередь
           tileLoadHandlesRef.current.add(handle);
           const p = handle.done
+            .then((loaded0) => loaded0 ? loaded0 : loadEsriMirrorByHandle(u))
             .then((loaded) => {
               if (!mountedRef.current) return; // unmount — результат не нужен (см. cleanup)
               if (loaded) {
@@ -920,6 +993,14 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
               if (!mountedRef.current) return; // cleanup уже сбросил очередь/pending
               tilePending.current.delete(u);
               activeTilesRef.current--;
+              // Индикатор слоя (пункт C): «загружается», пока очередь не пуста;
+              // «ошибка» имеет приоритет; иначе — «загружен».
+              const stillBusy = activeTilesRef.current > 0 || tileQueueRef.current.length > 0 || tilePending.current.size > 0;
+              const next: LayerLoadState = tileWarnedRef.current ? 'err' : stillBusy ? 'loading' : 'ok';
+              if (layerLoadStateRef.current !== next) {
+                layerLoadStateRef.current = next;
+                setLayerLoadState(next);
+              }
               setTilesVersion((t2) => t2 + 1);
               pump();
             });
@@ -3533,13 +3614,13 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // использовалась ширина канваса — масштаб сбивался на aspect-ratio окна.)
     const z0 = vcur.z0 ?? ZOOM_REF;
     let sc = worldTarget / (Math.max(1, canvasSize.height) * Math.pow(2, z0));
-    const bnds = scaleBoundsForZooms(canvasSize.width, z0, (project.openStreetMap?.tileServer as any) || 'osm');
+    const bnds = scaleBoundsForZooms(canvasSize.width, z0, tileServer);
     sc = Math.max(bnds.min, Math.min(Math.max(bnds.max * 4, bnds.max), sc));
     const cx = canvasSize.width / 2, cy = canvasSize.height / 2;
     const newOffsetX = cx - (cx - vcur.offsetX) * (sc / vcur.scale);
     const newOffsetY = cy - (cy - vcur.offsetY) * (sc / vcur.scale);
     setViewState({ scale: sc, offsetX: newOffsetX, offsetY: newOffsetY });
-  }, [project.map, project.openStreetMap?.tileServer, setViewState, canvasSize]);
+  }, [project.map, tileServer, setViewState, canvasSize]);
 
   const btnCls = 'w-9 h-9 flex items-center justify-center rounded-md bg-gray-800/90 hover:bg-gray-700 text-gray-100 border border-gray-600 shadow text-base select-none';
 
@@ -3748,6 +3829,30 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         </div>
       )}
 
+      {/* Индикатор состояния слоя подложки (пункт C аудита): загружается/загружен/ошибка */}
+      {tilesEnabled && (
+        <div
+          role="status"
+          aria-live="polite"
+          aria-label={`Состояние слоя подложки: ${
+            layerLoadState === 'err' ? 'ошибка загрузки' : layerLoadState === 'loading' ? 'слой загружается' : 'слой загружен'
+          }`}
+          className={`absolute top-3 left-1/2 -translate-x-1/2 z-20 px-3 py-1.5 rounded-lg border text-xs shadow-lg pointer-events-none whitespace-nowrap ${
+            layerLoadState === 'err'
+              ? 'bg-red-950/90 border-red-500/70 text-red-200'
+              : layerLoadState === 'loading'
+                ? 'bg-gray-900/85 border-amber-500/60 text-amber-200'
+                : 'bg-gray-900/85 border-emerald-500/50 text-emerald-200'
+          }`}
+        >
+          {layerLoadState === 'err'
+            ? `⚠ Слой «${TILE_PROVIDERS[tileServer].label}» недоступен — попробуйте другой стиль`
+            : layerLoadState === 'loading'
+              ? `⏳ Загрузка слоя «${TILE_PROVIDERS[tileServer].label}»…`
+              : `✓ Слой «${TILE_PROVIDERS[tileServer].label}» загружен`}
+        </div>
+      )}
+
       {/* Кнопки управления картой (доступность: aria-label, клавиатура) */}
       <div className="absolute top-3 right-3 z-10 flex flex-col gap-1.5" aria-label="Управление картой">
         <button className={btnCls} aria-label="Приблизить" title="Приблизить (+)" onClick={() => zoomAt(2)}>＋</button>
@@ -3785,6 +3890,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
           // общие пропсы панелей: фокус, редактирование, удаление кликом —
           // ОДИНАКОВО во всех трёх окнах (редактировать можно любое окно сразу)
           const base: Partial<React.ComponentProps<typeof MiniMapPanel>> = {
+            tileServer, // тот же рабочий стиль подложки, что у большой карты (аудит)
             focused: tripleStep === idx,
             panelIdx: idx,
             onFocus: () => { focusAndRaisePanel(idx); },

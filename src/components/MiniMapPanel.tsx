@@ -5,7 +5,8 @@
 // потребляют минимум соединений (общий кэш тайлов + лимит параллельных загрузок).
 // Зум колесом/кнопками, панорама перетаскиванием — в любых пределах z3..z19+.
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { getOSMTileUrl, loadTileWithMirrors } from '../utils/openStreetMap';
+import { getTileUrlVariantsFor, loadTileImage, normalizeTileServer, TILE_PROVIDERS } from '../utils/openStreetMap';
+import type { TileServerId } from '../utils/openStreetMap';
 import {
   PanelView, viewBox, geoToScreenPx, zoomPanelAt, panPanelBy,
   metersPerPixel, fitView, panelViewOf, GROUND_MPP_1CM_2KM,
@@ -53,6 +54,10 @@ interface MiniMapPanelProps {
   onZoneClick?: (id: string) => void;
   /** Двойной клик по свободной карте панели (замыкание полигона NFZ-черновика) */
   onPanelDoubleClick?: () => void;
+  /** Стиль подложки — рабочий тайловый провайдер из стора (Esri по умолчанию).
+   *  Панели мастера обязаны использовать ТОТ ЖЕ стиль, что и большая карта
+   *  (аудит audit/index.fixed.html: tile.openstreetmap.org удалён — 403 по Referer). */
+  tileServer?: TileServerId | 'osm' | 'carto' | '2gis';
 }
 
 /** Зоны для отрисовки: с опциональным id (для удаления кликом) */
@@ -90,7 +95,11 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   points = [], lines = [], height = 260, onReady,
   focused = false, onFocus, onMapClick, panelIdx = -1, zones = [], onPointClick, pointDeleteEnabled = true, onPointMove, onPointAltitudeDrag, onZoneClick,
   onPanelDoubleClick,
+  tileServer = 'esri',
 }) => {
+  // Рабочий провайдер (legacy 'osm'/'carto' нормализуются) + его нативный максимум
+  const serverId: TileServerId = normalizeTileServer(tileServer);
+  const nativeMax = TILE_PROVIDERS[serverId].maxNativeZoom;
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [size, setSize] = useState({ w: 320, h: typeof height === 'number' ? height : 260 });
@@ -201,11 +210,15 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
 
     const v = viewRef.current;
     const vb = viewBox(v, w, h);
-    // Исправление «синего экрана»: уровень тайлов НЕ должен обрезаться по maxZoom.
-    // При z>19 берём нативные z19-тайлы и рисуем их увеличенными (как Leaflet/OSM).
+    // Исправление «синего экрана»: уровень сетки НЕ должен обрезаться по maxZoom.
+    // Сетка тайлов строится по фактическому зуму (v.zoom), а запрашивается ближайший
+    // нативный уровень выбранного провайдера (как Leaflet maxNativeZoom): при
+    // z > nativeMax берём более мелкий нативный тайл и рисуем его увеличенным.
     // Раньше worldPx (по фактическому зуму) не совпадал с сеткой тайлов (по clamp z19) —
     // тайлы уезжали за экран, оставалась только тёмная подложка (#0f1729 ≈ синий экран).
-    const level = Math.max(minZoom, Math.min(19, Math.floor(v.zoom)));
+    const level = Math.max(minZoom, Math.floor(v.zoom));
+    const srcLevel = Math.min(level, nativeMax); // реальный уровень тайлов у провайдера
+    const upscale = Math.pow(2, level - srcLevel); // во сколько раз растягиваем тайл
     const n = Math.pow(2, level);
     const tileSize = vb.hpx / n; // экранных px на тайл уровня `level` (мир квадратный: hpx)
     // привязка строго от mercator-долей центра вида (та же формула, что и для объектов)
@@ -222,12 +235,17 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     for (let tx = tx0; tx <= tx1; tx++) {
       for (let ty = Math.max(0, ty0); ty <= Math.min(n - 1, ty1); ty++) {
         if (tx < 0 || tx >= n) continue;
-        const url = getOSMTileUrl(level, tx, ty, 'osm', 'scheme');
+        // Координаты тайла НА РЕАЛЬНОМ уровне srcLevel (для osmde/opentopomap при z>17)
+        const sTx = Math.floor(tx / upscale);
+        const sTy = Math.floor(ty / upscale);
+        const url = getTileUrlVariantsFor(serverId, srcLevel, sTx, sTy)[0];
         const img = sharedTileCache.get(url);
-        if (img === undefined) { need.push({ url, tx, ty }); continue; }
+        if (img === undefined) { need.push({ url, tx: sTx, ty: sTy }); continue; }
         if (img === null) continue; // ошибка загрузки — пропускаем (фон остаётся)
+        // Экранное положение тайла уровня `level`; для upscaled-тайлов — позиция
+        // родительского тайла минус смещение внутри него (ровно 1/n мира).
         const p = toTileScreen(tx, ty);
-        ctx.drawImage(img, p.x, p.y, tileSize + 0.5, tileSize + 0.5);
+        ctx.drawImage(img, p.x, p.y, tileSize * upscale + 0.5, tileSize * upscale + 0.5);
         drawnCount++;
       }
     }
@@ -238,11 +256,11 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       ctx.fillText('Нет данных тайлов в этой области — вернитесь к объекту (⌂)', w / 2, h / 2);
       ctx.restore();
     }
-    // Дозагрузка недостающих тайлов общей бережной очередью (с зеркалами OSM)
+    // Дозагрузка недостающих тайлов общей бережной очередью (Esri — с зеркалами)
     if (need.length > 0) {
       const cxw = w / 2, cyw = h / 2;
       need.sort((a, b) => {
-        const pa = toTileScreen(a.tx, a.ty), pb = toTileScreen(b.tx, b.ty);
+        const pa = toTileScreen(a.tx * upscale, a.ty * upscale), pb = toTileScreen(b.tx * upscale, b.ty * upscale);
         return ((pa.x - cxw) ** 2 + (pa.y - cyw) ** 2) - ((pb.x - cxw) ** 2 + (pb.y - cyw) ** 2);
       });
       for (const t of need.slice(0, 24)) { // жёсткий лимит запросов на перерисовку
@@ -250,7 +268,7 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
         if (tileInflight.has(t.url)) continue;
         tileInflight.add(t.url);
         sharedActiveLoads++;
-        loadTileWithMirrors(t.url, 10000)
+        loadTileImage(t.url, 10000)
           .then((loaded) => { cacheTile(t.url, loaded); })
           .finally(() => { tileInflight.delete(t.url); sharedActiveLoads--; bump(); });
       }
@@ -356,7 +374,10 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     ctx.strokeStyle = '#7dd3fc'; ctx.lineWidth = 1.5;
     ctx.beginPath(); ctx.moveTo(w - barPx - 10, h - 14); ctx.lineTo(w - 10, h - 14); ctx.stroke();
     ctx.restore();
-  }, [lines, points, zones, minZoom, maxZoom, bump, focused]);
+  }, [lines, points, zones, minZoom, maxZoom, bump, focused, serverId, nativeMax]);
+
+  // Смена стиля подложки — общая: кэш тайлов keyed по URL, достаточно перерисовки
+  useEffect(() => { bump(); }, [serverId, bump]);
 
   function mercLatOf(v: PanelView): number {
     const nn = Math.PI - 2 * Math.PI * v.fy;

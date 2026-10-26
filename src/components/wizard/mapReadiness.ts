@@ -40,10 +40,14 @@ export function computeMapReadiness(
     };
   }
   // Graceful degradation: провайдер без ключа (Google/Яндекс) физически не
-  // отдаст тайлы — подсказываем переключиться на бесплатные OSM/2ГИС.
+  // отдаст тайлы — подсказываем переключиться на бесплатные подложки.
+  // Рабочие id из нового реестра TILE_PROVIDERS (esri, osmfr, hot, osmde, cyclosm)
+  // не требуют ключа — считаем их готовными сразу; legacy-значения ('osm', '2gis',
+  // 'opentopomap', 'carto') проходят через старый реестр mapProviders.
   const provider = project.openStreetMap?.tileServer ?? 'osm';
-  const status = getProviderStatus(project, provider);
-  if (!status.ready) {
+  const isKeylessNewRegistry = ['esri', 'esri-sat', 'osmfr', 'hot', 'osmde', 'cyclosm'].includes(provider);
+  const status = isKeylessNewRegistry ? null : getProviderStatus(project, provider as TileProviderId);
+  if (status && !status.ready) {
     return { ready: false, reason: status.message ?? 'Провайдер карт недоступен.' };
   }
   if (!loaded) {

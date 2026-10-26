@@ -15,8 +15,10 @@ class HangingImage {
   onload: (() => void) | null = null;
   onerror: (() => void) | null = null;
   abortCalls = 0;
+  /** Все URL, когда-либо присвоенные src (включая отменённые — src сбрасывается в '' при abort). */
+  srcHistory: string[] = [];
   private _src = '';
-  set src(v: string) { this._src = v; }
+  set src(v: string) { if (v) this.srcHistory.push(v); this._src = v; }
   get src(): string { return this._src; }
   abort(): void { this.abortCalls++; }
   constructor() { HangingImage.instances.push(this); }
@@ -78,12 +80,27 @@ describe('loadTileImage — защита от зависания загрузк�
     expect(vi.getTimerCount()).toBe(0); // timer очищен — нет утечки таймеров
   });
 
-  it('очередь зеркал OSM завершается даже когда все хосты висят', async () => {
+  it('очередь зеркал Esri завершается даже когда оба хоста висят', async () => {
     vi.stubGlobal('Image', HangingImage);
-    const p = loadTileWithMirrors('https://tile.openstreetmap.org/10/512/340.png', 2000);
-    // 4 зеркала × 2 c таймаута = до 8 c; раньше — навсегда
-    await vi.advanceTimersByTimeAsync(9000);
+    // tile.openstreetmap.org УДАЛЁН из загрузчика (403 по Referer с github.io);
+    // единственный список зеркал теперь — Esri (server/services.arcgisonline.com)
+    const p = loadTileWithMirrors(
+      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/10/340/512',
+      2000,
+    );
+    // 2 зеркала × 2 с таймаута = до 4 с; раньше — навсегда
+    await vi.advanceTimersByTimeAsync(5000);
     await expect(p).resolves.toBeNull();
-    expect(HangingImage.instances.length).toBe(4);
+    expect(HangingImage.instances.length).toBe(2);
+    // второе зеркало опробовано после зависания первого
+    expect(HangingImage.instances[1].srcHistory[0]).toContain('services.arcgisonline.com');
+  });
+
+  it('URL не-Esri провайдера грузится одним запросом без перебора зеркал', async () => {
+    vi.stubGlobal('Image', HangingImage);
+    const p = loadTileWithMirrors('https://a.tile.opentopomap.org/10/512/340.png', 2000);
+    await vi.advanceTimersByTimeAsync(2500);
+    await expect(p).resolves.toBeNull();
+    expect(HangingImage.instances.length).toBe(1);
   });
 });
