@@ -520,6 +520,15 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   const [layerLoadState, setLayerLoadState] = useState<LayerLoadState>('ok');
   const layerLoadStateRef = useRef<LayerLoadState>('ok');
   const tileWarnedRef = useRef(false);
+  // Временное текстовое сообщение для индикатора слоя (поиск/геолокация и т.п.)
+  // — поверх стандартного статуса «Слой … загружен/загружается/недоступен».
+  const [tileStatusMsg, setTileStatusMsg] = useState<string | null>(null);
+  // Автоскрытие временного сообщения через 6 с (индикатор возвращается к статусу слоя).
+  useEffect(() => {
+    if (!tileStatusMsg) return;
+    const t = setTimeout(() => setTileStatusMsg(null), 6000);
+    return () => clearTimeout(t);
+  }, [tileStatusMsg]);
   // Геолокация пользователя
   const [userPos, setUserPos] = useState<{ lat: number; lng: number; acc: number } | null>(null);
 
@@ -1042,15 +1051,41 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     syncTileDom();
   }, [renderTick, tilesEnabled, tileServer, project.map?.bounds, canvasSize, syncTileDom]);
 
-  // Геолокация пользователя (по требованию — кнопка 📍)
+  // Геолокация пользователя (по требованию — кнопка 📍).
+  // По аудиту GitHub Pages (audit/index.fixed.html, пункты F/G):
+  // - проверяется наличие API и защищённый контекст (Pages отдаёт HTTPS, но на
+  //   file:// или http-зеркалах geolocation недоступен);
+  // - коды ошибок 1/2/3 переводятся в понятные сообщения;
+  // - никаких alert(): статус идёт в текстовый индикатор подложки (tileStatusMsg),
+  //   отказ в доступе не блокирует UI.
   const locateUser = useCallback(() => {
-    if (!navigator.geolocation) { alert('Геолокация не поддерживается браузером'); return; }
+    const showStatus = (msg: string) => setTileStatusMsg(msg);
+    if (!('geolocation' in navigator)) { showStatus('⚠ Браузер не поддерживает геолокацию'); return; }
+    if (!window.isSecureContext) { showStatus('⚠ Геолокация доступна только по HTTPS (или localhost)'); return; }
+    showStatus('Определение местоположения…');
+    let settled = false;
+    // Страховочный дубль-таймер: getCurrentPosition иногда «вешает» callback в
+    // WebView/блокировщиках — через 12 с показываем статус и разблокируем кнопку.
+    const guard = setTimeout(() => {
+      if (!settled) showStatus('⚠ Не удалось получить позицию (время вышло)');
+    }, 12000);
     navigator.geolocation.getCurrentPosition(
-      (pos) => setUserPos({ lat: pos.coords.latitude, lng: pos.coords.longitude, acc: pos.coords.accuracy }),
-      (err) => alert('Ошибка геолокации: ' + err.message),
-      { enableHighAccuracy: true, timeout: 10000 }
+      (pos) => {
+        settled = true; clearTimeout(guard);
+        setUserPos({ lat: pos.coords.latitude, lng: pos.coords.longitude, acc: pos.coords.accuracy });
+        showStatus(`✓ Позиция определена (±${Math.round(pos.coords.accuracy)} м)`);
+      },
+      (err) => {
+        settled = true; clearTimeout(guard);
+        const msg = err.code === err.PERMISSION_DENIED ? 'Доступ к геолокации запрещён — разрешите его в настройках браузера.'
+          : err.code === err.POSITION_UNAVAILABLE ? 'Позиция недоступна (нет GPS-сигнала / сети).'
+          : err.code === err.TIMEOUT ? 'Превышено время ожидания геолокации.'
+          : 'Не удалось определить местоположение.';
+        showStatus('⚠ ' + msg);
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }
     );
-  }, []);
+  }, [setTileStatusMsg]);
 
   // ─── ЕДИНСТВЕННЫЙ режим карты: три окна СТАРТ / МАРШРУТ / ЦЕЛЬ ──────────────
   // Приложение всегда работает в режиме трёх окон: МАРШРУТ занимает место
@@ -3829,29 +3864,38 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         </div>
       )}
 
-      {/* Индикатор состояния слоя подложки (пункт C аудита): загружается/загружен/ошибка */}
-      {tilesEnabled && (
-        <div
-          role="status"
-          aria-live="polite"
-          aria-label={`Состояние слоя подложки: ${
-            layerLoadState === 'err' ? 'ошибка загрузки' : layerLoadState === 'loading' ? 'слой загружается' : 'слой загружен'
-          }`}
-          className={`absolute top-3 left-1/2 -translate-x-1/2 z-20 px-3 py-1.5 rounded-lg border text-xs shadow-lg pointer-events-none whitespace-nowrap ${
-            layerLoadState === 'err'
+      {/* Индикатор состояния слоя подложки (пункт C аудита): загружается/загружен/ошибка.
+        Временные сообщения (геолокация и т.п.) показываются поверх статуса слоя. */}
+    {tilesEnabled && (
+      <div
+        role="status"
+        aria-live="polite"
+        aria-label={`Состояние слоя подложки: ${
+          tileStatusMsg ?? (layerLoadState === 'err' ? 'ошибка загрузки' : layerLoadState === 'loading' ? 'слой загружается' : 'слой загружен')
+        }`}
+        className={`absolute top-3 left-1/2 -translate-x-1/2 z-20 px-3 py-1.5 rounded-lg border text-xs shadow-lg pointer-events-none whitespace-nowrap ${
+          tileStatusMsg
+            ? tileStatusMsg.startsWith('⚠')
+              ? 'bg-red-950/90 border-red-500/70 text-red-200'
+              : tileStatusMsg.startsWith('✓')
+                ? 'bg-gray-900/85 border-emerald-500/50 text-emerald-200'
+                : 'bg-gray-900/85 border-amber-500/60 text-amber-200'
+            : layerLoadState === 'err'
               ? 'bg-red-950/90 border-red-500/70 text-red-200'
               : layerLoadState === 'loading'
                 ? 'bg-gray-900/85 border-amber-500/60 text-amber-200'
                 : 'bg-gray-900/85 border-emerald-500/50 text-emerald-200'
-          }`}
-        >
-          {layerLoadState === 'err'
+        }`}
+      >
+        {tileStatusMsg
+          ? tileStatusMsg
+          : layerLoadState === 'err'
             ? `⚠ Слой «${TILE_PROVIDERS[tileServer].label}» недоступен — попробуйте другой стиль`
             : layerLoadState === 'loading'
               ? `⏳ Загрузка слоя «${TILE_PROVIDERS[tileServer].label}»…`
               : `✓ Слой «${TILE_PROVIDERS[tileServer].label}» загружен`}
-        </div>
-      )}
+      </div>
+    )}
 
       {/* Кнопки управления картой (доступность: aria-label, клавиатура) */}
       <div className="absolute top-3 right-3 z-10 flex flex-col gap-1.5" aria-label="Управление картой">
