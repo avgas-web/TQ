@@ -185,6 +185,14 @@ afterEach(() => {
 });
 
 async function gotoStartPointsStep(): Promise<void> {
+  // Этап 1 — выбор карт: штатный путь пользователя (клик по карточке Esri).
+  // ВНИМАНИЕ: не менять на прямой setState в этом файле — здесь мок-таймеры
+  // (flushTimers), и тест обязан проходить через реальный UI-контракт этапа.
+  fireEvent.click(screen.getByTestId('map-choice-esri'));
+  await flushReact(2);
+  fireEvent.click(screen.getByRole('button', { name: /Далее/ }));
+  await flushReact(2);
+  // Этап 2 — тип аппарата
   fireEvent.click(screen.getByTestId('craft-card-drone'));
   await flushReact(2);
   fireEvent.click(screen.getByRole('button', { name: 'Продолжить' }));
@@ -257,19 +265,24 @@ describe('Работа с картой в режиме Мастера', () => {
     expect(useMissionWizardStore.getState().startPoints).toHaveLength(1);
   });
 
-  it('Google без API-ключа: оверлей требует ключ и предлагает OSM/2ГИС, точки не ставятся', async () => {
+  it('Google без API-ключа: оверлей требует ключ и предлагает бесплатную подложку, точки не ставятся', async () => {
     render(<MissionWizard />);
     await gotoStartPointsStep();
     act(() => { useMapStore.getState().setOSMTileServer('google'); });
     await flushReact(6);
     const overlay = screen.getByTestId('wizard-map-not-ready-overlay');
     expect(overlay.textContent).toMatch(/API-ключ Google/);
-    expect(overlay.textContent).toMatch(/2ГИС/);
+    // ТЗ: 2ГИС удалён полностью — подсказка ведёт на бесплатные Esri/OSM-подложки.
+    expect(overlay.textContent).not.toMatch(/2ГИС/);
+    expect(overlay.textContent).toMatch(/Esri\/OSM|бесплатн/i);
     expect(clickLiveMap('wizard-live-map-start', 300, 200)).toBe(false);
   });
 
   it('Этап целей: клики блокируются до готовности карты, после загрузки OSM цель ставится', async () => {
     const w = useMissionWizardStore.getState();
+    // Этап 1 (выбор карт) проходит через UI-экшены стора; в этом файле
+    // мок-таймеры, поэтому синхронизация подложки догоняется flushTimers ниже.
+    w.toggleMapChoice('esri');
     w.setCraftType('drone');
     w.goToNextStep(); // start-points
     w.addStartPoint({ name: 'С1', lat: 55.75, lon: 37.6, x: 100, y: 100 });
@@ -304,6 +317,11 @@ describe('Работа с картой в режиме Мастера', () => {
     // (мок ensureDefaultTileMap = тот же продакшен-путь стора), остаётся лишь
     // имитировать onload первого тайла (сеть в jsdom недоступна физически).
     render(<MissionWizard />);
+    // Этап 1: выбор карты — штатный путь UI (см. gotoStartPointsStep выше)
+    fireEvent.click(screen.getByTestId('map-choice-esri'));
+    await flushReact(2);
+    fireEvent.click(screen.getByRole('button', { name: /Далее/ }));
+    await flushReact(2);
     fireEvent.click(screen.getByTestId('craft-card-drone'));
     await flushReact(2);
     fireEvent.click(screen.getByRole('button', { name: 'Продолжить' }));

@@ -57,7 +57,7 @@ interface MiniMapPanelProps {
   /** Стиль подложки — рабочий тайловый провайдер из стора (Esri по умолчанию).
    *  Панели мастера обязаны использовать ТОТ ЖЕ стиль, что и большая карта
    *  (аудит audit/index.fixed.html: tile.openstreetmap.org удалён — 403 по Referer). */
-  tileServer?: TileServerId | 'osm' | 'carto' | '2gis';
+  tileServer?: TileServerId | 'osm' | 'carto';
 }
 
 /** Зоны для отрисовки: с опциональным id (для удаления кликом) */

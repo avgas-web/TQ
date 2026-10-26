@@ -52,11 +52,14 @@ export const DEFAULT_TILE_SERVER: TileServerId = 'esri';
 /** Нормализация значения из стора/импорта/старых сохранений → рабочий провайдер.
  *  Legacy-значения ('osm', 'carto') маппятся на совместимые рабочие серверы:
  *  'osm' → Esri Street (пункт B аудита: стиль по умолчанию — самый стабильный),
- *  'carto' → OSM France (стандартная схема, ближайший аналог Voyager без ключа). */
+ *  'carto' → OSM France (стандартная схема, ближайший аналог Voyager без ключа).
+ *  '2gis' УДАЛЁН ПОЛНОСТЬЮ (ТЗ: выбор карт без 2ГИС): публичный тайловый сервис
+ *  2ГИС закрыт (tile-b01.2gis.com не резолвится) — старые сохранения с этим
+ *  значением нормализуются в Esri Streets (он и рендерился вместо него). */
 export function normalizeTileServer(v: unknown): TileServerId {
   if (typeof v === 'string' && (v in TILE_PROVIDERS)) return v as TileServerId;
   if (v === 'carto') return 'osmfr';
-  return DEFAULT_TILE_SERVER; // 'osm' и всё неизвестное → Esri Streets
+  return DEFAULT_TILE_SERVER; // 'osm', '2gis' и всё неизвестное → Esri Streets
 }
 
 /** Зеркала-фоллбэки для Esri (при недоступности одного хоста). */
@@ -301,27 +304,26 @@ export type TileStyle = 'scheme' | 'satellite' | 'hybrid';
  * tileServer принимает и legacy-значения ('osm', 'carto') — они нормализуются
  * через normalizeTileServer в рабочие серверы из audit/index.fixed.html.
  * Порядок аргументов в URL соответствует каждому провайдеру (у Esri — z/y/x).
+ * Слой «2ГИС» УДАЛЁН ПОЛНОСТЬЮ (ТЗ): значение '2gis' больше не принимается типом;
+ * строковые legacy-подстановки из старых сохранений попадают в unknown-ветку
+ * normalizeTileServer → Esri Streets.
  */
 export function getOSMTileUrl(
   zoom: number,
   x: number,
   y: number,
-  tileServer: TileServerId | 'osm' | 'carto' | '2gis' = DEFAULT_TILE_SERVER,
+  tileServer: TileServerId | 'osm' | 'carto' = DEFAULT_TILE_SERVER,
   style: TileStyle = 'scheme'
 ): string {
   // Аудит audit/index.fixed.html: tile.openstreetmap.org и Carto УДАЛЕНЫ как URL
   // (403 по Referer для github.io / требование API-ключа). Все значения нормализуются
   // к рабочим HTTPS-провайдерам без ключей:
-  //  - legacy 'osm' и '2gis' → Esri World Street Map (публичный тайловый сервис 2ГИС
-  //    закрыт: tile-b01.2gis.com больше не резолвится — net::ERR_NAME_NOT_RESOLVED;
-  //    слой «2ГИС» сохранён в UI ради совместимости старых проектов, но физически
-  //    рендерит стабильную бесплатную подложку Esri World Street Map);
+  //  - legacy 'osm' → Esri World Street Map (стиль по умолчанию — самый стабильный);
   //  - legacy 'carto' → OSM France;
   //  - style 'satellite'/'hybrid' → Esri World Imagery (спутник, без ключа).
   // detectRetina (@2x) убран: тайлы @2x были доступны только удалённым OSM/Carto.
   void style;
-  const server: TileServerId =
-    tileServer === '2gis' ? 'esri' : normalizeTileServer(tileServer);
+  const server: TileServerId = normalizeTileServer(tileServer);
   // Нативный максимум берётся из реестра провайдеров — выше не поднимаемся
   // (нет данных, только растяжение). Общий потолок сетки — z19.
   const nativeMax = TILE_PROVIDERS[server].maxNativeZoom;
@@ -398,6 +400,17 @@ export function startTileLoad(url: string, timeoutMs = 8000): TileLoadHandle {
   }
   img.onload = () => finish(true);
   img.onerror = () => finish(false);
+  // P0-фикс «зависание/утечка при загрузке карт» (тест wizardFreeze): src
+  // выставляется ПОСЛЕДНИМ и только если ручку ещё не отменили. Раньше присваивание
+  // img.src происходило синхронно внутри startTileLoad — если вызывающая сторона
+  // отменяла ручку в том же такте событий (unmount карты в момент постановки
+  // загрузки в очередь), finish(false) уже выполнился, но src всё равно выставлялся
+  // ПОЗЖЕ → Image оставался in-flight навсегда (в проде — до внутреннего таймаута,
+  // в тестах с моками без onload/onerror — бесконечно). Settled-флаг делает такую
+  // гонку безвредной: отменённая ручка никогда не запускает загрузку.
+  if (settled) {
+    return { image: img, cancel(): void { finish(false); }, done };
+  }
   img.src = url;
   return { image: img, cancel(): void { finish(false); }, done };
 }

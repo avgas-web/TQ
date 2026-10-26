@@ -1,10 +1,11 @@
-// MissionWizard — оболочка пошагового мастера: прогресс-бар 8 этапов,
+// MissionWizard — оболочка пошагового мастера: прогресс-бар 9 этапов,
 // навигация Назад/Далее с жёсткой блокировкой, горячие клавиши Alt+←/→,
 // confirmation при переходе на завершённый этап назад.
 import React, { useEffect, useState } from 'react';
 import {
   useMissionWizardStore, WIZARD_STEPS, STEP_LABELS_RU, type WizardStep,
 } from '../../store/useMissionWizardStore';
+import { MapSelectionStep } from './MapSelectionStep';
 import { CraftSelectionStep } from './CraftSelectionStep';
 import { StartPointsStep } from './StartPointsStep';
 import { TargetPointsStep } from './TargetPointsStep';
@@ -17,6 +18,7 @@ import { ConfirmDialog, NextButton, StepIssues } from './shared';
 import { ensureDefaultTileMap } from '../../hooks/useAppInitialization';
 
 const STEP_COMPONENTS: Record<WizardStep, React.FC> = {
+  'map-selection': MapSelectionStep,
   'craft-selection': CraftSelectionStep,
   'start-points': StartPointsStep,
   'target-points': TargetPointsStep,
@@ -93,7 +95,7 @@ export function MissionWizard() {
             </button>
           );
         })}
-        <span className="ml-auto text-xs text-slate-400">Этап {idx + 1}/8 · Alt+←/→ навигация</span>
+        <span className="ml-auto text-xs text-slate-400">Этап {idx + 1}/{WIZARD_STEPS.length} · Alt+←/→ навигация</span>
       </nav>
 
       {/* Контент этапа */}

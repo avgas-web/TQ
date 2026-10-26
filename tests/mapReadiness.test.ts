@@ -34,27 +34,33 @@ describe('computeMapReadiness', () => {
     expect(r.reason).toBeNull();
   });
 
-  it('2ГИС доступен без API-ключа и разблокирует постановку точек', () => {
+  it('legacy «2gis» нормализуется в Esri и карта готова (2ГИС удалён полностью)', () => {
     const r = computeMapReadiness(
+      // @ts-expect-error legacy-значение из старых сохранений; тип больше не принимает '2gis'
       { ...readyProject, openStreetMap: { tileServer: '2gis' } },
       true,
     );
     expect(r.ready).toBe(true);
+    expect(r.reason).toBeNull();
   });
 
   it('Google без API-ключа: НЕ готово, причина — требование ключа с подсказкой (graceful degradation)', () => {
     const r = computeMapReadiness(
-      { ...readyProject, openStreetMap: { tileServer: 'google' }, googleMaps: undefined },
+      // googleMaps/yandexMaps отсутствуют в readyProject → приводим к типу теста
+      { ...readyProject, openStreetMap: { tileServer: 'google' }, googleMaps: undefined } as never,
       true,
     );
     expect(r.ready).toBe(false);
     expect(r.reason).toMatch(/API-ключ Google/);
-    expect(r.reason).toMatch(/OSM \/ 2ГИС/);
+    // Подсказка из mapProviders.getProviderStatus: «…переключитесь на бесплатную
+    // подложку (Esri/OSM)» — 2ГИС удалён полностью, упоминания быть не должно.
+    expect(r.reason).toMatch(/OSM|Esri/);
+    expect(r.reason).not.toMatch(/2ГИС|2gis/i);
   });
 
   it('Яндекс без ключа блокирует, с включённым ключом — разблокирует', () => {
     const blocked = computeMapReadiness(
-      { ...readyProject, openStreetMap: { tileServer: 'yandex' }, yandexMaps: undefined },
+      { ...readyProject, openStreetMap: { tileServer: 'yandex' }, yandexMaps: undefined } as never,
       true,
     );
     expect(blocked.ready).toBe(false);
@@ -65,7 +71,7 @@ describe('computeMapReadiness', () => {
         ...readyProject,
         openStreetMap: { tileServer: 'yandex' },
         yandexMaps: { apiKey: 'k', enabled: true },
-      },
+      } as never,
       true,
     );
     expect(allowed.ready).toBe(true);

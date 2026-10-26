@@ -7,7 +7,9 @@
 // ═══════════════════════════════════════════════════════════════
 import type { Project } from '../types';
 
-export type TileProviderId = 'osm' | '2gis' | 'opentopomap' | 'carto' | 'google' | 'yandex';
+/** Legacy-реестр провайдеров. «2gis» УДАЛЁН ПОЛНОСТЬЮ (ТЗ): слой убран из
+ *  всех списков выбора; старые сохранения нормализует normalizeTileServer(). */
+export type TileProviderId = 'osm' | 'opentopomap' | 'carto' | 'google' | 'yandex';
 
 export interface ProviderStatus {
   id: TileProviderId;
@@ -20,8 +22,10 @@ export interface ProviderStatus {
   message?: string;
 }
 
-/** Бесплатные XYZ-провайдеры, работающие без ключа. */
-export const KEYLESS_PROVIDERS: ReadonlySet<TileProviderId> = new Set(['osm', '2gis', 'opentopomap', 'carto']);
+/** Бесплатные XYZ-провайдеры, работающие без ключа.
+ *  «2ГИС» УДАЛЁН ПОЛНОСТЬЮ (ТЗ): публичный тайловый сервис закрыт
+ *  (tile-b01.2gis.com не резолвится), слой убран из всех списков выбора. */
+export const KEYLESS_PROVIDERS: ReadonlySet<TileProviderId> = new Set(['osm', 'opentopomap', 'carto']);
 
 export function providerRequiresKey(id: TileProviderId): boolean {
   return id === 'google' || id === 'yandex';
@@ -35,10 +39,6 @@ export function providerRequiresKey(id: TileProviderId): boolean {
  *  URL провайдеров, но osm/carto при рендере нормализуются в рабочие зеркала. */
 export function tileUrlTemplate(id: TileProviderId): string {
   switch (id) {
-    case '2gis':
-      // Хост tile-b01.2gis.com не резолвится (ERR_NAME_NOT_RESOLVED) — слой «2ГИС»
-      // рендерит бесплатную подложку Esri World Street Map (без ключа), как в getOSMTileUrl.
-      return 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}';
     case 'opentopomap':
       return 'https://tile.opentopomap.org/{z}/{x}/{y}.png';
     case 'carto':
@@ -71,7 +71,7 @@ export function getProviderStatus(project: Pick<Project, 'googleMaps' | 'yandexM
         ready: hasKey,
         message: hasKey
           ? undefined
-          : 'Требуется API-ключ Google Maps. Введите его в панели «Карты» или переключитесь на OSM / 2ГИС.',
+          : 'Требуется API-ключ Google Maps. Введите его в панели «Карты» или переключитесь на бесплатную подложку (Esri/OSM).',
       };
     }
     case 'yandex': {
@@ -82,11 +82,10 @@ export function getProviderStatus(project: Pick<Project, 'googleMaps' | 'yandexM
         ready: hasKey,
         message: hasKey
           ? undefined
-          : 'Требуется API-ключ Яндекс.Карт. Введите его в панели «Карты» или переключитесь на OSM / 2ГИС.',
+          : 'Требуется API-ключ Яндекс.Карт. Введите его в панели «Карты» или переключитесь на бесплатную подложку (Esri/OSM).',
       };
     }
-    case '2gis':
-      return { ...base, name: '2ГИС' };
+    // «2gis» УДАЛЁН ПОЛНОСТЬЮ (ТЗ): ветки нет — значение попадает в default (Esri-подложка)
     case 'opentopomap':
       return { ...base, name: 'OpenTopoMap' };
     case 'carto':

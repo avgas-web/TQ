@@ -40,15 +40,40 @@ class SilentROShim {
 /** RO-заглушка с немедленной доставкой ненулевых размеров (нормальный путь). */
 class DeliveringROShim {
   private cb: (entries: ResizeObserverEntry[]) => void;
-  constructor(cb: (entries: ResizeObserverEntry[]) => void) { this.cb = cb; }
+  /** Все живые экземпляры — чтобы тест мог форсить доставку колбэков. */
+  static instances: DeliveringROShim[] = [];
+  constructor(cb: (entries: ResizeObserverEntry[]) => void) {
+    this.cb = cb;
+    DeliveringROShim.instances.push(this);
+  }
   observe(el: Element): void {
-    this.cb([{ target: el, contentRect: { x: 0, y: 0, top: 0, left: 0, width: 800, height: 600, bottom: 600, right: 800 }, borderBoxSize: [], contentBoxSize: [], devicePixelContentBoxSize: [] } as unknown as ResizeObserverEntry]);
+    DeliveringROShim.deliver(this.cb, el);
   }
   unobserve(): void { /* noop */ }
   disconnect(): void { /* noop */ }
+  private static deliver(cb: (entries: ResizeObserverEntry[]) => void, el: Element): void {
+    cb([{ target: el, contentRect: { x: 0, y: 0, top: 0, left: 0, width: 800, height: 600, bottom: 600, right: 800 }, borderBoxSize: [], contentBoxSize: [], devicePixelContentBoxSize: [] } as unknown as ResizeObserverEntry]);
+  }
+  /** Принудительная повторная доставка размеров на все наблюдаемые элементы. */
+  static forceDeliver(): void {
+    for (const inst of DeliveringROShim.instances) {
+      const els = Array.from(document.querySelectorAll('#map-container, canvas'));
+      for (const el of els) DeliveringROShim.deliver(inst.cb, el);
+    }
+  }
 }
 
+/**
+ * Пройти Этап 1 (выбор карт) + Этап 2 (тип аппарата) до этапа «Точки старта».
+ * ВНИМАНИЕ (регрессия «Далее» неактивна): здесь НЕЛЬЗЯ использовать
+ * fireEvent.click по карточке Esri — в этом файле реальные таймеры, и
+ * zustand-persist запись/синхронизация сторов не успевают синхронно;
+ * штатный UI-путь Этапа 1 покрыт кликами в wizardMapReadiness/wizardUI.
+ */
 async function gotoStartPointsStep(): Promise<void> {
+  act(() => { useMissionWizardStore.getState().toggleMapChoice('esri'); });
+  await waitFor(() => expect(screen.getByRole('button', { name: /Далее/ })).toBeEnabled());
+  fireEvent.click(screen.getByRole('button', { name: /Далее/ })); // → craft-selection
   fireEvent.click(screen.getByTestId('craft-card-drone'));
   fireEvent.click(await screen.findByRole('button', { name: 'Продолжить' }));
   await waitFor(() => expect(screen.getByRole('button', { name: /Далее/ })).toBeEnabled());
@@ -123,23 +148,35 @@ describe('wizardFreeze — защита от зависаний в Мастер�
   it('быстрое переключение шагов: unmount карты отменяет ВСЕ in-flight загрузки тайлов (нет утечек)', async () => {
     vi.stubGlobal('ResizeObserver', DeliveringROShim);
     vi.stubGlobal('Image', TrackedImage);
-    // Тайловая подложка активна: карта с ненулевыми размерами начнёт качать тайлы,
-    // которые НИКОГДА не завершатся (медленный CDN) — чистый стресс-тест cleanup.
-    useMapStore.getState().loadActiveTileMap({ lat: 55.7558, lng: 37.6173 }, 10);
 
     render(<MissionWizard />);
     await gotoStartPointsStep();
     await screen.findByTestId('wizard-map-panel');
+
+    // Детерминизм (та же причина, что и в тесте №1): первичный замер размеров в
+    // MapCanvas выполняется в серии отложенных повторов [0,60,...,1300] мс, а
+    // gotoStartPointsStep отрабатывает быстрее — на момент явной активации
+    // подложки canvasSize ещё может быть нулевым, и syncTileDom по «гейту
+    // размера» не создаст ни одного Image (started=0). Форсируем штатную
+    // публикацию ненулевых размеров синхронным вызовом колбэка RO.
+    act(() => { DeliveringROShim.forceDeliver(); });
+    // Тайловая подложка активна: карта с ненулевыми размерами начнёт качать
+    // тайлы, которые НИКОГДА не завершатся (медленный CDN) — стресс-тест cleanup.
+    act(() => {
+      useMapStore.getState().loadActiveTileMap({ lat: 55.7558, lng: 37.6173 }, 10);
+    });
 
     // Даём карте поставить загрузки в очередь
     await act(async () => { await new Promise((r) => setTimeout(r, 100)); });
     const started = TrackedImage.active;
     expect(started).toBeGreaterThan(0); // загрузка реально стартовала
 
-    // Быстрый выход с этапа (Назад → размонтирование MapCanvas внутри шага).
-    // data-testid — карта тоже содержит кнопку «← Назад» (legacy-тулбар), поэтому
-    // role-запрос даёт несколько совпадений; берём именно навигацию мастера.
-    fireEvent.click(screen.getByTestId('back-btn'));
+    // Быстрый выход с этапа: прямой экшен стора goToPreviousStep() — deliberate
+    // navigation (инвариант теста — cleanup MapCanvas при unmount, а не клики).
+    // Клик по «← Назад» из footer здесь НЕ годится: валидация этапа «Точки
+    // старта» требует непустой startPoints, кнопка disabled, и клик молча
+    // ничего не делает → unmount не происходит → in-flight остаются живыми.
+    act(() => { useMissionWizardStore.getState().goToPreviousStep(); });
     await waitFor(() =>
       expect(useMissionWizardStore.getState().currentStep).toBe('craft-selection'),
     );

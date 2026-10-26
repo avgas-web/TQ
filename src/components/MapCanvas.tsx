@@ -30,13 +30,13 @@ const ROUTE_PALETTE = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#
 
 /** Нативный max zoom рабочих тайловых серверов (выше НЕ поднимаемся — нет данных,
  *  только растяжение). Реестр по аудиту audit/index.fixed.html: tile.openstreetmap.org
- *  и Carto удалены; legacy-значения ('osm', 'carto', '2gis') сохраняются как
+ *  и Carto удалены; legacy-значения ('osm', 'carto') сохраняются как
  *  совместимость со старыми проектами. */
 const NATIVE_MAX_BY_SERVER: Record<string, number> = {
   ...Object.fromEntries(
     Object.entries(TILE_PROVIDERS).map(([id, p]) => [id, p.maxNativeZoom]),
   ) as Record<string, number>,
-  osm: 19, carto: 18, '2gis': 19, // legacy-алиасы (нормализуются normalizeTileServer)
+  osm: 19, carto: 18, // legacy-алиасы (нормализуются normalizeTileServer); '2gis' УДАЛЁН ПОЛНОСТЬЮ (ТЗ)
 };
 
 /** КЛЮЧ сохранённого вида в localStorage. Раньше состояние камеры жило ТОЛЬКО в
@@ -473,6 +473,11 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   const loadEsriMirrorByHandle = useCallback((u: string): Promise<HTMLImageElement | null> => {
     const m = u.match(/^https:\/\/server\.arcgisonline\.com\/(.+)$/);
     if (!m) return Promise.resolve(null);
+    // P0-фикс гонки «unmount между отменой и зеркалом» (тест wizardFreeze):
+    // если компонент уже размонтирован (cleanup перебрал реестр и сбросил
+    // mountedRef), зеркальную загрузку создавать НЕЛЬЗЯ — иначе новый Image
+    // стартует ПОСЛЕ отмены всех in-flight и остаётся живым навсегда.
+    if (!mountedRef.current) return Promise.resolve(null);
     const h = startTileLoad(`https://services.arcgisonline.com/${m[1]}`, 10000);
     tileLoadHandlesRef.current.add(h);
     return h.done.then((img) => {
@@ -896,7 +901,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     if (!Number.isFinite(cs.width) || !Number.isFinite(cs.height) || cs.width <= 0 || cs.height <= 0) return;
     const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
     const zoom = clampZoom(zoomAtWorldPx(wp));
-    // Рабочий провайдер из стора (Esri по умолчанию; legacy 'osm'/'carto'/'2gis' нормализуется)
+    // Рабочий провайдер из стора (Esri по умолчанию; legacy 'osm'/'carto' нормализуются)
     const server: TileServerId = normalizeTileServer(proj.openStreetMap?.tileServer);
     const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[server] ?? MAX_ZOOM);
     const level = Math.max(MIN_ZOOM, Math.min(nativeMax, Math.round(zoom)));

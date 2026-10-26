@@ -1,5 +1,6 @@
 // WizardMapPanel — ВСТРОЕННАЯ ПАНЕЛЬ КАРТЫ («ЭКРАН В ЭКРАНЕ») режима мастера:
-// полноценная интерактивная тайловая карта (OSM/2ГИС/Carto/Topo).
+// полноценная интерактивная тайловая карта (рабочие XYZ-подложки из Этапа 1
+// мастера; 2ГИС удалён полностью, Carto требует ключ — не используется).
 // ТРЕБОВАНИЕ: «карта не должна закрывать весь экран — реализуй как экран в
 // экране, чтобы оставалось свободное место для всех данных; карта загружается
 // сразу при запуске; внутри карта передвигается и зумируется; все координаты
@@ -15,7 +16,10 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import MapCanvas from '../MapCanvas';
 import { useStore } from '../../store/useStore';
-import { getProviderStatus, type TileProviderId } from '../../utils/mapProviders';
+import { useMapStore } from '../../store/useMapStore';
+import { useMissionWizardStore } from '../../store/useMissionWizardStore';
+import { getProviderStatus } from '../../utils/mapProviders';
+import { TILE_SERVER_ORDER, normalizeTileServer, type TileServerId } from '../../utils/openStreetMap';
 import { ensureDefaultTileMap } from '../../hooks/useAppInitialization';
 import { screenToGeo } from '../../utils/mapGeoPick';
 import { findBuildingAt, buildingPopupHtml, type BuildingResult } from '../../utils/buildingLookup';
@@ -30,28 +34,33 @@ export const WIZARD_TILE_MAX_ZOOM = 17;
 export const WIZARD_TILE_ATTRIBUTION =
   'Map data: © OpenStreetMap contributors, SRTM | Map style: © OpenTopoMap (CC-BY-SA)';
 
-const SERVER_LABELS: Record<'osm' | 'opentopomap' | 'carto' | '2gis', string> = {
-  osm: '🌐 OSM',
-  '2gis': '🧭 2ГИС',
+/** Короткие подписи переключателя: берятся из реестра рабочих провайдеров. */
+const SERVER_SHORT_LABELS: Record<TileServerId, string> = {
+  esri: '🛰 Esri',
+  'esri-sat': '🌍 Спутник',
+  osmfr: '🌐 OSM FR',
+  hot: '❤️ HOT',
+  osmde: '🇩🇪 OSM DE',
   opentopomap: '⛰ Topo',
-  carto: '💡 Light',
+  cyclosm: '🚴 Cyclo',
 };
 
-/** Панель переключения бесплатных XYZ-подложек + статус ключевых провайдеров. */
+/** Панель переключения бесплатных XYZ-подложек + статус ключевых провайдеров.
+ *  Список = рабочие серверы аудита (TILE_SERVER_ORDER); 2ГИС удалён полностью. */
 const ProviderSwitcher: React.FC = () => {
-  const tileServer = useStore((s) => s.project.openStreetMap?.tileServer ?? 'osm');
+  const tileServer = normalizeTileServer(useStore((s) => s.project.openStreetMap?.tileServer ?? 'osm'));
   const setOSMTileServer = useStore((s) => s.setOSMTileServer);
   const google = useStore((s) => s.project.googleMaps);
   const yandex = useStore((s) => s.project.yandexMaps);
 
   // Graceful degradation: Google/Яндекс показаны, но помечены как требующие
-  // ключа — при отсутствии ключа система НЕ падает, а подсказывает OSM/2ГИС.
+  // ключа — при отсутствии ключа система НЕ падает, а подсказывает рабочие XYZ.
   const gStatus = getProviderStatus({ googleMaps: google, yandexMaps: yandex }, 'google');
   const yStatus = getProviderStatus({ googleMaps: google, yandexMaps: yandex }, 'yandex');
 
   return (
     <div className="flex items-center gap-1 border-b border-slate-800 bg-slate-950 px-2 py-1" data-testid="wizard-map-providers">
-      {(Object.keys(SERVER_LABELS) as Array<keyof typeof SERVER_LABELS>).map((id) => (
+      {TILE_SERVER_ORDER.map((id) => (
         <button
           key={id}
           type="button"
@@ -63,9 +72,9 @@ const ProviderSwitcher: React.FC = () => {
               ? 'bg-cyan-600 font-bold text-white'
               : 'bg-slate-800 text-slate-300 hover:bg-slate-700')
           }
-          title={id === '2gis' ? 'Подложка Esri Streets (публичные тайлы 2ГИС закрыты — DNS не резолвится), API-ключ не требуется' : undefined}
+          title="Публичные HTTPS-тайлы без API-ключа"
         >
-          {SERVER_LABELS[id]}
+          {SERVER_SHORT_LABELS[id]}
         </button>
       ))}
       <span className="ml-auto flex gap-2 text-[10px]">
@@ -101,12 +110,37 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
   const [popup, setPopup] = useState<{ x: number; y: number; html: string } | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  // Эталон: при монтировании мастер фиксирует подложку OpenTopoMap.
+  // Этап 1 мастера: подложка = основная карта, выбранная пользователем.
+  // При монтировании панели синхронизируем картографический стор с выбором
+  // (если выбор ещё не сделан — остаётся текущий стиль; legacy-значения
+  // нормализуются normalizeTileServer в рабочие серверы аудита).
   useEffect(() => {
-    if ((useStore.getState().project.openStreetMap?.tileServer ?? 'osm') !== 'opentopomap') {
-      useStore.getState().setOSMTileServer('opentopomap');
+    const primary = useMissionWizardStore.getState().primaryMap;
+    if (!primary) return;
+    if ((useStore.getState().project.openStreetMap?.tileServer ?? 'osm') !== primary) {
+      useStore.getState().setOSMTileServer(primary);
     }
   }, []);
+  // КЛЮЧЕВОЙ ФИКС «мастер не показывает карту»: ensureDefaultTileMap идемпотентен
+  // по map и при уже загруженной карте НЕ включает тайловую подложку. Вне мастера
+  // включение делает App/useAppInitialization, но изолированный рендер Wizard
+  // (тесты RTL, будущие standalone-режимы) его не проходит → tilesEnabled=false →
+  // computeMapReadiness навсегда «Карта ещё не загружена». Панель мастера обязана
+  // сама включать активную тайловую подложку при монтировании.
+  useEffect(() => {
+    const ms = useMapStore.getState();
+    if (!ms.openStreetMap.enabled) ms.toggleOpenStreetMap(true);
+    if (!ms.settings.tilesEnabled) ms.updateSettings({ tilesEnabled: true });
+  }, []);
+  // Реактивная синхронизация: смена основной карты на Этапе 1 сразу меняет
+  // активную подложку во всех этапах мастера.
+  const wizardPrimaryMap = useMissionWizardStore((s) => s.primaryMap);
+  useEffect(() => {
+    if (!wizardPrimaryMap) return;
+    if ((useStore.getState().project.openStreetMap?.tileServer ?? 'osm') !== wizardPrimaryMap) {
+      useStore.getState().setOSMTileServer(wizardPrimaryMap);
+    }
+  }, [wizardPrimaryMap]);
 
   /**
    * map.on('click', ...) из эталона. Обработчик висит на контейнере карты
@@ -145,7 +179,10 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
       setStatusMsg('⚠️ Не удалось связаться с сервером OSM. Попробуйте позже.');
     }
   }, []);
-  const status = getProviderStatus(project, (project.openStreetMap?.tileServer ?? 'osm') as TileProviderId);
+  // Все серверы из TILE_SERVER_ORDER — публичные XYZ без ключей; getProviderStatus
+  // принимает legacy-идентификаторы ('osm' и т.п.), поэтому нормализованное
+  // значение прокидывается как 'osm' (готовность = ready всегда для keyless).
+  const status = getProviderStatus(project, 'osm');
   return (
     <>
       <ProviderSwitcher />

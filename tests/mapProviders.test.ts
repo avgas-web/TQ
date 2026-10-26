@@ -1,10 +1,10 @@
 // ═══════════════════════════════════════════════════════════════
-// Тесты реестра провайдеров карт и дефолтов (ТЗ «Интеграция 2ГИС»,
-// «Автоматическая загрузка и дефолты»).
-// - Дефолтный провайдер при инициализации стора — 'osm'.
-// - Переключение на '2gis' обновляет URL-шаблон тайлов.
+// Тесты реестра провайдеров карт и дефолтов (аудит audit/index.fixed.html +
+// ТЗ «Этап 1 — выбор карт»: 2ГИС удалён полностью).
+// - Дефолтный провайдер при инициализации стора — 'osm' (рендерится как Esri).
+// - Legacy-'2gis' больше не принимается типом TileProviderId (удалён из реестра).
 // - Отсутствие API-ключа Google/Яндекс => состояние ошибки, без краша.
-// - Регрессия: OSM/Topo/Carto работают без ключей.
+// - Регрессия: osm/opentopomap/carto работают без ключей.
 // ═══════════════════════════════════════════════════════════════
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
@@ -35,25 +35,16 @@ describe('mapProviders: дефолты стора', () => {
     expect(KEYLESS_PROVIDERS.has('osm')).toBe(true);
   });
 
-  it('переключение провайдера на 2gis корректно обновляет состояние стора', () => {
-    useMapStore.getState().setOSMTileServer('2gis');
-    expect(useMapStore.getState().openStreetMap.tileServer).toBe('2gis');
+  it('переключение провайдера обновляет состояние стора (2ГИС удалён из реестра)', () => {
+    useMapStore.getState().setOSMTileServer('osmfr');
+    expect(useMapStore.getState().openStreetMap.tileServer).toBe('osmfr');
     useMapStore.getState().setOSMTileServer('osm');
     expect(useMapStore.getState().openStreetMap.tileServer).toBe('osm');
   });
 });
 
 describe('mapProviders: URL-шаблоны тайлов', () => {
-  it('2gis рендерит рабочую подложку Esri (tile-b01.2gis.com не резолвится)', () => {
-    const t = tileUrlTemplate('2gis');
-    expect(t).not.toContain('2gis.com');
-    expect(t).toContain('server.arcgisonline.com');
-    expect(t).toContain('{z}');
-    expect(t).toContain('{x}');
-    expect(t).toContain('{y}');
-  });
-
-  it('osm — по аудиту рендерит Esri Streets (tile.openstreetmap.org даёт 403 с github.io)', () => {
+  it('legacy osm рендерит рабочую подложку Esri (tile.openstreetmap.org даёт 403 с github.io)', () => {
     const t = tileUrlTemplate('osm');
     expect(t).not.toContain('tile.openstreetmap.org');
     expect(t).toContain('server.arcgisonline.com');
@@ -76,7 +67,7 @@ describe('mapProviders: graceful degradation без ключей', () => {
     expect(s.ready).toBe(false);
     expect(s.requiresKey).toBe(true);
     expect(s.message).toMatch(/API-ключ/);
-    expect(s.message).toMatch(/OSM|2ГИС/);
+    expect(s.message).toMatch(/OSM|Esri/);
   });
 
   it('Яндекс без ключа: ready:false + сообщение о ключе', () => {
@@ -99,8 +90,8 @@ describe('mapProviders: graceful degradation без ключей', () => {
     expect(s.ready).toBe(false);
   });
 
-  it('бесплатные провайдеры (osm/2gis/topo/carto) всегда ready без ключа', () => {
-    for (const id of ['osm', '2gis', 'opentopomap', 'carto'] as const) {
+  it('бесплатные провайдеры (osm/topo/carto) всегда ready без ключа', () => {
+    for (const id of ['osm', 'opentopomap', 'carto'] as const) {
       const s = getProviderStatus(noKeys, id);
       expect(s.ready).toBe(true);
       expect(providerRequiresKey(id)).toBe(false);

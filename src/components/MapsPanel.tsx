@@ -117,9 +117,8 @@ const MapsPanel: React.FC = () => {
         result = await geocodeAddress(addressInput);
       } else if (activeProvider === 'yandex' && isYandexMapsLoaded()) {
         result = await yandexGeocode(addressInput);
-      } else if (activeProvider === 'osm' || activeProvider === '2gis') {
-        // 2ГИС-вкладка использует тот же бесплатный геокодер (Nominatim): у 2ГИС
-        // публичного геокодинга без ключа нет, а тайлы — есть.
+      } else if (activeProvider === 'osm') {
+        // Тот же бесплатный геокодер (Nominatim + fallback Photon).
         const res = await osmGeocode(addressInput);
         result = res.point;
         if (!result) {
@@ -226,29 +225,10 @@ const MapsPanel: React.FC = () => {
           bounds: mapResult.bounds,
           source: 'yandex',
         });
-      } else if (activeProvider === '2gis') {
-        // ЗАГРУЗКА КАРТ «2ГИС»: хост tile-b01.2gis.com не резолвится (ERR_NAME_NOT_RESOLVED),
-        // поэтому слой рендерит бесплатную подложку Esri World Street Map (ключ НЕ требуется).
-        // Тайлсервер фиксируется в сторе, после чего
-        // создается активная тайловая карта с той же строгой Mercator-привязкой,
-        // что и OSM — точки/маршруты ставятся по реальным координатам.
-        setOSMTileServer('2gis');
-        const geoRes = await osmGeocode(addressInput);
-        geoResult = geoRes.point;
-        if (!geoResult) {
-          setError(geoRes.kind === 'not_found' ? 'Место не найдено.' : 'Сервис геокодирования временно недоступен. Попробуйте ещё раз.');
-          setLoading(false);
-          return;
-        }
-        loadActiveTileMap(geoResult, zoom);
-        useStore.setState((cur) => ({
-          project: cur.project.map
-            ? { ...cur.project, map: { ...cur.project.map, source: '2gis' } }
-            : cur.project,
-        }));
-        setSuccess('Карта 2ГИС загружена: доступен зум и панорама, привязка к координатам строгая.');
-        return;
       } else if (activeProvider === 'osm') {
+        // «2ГИС» УДАЛЁН ПОЛНОСТЬЮ (ТЗ): вкладки и ветки загрузки больше нет —
+        // выбор карт ограничен рабочими провайдерами (Google/Яндекс по ключу,
+        // бесплатные XYZ-подложки без ключей).
         // ПРОСТАЯ ЗАГРУЗКА KAK НА OPENSTREETMAP.ORG: вместо «фотографии»-стоп-кадра
         // (сотни тайлов в один большой PNG — медленно и с потерей чёткости при зуме)
         // создаётся АКТИВНАЯ тайловая карта: подложка грузится тайлами динамически,
@@ -263,21 +243,14 @@ const MapsPanel: React.FC = () => {
         }
 
         loadActiveTileMap(geoResult, zoom);
-        // Legacy-значение «2gis» normalizeTileServer() маппит на Esri World Street Map
-        // (публичный тайловый сервис 2ГИС закрыт). Источник помечаем для бейджа/статистики.
-        if (osmTileServer === ('2gis' as TileServerId)) {
-          useStore.setState((cur) => ({
-            project: cur.project.map
-              ? { ...cur.project, map: { ...cur.project.map, source: '2gis' } }
-              : cur.project,
-          }));
-        } else {
-          useStore.setState((cur) => ({
-            project: cur.project.map
-              ? { ...cur.project, map: { ...cur.project.map, source: 'osm' } }
-              : cur.project,
-          }));
-        }
+        // «2ГИС» УДАЛЁН ПОЛНОСТЬЮ (ТЗ): источник — только 'osm' (активная тайловая
+        // карта рабочих HTTPS-подложек без ключей; legacy-значения из старых
+        // сохранений нормализует normalizeTileServer()).
+        useStore.setState((cur) => ({
+          project: cur.project.map
+            ? { ...cur.project, map: { ...cur.project.map, source: 'osm' } }
+            : cur.project,
+        }));
 
         // Снимок-подложка для OSM НЕ загружается: активная тайловая карта уже
         // является основной подложкой (как на openstreetmap.org). Фоновый big-PNG
@@ -310,7 +283,7 @@ const MapsPanel: React.FC = () => {
     { id: 'google' as MapProvider, name: 'Google', icon: '🌍', enabled: project.googleMaps?.enabled },
     { id: 'yandex' as MapProvider, name: 'Яндекс', icon: '🗺️', enabled: project.yandexMaps?.enabled },
     { id: 'osm' as MapProvider, name: 'OSM', icon: '🌐', enabled: project.openStreetMap?.enabled },
-    { id: '2gis' as MapProvider, name: '2ГИС', icon: '🧭', enabled: project.openStreetMap?.tileServer === '2gis' },
+    // «2ГИС» УДАЛЁН ПОЛНОСТЬЮ (ТЗ: выбор карт без 2ГИС) — пункт C аудита.
   ];
 
   return (
@@ -515,7 +488,7 @@ const MapsPanel: React.FC = () => {
       {/* Load map button */}
       <button
         onClick={handleLoadMap}
-        disabled={loading || (activeProvider !== 'osm' && activeProvider !== '2gis' && !providers.find(p => p.id === activeProvider)?.enabled)}
+        disabled={loading || (activeProvider !== 'osm' && !providers.find(p => p.id === activeProvider)?.enabled)}
         className="w-full px-3 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 text-white rounded text-sm font-medium"
       >
         {loading ? 'Загрузка...' : `🗺️ Загрузить карту ${providers.find(p => p.id === activeProvider)?.name}`}

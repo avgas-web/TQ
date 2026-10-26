@@ -1,4 +1,4 @@
-// ЭТАП 1: выбор типа аппарата (drone / uav) с confirmation-диалогом.
+// ЭТАП 2: выбор типа аппарата (drone / uav) с confirmation-диалогом.
 import { useState } from 'react';
 import { useMissionWizardStore } from '../../store/useMissionWizardStore';
 import { CRAFT_OPTIONS, type CraftOptionPublic } from './craftOptions';
@@ -14,6 +14,8 @@ export function CraftSelectionStep() {
   const [changeWarn, setChangeWarn] = useState(false);
 
   const pick = (opt: CraftOptionPublic) => {
+    // клик по уже выбранной карточке — no-op: не создаём ложного диалога
+    if (craftType === opt.type) return;
     if (craftType && craftType !== opt.type) {
       // тип уже зафиксирован — изменение сбрасывает все последующие данные
       setPendingChange(opt);
@@ -25,7 +27,7 @@ export function CraftSelectionStep() {
 
   return (
     <StepShell
-      title="Этап 1. Выбор типа аппарата"
+      title="Этап 2. Выбор типа аппарата"
       hint="Дрон — электрический мультикоптер (до 100 км). БПЛА — самолётного типа (межконтинентальные дальности)."
     >
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">

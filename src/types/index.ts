@@ -60,7 +60,9 @@ export interface MapBounds {
   west: number;
 }
 
-export type MapProvider = 'local' | 'google' | 'yandex' | 'osm' | '2gis';
+/** Провайдеры карт. «2gis» УДАЛЁН ПОЛНОСТЬЮ (ТЗ: выбор карт без 2ГИС):
+ *  публичный тайловый сервис закрыт (tile-b01.2gis.com не резолвится). */
+export type MapProvider = 'local' | 'google' | 'yandex' | 'osm';
 
 export interface MapData {
   name: string;
@@ -111,7 +113,7 @@ export interface Project {
   openStreetMap: {
     enabled: boolean;
     /** Рабочие тайловые серверы без API-ключей (см. TILE_PROVIDERS в utils/openStreetMap.ts).
-     *  Значения legacy ('osm', 'carto', '2gis') нормализуются normalizeTileServer()
+     *  Значения legacy ('osm', 'carto') нормализуются normalizeTileServer()
      *  при чтении — тип остаётся строкой для совместимости со старыми проектами. */
     tileServer?: string;
   };

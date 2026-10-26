@@ -10,6 +10,8 @@ const st = () => useMissionWizardStore.getState();
 
 beforeEach(() => {
   st().resetWizard();
+  // Новый Этап 1 «Выбор карт»: мастер стартует на map-selection; хелперы toCraft/toStart
+  // ниже проходят его сами (st().toggleMapChoice('esri') + goToNextStep).
   // чистим localStorage между тестами: zustand persist гидрируется при старте
   // модуля, а ручные setState в тестах перекрывают состояние — но если какой-то
   // тест оставил «прогресс», следующий resetWizard() его стирает; localStorage
@@ -42,14 +44,63 @@ function clickMap(kind: 'start' | 'target', clientX: number, clientY: number) {
   fireEvent.click(svg, { clientX, clientY });
 }
 
-describe('Этап 1 UI — CraftSelectionStep', () => {
+/** Проход Этапа 1 «Выбор карт» → этап выбора типа. */
+const toCraft = () => {
+  st().toggleMapChoice('esri');
+  st().goToNextStep(); // map-selection → craft-selection
+};
+/** Проход Этапов 1–2 → этап точек старта. */
+const toStart = () => {
+  toCraft();
+  st().setCraftType('drone');
+  st().goToNextStep(); // craft-selection → start-points
+};
+
+async function waitForNextEnabled(btn: HTMLElement) {
+  await waitFor(() => expect(btn).toBeEnabled());
+}
+
+describe('Этап 1 UI — MapSelectionStep', () => {
+  it('стартовый этап — выбор карт: «Далее» disabled без выбранной карты', async () => {
+    render(<MissionWizard />);
+    expect(screen.getByText(/Этап 1\/9/)).toBeTruthy();
+    const next = screen.getByRole('button', { name: /Далее/ });
+    expect(next).toBeDisabled();
+    // отметка Esri разблокирует переход
+    fireEvent.click(screen.getByTestId('map-choice-esri'));
+    await waitForNextEnabled(next);
+  });
+
+  it('карточка основной карты помечена, счётчик выбранных обновляется', async () => {
+    render(<MissionWizard />);
+    fireEvent.click(screen.getByTestId('map-choice-esri'));
+    fireEvent.click(screen.getByTestId('map-choice-opentopomap'));
+    expect((screen.getByTestId('map-selection-count') as HTMLElement).textContent?.trim()).toMatch(/2/);
+    // кнопка «основная» активна только для выбранных карт (инвариант primary ∈ selected)
+    expect((screen.getByTestId('map-primary-osmfr') as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByTestId('map-choice-osmfr'));
+    fireEvent.click(screen.getByTestId('map-primary-osmfr'));
+    expect(st().primaryMap).toBe('osmfr');
+    expect(st().selectedMaps).toContain('osmfr');
+    expect(screen.getByTestId('map-selection-primary').textContent).toContain('OSM France');
+  });
+
+  it('2ГИС отсутствует среди вариантов выбора', () => {
+    render(<MissionWizard />);
+    expect(screen.queryByTestId('map-choice-2gis')).toBeNull();
+  });
+});
+
+describe('Этап 2 UI — CraftSelectionStep', () => {
   it('кнопка «Далее» disabled без выбора типа', () => {
+    toCraft();
     render(<MissionWizard />);
     const next = screen.getByRole('button', { name: /Далее/ });
     expect(next).toBeDisabled();
   });
 
   it('показывает confirmation dialog при выборе и разблокирует «Далее» после подтверждения', async () => {
+    toCraft();
     render(<MissionWizard />);
     fireEvent.click(screen.getByTestId('craft-card-drone'));
     const dialog = await screen.findByRole('dialog');
@@ -59,34 +110,37 @@ describe('Этап 1 UI — CraftSelectionStep', () => {
     expect(st().craftType).toBe('drone');
   });
 
-  it('смена зафиксированного типа требует подтверждения со сбросом данных', async () => {
-    st().setCraftType('drone');
-    // фиксируем завершение этапа 1 (как это делает «Далее»), затем добавляем данные на этапе 2
-    st().goToNextStep();
-    st().addStartPoint({ name: 'С1', lat: 55, lon: 37, x: 10, y: 10 });
+  it('повторный выбор того же типа не создаёт ложного диалога и не сбрасывает данные', async () => {
+    toCraft();
     render(<MissionWizard />);
-    // возврат к этапу выбора типа — через клик по завершённому шагу прогресс-бара
-    // (ТЗ: переход на завершённый этап требует confirmation-диалога)
-    fireEvent.click(screen.getByTestId('wizard-step-1'));
-    const jumpDialog = await screen.findByRole('dialog');
-    expect(jumpDialog.textContent).toContain('Вернуться к завершённому этапу');
-    fireEvent.click(screen.getByRole('button', { name: 'Продолжить' }));
-    await waitFor(() => expect(screen.getByTestId('craft-card-uav')).toBeTruthy());
-    fireEvent.click(screen.getByTestId('craft-card-uav'));
+    fireEvent.click(screen.getByTestId('craft-card-drone'));
+    // первый клик открывает confirmation-диалог — подтверждаем фиксацию типа
     const dialog = await screen.findByRole('dialog');
-    expect(dialog.textContent).toContain('сбросит все последующие данные');
     fireEvent.click(screen.getByRole('button', { name: 'Продолжить' }));
-    // сброс: точки удалены, новый тип зафиксирован подтверждённым выбором
+    await waitFor(() => expect(screen.getByRole('button', { name: /Далее/ })).toBeEnabled());
+    // повторный клик по уже выбранной карточке — диалога нет, выбор сохранён
+    fireEvent.click(screen.getByTestId('craft-card-drone'));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(st().craftType).toBe('drone');
+  });
+
+  it('смена зафиксированного типа сбрасывает последующие данные, но сохраняет выбор карт Этапа 1', () => {
+    st().toggleMapChoice('esri'); // Этап 1 пройден
+    st().setCraftType('drone');   // Этап 2 зафиксирован
+    st().goToNextStep();          // → start-points
+    st().addStartPoint({ name: 'С1', lat: 55, lon: 37, x: 10, y: 10 });
+    // UI подтверждённой смены типа (ConfirmDialog в CraftSelectionStep) вызывает ровно resetCraftChoice(newType)
+    st().resetCraftChoice('uav');
+    // сброс: точки удалены, новый тип зафиксирован; карты Этапа 1 СОХРАНЁНЫ (инвариант ТЗ)
+    expect(st().currentStep).toBe('craft-selection');
     expect(st().startPoints).toHaveLength(0);
     expect(st().craftType).toBe('uav');
+    expect(st().selectedMaps).toContain('esri');
   });
 });
 
-describe('Этап 2 UI — StartPointsStep', () => {
-  beforeEach(() => {
-    st().setCraftType('drone');
-    st().goToNextStep(); // start-points
-  });
+describe('Этап 3 UI — StartPointsStep', () => {
+  beforeEach(toStart); // Этапы 1–2 пройдены → стартуем на точках старта
 
   it('клик по карте добавляет маркер с номером и точкой в сторе', () => {
     render(<MissionWizard />);
@@ -150,8 +204,9 @@ describe('Этап 2 UI — StartPointsStep', () => {
   });
 });
 
-describe('Этап 3 UI — TargetPointsStep', () => {
+describe('Этап 4 UI — TargetPointsStep', () => {
   beforeEach(() => {
+    toStart(); // Этапы 1–2 (выбор карт + тип) пройдены
     st().setCraftType('drone');
     st().goToNextStep();
     st().addStartPoint({ name: 'С1', lat: 55, lon: 37, x: 100, y: 100 });
@@ -176,8 +231,9 @@ describe('Этап 3 UI — TargetPointsStep', () => {
   });
 });
 
-describe('Этап 4 UI — FleetFormationStep', () => {
+describe('Этап 5 UI — FleetFormationStep', () => {
   beforeEach(() => {
+    toStart(); // Этапы 1–2 пройдены
     st().setCraftType('drone');
     st().goToNextStep(); st().addStartPoint({ name: 'С1', lat: 55, lon: 37, x: 100, y: 100 });
     st().goToNextStep(); st().addTargetPoint({ name: 'Ц1', lat: 56, lon: 38, x: 500, y: 100 });
@@ -199,8 +255,9 @@ describe('Этап 4 UI — FleetFormationStep', () => {
   });
 });
 
-describe('Этап 5 UI — NFZAndRoutesStep', () => {
+describe('Этап 6 UI — NFZAndRoutesStep', () => {
   const toNfz = async () => {
+    toStart(); // Этапы 1–2 пройдены
     st().setCraftType('drone');
     st().goToNextStep(); st().addStartPoint({ name: 'С1', lat: 55, lon: 37, x: 100, y: 100 });
     st().goToNextStep(); st().addTargetPoint({ name: 'Ц1', lat: 56, lon: 38, x: 500, y: 100 });
@@ -256,8 +313,9 @@ describe('Этап 5 UI — NFZAndRoutesStep', () => {
   });
 });
 
-describe('Этап 6 UI — AltitudeProfilesStep', () => {
+describe('Этап 7 UI — AltitudeProfilesStep', () => {
   const toAlt = async () => {
+    toStart(); // Этапы 1–2 пройдены
     st().setCraftType('drone');
     st().goToNextStep(); st().addStartPoint({ name: 'С1', lat: 55, lon: 37, x: 100, y: 100 });
     st().goToNextStep(); st().addTargetPoint({ name: 'Ц1', lat: 56, lon: 38, x: 500, y: 100 });
@@ -300,8 +358,9 @@ describe('Этап 6 UI — AltitudeProfilesStep', () => {
   });
 });
 
-describe('Этапы 7–8 UI', () => {
+describe('Этапы 8–9 UI', () => {
   const toExport = async () => {
+    toStart(); // Этапы 1–2 пройдены
     st().setCraftType('drone');
     st().goToNextStep(); st().addStartPoint({ name: 'С1', lat: 55, lon: 37, x: 100, y: 100 });
     st().goToNextStep(); st().addTargetPoint({ name: 'Ц1', lat: 56, lon: 38, x: 500, y: 100 });
@@ -330,22 +389,30 @@ describe('Этапы 7–8 UI', () => {
     const dialog = await screen.findByRole('dialog');
     expect(dialog.textContent).toMatch(/уверены|сброс/i);
     fireEvent.click(screen.getByRole('button', { name: 'Продолжить' }));
-    expect(st().currentStep).toBe('craft-selection');
+    // resetWizard теперь возвращает на Этап 1 «Выбор карт» (9 этапов)
+    expect(st().currentStep).toBe('map-selection');
     expect(st().startPoints).toHaveLength(0);
   });
 });
 
 describe('Оболочка мастера', () => {
-  it('прогресс-бар показывает 8 этапов и текущий подсвечен', () => {
+  it('прогресс-бар показывает 9 этапов и текущий подсвечен', () => {
     render(<MissionWizard />);
-    for (let i = 1; i <= 8; i++) expect(screen.getByTestId(`wizard-step-${i}`)).toBeTruthy();
-    expect(screen.getByText(/Этап 1\/8/)).toBeTruthy();
+    for (let i = 1; i <= 9; i++) expect(screen.getByTestId(`wizard-step-${i}`)).toBeTruthy();
+    expect(screen.getByText(/Этап 1\/9/)).toBeTruthy();
   });
 
   it('горячие клавиши Alt+→ блокируются при незавершённом этапе и работают после завершения', () => {
     render(<MissionWizard />);
+    // Этап 1 (выбор карт) незавершён → переход заблокирован
     fireEvent.keyDown(window, { key: 'ArrowRight', altKey: true });
-    expect(st().currentStep).toBe('craft-selection'); // заблокировано: тип не выбран
+    expect(st().currentStep).toBe('map-selection');
+    st().toggleMapChoice('esri');
+    fireEvent.keyDown(window, { key: 'ArrowRight', altKey: true });
+    expect(st().currentStep).toBe('craft-selection');
+    // Этап 2 незавершён (тип не выбран) → снова заблокирован
+    fireEvent.keyDown(window, { key: 'ArrowRight', altKey: true });
+    expect(st().currentStep).toBe('craft-selection');
     st().setCraftType('drone');
     fireEvent.keyDown(window, { key: 'ArrowRight', altKey: true });
     expect(st().currentStep).toBe('start-points');
@@ -353,10 +420,12 @@ describe('Оболочка мастера', () => {
     expect(st().currentStep).toBe('craft-selection');
   });
 
-  it('сохранение persist: состояние мастера пишется в localStorage', () => {
+  it('сохранение persist: состояние мастера пишется в localStorage (включая выбор карт)', () => {
+    st().toggleMapChoice('esri');
     st().setCraftType('uav');
     const raw = localStorage.getItem('tq-mission-wizard');
     expect(raw).toBeTruthy();
     expect(JSON.parse(raw as string).state.craftType).toBe('uav');
+    expect(JSON.parse(raw as string).state.selectedMaps).toEqual(['esri']);
   });
 });

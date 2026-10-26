@@ -5,7 +5,7 @@
 //     таймауту, а не висит вечно (circuit breaker нижнего уровня);
 //  2) loadTileWithMirrors при 429-шторме перебирает зеркала и ЗАВЕРШАЕТСЯ
 //     (maxRetries = число зеркал, экспоненциальных бесконечных ретраев нет);
-//  3) URL-шаблон 2ГИС уникален и корректен для XYZ-протокола;
+//  3) legacy-алиасы нормализуются в рабочие XYZ-URL (2ГИС удалён полностью);
 //  4) OSM включён по умолчанию (graceful default без API-ключа).
 // ═══════════════════════════════════════════════════════════════
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -55,22 +55,21 @@ describe('mapStability — circuit breakers загрузки тайлов', () =
     expect(result).toBeNull();
   });
 
-  it('legacy-алиасы: 2gis и osm → Esri Streets (без мёртвого 2gis.com и без 403 tile.openstreetmap.org); carto → OSM France', () => {
-    const url2gis = getOSMTileUrl(10, 511, 340, '2gis', 'scheme');
+  it('legacy-алиасы: osm → Esri Streets (без 403 tile.openstreetmap.org); carto → OSM France; «2gis» больше не поддерживается', () => {
     const urlOsm = getOSMTileUrl(10, 511, 340, 'osm', 'scheme');
     const urlCarto = getOSMTileUrl(10, 511, 340, 'carto', 'scheme');
-    // tile-b01.2gis.com не резолвится (ERR_NAME_NOT_RESOLVED) — слой рендерит Esri Streets
-    expect(url2gis).not.toContain('2gis.com');
-    expect(url2gis).toContain('arcgisonline.com');
     // Аудит audit/index.fixed.html, пункт B: стиль по умолчанию — Esri World Street Map
     // (самый стабильный); tile.openstreetmap.org удалён (403 по Referer для github.io),
     // legacy 'osm' нормализуется в DEFAULT_TILE_SERVER = 'esri'.
     expect(urlOsm).not.toContain('tile.openstreetmap.org');
-    expect(urlOsm).toBe(url2gis);
+    expect(urlOsm).toContain('arcgisonline.com');
     // 'carto' (требовал API-ключ) → OSM France — рабочий HTTPS-сервер без ключа
     expect(urlCarto).toContain('openstreetmap.fr');
     expect(urlCarto).not.toBe(urlOsm);
-    expect(url2gis).toMatch(/\/10\/340\/511$/);
+    expect(urlOsm).toMatch(/\/10\/340\/511$/);
+    // 2ГИС УДАЛЁН ПОЛНОСТЬЮ (ТЗ): тип TileServerId больше не принимает '2gis';
+    // runtime-значение из старых сохранений безопасно нормализуется в Esri.
+    expect(getOSMTileUrl(10, 511, 340, '2gis' as never, 'scheme')).toBe(urlOsm);
   });
 
   it('провайдер по умолчанию — osm, подложка включена (автозагрузка без ключей)', () => {

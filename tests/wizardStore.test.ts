@@ -1,11 +1,23 @@
 // Юнит-тесты стора пошагового мастера: навигация, валидации, лимиты, edge cases.
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
-  useMissionWizardStore, MAX_START_POINTS, MAX_TARGET_POINTS,
+  useMissionWizardStore, MAP_CHOICES, MAX_START_POINTS, MAX_TARGET_POINTS,
   parseCoordinateQuery, geoDistanceM, isValidLatLon, lonToPx, latToPy, type StartPoint, type TargetPoint,
 } from '../src/store/useMissionWizardStore';
 
 const st = () => useMissionWizardStore.getState();
+
+/** Проход Этапа 1 (выбор карт) до этапа выбора типа — используется тестами
+ *  этапов 2+, у которых beforeEach остаётся на map-selection. */
+const toCraft = () => {
+  st().goToNextStep(); // map-selection → craft-selection
+};
+/** Проход Этапа 2 (тип аппарата) до этапа точек старта. */
+const toStart = () => {
+  toCraft();
+  st().setCraftType('drone');
+  st().goToNextStep(); // craft-selection → start-points
+};
 
 const mkPt = (i: number, name = `П${i}`): Omit<StartPoint, 'id'> => ({
   name, lat: 55 + i * 0.01, lon: 37 + i * 0.01, x: 100 + i * 40, y: 100,
@@ -13,20 +25,70 @@ const mkPt = (i: number, name = `П${i}`): Omit<StartPoint, 'id'> => ({
 
 beforeEach(() => {
   st().resetWizard();
-  st().setCraftType('drone');
+  // Этап 1 (ТЗ) — выбор карт: мастер не пройдёт дальше без выбранной карты,
+  // поэтому во всех прежних тестах этапов 2+ эмулируем завершённый этап 1.
+  st().toggleMapChoice('esri');
 });
 
-describe('Этап 1 — выбор типа аппарата', () => {
-  it('блокирует переход без выбора типа', () => {
-    st().resetWizard(); // craftType = null
+describe('Этап 1 — выбор карт для загрузки', () => {
+  it('блокирует переход без выбора карты', () => {
+    st().resetWizard(); // selectedMaps = []
+    expect(st().currentStep).toBe('map-selection');
     expect(st().canProceedToNextStep()).toBe(false);
     expect(st().validateCurrentStep().some((i) => i.level === 'error')).toBe(true);
   });
 
-  it('разблокирует переход после выбора типа', () => {
+  it('разблокирует переход после мультивыбора и сохраняет основную карту', () => {
+    st().resetWizard(); // beforeEach уже выбрал esri — начинаем с чистого Этапа 1
+    st().toggleMapChoice('esri');
+    st().toggleMapChoice('opentopomap');
+    expect(st().selectedMaps).toEqual(['esri', 'opentopomap']);
+    expect(st().primaryMap).toBe('opentopomap'); // последний выбранный становится основной
     expect(st().canProceedToNextStep()).toBe(true);
+    st().goToNextStep();
+    expect(st().currentStep).toBe('craft-selection');
   });
 
+  it('setPrimaryMap автоматически добавляет карту в выбранные', () => {
+    st().resetWizard();
+    st().setPrimaryMap('cyclosm');
+    expect(st().selectedMaps).toContain('cyclosm');
+    expect(st().primaryMap).toBe('cyclosm');
+  });
+
+  it('снятие основной карты передаёт статус первой оставшейся', () => {
+    st().resetWizard(); // beforeEach уже выбрал esri — чистый Этап 1
+    st().toggleMapChoice('esri'); // primary = esri (первый выбор)
+    st().toggleMapChoice('osmfr'); // esri → osmfr primary
+    st().toggleMapChoice('osmfr'); // снять
+    expect(st().selectedMaps).toEqual(['esri']);
+    expect(st().primaryMap).toBe('esri');
+  });
+
+  it('2ГИС недоступен как вариант выбора (ТЗ: удалён полностью)', () => {
+    expect(MAP_CHOICES.some((c) => c.id === '2gis')).toBe(false);
+    expect(MAP_CHOICES.every((c) => ['esri', 'esri-sat', 'osmfr', 'hot', 'osmde', 'opentopomap', 'cyclosm'].includes(c.id))).toBe(true);
+  });
+
+  it('смена типа аппарата НЕ сбрасывает выбор карт Этапа 1', () => {
+    st().toggleMapChoice('hot');
+    st().resetCraftChoice('uav');
+    expect(st().selectedMaps).toContain('hot');
+    expect(st().completedSteps).toHaveLength(0);
+  });
+
+  it('блокирует переход без выбора типа (прежний Этап 1 → теперь Этап 2)', () => {
+    st().goToNextStep(); // map-selection → craft-selection
+    st().resetWizard();
+    st().toggleMapChoice('esri'); // этап 1 пройден, но тип не выбран
+    st().goToNextStep();
+    expect(st().currentStep).toBe('craft-selection');
+    expect(st().canProceedToNextStep()).toBe(false);
+    expect(st().validateCurrentStep().some((i) => i.level === 'error')).toBe(true);
+  });
+});
+
+describe('Сброс выбора типа (Этап 2 → Этап 1-е данные)', () => {
   it('сброс по подтверждению меняет тип и очищает все данные', () => {
     st().addStartPoint(mkPt(1));
     st().resetCraftChoice();
@@ -38,7 +100,7 @@ describe('Этап 1 — выбор типа аппарата', () => {
 
 describe('Этап 2 — точки старта', () => {
   it('блокирует переход без точек', () => {
-    st().goToNextStep();
+    toStart();
     expect(st().currentStep).toBe('start-points');
     expect(st().canProceedToNextStep()).toBe(false);
   });
@@ -99,6 +161,8 @@ describe('Этап 2 — точки старта', () => {
 
 describe('Этап 3 — точки целей', () => {
   beforeEach(() => {
+    toCraft();
+    st().setCraftType('drone');
     st().goToNextStep(); // → start-points
     st().addStartPoint(mkPt(1));
     st().goToNextStep(); // → target-points
@@ -129,6 +193,8 @@ describe('Этап 3 — точки целей', () => {
 
 describe('Этап 4 — группировка флота', () => {
   const toFleet = () => {
+    toCraft();
+    st().setCraftType('drone');
     st().goToNextStep(); // start-points
     st().addStartPoint(mkPt(1));
     st().goToNextStep(); // target-points
@@ -171,7 +237,10 @@ describe('Этап 4 — группировка флота', () => {
 
 describe('Этап 5 — NFZ и маршруты', () => {
   const toNfz = () => {
-    st().goToNextStep(); st().addStartPoint(mkPt(1));
+    toCraft();
+    st().setCraftType('drone');
+    st().goToNextStep(); // → start-points
+    st().addStartPoint(mkPt(1));
     st().goToNextStep(); st().addTargetPoint({ name: 'Ц1', lat: 56, lon: 38, x: 500, y: 100 });
     st().goToNextStep(); st().setTotalCraft(4); st().autoFormGroups();
     st().goToNextStep(); // nfz-and-routes
@@ -234,7 +303,10 @@ describe('Этап 5 — NFZ и маршруты', () => {
 
 describe('Этап 6 — профили высот (опциональный этап)', () => {
   const toAlt = async () => {
-    st().goToNextStep(); st().addStartPoint(mkPt(1));
+    toCraft();
+    st().setCraftType('drone');
+    st().goToNextStep(); // → start-points
+    st().addStartPoint(mkPt(1));
     st().goToNextStep(); st().addTargetPoint({ name: 'Ц1', lat: 56, lon: 38, x: 500, y: 100 });
     st().goToNextStep(); st().setTotalCraft(2); st().autoFormGroups();
     st().goToNextStep(); await st().calculateRoutes();
@@ -280,7 +352,10 @@ describe('Этап 6 — профили высот (опциональный э�
 
 describe('Этапы 7–8 — экспорт и развёртывание', () => {
   const toExport = async () => {
-    st().goToNextStep(); st().addStartPoint(mkPt(1));
+    toCraft();
+    st().setCraftType('drone');
+    st().goToNextStep(); // → start-points
+    st().addStartPoint(mkPt(1));
     st().goToNextStep(); st().addTargetPoint({ name: 'Ц1', lat: 56, lon: 38, x: 500, y: 100 });
     st().goToNextStep(); st().setTotalCraft(2); st().autoFormGroups();
     st().goToNextStep(); await st().calculateRoutes();
@@ -320,6 +395,7 @@ describe('Этапы 7–8 — экспорт и развёртывание', ()
 
 describe('Навигация мастера', () => {
   it('goToStep запрещает прыжок вперёд через незавершённые этапы', () => {
+    toCraft();
     expect(st().currentStep).toBe('craft-selection');
     st().goToStep('nfz-and-routes');
     expect(st().currentStep).toBe('craft-selection');
@@ -327,16 +403,21 @@ describe('Навигация мастера', () => {
   });
 
   it('goToPreviousStep свободен назад, на первом этапе — no-op', () => {
-    st().goToNextStep();
+    toStart();
     expect(st().currentStep).toBe('start-points');
     st().goToPreviousStep();
     expect(st().currentStep).toBe('craft-selection');
     st().goToPreviousStep();
-    expect(st().currentStep).toBe('craft-selection');
+    expect(st().currentStep).toBe('map-selection'); // Этап 1 по ТЗ
+    st().goToPreviousStep();
+    expect(st().currentStep).toBe('map-selection'); // no-op на первом этапе
   });
 
   it('полный проход 1→8 с завершением каждого этапа', async () => {
-    st().goToNextStep(); st().addStartPoint(mkPt(1));
+    toCraft();
+    st().setCraftType('drone');
+    st().goToNextStep(); // → start-points
+    st().addStartPoint(mkPt(1));
     st().goToNextStep(); st().addTargetPoint({ name: 'Ц1', lat: 56, lon: 38, x: 500, y: 100 });
     st().goToNextStep(); st().setTotalCraft(2); st().autoFormGroups();
     st().goToNextStep(); await st().calculateRoutes();
@@ -344,6 +425,6 @@ describe('Навигация мастера', () => {
     st().goToNextStep(); st().setExportFormat('kml');
     st().goToNextStep();
     expect(st().currentStep).toBe('mission-deployment');
-    expect(st().completedSteps).toHaveLength(7);
+    expect(st().completedSteps).toHaveLength(8);
   });
 });

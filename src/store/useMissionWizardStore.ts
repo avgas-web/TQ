@@ -1,16 +1,20 @@
 // ═══════════════════════════════════════════════════════════════
 // useMissionWizardStore — Zustand-стор пошагового мастера миссий.
-// 8 этапов с жёсткой последовательностью: переход вперёд разрешён
+// 9 этапов с жёсткой последовательностью: переход вперёд разрешён
 // только при выполнении критериев завершения текущего этапа.
+// Этап 1 — выбор карт для загрузки (ТЗ: первым этапом; 2ГИС удалён).
 // Автосохранение через zustand persist (localStorage) после каждого
 // изменения — перезагрузка страницы восстанавливает прогресс.
 // ═══════════════════════════════════════════════════════════════
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { v4 as uuidv4 } from 'uuid';
+import { useMapStore } from './useMapStore';
+import type { TileServerId } from '../utils/openStreetMap';
 
 // ─── Типы домена мастера ────────────────────────────────────────
 export type WizardStep =
+  | 'map-selection'
   | 'craft-selection'
   | 'start-points'
   | 'target-points'
@@ -21,11 +25,12 @@ export type WizardStep =
   | 'mission-deployment';
 
 export const WIZARD_STEPS: WizardStep[] = [
-  'craft-selection', 'start-points', 'target-points', 'fleet-formation',
+  'map-selection', 'craft-selection', 'start-points', 'target-points', 'fleet-formation',
   'nfz-and-routes', 'altitude-profiles', 'export-preparation', 'mission-deployment',
 ];
 
 export const STEP_LABELS_RU: Record<WizardStep, string> = {
+  'map-selection': 'Выбор карт',
   'craft-selection': 'Выбор типа аппарата',
   'start-points': 'Точки старта',
   'target-points': 'Точки целей',
@@ -142,9 +147,26 @@ export function parseCoordinateQuery(q: string): { lat: number; lon: number } | 
 }
 
 // ─── Контракт стора ─────────────────────────────────────────────
+/** Доступные для выбора карты (стили подложки) — ТЗ: пользователь выбирает из
+ *  всех вариантов, кроме 2ГИС; 2ГИС УДАЛЁН ПОЛНОСТЬЮ (пункт C аудита). */
+export const MAP_CHOICES: ReadonlyArray<{ id: TileServerId; label: string; desc: string }> = [
+  { id: 'esri',        label: 'Esri — улицы',           desc: 'Стабильная уличная подложка (стиль по умолчанию)' },
+  { id: 'esri-sat',    label: 'Esri — спутник',          desc: 'Спутниковые снимки высокого разрешения' },
+  { id: 'osmfr',       label: 'OSM France (стандарт)',   desc: 'Классическая схема OpenStreetMap (зеркало FR)' },
+  { id: 'hot',         label: 'OSM France (гуманитарный)', desc: 'HOT-стиль: детали для ЧС и картографирования' },
+  { id: 'osmde',       label: 'OSM Germany',             desc: 'Зеркало немецкого сообщества OSM' },
+  { id: 'opentopomap', label: 'OpenTopoMap',             desc: 'Топографический стиль с рельефом' },
+  { id: 'cyclosm',     label: 'CyclOSM',                 desc: 'Велосипедные маршруты и инфраструктура' },
+];
+
 export interface MissionWizardState {
   currentStep: WizardStep;
   completedSteps: WizardStep[];
+
+  /** Этап 1 (ТЗ): выбранные пользователем карты для загрузки (мультивыбор). */
+  selectedMaps: TileServerId[];
+  /** Основная карта — активный стиль подложки (должна быть в selectedMaps). */
+  primaryMap: TileServerId | null;
 
   craftType: 'drone' | 'uav' | null;
   startPoints: StartPoint[];
@@ -159,6 +181,10 @@ export interface MissionWizardState {
   issues: WizardValidationIssue[];
   deploymentLog: string[];
 
+  /** Переключить карту в списке выбранных (Этап 1, мультивыбор). */
+  toggleMapChoice: (id: TileServerId) => void;
+  /** Назначить основную (активную) карту; автоматически добавляет в selectedMaps. */
+  setPrimaryMap: (id: TileServerId) => void;
   setCraftType: (type: 'drone' | 'uav') => void;
   addStartPoint: (point: Omit<StartPoint, 'id'>) => void;
   updateStartPoint: (id: string, patch: Partial<StartPoint>) => void;
@@ -196,8 +222,12 @@ export interface MissionWizardState {
 }
 
 const initialData = {
-  currentStep: 'craft-selection' as WizardStep,
+  currentStep: 'map-selection' as WizardStep,
   completedSteps: [] as WizardStep[],
+  // Этап 1 (ТЗ): карты не выбраны — валидация этапа потребует хотя бы одну;
+  // основная по умолчанию Esri Streets (стиль по умолчанию аудита).
+  selectedMaps: [] as TileServerId[],
+  primaryMap: 'esri' as TileServerId | null,
   craftType: null as 'drone' | 'uav' | null,
   startPoints: [] as StartPoint[],
   targetPoints: [] as TargetPoint[],
@@ -254,15 +284,52 @@ export const useMissionWizardStore = create<MissionWizardState>()(
         return false;
       };
 
-      // ── Этап 1 ─────────────────────────────────────────────────
+      // ── Этап 1: выбор карт для загрузки (ТЗ) ───────────────────
+      /** Синхронизация картографического стора с выбором мастера:
+       *  активный стиль подложки = основная карта; все выбранные включены
+       *  в список доступных. Без этого «выбор карты» был бы декорацией. */
+      const syncMapStoreFromChoice = () => {
+        const { selectedMaps, primaryMap } = get();
+        const mapStore = useMapStore.getState();
+        if (primaryMap && mapStore.openStreetMap?.tileServer !== primaryMap) {
+          mapStore.setOSMTileServer(primaryMap);
+        }
+        if (selectedMaps.length > 0 && !mapStore.openStreetMap?.enabled) {
+          mapStore.toggleOpenStreetMap(true);
+        }
+      };
+
+      const toggleMapChoice = (id: TileServerId) => {
+        set((s) => {
+          const has = s.selectedMaps.includes(id);
+          const nextSelected = has ? s.selectedMaps.filter((m) => m !== id) : [...s.selectedMaps, id];
+          // снимаем основную карту, если её убрали из выбора (держим инвариант)
+          const nextPrimary = !has ? id : s.primaryMap === id ? (nextSelected[0] ?? null) : s.primaryMap;
+          return { selectedMaps: nextSelected, primaryMap: nextPrimary };
+        });
+        syncMapStoreFromChoice();
+      };
+
+      const setPrimaryMap = (id: TileServerId) => {
+        set((s) => ({
+          primaryMap: id,
+          selectedMaps: s.selectedMaps.includes(id) ? s.selectedMaps : [...s.selectedMaps, id],
+        }));
+        syncMapStoreFromChoice();
+      };
+
+      // ── Этап 2 ─────────────────────────────────────────────────
       const setCraftType = (type: 'drone' | 'uav') => {
         set({ craftType: type });
       };
       const resetCraftChoice = (newType?: 'drone' | 'uav') => {
         // полный сброс мастер-данных при смене типа (edge-case из ТЗ);
         // остаёмся на этапе выбора типа; если пользователь уже подтвердил
-        // новый тип — фиксируем его сразу, чтобы не терять двойной диалог
-        set({ ...initialData, currentStep: 'craft-selection', craftType: newType ?? null });
+        // новый тип — фиксируем его сразу, чтобы не терять двойной диалог.
+        // Карты Этапа 1 НЕ сбрасываются: выбор подложек — свойство проекта,
+        // а не аппарата (иначе после смены типа возвращались бы к этапу 1).
+        set({ ...initialData, currentStep: 'craft-selection', craftType: newType ?? null,
+              selectedMaps: get().selectedMaps, primaryMap: get().primaryMap });
       };
 
       // ── Этапы 2/3: точки ───────────────────────────────────────
@@ -652,7 +719,20 @@ export const useMissionWizardStore = create<MissionWizardState>()(
         }
       };
 
-      const resetWizard = () => set({ ...initialData });
+      // ВАЖНО (регрессия «мастер не загружает карту» / тесты стартовали не с
+      // Этапа 1): resetWizard обязан очищать и persist-хранилище. Иначе после
+      // set({...initialData}) zustand persist СРАЗУ сериализует initialData в
+      // localStorage; затем следующий mount гидратирует этот снапшот — shallow
+      // merge поверх дефолтов — и любое расхождение (старые ключи, порядок
+      // hydration) уводит мастер не на 'map-selection'. Плюс очистка хранилища
+      // даёт детерминированный чистый старт и в UI («Начать заново»), и в
+      // тестах (beforeEach → resetWizard + localStorage.clear()).
+      const resetWizard = () => {
+        set({ ...initialData });
+        try {
+          localStorage.removeItem('tq-mission-wizard');
+        } catch { /* localStorage может быть недоступен (приватный режим Safari ITP) */ }
+      };
 
       /** Валидация этапа. При вызове с `publish: true` результаты также
        *  публикуются в `issues` (для отображения в UI). По умолчанию — чистый
@@ -664,6 +744,12 @@ export const useMissionWizardStore = create<MissionWizardState>()(
         const errs: WizardValidationIssue[] = [];
         const step = s.currentStep;
         switch (step) {
+          case 'map-selection':
+            // ТЗ: первым этапом — выбор карт для загрузки. Без выбора дальше
+            // идти нельзя (иначе мастер «молча» грузит подложку по умолчанию).
+            if (s.selectedMaps.length === 0) errs.push({ step, level: 'error', message: 'Выберите хотя бы одну карту для загрузки.' });
+            else if (!s.primaryMap || !s.selectedMaps.includes(s.primaryMap)) errs.push({ step, level: 'error', message: 'Назначьте основную карту из выбранных.' });
+            break;
           case 'craft-selection':
             if (!s.craftType) errs.push({ step, level: 'error', message: 'Выберите тип аппарата.' });
             break;
@@ -758,6 +844,7 @@ export const useMissionWizardStore = create<MissionWizardState>()(
 
       return {
         ...initialData,
+        toggleMapChoice, setPrimaryMap,
         setCraftType, resetCraftChoice,
         addStartPoint, updateStartPoint, removeStartPoint,
         addTargetPoint, updateTargetPoint, removeTargetPoint,
@@ -772,9 +859,15 @@ export const useMissionWizardStore = create<MissionWizardState>()(
     {
       name: 'tq-mission-wizard',
       storage: createJSONStorage(() => localStorage),
+      // Миграция старых сохранений (до Этапа 1 «Выбор карт»): zustand persist
+      // делает shallow-merge persisted-объекта поверх дефолтов состояния,
+      // поэтому достаточно включить новые поля в partialize — у старых снапшотов
+      // их просто нет и останутся дефолты (primaryMap='esri', selectedMaps=[]).
       partialize: (s) => ({
         currentStep: s.currentStep,
         completedSteps: s.completedSteps,
+        selectedMaps: s.selectedMaps,
+        primaryMap: s.primaryMap,
         craftType: s.craftType,
         startPoints: s.startPoints,
         targetPoints: s.targetPoints,
