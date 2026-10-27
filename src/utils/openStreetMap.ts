@@ -1,24 +1,121 @@
 // Утилиты для работы с OpenStreetMap
 import { calculateBoundsFromCenter, latToMercatorY } from './googleMaps';
 
-/** Зеркала тайлового сервера tile.openstreetmap.org (перебираются при ошибках/таймаутах) */
-const OSM_TILE_MIRRORS = [
-  'https://tile.openstreetmap.org',
-  'https://a.tile.openstreetmap.org',
-  'https://b.tile.openstreetmap.org',
-  'https://c.tile.openstreetmap.org',
+/* ============================================================
+   ТАЙЛОВЫЕ СЕРВЕРЫ — по аудиту audit/index.fixed.html:
+   tile.openstreetmap.org и Carto (basemaps.cartocdn.com) УДАЛЕНЫ
+   намеренно: основной OSM отдаёт 403 по Referer/User-Agent для
+   github.io, Carto требует ключ. Оставлены только HTTPS-серверы
+   без API-ключа, не блокирующие github.io:
+   Esri World Street Map (стиль по умолчанию), Esri World Imagery,
+   OSM France (osmfr/hot), OSM Germany, OpenTopoMap, CyclOSM.
+   maxZoom/maxNativeZoom и attribution заданы для каждого слоя.
+   ============================================================ */
+
+export type TileServerId =
+  | 'esri'          // Esri World Street Map — самый стабильный, стиль по умолчанию
+  | 'esri-sat'      // Esri World Imagery (спутник)
+  | 'osmfr'         // OSM France (стандартная схема)
+  | 'hot'           // OSM France (гуманитарный HOT)
+  | 'osmde'         // OSM Germany
+  | 'opentopomap'   // OpenTopoMap (топографический)
+  | 'cyclosm';      // CyclOSM (велосипедный)
+
+export interface TileProviderInfo {
+  /** Человекочитаемое название стиля (для UI) */
+  label: string;
+  /** Нативный максимум тайлов (выше — только растяжение, не поднимаемся) */
+  maxNativeZoom: number;
+  /** Верхняя граница зума в UI */
+  maxZoom: number;
+  attribution: string;
+}
+
+const OSM_ATTR = '© OpenStreetMap contributors';
+
+export const TILE_PROVIDERS: Record<TileServerId, TileProviderInfo> = {
+  esri:        { label: 'Esri — улицы (стабильный)', maxNativeZoom: 19, maxZoom: 19, attribution: 'Tiles © Esri' },
+  'esri-sat':  { label: 'Esri — спутник',            maxNativeZoom: 19, maxZoom: 19, attribution: 'Tiles © Esri' },
+  osmfr:       { label: 'OSM France (стандарт)',     maxNativeZoom: 19, maxZoom: 19, attribution: `${OSM_ATTR} | OSM France` },
+  hot:         { label: 'OSM France (гуманитарный)', maxNativeZoom: 19, maxZoom: 19, attribution: `${OSM_ATTR} | HOT France` },
+  osmde:       { label: 'OSM Germany',               maxNativeZoom: 17, maxZoom: 18, attribution: `${OSM_ATTR} | OSM Germany` },
+  opentopomap: { label: 'OpenTopoMap',               maxNativeZoom: 17, maxZoom: 17, attribution: `${OSM_ATTR} | OpenTopoMap (CC-BY-SA)` },
+  cyclosm:     { label: 'CyclOSM',                   maxNativeZoom: 19, maxZoom: 20, attribution: `${OSM_ATTR} | CyclOSM` },
+};
+
+/** Порядок стилей в выпадающих списках UI */
+export const TILE_SERVER_ORDER: TileServerId[] = ['esri', 'esri-sat', 'osmfr', 'hot', 'osmde', 'opentopomap', 'cyclosm'];
+
+/** Стиль подложки по умолчанию — Esri World Street Map (пункт B аудита) */
+export const DEFAULT_TILE_SERVER: TileServerId = 'esri';
+
+/** Нормализация значения из стора/импорта/старых сохранений → рабочий провайдер.
+ *  Legacy-значения ('osm', 'carto') маппятся на совместимые рабочие серверы:
+ *  'osm' → Esri Street (пункт B аудита: стиль по умолчанию — самый стабильный),
+ *  'carto' → OSM France (стандартная схема, ближайший аналог Voyager без ключа).
+ *  '2gis' УДАЛЁН ПОЛНОСТЬЮ (ТЗ: выбор карт без 2ГИС): публичный тайловый сервис
+ *  2ГИС закрыт (tile-b01.2gis.com не резолвится) — старые сохранения с этим
+ *  значением нормализуются в Esri Streets (он и рендерился вместо него). */
+export function normalizeTileServer(v: unknown): TileServerId {
+  if (typeof v === 'string' && (v in TILE_PROVIDERS)) return v as TileServerId;
+  if (v === 'carto') return 'osmfr';
+  return DEFAULT_TILE_SERVER; // 'osm', '2gis' и всё неизвестное → Esri Streets
+}
+
+/** Зеркала-фоллбэки для Esri (при недоступности одного хоста). */
+const ESRI_MIRRORS = [
+  'https://server.arcgisonline.com',
+  'https://services.arcgisonline.com',
 ];
 
-/**
- * Провайдер растровой подложки «esri-sat» — Esri World Imagery.
- * ИСПРАВЛЕНИЕ АУДИТА 1.3: раньше параметр `style` в getOSMTileUrl уничтожался
- * через `void style;` — режимы «спутник/гибрид» молча возвращали схемные тайлы
- * OSM. Теперь при style='satellite'|'hybrid' URL строится по шаблону Esri
- * (x/y перевёрнуты относительно стандартной XYZ-схемы: z/{y}/{x}).
- */
-export const ESRI_SAT_TILE_URL = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile';
-/** Эталонный шаблон esri-sat (используется тестами привязки стилей) */
-export const ESRI_SAT_TEMPLATE = `${ESRI_SAT_TILE_URL}/{z}/{y}/{x}`;
+/** URL тайла для любого рабочего провайдера (без нормализации зума вызывающим кодом). */
+function tileUrlFor(server: TileServerId, z: number, x: number, y: number): string {
+  switch (server) {
+    case 'esri':        return esriUrl(ESRI_MIRRORS[0], 'World_Street_Map', z, x, y);
+    case 'esri-sat':    return esriUrl(ESRI_MIRRORS[0], 'World_Imagery', z, x, y);
+    case 'osmfr':       return `https://a.tile.openstreetmap.fr/osmfr/${z}/${x}/${y}.png`;
+    case 'hot':         return `https://a.tile.openstreetmap.fr/hot/${z}/${x}/${y}.png`;
+    case 'osmde':       return `https://tile.openstreetmap.de/${z}/${x}/${y}.png`;
+    case 'opentopomap': return `https://a.tile.opentopomap.org/${z}/${x}/${y}.png`;
+    case 'cyclosm':     return `https://a.tile-cyclosm.openstreetmap.fr/cyclosm/${z}/${x}/${y}.png`;
+    default:            return esriUrl(ESRI_MIRRORS[0], 'World_Street_Map', z, x, y);
+  }
+}
+
+/** Шаблон тайла Esri World Imagery (спутник) — экспорт для тестов привязки стилей. */
+export const ESRI_SAT_TEMPLATE = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+
+/** URL тайла для Esri-провайдеров с перебором зеркал */
+function esriUrl(host: string, service: string, z: number, x: number, y: number): string {
+  return `${host}/ArcGIS/rest/services/${service}/MapServer/tile/${z}/${y}/${x}`; // у Esri порядок z/y/x
+}
+
+/** Все варианты URL одного тайла (зеркала) — пустой массив, если сервер не Esri */
+export function getTileUrlVariants(
+  zoom: number, x: number, y: number,
+  tileServer: TileServerId = DEFAULT_TILE_SERVER,
+): string[] {
+  const z = Math.min(Math.max(Math.round(zoom), 0), 19);
+  if (tileServer === 'esri')
+    return ESRI_MIRRORS.map((h) => esriUrl(h, 'World_Street_Map', z, x, y));
+  if (tileServer === 'esri-sat')
+    return ESRI_MIRRORS.map((h) => esriUrl(h, 'World_Imagery', z, x, y));
+  return [];
+}
+
+/** Варианты URL одного тайла для ЛЮБОГО рабочего провайдера (Esri — с зеркалами).
+ *  Отдача выше maxNativeZoom («как Leaflet»: ближайший нативный уровень + растяжение)
+ *  остаётся на стороне вызывающего кода. */
+export function getTileUrlVariantsFor(
+  server: TileServerId | 'osm' | 'carto',
+  zoom: number, x: number, y: number,
+): string[] {
+  const s = normalizeTileServer(server);
+  const z = Math.min(Math.max(Math.round(zoom), 0), 19);
+  if (s === 'esri') return ESRI_MIRRORS.map((h) => esriUrl(h, 'World_Street_Map', z, x, y));
+  if (s === 'esri-sat') return ESRI_MIRRORS.map((h) => esriUrl(h, 'World_Imagery', z, x, y));
+  return [tileUrlFor(s, z, x, y)];
+}
 
 /** Ограничение параллельных загрузок тайлов на один хост: браузер даёт ~6 соединений,
  *  сотни запросов без лимита = таймауты и «вечная загрузка» большой карты. */
@@ -40,7 +137,7 @@ export interface OSMConfig {
   loaded: boolean;
 }
 
-let osmConfig: OSMConfig = {
+const osmConfig: OSMConfig = {
   loaded: false,
 };
 
@@ -54,14 +151,29 @@ export function initOpenStreetMap(): Promise<void> {
   });
 }
 
-// Зеркала Nominatim. Публичный nominatim.openstreetmap.org часто недоступен из ряда
-// сетей/регионов (ERR_CONNECTION_TIMED_OUT) и жёстко лимитирует запросы, поэтому
-// перебираем несколько инстансов с таймаутом и вежливым паузированием.
+// Инстансы Nominatim. Публичный nominatim.openstreetmap.org часто недоступен из ряда
+// сетей/регионов (net::ERR_CONNECTION_TIMED_OUT) и жёстко лимитирует запросы, поэтому
+// он идёт ПОСЛЕДНИМ: сначала независимые зеркала. Если все инстансы упали —
+// включается fallback на Photon (см. osmGeocode).
 const NOMINATIM_HOSTS = [
-  'https://nominatim.openstreetmap.org',
-  'https://nominatim.mapnik.us',
-  'https://nominatim.private.coffee',
+  'https://nominatim.openstreetmap.fr', // independent OSM-France instance
+  'https://nominatim.othercodefor.com', // independent Code for America instance
+  'https://nominatim.openstreetmap.org', // основной — в конце (самый блокируемый)
 ];
+
+// Кэш живых хостов: упавшие по сети/таймауту исключаются из ротации на 5 минут,
+// чтобы каждый новый поиск не тратил секунды на заведомо мёртвые зеркала.
+const hostHealth = new Map<string, number>(); // host -> timestamp «считать мёртвым до»
+const DEAD_HOST_TTL_MS = 5 * 60 * 1000;
+function isHostDead(host: string): boolean {
+  const until = hostHealth.get(host);
+  if (!until) return false;
+  if (Date.now() >= until) {
+    hostHealth.delete(host);
+    return false;
+  }
+  return true;
+}
 
 // Локальная очередь «не чаще 1 запроса в секунду» — требование usage policy Nominatim.
 // Резервирование момента выполнения синхронно (до await) исключает «шторм» из
@@ -78,20 +190,15 @@ function reserveNominatimSlot(): Promise<void> {
 export type NominatimErrorKind = 'network' | 'http';
 
 /**
- * Запрос к Nominatim с перебором зеркал, таймаутом и повтором.
- * Возвращает [данные, kind] где kind='ok'|'not_found'|'network'|'http' —
- * вызывающий код различает «сервис недоступен», «адрес не найден» и HTTP-ошибку.
- * Поддерживает внешний AbortController для отмены (уход пользователя, новый запрос).
+ * Запрос к Nominatim с перебором зеркал, таймаутом и одним повтором.
+ * Возвращает kind='ok'|'not_found'|'network'|'http' — вызывающий код различает
+ * «сервис недоступен», «адрес не найден» и HTTP-ошибку.
+ * Таймаут 8 с (по аудиту): при недоступном хосте браузер сам выдаёт
+ * ERR_CONNECTION_TIMED_OUT раньше — это штатная ситуация, ловится и ведёт к
+ * следующему зеркалу / Photon.
+ * Поддерживает внешний AbortSignal для отмены (уход пользователя, новый запрос).
  * Ошибки внешних серверов не пишутся в console.error — это штатная ситуация,
  * вызывающий код показывает пользователю понятное сообщение.
- *
- * ИСПРАВЛЕНИЕ АУДИТА 1.4 (обработка 404): статус 404 означает «адрес/объект не
- * найден» — ШТАТНЫЙ ответ сервиса, а не сбой. Раньше он попадал в ветку
- * `!response.ok -> kind:'http'`, что воспринималось вызывающим кодом как ошибка
- * службы и триггерило лишний fallback (повторные раунды по всем зеркалам и
- * резервному геокодеру Photon). Теперь 404/400 возвращают 'not_found' немедленно,
- * без перебора зеркал; 429/5xx по-прежнему считаются сервисной ошибкой ('http')
- * и приводят к ретраям.
  */
 async function fetchNominatimJson(
   path: string,
@@ -102,45 +209,52 @@ async function fetchNominatimJson(
   for (let round = 0; round < 2; round++) {
     for (let i = 0; i < NOMINATIM_HOSTS.length; i++) {
       if (outerSignal?.aborted) return { data: null, kind: 'network' };
-      const host = NOMINATIM_HOSTS[(i + round) % NOMINATIM_HOSTS.length];
+      const host = NOMINATIM_HOSTS[i];
+      if (isHostDead(host)) continue; // известное мёртвое зеркало — не ждём таймаута
       await reserveNominatimSlot();
       if (outerSignal?.aborted) return { data: null, kind: 'network' };
       const ctrl = new AbortController();
       const abortOuter = () => ctrl.abort();
       outerSignal?.addEventListener('abort', abortOuter);
-      const timer = setTimeout(() => ctrl.abort(), 12000);
+      const timer = setTimeout(() => ctrl.abort(), 8000);
       try {
         const response = await fetch(`${host}${path}?format=json&${params}`, {
           signal: ctrl.signal,
-          headers: { Accept: 'application/json' },
         });
         if (response.status === 429 || response.status >= 500) {
           sawHttpError = true;
           continue; // пробуем следующее зеркало
         }
-        // 404 (и 400 — некорректный запрос) = штатное «не найдено»: НЕ является
-        // ошибкой сервиса, fallback на зеркала/Photon не требуется.
+        // ИСПРАВЛЕНИЕ АУДИТА 1.4 (обработка 404): статус 404 означает «адрес/объект
+        // не найден» — ШТАТНЫЙ ответ сервиса, а не сбой. Раньше он попадал в ветку
+        // `!response.ok -> kind:'http'`, что воспринималось вызывающим кодом как
+        // ошибка службы и триггерило лишний fallback (повторные раунды по всем
+        // зеркалам и резервному геокодеру Photon). Теперь 404/400 возвращают
+        // 'not_found' немедленно, без перебора зеркал; 429/5xx по-прежнему
+        // считаются сервисной ошибкой ('http') и приводят к ретраям.
         if (response.status === 404 || response.status === 400) {
           return { data: null, kind: 'not_found' };
         }
         if (!response.ok) return { data: null, kind: 'http' };
         const json = await response.json();
+        hostHealth.delete(host); // хост жив — снимаем метку, если была
         return { data: json, kind: Array.isArray(json) && json.length === 0 ? 'not_found' : 'ok' };
       } catch {
-        /* сеть/таймаут/отмена — следующее зеркало */
+        hostHealth.set(host, Date.now() + DEAD_HOST_TTL_MS); // сеть/таймаут — временно исключаем
       } finally {
         clearTimeout(timer);
         outerSignal?.removeEventListener('abort', abortOuter);
       }
     }
-    // после первого раунда — короткая пауза перед повтором
-    if (round === 0) await new Promise((res) => setTimeout(res, 1000));
+    // после первого раунда — короткая пауза перед повтором (разрешаем retry даже
+    // для помеченных мёртвыми: возможно, это был единичный таймаут)
+    if (round === 0) {
+      hostHealth.clear();
+      await new Promise((res) => setTimeout(res, 500));
+    }
   }
   return { data: null, kind: sawHttpError ? 'http' : 'network' };
 }
-
-/** Экспорт для юнит-тестов (регрессия аудита 1.4): различение 404/5xx без сети */
-export const __test_fetchNominatimJson = fetchNominatimJson;
 
 export interface OsmGeocodeResult {
   point: { lat: number; lng: number } | null;
@@ -148,8 +262,52 @@ export interface OsmGeocodeResult {
   kind: 'ok' | 'not_found' | NominatimErrorKind;
 }
 
+/** Экспорт для юнит-тестов (регрессия аудита 1.4): различение 404/5xx без сети */
+export const __test_fetchNominatimJson = fetchNominatimJson;
+
 /**
- * Геокодирование адреса через Nominatim (OSM).
+ * Запрос к Photon (https://photon.komoot.io) — резервному геокодеру по аудиту
+ * audit/index.fixed.html (пункт D: «основной Nominatim с обязательным fallback на
+ * Photon при любой ошибке fetch»). Без ключей, HTTPS, CORS открыт.
+ * Возвращает первую точку GeoJSON или null. Ошибки глотаются (вызывающий код сам
+ * решает, что показывать пользователю).
+ */
+async function fetchPhotonPoint(query: string, outerSignal?: AbortSignal): Promise<{ lat: number; lng: number } | null> {
+  if (outerSignal?.aborted) return null;
+  const ctrl = new AbortController();
+  const abortOuter = () => ctrl.abort();
+  outerSignal?.addEventListener('abort', abortOuter);
+  // По аудиту: таймаут 8 секунд.
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    // ВАЖНО: Photon НЕ поддерживает lang=ru (возвращает HTTP 400 «Language is not
+    // supported. Supported are: default, de, en, fr» — проверено живым запросом).
+    // Поэтому параметр lang не передаём вовсе: сервер отдаёт результаты на языке
+    // страны поиска (для русскоязычных адресов — кириллицу), что нам и нужно.
+    const url = `https://photon.komoot.io/api/?${new URLSearchParams({ q: query, limit: '1' })}`;
+    const response = await fetch(url, { signal: ctrl.signal });
+    if (!response.ok) return null;
+    const json: any = await response.json();
+    const feature = json?.features?.[0];
+    const coords = feature?.geometry?.coordinates;
+    if (!Array.isArray(coords)) return null;
+    const [lng, lat] = coords.map((v: unknown) => Number(v));
+    if (!isFinite(lat) || !isFinite(lng)) return null;
+    return { lat, lng };
+  } catch {
+    return null; // сеть/таймаут/отмена — считаем «резервный тоже недоступен»
+  } finally {
+    clearTimeout(timer);
+    outerSignal?.removeEventListener('abort', abortOuter);
+  }
+}
+
+/**
+ * Геокодирование адреса через Nominatim (OSM) с ОБЯЗАТЕЛЬНЫМ fallback на Photon
+ * (audit/index.fixed.html, пункт D). При сетевой/HTTP-ошибке всех зеркал Nominatim
+ * делаем один запрос к Photon — только если он тоже неудачен, возвращаем исходную
+ * ошибку («нет соединения с геокодером»). «not_found» от Nominatim fallback НЕ
+ * триггерит (адрес реально отсутствует, а сервис жив).
  * Возвращает различимый статус, чтобы UI не смешивал «не найдено» и «сервис недоступен».
  */
 export async function osmGeocode(address: string, signal?: AbortSignal): Promise<OsmGeocodeResult> {
@@ -158,12 +316,18 @@ export async function osmGeocode(address: string, signal?: AbortSignal): Promise
     `q=${encodeURIComponent(address)}&limit=1`,
     signal,
   );
-  if (kind !== 'ok') return { point: null, kind };
-  const first = Array.isArray(data) ? data[0] : null;
-  const lat = first ? parseFloat(first.lat) : NaN;
-  const lng = first ? parseFloat(first.lon) : NaN;
-  if (!isFinite(lat) || !isFinite(lng)) return { point: null, kind: 'not_found' };
-  return { point: { lat, lng }, kind: 'ok' };
+  if (kind === 'ok') {
+    const first = Array.isArray(data) ? data[0] : null;
+    const lat = first ? parseFloat(first.lat) : NaN;
+    const lng = first ? parseFloat(first.lon) : NaN;
+    if (!isFinite(lat) || !isFinite(lng)) return { point: null, kind: 'not_found' };
+    return { point: { lat, lng }, kind: 'ok' };
+  }
+  if (kind === 'not_found') return { point: null, kind: 'not_found' };
+  // Сервисная ошибка (network/http) — fallback на Photon.
+  const photon = await fetchPhotonPoint(address, signal);
+  if (photon) return { point: photon, kind: 'ok' };
+  return { point: null, kind };
 }
 
 /**
@@ -178,43 +342,62 @@ export async function osmReverseGeocode(lat: number, lng: number, signal?: Abort
 
 export type TileStyle = 'scheme' | 'satellite' | 'hybrid';
 
-/** Тайловый URL провайдера esri-sat (Esri World Imagery): z/{y}/{x}. */
-function esriSatTileUrl(z: number, x: number, y: number): string {
-  return `${ESRI_SAT_TILE_URL}/${z}/${y}/${x}`;
-}
-
 /**
- * Получение URL тайла подложки.
- * ИСПРАВЛЕНИЕ АУДИТА 1.3: параметр `style` БОЛЬШЕ НЕ уничтожается (`void style;`) —
- * при style='satellite'|'hybrid' для любого tileServer подключается провайдер
- * esri-sat (Esri World Imagery); 'scheme' — обычная схема выбранного сервера.
+ * Получение URL тайла для выбранного рабочего провайдера (все — HTTPS, без ключей).
+ * tileServer принимает и legacy-значения ('osm', 'carto') — они нормализуются
+ * через normalizeTileServer в рабочие серверы из audit/index.fixed.html.
+ * Порядок аргументов в URL соответствует каждому провайдеру (у Esri — z/y/x).
+ * Слой «2ГИС» УДАЛЁН ПОЛНОСТЬЮ (ТЗ): значение '2gis' больше не принимается типом;
+ * строковые legacy-подстановки из старых сохранений попадают в unknown-ветку
+ * normalizeTileServer → Esri Streets.
  */
 export function getOSMTileUrl(
   zoom: number,
   x: number,
   y: number,
-  tileServer: 'osm' | 'opentopomap' | 'carto' | 'esri-sat' = 'osm',
+  tileServer: TileServerId | 'osm' | 'carto' = DEFAULT_TILE_SERVER,
   style: TileStyle = 'scheme'
 ): string {
-  // detectRetina: тайлы @2x доступны ТОЛЬКО у tile.openstreetmap.org и basemaps.cartocdn.com
-  // (макс. уровень их нативного зума — 19). Esri World_Imagery отдаёт 512-px тайлы без @2x,
-  // opentopomap — только до z17. maxNativeZoom учитывается вызывающим кодом.
-  const z = Math.min(Math.max(zoom, 0), 19);
-  // Спутниковые стили: явный запрос esri-sat ИЛИ style=satellite|hybrid на любом
-  // сервере — всегда Esri World Imagery (прямой XYZ-шаблон, x/y перевёрнуты).
-  if (tileServer === 'esri-sat' || style === 'satellite' || style === 'hybrid') {
-    return esriSatTileUrl(z, x, y);
+  // Аудит audit/index.fixed.html: tile.openstreetmap.org и Carto УДАЛЕНЫ как URL
+  // (403 по Referer для github.io / требование API-ключа). Все значения нормализуются
+  // к рабочим HTTPS-провайдерам без ключей:
+  //  - legacy 'osm' → Esri World Street Map (стиль по умолчанию — самый стабильный);
+  //  - legacy 'carto' → OSM France;
+  //  - style 'satellite'/'hybrid' → Esri World Imagery (спутник, без ключа).
+  // detectRetina (@2x) убран: тайлы @2x были доступны только удалённым OSM/Carto.
+  // ИСПРАВЛЕНИЕ АУДИТА 1.3 (игнорирование стиля): раньше параметр style уничтожался
+  // через `void style`, и спутниковые стили молча отдавали вектурную подложку.
+  // Теперь style='satellite'|'hybrid' (как и явный сервер 'esri-sat') жёстко
+  // маршрутизируется на провайдер Esri World Imagery (без ключа, HTTPS).
+  if (style === 'satellite' || style === 'hybrid') {
+    const zSat = Math.min(Math.max(Math.round(zoom), 0), TILE_PROVIDERS['esri-sat'].maxNativeZoom);
+    return esriUrl(ESRI_MIRRORS[0], 'World_Imagery', zSat, x, y);
   }
-  const retina = typeof window !== 'undefined' && (window.devicePixelRatio || 1) >= 1.5;
-  const at = retina ? '@2x' : '';
-  switch (tileServer) {
-    case 'opentopomap':
-      return `https://tile.opentopomap.org/${Math.min(z, 17)}/${x}/${y}.png`;
-    case 'carto':
-      return `https://basemaps.cartocdn.com/dark_all${at}/${z}/${x}/${y}.png`;
-    case 'osm':
-    default:
-      return `https://tile.openstreetmap.org/${z}/${x}/${y}${at}.png`;
+  const server: TileServerId = normalizeTileServer(tileServer);
+  // Нативный максимум берётся из реестра провайдеров — выше не поднимаемся
+  // (нет данных, только растяжение). Общий потолок сетки — z19.
+  const nativeMax = TILE_PROVIDERS[server].maxNativeZoom;
+  const z = Math.min(Math.max(Math.round(zoom), 0), 19);
+  const zc = Math.min(z, nativeMax);
+  return tileUrlFor(server, zc, x, y);
+}
+
+/**
+ * Отмена незавершённой загрузки <img>. Нативный HTMLImageElement.abort() есть не
+ * во всех движках (и отсутствует в типах DOM и happy-dom), поэтому вызов
+ * защищён feature-det'ом; сброс src='' — универсальный fallback.
+ */
+export function abortTileImage(img: HTMLImageElement): void {
+  const maybeAbort = (img as { abort?: () => void }).abort;
+  if (typeof maybeAbort === 'function') {
+    try { maybeAbort.call(img); } catch { /* движок отклонил отмену */ }
+  }
+  // removeAttribute — метод DOM-элемента; в моках/старых движках может отсутствовать,
+  // поэтому сброс src выполняется защищённо (тот же эффект отмены загрузки).
+  if (typeof img.removeAttribute === 'function') {
+    img.removeAttribute('src');
+  } else {
+    img.src = '';
   }
 }
 
@@ -222,65 +405,135 @@ export function getOSMTileUrl(
  * Тайл с деградацией до maxNativeZoom: выше родного разрешения тайлы НЕ растягиваются —
  * берётся ближайший доступный уровень и рисуется в физическом разрешении.
  *
- * ИСПРАВЛЕНИЕ АУДИТА 1.5 (утечки Canvas/Map): у загрузки есть `cancel()` — после
- * него гарантированно НЕ происходит ни resolve(img), ни присваивания img.src
- * вызывающим кодом (загрузка обрывается, обработчики снимаются, ссылка на Image
- * зануляется). Это исключает «прилетевшие» после отмены изображения в кэше и
- * DOM-слое при быстром панорамировании и при размонтировании компонента.
+ * ИСПРАВЛЕНИЕ ВЕЧНОГО СПИННЕРА («карта грузится и висит»): у <img> нет встроенного
+ * таймаута. Если CDN провайдера принимает соединение, но не отдаёт ответ (OSM-зеркала
+ * при 429/перегрузке так делают стабильно), onload/onerror не срабатывают НИКОГДА,
+ * а старый `img.src=''` отменяет загрузку только на части движков — промис зависал
+ * навсегда, слот очереди не освобождался и загрузка всей подложки останавливалась.
+ * Теперь по таймауту вызывается нативный img.abort() (гарантированная отмена),
+ * обработчики снимаются, а resolve происходит РОВНО один раз (settled-флаг).
+ */
+/** Публичный тип ручки загрузки тайла (см. startTileLoad). */
+export type TileLoadHandle = {
+  readonly image: HTMLImageElement;
+  cancel(): void;
+  readonly done: Promise<HTMLImageElement | null>;
+};
+
+/**
+ * Совместимость с legacy-API аудиторской ветки (регрессия аудита 1.5):
+ * `{ promise, cancel }` — тонкая обёртка над startTileLoad. Гарантии те же:
+ * после cancel() НЕ происходит ни resolve(img), ни последующего присваивания
+ * img.src (settled-флаг в startTileLoad + снятие обработчиков и сброс src в
+ * abortTileImage) — отменённая загрузка не оставляет in-flight Image.
  */
 export interface CancellableTileLoad {
   promise: Promise<HTMLImageElement | null>;
   cancel: () => void;
 }
-
 export function loadTileImageCancellable(url: string, timeoutMs = 8000): CancellableTileLoad {
-  let settled = false;
-  let cancelled = false;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  let resolveFn: (v: HTMLImageElement | null) => void = () => {};
-  const promise = new Promise<HTMLImageElement | null>((resolve) => { resolveFn = resolve; });
-  const img = new Image();
-  img.crossOrigin = 'anonymous';
-  const cleanup = () => {
-    if (timer !== null) { clearTimeout(timer); timer = null; }
-    img.onload = null;
-    img.onerror = null;
-  };
-  const finish = (value: HTMLImageElement | null) => {
-    if (settled) return;
-    settled = true;
-    cleanup();
-    // ЖЁСТКАЯ ГАРАНТИЯ: отменённая загрузка никогда не резолвится изображением
-    resolveFn(cancelled ? null : value);
-  };
-  timer = setTimeout(() => finish(null), timeoutMs);
-  img.onload = () => finish(img);
-  img.onerror = () => finish(null);
-  img.src = url;
-  const cancel = () => {
-    if (cancelled) return;
-    cancelled = true;
-    // Обрываем текущую сетевую загрузку браузера и снимаем все ссылки
-    try { img.src = ''; } catch { /* защищённые контексты */ }
-    finish(null);
-  };
-  return { promise, cancel };
-}
-
-/** Обратная совместимость: промис без handles отмены. */
-export async function loadTileImage(url: string, timeoutMs = 8000): Promise<HTMLImageElement | null> {
-  return loadTileImageCancellable(url, timeoutMs).promise;
+  const handle = startTileLoad(url, timeoutMs);
+  return { promise: handle.done, cancel: () => handle.cancel() };
 }
 
 /**
- * Тайл с перебором зеркал tile.openstreetmap.org (основной хост часто отдаёт
- * 429/таймауты под нагрузкой). Для URL других провайдеров — обычная загрузка.
+ * Загрузка тайла с ЯВНЫМ ручкой-контролем (P0 «зависания/утечки»): вызывающая
+ * сторона (MapCanvas) регистрирует handle в реестре in-flight и ОБЯЗАНА вызвать
+ * cancel() при размонтировании или отмене вида. Без этого Image с выставленным
+ * src доживал до внутреннего таймаута (10 c), держал DOM-элементы и резолвился
+ * на уже несмонтированном компоненте — утечка памяти + предупреждения React.
+ */
+export function startTileLoad(url: string, timeoutMs = 8000): TileLoadHandle {
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  let settled = false;
+  let resolveFn: ((v: HTMLImageElement | null) => void) | null = null;
+  const done = new Promise<HTMLImageElement | null>((res) => { resolveFn = res; });
+  const timer: ReturnType<typeof setTimeout> = setTimeout(() => finish(false), timeoutMs);
+  function finish(ok: boolean): void {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    img.onload = null;
+    img.onerror = null;
+    if (!ok) {
+      // Гарантированная отмена незавершённой загрузки (освобождает соединение браузера)
+      abortTileImage(img);
+      resolveFn?.(null);
+    } else {
+      resolveFn?.(img);
+    }
+  }
+  img.onload = () => finish(true);
+  img.onerror = () => finish(false);
+  // P0-фикс «зависание/утечка при загрузке карт» (тест wizardFreeze): src
+  // выставляется ПОСЛЕДНИМ и только если ручку ещё не отменили. Раньше присваивание
+  // img.src происходило синхронно внутри startTileLoad — если вызывающая сторона
+  // отменяла ручку в том же такте событий (unmount карты в момент постановки
+  // загрузки в очередь), finish(false) уже выполнился, но src всё равно выставлялся
+  // ПОЗЖЕ → Image оставался in-flight навсегда (в проде — до внутреннего таймаута,
+  // в тестах с моками без onload/onerror — бесконечно). Settled-флаг делает такую
+  // гонку безвредной: отменённая ручка никогда не запускает загрузку.
+  if (settled) {
+    return { image: img, cancel(): void { finish(false); }, done };
+  }
+  img.src = url;
+  return { image: img, cancel(): void { finish(false); }, done };
+}
+
+/** Обратная совместимость: обёртка над startTileLoad для существующих вызовов. */
+export async function loadTileImage(url: string, timeoutMs = 8000): Promise<HTMLImageElement | null> {
+  // P0-исправление wip-local: загрузка через ручку startTileLoad (гарантированная
+  // отмена img.abort() по таймауту, settled-флаг) + учёт ошибок/успехов аудита
+  // (noteTileError/noteTileSuccess → индикатор состояния слоя в MapCanvas).
+  const handle = startTileLoad(url, timeoutMs);
+  handle.done.then((img) => {
+    if (img) noteTileSuccess(); else noteTileError(url);
+    return img;
+  });
+  return handle.done;
+}
+
+/* ===== C. Учёт ошибок тайлов (аналог tileerror-наблюдателя из аудита) =====
+   Каждая неудачная загрузка/таймаут увеличивает счётчик, каждая успешная —
+   обнуляет его. При ≥3 ошибках подряд UI (MapCanvas) показывает понятное
+   предупреждение «Слой недоступен, попробуйте другой стиль» и индикатор
+   состояния слоя; alert() не используется. */
+let tileErrorCount = 0;
+const tileErrorListeners = new Set<(n: number) => void>();
+
+export function getTileErrorCount(): number { return tileErrorCount; }
+
+export function onTileError(cb: (n: number) => void): () => void {
+  tileErrorListeners.add(cb);
+  return () => { tileErrorListeners.delete(cb); };
+}
+
+function noteTileError(url: string): void {
+  tileErrorCount++;
+  tileErrorListeners.forEach((cb) => { try { cb(tileErrorCount); } catch { /* слушатель не должен ломать загрузку */ } });
+  // Единичные ошибки внешних серверов — штатная ситуация: только console.warn,
+  // без console.error (не засоряем консоль и не пугаем пользователя).
+  if (tileErrorCount <= 5) console.warn('Не удалось загрузить тайл:', url);
+}
+
+function noteTileSuccess(): void {
+  if (tileErrorCount !== 0) {
+    tileErrorCount = 0; // авто-возврат в состояние «ок» после первой удачи
+    tileErrorListeners.forEach((cb) => { try { cb(0); } catch { /* noop */ } });
+  }
+}
+
+/**
+ * Тайл с перебором зеркал: для Esri — server/services.arcgisonline.com
+ * (основной хост иногда отдаёт 5xx под нагрузкой). Для URL других провайдеров —
+ * обычная загрузка. Зеркала tile.openstreetmap.org УДАЛЕНЫ (403 по Referer).
  */
 export async function loadTileWithMirrors(url: string, timeoutMs = 8000): Promise<HTMLImageElement | null> {
-  const m = url.match(/^https:\/\/tile\.openstreetmap\.org\/(.+)$/);
+  const m = url.match(/^https:\/\/(server|services)\.arcgisonline\.com\/(.+)$/);
   if (!m) return loadTileImage(url, timeoutMs);
-  for (const host of OSM_TILE_MIRRORS) {
-    const img = await loadTileImage(host + '/' + m[1], timeoutMs);
+  for (const host of ESRI_MIRRORS) {
+    const img = await loadTileImage(`${host}/${m[2]}`, timeoutMs);
     if (img) return img;
   }
   return null;
@@ -324,7 +577,7 @@ export async function loadOSMStaticMap(
   zoom: number,
   width: number,
   height: number,
-  tileServer: 'osm' | 'opentopomap' | 'carto' = 'osm'
+  tileServer: TileServerId | 'osm' | 'carto' = DEFAULT_TILE_SERVER
 ): Promise<{ dataUrl: string; bounds: { north: number; south: number; east: number; west: number } }> {
   console.log(`Загрузка карты OSM: сервер=${tileServer}, центр=(${center.lat}, ${center.lng}), зум=${zoom}, размер=${width}x${height}`);
   

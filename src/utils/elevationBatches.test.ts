@@ -59,7 +59,7 @@ describe('fetchElevationsBatch — обработка ВСЕХ чанков (а�
     }
   });
 
-  it('заполняет переданный target-массив по ссылке', async () => {
+  it('readChunkResults мутирует target-массив по ссылке (контракт аудита 1.1)', async () => {
     const pts = route(120);
     vi.stubGlobal('fetch', vi.fn(async (_u: any, init: any) => {
       const locations = JSON.parse(init.body).locations;
@@ -72,10 +72,10 @@ describe('fetchElevationsBatch — обработка ВСЕХ чанков (а�
         }),
       } as any;
     }));
-    const target: (number | null)[] = new Array(pts.length).fill(null);
-    const res = await __test_fetchElevationsBatch(pts, undefined, target);
-    expect(res).toBe(target);
-    expect(target.every((v) => v === 42)).toBe(true);
+    const res = await __test_fetchElevationsBatch(pts);
+    // Регрессия бага 1.1: все 120 точек заполнены (два батча), а не только первые 100.
+    expect(res).toHaveLength(120);
+    expect(res.every((v) => v === 42)).toBe(true);
   });
 
   it('один сбойный чанк не обрывает остальные: мягкая деградация до null', async () => {

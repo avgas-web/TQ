@@ -626,13 +626,12 @@ export function planPathAroundZones(
       const pulled = stringPull(grid, obstacles);
       // финальная страховка: если после утончения путь всё же задевает зону —
       // возвращаем сырую сетку (она строится только по проходимым клеткам)
-      if (pulled.length >= 2 && !segmentTouchesZones(pulled[0], pulled[pulled.length - 1], obstacles) || true) {
-        let bad = false;
-        for (let i = 0; i + 1 < pulled.length; i++) {
-          if (segmentTouchesZones(pulled[i], pulled[i + 1], obstacles)) { bad = true; break; }
-        }
-        return simplify(bad ? grid : pulled);
-      }
+      // Финальная страховка без мёртвого условия: проверяем ВСЕ сегменты
+      // утончённого пути; если хоть один задевает зону — возвращаем сырую сетку.
+      const pulledOk =
+        pulled.length >= 2 &&
+        !pulled.some((_, i) => i + 1 < pulled.length && segmentTouchesZones(pulled[i], pulled[i + 1], obstacles));
+      return simplify(pulledOk ? pulled : grid);
       return simplify(pulled);
     }
   }

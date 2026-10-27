@@ -1,4 +1,5 @@
 // Утилиты для работы с хранилищем данных
+import { eventBus } from './eventBus';
 
 const STORAGE_KEY = 'totalquadro-storage';
 const MAP_DB_NAME = 'totalquadro-maps';
@@ -12,10 +13,8 @@ const TACTICAL_STORE_NAME = 'tactical-overlays';
 export function checkLocalStorageQuota(): { used: number; available: number; percentage: number } {
   let used = 0;
   
-  for (let key in localStorage) {
-    if (localStorage.hasOwnProperty(key)) {
-      used += localStorage[key].length + key.length;
-    }
+  for (const key of Object.keys(localStorage)) {
+    used += (localStorage.getItem(key)?.length ?? 0) + key.length;
   }
   
   // Примерный лимит localStorage (5 МБ)
@@ -54,15 +53,11 @@ export function cleanupLocalStorage(): void {
 /**
  * Пользовательское уведомление об ошибке сохранения (UX-слой).
  * console.error сам по себе невидим пользователю — при переполнении хранилища
- * данные терялись молча. Dispatch собственного события; компоненты могут
- * подписаться на него для показа тоста. detail содержит только текст (строку).
+ * данные терялись молча. Типобезопасная шина eventBus вместо window CustomEvent:
+ * компоненты подписываются через eventBus.on('storage:error', …).
  */
 export function notifyStorageError(message: string): void {
-  try {
-    window.dispatchEvent(new CustomEvent('tq:storage-error', { detail: message }));
-  } catch {
-    /* окружение без DOM — тихо пропускаем */
-  }
+  eventBus.emit('storage:error', { message });
 }
 
 /**
@@ -101,6 +96,16 @@ export function safeSetItem(key: string, value: string): boolean {
  */
 export function initMapDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
+    // Graceful degradation в средах без IndexedDB (jsdom/happy-dom в тестах,
+    // приватные режимы некоторых браузеров): раньше обращение к глобальному
+    // indexedDB бросало ReferenceError СИНХРОННО внутри executor'а — часть
+    // вызывающих кодов не имела .catch и получала unhandled rejection
+    // («Ошибка очистки IndexedDB» в консоли/тестах). Теперь — явная ошибка,
+    // которую все вызывающие обрабатывают штатно.
+    if (typeof indexedDB === 'undefined') {
+      reject(new Error('IndexedDB недоступна в этой среде'));
+      return;
+    }
     // Версия 2: добавлен store 'tactical-overlays' (Задача 2 — загрузка
     // пользовательских тактических карт). Апгрейд идемпотентен: старые БД v1
     // получают новый store в onupgradeneeded, существующие данные не трогаются.
@@ -256,6 +261,29 @@ export async function loadMapFromIndexedDB(mapId: string): Promise<string | null
   } catch (error) {
     console.error('Ошибка загрузки карты:', error);
     return null;
+  }
+}
+
+/**
+ * Полная очистка хранилища карт (используется кнопкой «Сброс»).
+ * @returns true, если база успешно очищена.
+ */
+export async function clearAllStoredMaps(): Promise<boolean> {
+  try {
+    const db = await initMapDatabase();
+    return new Promise((resolve) => {
+      const transaction = db.transaction([MAP_STORE_NAME], 'readwrite');
+      const store = transaction.objectStore(MAP_STORE_NAME);
+      const request = store.clear();
+      request.onsuccess = () => resolve(true);
+      request.onerror = () => {
+        console.error('Ошибка очистки хранилища карт');
+        resolve(false);
+      };
+    });
+  } catch (error) {
+    console.error('Ошибка очистки IndexedDB:', error);
+    return false;
   }
 }
 

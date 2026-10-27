@@ -8,6 +8,12 @@ import { useStore } from '../store/useStore';
 import type { OptimizeAlgorithm } from '../utils/mission';
 import { DEFAULT_WAYPOINT_PARAMS } from '../utils/mission';
 import { CombatAssetSim, type Telemetry } from '../utils/combatAssetSim';
+import { DRONE_PROFILES, type DroneMode, type DroneClass } from '../utils/droneProfiles';
+
+const MODE_OPTIONS: Array<{ id: DroneMode; label: string }> = [
+  { id: 'short_range', label: DRONE_PROFILES.short_range.label },
+  { id: 'long_range', label: DRONE_PROFILES.long_range.label },
+];
 
 const ALGORITHMS: Array<{ id: OptimizeAlgorithm; label: string }> = [
   { id: 'nearest_neighbor', label: 'Ближайший сосед' },
@@ -17,14 +23,24 @@ const ALGORITHMS: Array<{ id: OptimizeAlgorithm; label: string }> = [
 
 const MissionPanel: React.FC = () => {
   const project = useStore((s) => s.project);
+  // Флаг тяжёлой операции (пересчёт высот / загрузка миссии) — блокирует mutate-кнопки
+  const isProcessing = useStore((s) => s.isProcessing);
   const activeRouteId = useStore((s) => s.activeRouteId);
   const setActiveRoute = useStore((s) => s.setActiveRoute);
   const optimizeRouteOrder = useStore((s) => s.optimizeRouteOrder);
   const generateScanRoute = useStore((s) => s.generateScanRoute);
   const setWaypointParams = useStore((s) => s.setWaypointParams);
   const setMissionMeta = useStore((s) => s.setMissionMeta);
+  const setMissionMode = useStore((s) => s.setMissionMode);
   const droneAssignments = useStore((s) => s.droneAssignments);
   const setDroneAssignment = useStore((s) => s.setDroneAssignment);
+  // Парк дронов: режимы (short/long range), агрокласс, видеоканал — из домен-стора
+  const fleetDrones = useStore((s) => s.drones);
+  const registerDrone = useStore((s) => s.registerDrone);
+  const setDroneMode = useStore((s) => s.setDroneMode);
+  const setDroneClass = useStore((s) => s.setDroneClass);
+  const requestVideo = useStore((s) => s.requestVideo);
+  const videoStatusFor = useStore((s) => s.videoStatusFor);
 
   const routes = useMemo(() => project.routes || [], [project.routes]);
   const route = routes.find((r) => r.id === activeRouteId) ?? routes[0] ?? null;
@@ -36,6 +52,21 @@ const MissionPanel: React.FC = () => {
   const [author, setAuthor] = useState('');
   const [droneCount, setDroneCount] = useState(Math.max(1, droneAssignments.length));
   const [simLog, setSimLog] = useState<string[]>([]);
+  const [modeMsg, setModeMsg] = useState('');
+
+  /** Смена режима работы миссии (короткие/дальнобойные) + валидация профиля. */
+  const applyMissionMode = (mode: DroneMode): void => {
+    if (!route) return;
+    const cls: DroneClass | undefined = route.missionMeta?.droneClass;
+    const warns = setMissionMode(route.id, mode, cls);
+    if (warns === null) {
+      setModeMsg('⛔ Режим не применён — маршрут не соответствует профилю (см. предупреждения маршрута)');
+    } else if (warns.length > 0) {
+      setModeMsg(`⚠ Режим применён с предупреждениями: ${warns.join('; ')}`);
+    } else {
+      setModeMsg('✓ Режим применён: маршрут в пределах профиля');
+    }
+  };
 
   const wp = route?.waypointParams?.[Math.min(wpIndex, (route?.points.length ?? 1) - 1)] ?? DEFAULT_WAYPOINT_PARAMS;
 
@@ -103,9 +134,40 @@ const MissionPanel: React.FC = () => {
         {route?.missionMeta && (
           <div className="text-[11px] text-gray-400 mt-1">
             Автор: {route.missionMeta.author} · создана {new Date(route.missionMeta.createdAt).toLocaleString()}
+            {route.missionMeta.mode && (
+              <> · режим: {DRONE_PROFILES[route.missionMeta.mode].label}{route.missionMeta.droneClass === 'agri' ? ' · агродрон' : ''}</>
+            )}
           </div>
         )}
       </div>
+
+      {/* Режим работы миссии: короткие дистанции / дальнобойные */}
+      {route && (
+        <div className="border-t border-gray-700 pt-2">
+          <div className="text-xs text-gray-400 mb-1">Режим работы (профиль парка)</div>
+          <div className="flex gap-2">
+            {MODE_OPTIONS.map((m) => {
+              const active = (route.missionMeta?.mode ?? 'short_range') === m.id;
+              return (
+                <button
+                  key={m.id}
+                  onClick={() => applyMissionMode(m.id)}
+                  disabled={isProcessing}
+                  title={`${DRONE_PROFILES[m.id].maxMissionRangeM >= 1e6
+                    ? `до ${Math.round(DRONE_PROFILES[m.id].maxMissionRangeM / 1000)} км`
+                    : `до ${Math.round(DRONE_PROFILES[m.id].maxMissionRangeM / 1000)} км`} · высота ${DRONE_PROFILES[m.id].altitudeBandM[0]}–${DRONE_PROFILES[m.id].altitudeBandM[1]} м · видео ${DRONE_PROFILES[m.id].video.resolution}`}
+                  className={`flex-1 px-2 py-1 rounded text-white text-[11px] leading-tight ${
+                    active ? 'bg-blue-600' : 'bg-gray-700 hover:bg-gray-600'
+                  } disabled:opacity-40 disabled:cursor-not-allowed`}
+                >
+                  {m.id === 'short_range' ? '🚜 Короткие / агро' : '🛰 Дальнобойные ≤50 000 км'}
+                </button>
+              );
+            })}
+          </div>
+          {modeMsg && <div className="text-[11px] text-yellow-300 mt-1">{modeMsg}</div>}
+        </div>
+      )}
 
       {/* Оптимизация порядка точек */}
       <div className="border-t border-gray-700 pt-2">
@@ -120,8 +182,13 @@ const MissionPanel: React.FC = () => {
               <option key={a.id} value={a.id}>{a.label}</option>
             ))}
           </select>
-          <button onClick={runOptimize} className="px-3 py-1 bg-cyan-600 hover:bg-cyan-700 rounded text-white">
-            Оптимизировать
+          <button
+            onClick={runOptimize}
+            disabled={isProcessing}
+            title={isProcessing ? 'Блокировано: идёт тяжёлая операция' : undefined}
+            className="px-3 py-1 bg-cyan-600 hover:bg-cyan-700 rounded text-white disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {isProcessing ? '⏳ Занято…' : 'Оптимизировать'}
           </button>
         </div>
         {optMsg && <div className="text-[11px] text-emerald-300 mt-1">{optMsg}</div>}
@@ -140,8 +207,13 @@ const MissionPanel: React.FC = () => {
             title="Шаг линий сканирования, пикселей карты"
           />
           <span className="text-[11px] text-gray-500">шаг, px</span>
-          <button onClick={runScan} className="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 rounded text-white">
-            Построить
+          <button
+            onClick={runScan}
+            disabled={isProcessing}
+            title={isProcessing ? 'Блокировано: идёт тяжёлая операция' : undefined}
+            className="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 rounded text-white disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {isProcessing ? '⏳ Занято…' : 'Построить'}
           </button>
         </div>
       </div>
@@ -214,9 +286,47 @@ const MissionPanel: React.FC = () => {
         </div>
         {Array.from({ length: droneCount }, (_, i) => `uav-${i + 1}`).map((droneId) => {
           const a = droneAssignments.find((d) => d.droneId === droneId);
+          // Авто-регистрация дрона в парке при первом появлении в панели
+          if (!fleetDrones.some((d) => d.droneId === droneId)) {
+            registerDrone(droneId, 'udp://127.0.0.1:14550', ['video']);
+          }
+          const rec = fleetDrones.find((d) => d.droneId === droneId);
+          const video = videoStatusFor(droneId, 0);
           return (
             <div key={droneId} className="mb-1 p-2 bg-gray-800 rounded">
-              <div className="text-[11px] text-gray-400 mb-1">🛩 {droneId}</div>
+              <div className="text-[11px] text-gray-400 mb-1 flex items-center justify-between">
+                <span>🛩 {droneId}</span>
+                <button
+                  onClick={() => requestVideo(droneId, !rec?.videoRequested)}
+                  className={`px-2 py-0.5 rounded text-[10px] text-white ${video.streaming ? 'bg-red-600 animate-pulse' : 'bg-gray-600 hover:bg-gray-500'}`}
+                  title={video.note}
+                >
+                  {video.streaming ? '● REC LIVE' : '▶ Видео'}
+                </button>
+              </div>
+              <div className="grid grid-cols-3 gap-1 mb-1">
+                <select
+                  value={rec?.mode ?? 'short_range'}
+                  onChange={(e) => setDroneMode(droneId, e.target.value as DroneMode)}
+                  className="px-1 py-1 bg-gray-700 border border-gray-600 rounded text-white text-[11px]"
+                  title="Режим работы дрона"
+                >
+                  <option value="short_range">Короткий / агро</option>
+                  <option value="long_range">Дальнобойный ≤50 000 км</option>
+                </select>
+                <select
+                  value={rec?.droneClass ?? 'standard'}
+                  onChange={(e) => setDroneClass(droneId, e.target.value as DroneClass)}
+                  className="px-1 py-1 bg-gray-700 border border-gray-600 rounded text-white text-[11px]"
+                  title="Класс применения"
+                >
+                  <option value="standard">Обычный</option>
+                  <option value="agri">Агродрон</option>
+                </select>
+                <div className="px-1 py-1 text-[10px] text-gray-400 truncate" title={video.note}>
+                  {video.ok ? `📹 ${DRONE_PROFILES[rec?.mode ?? 'short_range'].video.resolution}` : '📹 —'}
+                </div>
+              </div>
               <div className="grid grid-cols-3 gap-1">
                 <select
                   value={a?.startId ?? ''}

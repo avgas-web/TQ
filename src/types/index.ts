@@ -74,6 +74,8 @@ export interface MapBounds {
   west: number;
 }
 
+/** Провайдеры карт. «2gis» УДАЛЁН ПОЛНОСТЬЮ (ТЗ: выбор карт без 2ГИС):
+ *  публичный тайловый сервис закрыт (tile-b01.2gis.com не резолвится). */
 export type MapProvider = 'local' | 'google' | 'yandex' | 'osm';
 
 export interface MapData {
@@ -127,11 +129,16 @@ export interface Project {
   };
   openStreetMap: {
     enabled: boolean;
-    tileServer: 'osm' | 'opentopomap' | 'carto';
+    /** Рабочие тайловые серверы без API-ключей (см. TILE_PROVIDERS в utils/openStreetMap.ts).
+     *  Значения legacy ('osm', 'carto') нормализуются normalizeTileServer()
+     *  при чтении — тип остаётся строкой для совместимости со старыми проектами. */
+    tileServer?: string;
   };
 }
 
-export type Tool = 'pan' | 'select' | 'addMarker' | 'drawRect' | 'drawPolygon' | 'drawCircle' | 'measure';
+// Ограничения — только бесполетные зоны произвольной геометрии (полигон):
+// инструменты drawRect/drawCircle удалены из рабочего процесса.
+export type Tool = 'pan' | 'select' | 'addMarker' | 'drawPolygon' | 'measure';
 
 export interface ViewState {
   offsetX: number;
@@ -140,6 +147,12 @@ export interface ViewState {
   /** Стартовый zoom (z0) тайловой привязки: мир = canvasWidth·2^z0 px при scale=1.
    *  Фиксируется при загрузке карты — масштаб больше не «сбивается» при ресайзе окна. */
   z0?: number;
+  /** Фактическая ширина канваса в CSS-px на момент записи вида в зеркало
+   *  'tq-view'. Нужна конвертеру кликов режима мастера (screenToGeo): без базы
+   *  размеров точка клика не может быть строго привязана к подложке. */
+  width?: number;
+  /** Фактическая высота канваса в CSS-px (см. width). */
+  height?: number;
 }
 
 export interface Measurement {
@@ -164,6 +177,9 @@ export interface RoutePoint {
    *  Задаётся перетаскиванием точки вверх/вниз (или вводом числа); определяет
    *  высоту всего участка до следующей управляющей точки. */
   altitudeAGL?: number | null;
+  /** Привязка узла к точке списка старта/цели: при переносе такой точки
+   *  маршрут автоматически перестраивается (routeId хранится в ImportPoint). */
+  binding?: WaypointBinding;
 }
 
 /** Тип линии маршрута: прямая или кривая (сглаженная сплайн-ломаная) */
@@ -189,10 +205,21 @@ export interface Route {
   waypointParams?: Record<number, WaypointParamsLite>;
 }
 
+/** Привязка путевой точки к списку старта/цели (importLists) — узел, а не весь маршрут. */
+export interface WaypointBinding {
+  kind: 'start' | 'goal';
+  /** id из importLists.starts / importLists.goals */
+  pointId: string;
+}
+
 /** Метаданные миссии (минимальная версия для сериализации проекта). */
 export interface MissionMetaLite {
   author: string;
   createdAt: string; // ISO 8601
+  /** Режим работы дрона для этой миссии (профиль парка). */
+  mode?: 'short_range' | 'long_range';
+  /** Класс применения: обычный / агродрон. */
+  droneClass?: 'standard' | 'agri';
 }
 
 /** Параметры путевой точки: задержка, угол камеры, скорость, радиус принятия. */
@@ -209,6 +236,26 @@ export interface DroneAssignment {
   startId?: string | null;  // id из importLists.starts
   goalId?: string | null;   // id из importLists.goals
   routeId?: string | null;
+  /** Имена дронов группы (роль в группе — leader и т.п.). Пусто = соло-дрон. */
+  groupMembers?: string[];
+}
+
+/** Группа дронов на один общий маршрут (до MAX_GROUP_SIZE штук). */
+export interface DroneGroup {
+  id: string;
+  name: string;
+  memberIds: string[];
+  routeId: string | null;
+  formation?: 'line' | 'v-shape' | 'grid';
+}
+
+/** Видеоканал дрона → GCS (симуляция стрима в браузере). */
+export interface DroneVideoState {
+  streaming: boolean;
+  /** Запрошен ли поток (кнопка «видео»). */
+  requested: boolean;
+  note: string;
+  ok: boolean;
 }
 
 /** Импортные списки: стартовые позиции и цели, каждая привязана к маршруту */
@@ -283,3 +330,8 @@ export interface TacticalOverlayLayer {
   importedAt: string; // ISO
   sizeBytes: number;
 }
+
+/** Максимум боевых аппаратов в парке (групповой удар до 10 000 БПЛА). */
+export const MAX_FLEET_SIZE = 10000;
+/** Максимум боевых аппаратов в одной группе (группа летит по одному боевому курсу). */
+export const MAX_GROUP_SIZE = 10000;

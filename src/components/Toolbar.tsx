@@ -53,9 +53,7 @@ const Toolbar: React.FC = () => {
     { id: 'pan', label: 'Пан', icon: '✋', title: 'Панорамирование (пробел+ЛКМ)' },
     { id: 'select', label: 'Выбор', icon: '👆', title: 'Выбор и перемещение точек' },
     { id: 'addMarker', label: 'Точка', icon: '📍', title: 'Добавить точку' },
-    { id: 'drawRect', label: 'Прям.', icon: '▭', title: 'Нарисовать прямоугольник' },
-    { id: 'drawPolygon', label: 'Полиг.', icon: '⬡', title: 'Нарисовать полигон (двойной клик — завершить)' },
-    { id: 'drawCircle', label: 'Круг', icon: '⭕', title: 'Нарисовать круг' },
+    { id: 'drawPolygon', label: 'NFZ', icon: '⬡', title: 'Бесполетная зона (произвольный полигон; двойной клик — завершить)' },
     { id: 'measure', label: 'Линейка', icon: '📏', title: 'Измерение расстояний' },
   ];
 
@@ -131,12 +129,12 @@ const Toolbar: React.FC = () => {
       {/* Abort Mission / Scrub Sector */}
       <button
         onClick={() => {
-          if (confirm('ОТМЕНА БОЕВОЙ ЗАДАЧИ: стереть сектор? Все данные будут потеряны.')) {
+          if (confirm('ОТМЕНА БОЕВОЙ ЗАДАЧИ (Abort Mission / Scrub Sector): стереть сектор? Будут удалены ВСЕ данные: карта, точки старта/цели, все маршруты, зоны ПВО (ADIZ), парк боевых аппаратов и настройки.')) {
             resetProject();
           }
         }}
         className="px-3 py-2 bg-red-700 hover:bg-red-800 text-white rounded text-sm font-medium transition-colors"
-        title="Новый проект"
+        title="Полный сброс: карта, точки, маршруты, ограничения, дроны"
       >
         🔄 Abort Mission
       </button>

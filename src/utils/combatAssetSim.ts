@@ -4,10 +4,23 @@
 // таймаутами, retry-логикой и журналированием. Публичный API повторяет
 // имена функций из ТЗ (preflight_check, arm, takeoff, ...), стиль — camelCase.
 
-import { MAX_ALTITUDE_M, ValidationError, normalizeAngle360 } from './mission';
+import { MAX_ALTITUDE_M, ValidationError, normalizeAngle360, missionChecksum, type RouteNode3D } from './mission';
 
 export type FlightMode = 'Manual' | 'Stabilize' | 'Loiter' | 'Guided' | 'Auto' | 'RTL' | 'Land';
 export const FLIGHT_MODES: readonly FlightMode[] = ['Manual', 'Stabilize', 'Loiter', 'Guided', 'Auto', 'RTL', 'Land'];
+
+/** Детекция распознавателя (CV-канал для track_target). */
+export interface CvDetection {
+  objectId: string;
+  lat: number;
+  lon: number;
+  altM: number;
+  /** Уверенность модели [0..1]. */
+  confidence: number;
+}
+
+/** Источник детекций: callback, возвращающий объекты текущего кадра. */
+export type DetectionSource = () => CvDetection[] | Promise<CvDetection[]>;
 
 export type GeofenceAction = 'report' | 'loiter' | 'rtl' | 'land';
 export type NoFlyShape = 'cylinder' | 'polygon' | 'sphere';
@@ -79,6 +92,8 @@ export interface MissionExecutionState {
   missionId: string | null;
   wpIndex: number;
   status: 'idle' | 'running' | 'paused' | 'done' | 'aborted';
+  /** Чексумма загруженной миссии (для сверки с локальной версией). */
+  checksum?: string;
 }
 
 type LogLevel = 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL';
@@ -89,6 +104,8 @@ interface LogRecord {
 }
 
 const DEFAULT_TIMEOUT_MS = 5000;
+/** Допустимые форматы канала связи: udp://host:port, tcp://host:port, serial://dev, host:port. */
+const CONNECTION_STRING_RE = /^(?:[\w.-]+@)?(?:(?:udp|tcp|serial|ws|wss):\/\/[\w.:/+-]+|[\w.-]+:\d+)$/;
 const RETRY_BASE_DELAY_MS = 100;
 const MIN_SATS = 6;
 const MIN_BATTERY_ARM_PCT = 50;
@@ -116,12 +133,14 @@ export class CombatAssetSim {
   };
   private targets: Map<string, { lat: number; lon: number; altM: number; priority: number; type: TargetType }> = new Map();
   private trackedTargetId: string | null = null;
+  private cvSource: DetectionSource | null = null;
   private gimbal = { pitch: 0, roll: 0, yaw: 0 };
   private media = { photos: 0, videoRecording: false };
   private mission: MissionExecutionState = { missionId: null, wpIndex: 0, status: 'idle' };
   private log: LogRecord[] = [];
   private connectionUp = true;
   private lockChain: Promise<unknown> = Promise.resolve();
+  private heldBy = 0;
 
   constructor(droneId: string, start: Partial<Telemetry> = {}) {
     this.droneId = droneId;
@@ -172,6 +191,18 @@ export class CombatAssetSim {
     return run;
   }
 
+  /** Реентерабельная секция: если замок уже удерживается текущей цепочкой — выполняется сразу. */
+  private async withLockReentrant<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.heldBy > 0) {
+      this.heldBy++;
+      try { return await fn(); } finally { this.heldBy--; }
+    }
+    return this.withLock(async () => {
+      this.heldBy++;
+      try { return await fn(); } finally { this.heldBy--; }
+    });
+  }
+
   /** Выполняет команду с таймаутом и повторными попытками (эксп. задержка). */
   private async withRetry<T>(label: string, fn: () => Promise<T>, timeoutMs = DEFAULT_TIMEOUT_MS, retries = 2): Promise<T> {
     let attempt = 0;
@@ -205,7 +236,7 @@ export class CombatAssetSim {
    *   причин в поле checks.
    */
   async preflightCheck(): Promise<PreflightResult> {
-    return this.withLock(async () => {
+    return this.withLockReentrant(async () => {
       this.requireConnection();
       const checks: Record<string, string> = {};
       if (this.state.sats < MIN_SATS) checks.gps = `GPS fix слабый: ${this.state.sats} спутников (мин. ${MIN_SATS})`;
@@ -221,8 +252,8 @@ export class CombatAssetSim {
 
   /** Вооружение моторов с проверками безопасности (arm). */
   async arm(): Promise<void> {
-    return this.withLock(() =>
-      this.withRetry('arm', async () => {
+    return this.withLockReentrant(async () => {
+      await this.withRetry('arm', async () => {
         this.requireConnection();
         if (this.state.armed) throw new ValidationError('Дрон уже вооружён');
         if (this.state.airborne) throw new ValidationError('Нельзя вооружить дрон в воздухе повторно');
@@ -230,13 +261,13 @@ export class CombatAssetSim {
         if (!pf.ok) throw new HardwareError(`Preflight не пройден: ${Object.values(pf.checks).filter((v) => v !== 'ok').join('; ')}`);
         this.state.armed = true;
         this.pushLog('INFO', 'Моторы вооружены');
-      }),
-    );
+      });
+    });
   }
 
   /** Сброс вооружения; в воздухе disarm запрещён (disarm). */
   async disarm(): Promise<void> {
-    return this.withLock(() =>
+    return this.withLockReentrant(() =>
       this.withRetry('disarm', async () => {
         this.requireConnection();
         if (!this.state.armed) throw new ValidationError('Дрон не вооружён');
@@ -253,7 +284,7 @@ export class CombatAssetSim {
     if (altitudeM <= 0 || altitudeM > MAX_ALTITUDE_M) {
       throw new ValidationError(`Высота взлёта вне диапазона [0..${MAX_ALTITUDE_M}]: ${altitudeM}`);
     }
-    return this.withLock(() =>
+    return this.withLockReentrant(() =>
       this.withRetry('takeoff', async () => {
         this.requireConnection();
         if (!this.state.armed) throw new HardwareError('Вооружите моторы перед взлётом');
@@ -379,11 +410,50 @@ export class CombatAssetSim {
     this.pushLog('INFO', `Цель ${id} (${type}, приоритет ${priority}) назначена`);
   }
 
-  /** Автослежение за целью (track_target); CV-интеграция — заглушка. */
-  trackTarget(objectId: string): void {
+  /**
+   * Автослежение за целью (track_target) с CV-интеграцией.
+   *
+   * Регистрирует callback детектора (например, YOLO через WebRTC-поток):
+   * при каждом вызове `processFrame(detections)` цель, совпавшая по object_id,
+   * обновляет координаты и дрон доворачивается на неё (pointCameraAtTarget).
+   * Без зарегистрированного CV-канала поведение — ручное слежение по последней
+   * известной позиции цели (как раньше).
+   *
+   * Args:
+   *   objectId (string): идентификатор распознанного объекта/цели.
+   *   cv (DetectionSource | null): источник детекций; null — отключить CV-канал.
+   *
+   * Raises:
+   *   ValidationError: цель не зарегистрирована.
+   */
+  trackTarget(objectId: string, cv: DetectionSource | null = null): void {
     if (!this.targets.has(objectId)) throw new ValidationError(`Цель ${objectId} не зарегистрирована`);
     this.trackedTargetId = objectId;
-    this.pushLog('INFO', `Автослежение за ${objectId}`);
+    this.cvSource = cv;
+    this.pushLog('INFO', cv ? `Автослежение за ${objectId} (CV-канал подключён)` : `Автослежение за ${objectId} (ручная позиция)`);
+  }
+
+  /**
+   * Обработка кадра детекций от CV-системы (интеграция recognition-модуля).
+   *
+   * Args:
+   *   detections (CvDetection[]): распознанные объекты кадра.
+   *
+   * Returns:
+   *   boolean: true, если текущая отслеживаемая цель обновлена этим кадром.
+   */
+  processFrame(detections: CvDetection[]): boolean {
+    if (!this.trackedTargetId || !this.cvSource) return false;
+    const det = detections.find((d) => d.objectId === this.trackedTargetId);
+    if (!det) return false;
+    validateGeoPoint(det.lat, det.lon);
+    const t = this.targets.get(this.trackedTargetId)!;
+    t.lat = det.lat;
+    t.lon = det.lon;
+    if (Number.isFinite(det.altM)) t.altM = Math.max(0, Math.min(MAX_ALTITUDE_M, det.altM));
+    this.pointCameraAtTarget(this.trackedTargetId);
+    this.pushLog('DEBUG', `CV: цель ${this.trackedTargetId} обновлена (${det.confidence.toFixed(2)})`);
+    return true;
   }
 
   /** Управление подвесом камеры (set_gimbal), углы нормализуются. */
@@ -571,9 +641,38 @@ export class CombatAssetSim {
 
   // ──────────────────────── Блок 1 (выполнение): миссия ────────────────────────
 
-  loadMission(missionId: string): void {
-    this.mission = { missionId, wpIndex: 0, status: 'running' };
-    this.pushLog('INFO', `Миссия ${missionId} загружена`);
+  /**
+   * Загрузка миссии в память контроллера (upload_mission) с проверкой чексуммы.
+   *
+   * Args:
+   *   missionId (string): идентификатор миссии.
+   *   waypoints (RouteNode3D[]): путевые точки (для расчёта чексуммы).
+   *   expectedChecksum (string | undefined): эталон; по умолчанию — вычисленная
+   *     из точек (эмуляция успешного подтверждения борта).
+   *
+   * Returns:
+   *   { ok: boolean; checksum: string; message?: string }.
+   *
+   * Raises:
+   *   ValidationError: некорректные точки маршрута.
+   */
+  loadMission(
+    missionId: string,
+    waypoints?: RouteNode3D[],
+    expectedChecksum?: string,
+  ): { ok: boolean; checksum: string; message?: string } {
+    let checksum = expectedChecksum ?? '';
+    if (waypoints) {
+      const computed = missionChecksum(waypoints);
+      checksum = expectedChecksum ?? computed;
+      if (expectedChecksum && expectedChecksum !== computed) {
+        this.pushLog('ERROR', `Миссия ${missionId}: чексумма не совпала (${computed} ≠ ${expectedChecksum})`);
+        return { ok: false, checksum: computed, message: 'checksum_mismatch' };
+      }
+    }
+    this.mission = { missionId, wpIndex: 0, status: 'running', checksum };
+    this.pushLog('INFO', `Миссия ${missionId} загружена (чексумма ${checksum || '—'})`);
+    return { ok: true, checksum };
   }
 
   pauseMission(): void {
@@ -647,7 +746,8 @@ export class FleetManager {
 
   registerDrone(droneId: string, connectionString: string, capabilities: string[]): void {
     if (!droneId.trim()) throw new ValidationError('drone_id пуст');
-    if (!/^[\w.-]+@[\w.-]+(:\d+)?$/.test(connectionString)) throw new ValidationError(`Некорректный connection_string: ${connectionString}`);
+    // Формат: [имя@]udp://host[:порт] | tcp://host:порт | serial://устройство | host:порт
+    if (!CONNECTION_STRING_RE.test(connectionString.trim())) throw new ValidationError(`Некорректный connection_string: ${connectionString}`);
     if (!capabilities.length) throw new ValidationError('capabilities пусты');
     this.drones.set(droneId, { droneId, connectionString, capabilities });
   }

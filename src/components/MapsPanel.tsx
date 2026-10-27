@@ -2,7 +2,9 @@ import React, { useState, useRef } from 'react';
 import { useStore } from '../store/useStore';
 import { loadGoogleMapsApi, geocodeAddress, loadStaticMap, isGoogleMapsLoaded } from '../utils/googleMaps';
 import { loadYandexMapsApi, yandexGeocode, loadYandexStaticMap, isYandexMapsLoaded } from '../utils/yandexMaps';
-import { osmGeocode, loadOSMStaticMap } from '../utils/openStreetMap';
+import { osmGeocode } from '../utils/openStreetMap';
+import { TILE_PROVIDERS, TILE_SERVER_ORDER, DEFAULT_TILE_SERVER, normalizeTileServer } from '../utils/openStreetMap';
+import type { TileServerId } from '../utils/openStreetMap';
 import type { MapProvider } from '../types';
 
 const MapsPanel: React.FC = () => {
@@ -13,7 +15,10 @@ const MapsPanel: React.FC = () => {
   const [zoomInput, setZoomInput] = useState('15');
   const [googleMapType, setGoogleMapType] = useState<'roadmap' | 'satellite' | 'hybrid' | 'terrain'>('satellite');
   const [yandexMapType, setYandexMapType] = useState<'map' | 'satellite' | 'hybrid'>('satellite');
-  const [osmTileServer, setOsmTileServer] = useState<'osm' | 'opentopomap' | 'carto'>('osm');
+  // Стиль подложки — рабочий провайдер без API-ключей (реестр TILE_PROVIDERS,
+  // аудит audit/index.fixed.html): tile.openstreetmap.org и CartoDB УДАЛЕНЫ
+  // (403 по Referer для github.io / требование ключа соответственно).
+  const [osmTileServer, setOsmTileServer] = useState<TileServerId>(DEFAULT_TILE_SERVER);
   const [widthInput, setWidthInput] = useState('2048');
   const [heightInput, setHeightInput] = useState('2048');
   const [loading, setLoading] = useState(false);
@@ -44,7 +49,8 @@ const MapsPanel: React.FC = () => {
       setYandexApiKey(project.yandexMaps.apiKey);
     }
     if (project.openStreetMap?.tileServer) {
-      setOsmTileServer(project.openStreetMap.tileServer);
+      // legacy-значения ('osm', 'carto') нормализуются в рабочие серверы
+      setOsmTileServer(normalizeTileServer(project.openStreetMap.tileServer));
     }
   }, [project]);
 
@@ -112,6 +118,7 @@ const MapsPanel: React.FC = () => {
       } else if (activeProvider === 'yandex' && isYandexMapsLoaded()) {
         result = await yandexGeocode(addressInput);
       } else if (activeProvider === 'osm') {
+        // Тот же бесплатный геокодер (Nominatim + fallback Photon).
         const res = await osmGeocode(addressInput);
         result = res.point;
         if (!result) {
@@ -219,6 +226,9 @@ const MapsPanel: React.FC = () => {
           source: 'yandex',
         });
       } else if (activeProvider === 'osm') {
+        // «2ГИС» УДАЛЁН ПОЛНОСТЬЮ (ТЗ): вкладки и ветки загрузки больше нет —
+        // выбор карт ограничен рабочими провайдерами (Google/Яндекс по ключу,
+        // бесплатные XYZ-подложки без ключей).
         // ПРОСТАЯ ЗАГРУЗКА KAK НА OPENSTREETMAP.ORG: вместо «фотографии»-стоп-кадра
         // (сотни тайлов в один большой PNG — медленно и с потерей чёткости при зуме)
         // создаётся АКТИВНАЯ тайловая карта: подложка грузится тайлами динамически,
@@ -233,6 +243,14 @@ const MapsPanel: React.FC = () => {
         }
 
         loadActiveTileMap(geoResult, zoom);
+        // «2ГИС» УДАЛЁН ПОЛНОСТЬЮ (ТЗ): источник — только 'osm' (активная тайловая
+        // карта рабочих HTTPS-подложек без ключей; legacy-значения из старых
+        // сохранений нормализует normalizeTileServer()).
+        useStore.setState((cur) => ({
+          project: cur.project.map
+            ? { ...cur.project, map: { ...cur.project.map, source: 'osm' } }
+            : cur.project,
+        }));
 
         // Снимок-подложка для OSM НЕ загружается: активная тайловая карта уже
         // является основной подложкой (как на openstreetmap.org). Фоновый big-PNG
@@ -265,6 +283,7 @@ const MapsPanel: React.FC = () => {
     { id: 'google' as MapProvider, name: 'Google', icon: '🌍', enabled: project.googleMaps?.enabled },
     { id: 'yandex' as MapProvider, name: 'Яндекс', icon: '🗺️', enabled: project.yandexMaps?.enabled },
     { id: 'osm' as MapProvider, name: 'OSM', icon: '🌐', enabled: project.openStreetMap?.enabled },
+    // «2ГИС» УДАЛЁН ПОЛНОСТЬЮ (ТЗ: выбор карт без 2ГИС) — пункт C аудита.
   ];
 
   return (
@@ -295,66 +314,78 @@ const MapsPanel: React.FC = () => {
 
       {/* API Key section */}
       {activeProvider === 'google' && (
-        <div>
+        <form
+          onSubmit={(e) => { e.preventDefault(); handleSaveGoogleApiKey(); }}
+          autoComplete="off"
+        >
           <label className="text-xs text-gray-400 block mb-1">API ключ Google Maps</label>
           <div className="flex gap-1">
             <input
               type="password"
+              name="google-maps-key"
+              autoComplete="new-password"
               value={googleApiKey}
               onChange={(e) => setGoogleApiKey(e.target.value)}
               placeholder="Введите API ключ"
               className="flex-1 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white placeholder-gray-500"
             />
             <button
-              onClick={handleSaveGoogleApiKey}
+              type="submit"
               disabled={loading}
               className="px-3 py-1 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white rounded text-xs"
             >
               {loading ? '...' : 'OK'}
             </button>
           </div>
-        </div>
+        </form>
       )}
 
       {activeProvider === 'yandex' && (
-        <div>
+        <form
+          onSubmit={(e) => { e.preventDefault(); handleSaveYandexApiKey(); }}
+          autoComplete="off"
+        >
           <label className="text-xs text-gray-400 block mb-1">API ключ Яндекс.Карт</label>
           <div className="flex gap-1">
             <input
               type="password"
+              name="yandex-maps-key"
+              autoComplete="new-password"
               value={yandexApiKey}
               onChange={(e) => setYandexApiKey(e.target.value)}
               placeholder="Введите API ключ"
               className="flex-1 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white placeholder-gray-500"
             />
             <button
-              onClick={handleSaveYandexApiKey}
+              type="submit"
               disabled={loading}
               className="px-3 py-1 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white rounded text-xs"
             >
               {loading ? '...' : 'OK'}
             </button>
           </div>
-        </div>
+        </form>
       )}
 
       {activeProvider === 'osm' && (
         <div>
-          <label className="text-xs text-gray-400 block mb-1">Сервер тайлов</label>
+          <label className="text-xs text-gray-400 block mb-1" htmlFor="osm-tile-server">Сервер тайлов (рабочие, без ключей)</label>
           <select
+            id="osm-tile-server"
+            aria-label="Сервер тайлов подложки карты"
             value={osmTileServer}
             onChange={(e) => {
-              const value = e.target.value as 'osm' | 'opentopomap' | 'carto';
+              const value = normalizeTileServer(e.target.value);
               setOsmTileServer(value);
               setOSMTileServer(value);
             }}
             className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white"
           >
-            <option value="osm">OpenStreetMap</option>
-            <option value="opentopomap">OpenTopoMap</option>
-            <option value="carto">CartoDB Light</option>
+            {TILE_SERVER_ORDER.map((id) => (
+              <option key={id} value={id}>{TILE_PROVIDERS[id].label}</option>
+            ))}
           </select>
-          <p className="text-xs text-green-400 mt-2">✓ OSM активен (не требует API ключа)</p>
+          <p className="text-xs text-green-400 mt-2">✓ Все стили работают по HTTPS без API-ключей; стиль по умолчанию — Esri (самый стабильный)</p>
         </div>
       )}
 
@@ -419,17 +450,18 @@ const MapsPanel: React.FC = () => {
           )}
           {activeProvider === 'osm' && (
             <select
+              aria-label="Стиль подложки карты"
               value={osmTileServer}
               onChange={(e) => {
-                const value = e.target.value as 'osm' | 'opentopomap' | 'carto';
+                const value = normalizeTileServer(e.target.value);
                 setOsmTileServer(value);
                 setOSMTileServer(value);
               }}
               className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white"
             >
-              <option value="osm">OSM Standard</option>
-              <option value="opentopomap">Topo</option>
-              <option value="carto">Light</option>
+              {TILE_SERVER_ORDER.map((id) => (
+                <option key={id} value={id}>{TILE_PROVIDERS[id].label}</option>
+              ))}
             </select>
           )}
         </div>
@@ -494,10 +526,10 @@ const MapsPanel: React.FC = () => {
         {activeProvider === 'osm' && (
           <div className="space-y-0.5">
             <p>• Не требует API ключа</p>
-            <p>• Бесплатно и открыто</p>
-            <p>• Автоматически активирован</p>
-            <p>• Ограничения: 1 запрос/сек</p>
-            <p>• Уважайте правила использования</p>
+            <p>• Esri Street — стиль по умолчанию (самый стабильный на GitHub Pages)</p>
+            <p>• OSM France / Germany, OpenTopoMap, CyclOSM — рабочие зеркала без 403</p>
+            <p>• Геокодер: Nominatim с фоллбэком при недоступности (1 запрос/сек)</p>
+            <p>• Уважайте правила использования серверов тайлов</p>
           </div>
         )}
       </div>

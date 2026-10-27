@@ -37,51 +37,123 @@ function dedupe(points: ElevationPoint[]): ElevationPoint[] {
   return out;
 }
 
+/** Сброс кэша высот. Используется тестами для изоляции: module-level кэш
+ *  живёт всю жизнь воркера, и без очистки мок-fetch из одного теста мог
+ *  «прижить» значение для координат другого теста. */
+export function __resetElevationCacheForTests(): void {
+  elevCache.clear();
+}
+
 /** Запрос батча высот к Open-Elevation. Батчи разбиваются по ≤100 точек
  *  (защита от слишком больших URL/таймаутов), выполняются последовательно
- *  (публичный API бесплатно троттлит частые запросы).
- *  ВАЖНО (исправление аудита 1.1): цикл обрабатывает ВСЕ чанки — досрочный
- *  `return readChunkResults(...)` внутри цикла раньше обрывал маршруты длиннее
- *  100 точек (второй и последующие батчи не запрашивались, хвост оставался без
- *  высот). Здесь нет return в теле цикла: функция заполняет массив результатов
- *  по ссылке (`target`, если передан) и возвращает его только после прохода
- *  всех батчей. */
-async function fetchElevationsBatch(
-  points: ElevationPoint[],
-  signal?: AbortSignal,
-  target?: (number | null)[],
-): Promise<(number | null)[]> {
-  const results: (number | null)[] = target ?? new Array(points.length).fill(null);
+ *  (публичный API бесплатно троттлит частые запросы). */
+interface RawElevationResult {
+  latitude?: unknown;
+  longitude?: unknown;
+  elevation?: unknown;
+}
+interface ElevationResponseShape {
+  results?: unknown;
+}
+
+/** Таймаут одного запроса к публичному API: без него зависшее соединение
+ *  (open-elevation медленно отвечает под нагрузкой) вешает весь прогон
+ *  пересчёта высот — «кнопка Пересчитать не работает». */
+const REQUEST_TIMEOUT_MS = 25_000;
+
+/** Разобрать ответ API для чанка: сопоставление по координатам (API обычно
+ *  сохраняет порядок, но надёжнее keyed-сопоставление), null для отсутствующих. */
+function readChunkResults(
+  json: ElevationResponseShape,
+  chunk: ElevationPoint[],
+  results: (number | null)[],
+  off: number,
+): (number | null)[] {
+  const list: RawElevationResult[] = Array.isArray(json?.results) ? (json.results as RawElevationResult[]) : [];
+  const isValidElev = (r: RawElevationResult | undefined): r is RawElevationResult & { elevation: number } =>
+    !!r && typeof r.elevation === 'number' && Number.isFinite(r.elevation);
+  // Сопоставление по координатам (API обычно сохраняет порядок, но надёжнее
+  // keyed-сопоставление). Если ответ не содержит latitude/longitude (упрощённые
+  // мок-ответы или нестандартные прокси) — откат на позиционное сопоставление:
+  // API гарантирует тот же порядок locations, что и в запросе.
+  const byKey = new Map<string, number>();
+  let anyCoordMatched = false;
+  for (const r of list) {
+    if (isValidElev(r) && typeof r.latitude === 'number' && typeof r.longitude === 'number') {
+      byKey.set(cacheKey(r.latitude, r.longitude), r.elevation);
+    }
+  }
+  chunk.forEach((p, i) => {
+    const v = byKey.get(cacheKey(p.lat, p.lng));
+    if (v !== undefined) { results[off + i] = v; anyCoordMatched = true; }
+    else if (byKey.size === 0) {
+      // ни одна запись не имеет координат → используем порядок ответа
+      results[off + i] = isValidElev(list[i]) ? list[i].elevation : null;
+    } else results[off + i] = null;
+  });
+  void anyCoordMatched;
+  return results;
+}
+
+export async function fetchElevationsBatch(points: ElevationPoint[], signal?: AbortSignal): Promise<(number | null)[]> {
+  const results: (number | null)[] = new Array(points.length).fill(null);
   const CHUNK = 100;
   for (let off = 0; off < points.length; off += CHUNK) {
     const chunk = points.slice(off, off + CHUNK);
+    // Собственный сигнал с таймаутом, наследующий отмену внешнего.
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
+    const onOuterAbort = (): void => timeout.abort();
+    signal?.addEventListener('abort', onOuterAbort);
     try {
       const resp = await fetch(OPEN_ELEVATION_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ locations: chunk.map((p) => ({ latitude: p.lat, longitude: p.lng })) }),
-        signal,
+        signal: timeout.signal,
       });
-      if (!resp.ok) throw new Error(`Open-Elevation HTTP ${resp.status}`);
-      const json = await resp.json();
-      const list: any[] = Array.isArray(json?.results) ? json.results : [];
-      // API обычно сохраняет порядок, но сопоставляем надёжно по координатам
-      const byKey = new Map<string, number>();
-      for (const r of list) {
-        if (typeof r?.elevation === 'number' && Number.isFinite(r.elevation) &&
-            typeof r?.latitude === 'number' && typeof r?.longitude === 'number') {
-          byKey.set(cacheKey(r.latitude, r.longitude), r.elevation);
+      // 429 Too Many Requests (публичный Open-Elevation троттлит частые
+      // обращения): одна вежливая повторная попытка с backoff по Retry-After
+      // (или 3 с). Если снова 429 — НЕ роняем приложение: мягкая деградация
+      // ниже (null-высоты + warning в routeWarnings у вызывающего кода).
+      if (resp.status === 429 && !timeout.signal.aborted) {
+        const raHeader = Number(resp.headers?.get?.('Retry-After'));
+        const delayMs = Number.isFinite(raHeader) && raHeader > 0 ? Math.min(raHeader * 1000, 10_000) : 3_000;
+        await new Promise<void>((res) => {
+          const t = setTimeout(res, delayMs);
+          const stop = (): void => { clearTimeout(t); res(); };
+          timeout.signal.addEventListener('abort', stop, { once: true });
+        });
+        if (!timeout.signal.aborted) {
+          const retry = await fetch(OPEN_ELEVATION_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ locations: chunk.map((p) => ({ latitude: p.lat, longitude: p.lng })) }),
+            signal: timeout.signal,
+          });
+          if (retry.ok) {
+            const json = (await retry.json()) as ElevationResponseShape;
+            // Аудит 1.1: НЕ возвращаем результат досрочно — readChunkResults
+            // мутирует results по ссылке; цикл обязан пройти ВСЕ чанки
+            // (маршруты >100 точек раньше обрывались на первом батче).
+            readChunkResults(json, chunk, results, off);
+            continue; // повтор успешен — читаем исходный 429-ответ нельзя
+          }
         }
       }
-      chunk.forEach((p, i) => {
-        const v = byKey.get(cacheKey(p.lat, p.lng));
-        results[off + i] = v ?? null;
-      });
+      if (!resp.ok) throw new Error(`Open-Elevation HTTP ${resp.status}`);
+      const json = (await resp.json()) as ElevationResponseShape;
+      // Аудит 1.1: без return внутри цикла for — иначе хвост маршрутов
+      // длиннее 100 точек оставался без высот (null).
+      readChunkResults(json, chunk, results, off);
     } catch (err) {
-      if ((err as any)?.name === 'AbortError') throw err;
+      if ((err as { name?: string })?.name === 'AbortError' && signal?.aborted) throw err; // явная отмена прогона — не глотаем
       console.warn('[elevation] запрос батча не выполнен:', (err as Error)?.message);
       // остальные чанки помечаем null — вызывающий код деградирует мягко
       for (let i = off; i < Math.min(off + CHUNK, points.length); i++) results[i] = null;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onOuterAbort);
     }
   }
   return results;
@@ -95,9 +167,6 @@ export async function fetchElevations(points: ElevationPoint[], signal?: AbortSi
   const out: (number | null)[] = new Array(points.length).fill(null);
   const uniq = dedupe(points);
   const missing = uniq.filter((p) => !elevCache.has(cacheKey(p.lat, p.lng)));
-  // ВАЖНО (аудит 1.1): один вызов покрывает ВСЕ недостающие точки независимо
-  // от их количества — разбиение на чанки ≤100 и последовательная обработка
-  // находятся внутри fetchElevationsBatch (без досрочного return в цикле).
   const fetched = missing.length > 0 ? await fetchElevationsBatch(missing, signal) : [];
   missing.forEach((p, i) => {
     const v = fetched[i];
@@ -109,11 +178,6 @@ export async function fetchElevations(points: ElevationPoint[], signal?: AbortSi
   });
   return out;
 }
-
-/** Экспорт для юнит-тестов батчевой загрузки высот (>100 точек). */
-export const __test_fetchElevationsBatch = fetchElevationsBatch;
-/** Экспорт для юнит-тестов: сброс кэша высот между тестами. */
-export function __test_clearElevationCache(): void { elevCache.clear(); }
 
 /** Высота одной точки (или null, если сервис недоступен) */
 export async function fetchElevation(lat: number, lng: number, signal?: AbortSignal): Promise<number | null> {
@@ -297,3 +361,7 @@ export function clampAltitudesToLimits(
   const changed = raised + lowered > 0;
   return { changed, next, raised, lowered };
 }
+
+// Алиасы для регрессионных тестов аудита 1.1 (elevationBatches.test.ts)
+export const __test_fetchElevationsBatch = fetchElevationsBatch;
+export const __test_clearElevationCache = __resetElevationCacheForTests;

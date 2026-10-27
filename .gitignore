@@ -1,7 +1,13 @@
 node_modules/
 dist/
+build/
 .env
-*.local
-.DS_Store
-npm-debug.log*
-route.test.mjs
+.env.local
+.env.*.local
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
