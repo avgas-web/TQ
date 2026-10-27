@@ -16,6 +16,10 @@ import { useMapStore } from '../store/useMapStore';
 import { ensureDefaultTileMap } from '../hooks/useAppInitialization';
 import MiniMapPanel, { MiniOverlayLine, MiniOverlayPoint, type MiniZone } from './MiniMapPanel';
 import { zoomForGroundMpp, GROUND_MPP_1CM_2KM } from '../utils/pannelli';
+import {
+  drawTacticalRasterLayer, drawTacticalVectorLayer, makeRasterToScreen,
+  getCachedOverlayRaster, ensureOverlayRaster, evictOverlayRaster,
+} from '../utils/tacticalOverlayRender';
 import { eventBus } from '../utils/eventBus';
 import type { Point, Route, RoutePoint, MapBounds, ViewState } from '../types';
 
@@ -747,6 +751,36 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     });
   }, []);
   const [renderTick, setRenderTick] = useState(0);
+  // Тактические оверлеи: id слоёв с незавершённой декодировкой растра
+  // (защита от дублей ensureOverlayRaster в rAF-рендере) + ref для гидрации.
+  const overlayDecodeInflightRef = useRef<Set<string>>(new Set());
+  const hydratedOnceRef = useRef(false);
+
+  // ─── Гидрация пользовательских тактических карт из IndexedDB (Задача 2, п.4) ─
+  // Метаданные слоёв приходят из zustand-persist; бинарные payload-ы (base64
+  // растров) поднимаются один раз при маунте во внешний кэш tacticalPayloadCache.
+  // При размонтировании выгружаются растры удалённых слоёв — нет утечек памяти.
+  useEffect(() => {
+    if (!hydratedOnceRef.current) {
+      hydratedOnceRef.current = true;
+      const st = useStore.getState() as unknown as { hydrateTacticalOverlays?: () => Promise<void> };
+      if (typeof st.hydrateTacticalOverlays === 'function') {
+        st.hydrateTacticalOverlays()
+          .then(() => setRenderTick((t) => t + 1))
+          .catch(() => { /* IDB недоступен — слои останутся в метаданных */ });
+      }
+    }
+    const layers = project.tacticalOverlays || [];
+    return () => {
+      // Выгружаем только растры слоёв, которых больше нет в сторе (удалены):
+      // остальные остаются в LRU-кэше для последующих маунтов карты.
+      const alive = new Set(layers.map((l) => l.id));
+      for (const id of Array.from(overlayDecodeInflightRef.current)) {
+        if (!alive.has(id)) evictOverlayRaster(id);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project.tacticalOverlays]);
   useEffect(() => {
     let raf = 0;
     // ── ФИКС «ВИСНЕТ НАМЕРТВО ПРИ ЗАГРУЗКЕ КАРТ» (корень #1) ────────────────
@@ -2486,6 +2520,46 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
 
     // Draw restrictions
     drawRestrictions(ctx);
+
+    // ─── Пользовательские тактические карты (Задача 2, п.3) ────────────────
+    // Растровые слои (GeoTIFF/PNG/JPEG/KMZ-изображения) накладываются поверх
+    // подложки по ТОЙ ЖЕ математике Web Mercator, что и DOM-слой тайлов OSM
+    // (worldPx = canvasHeight·2^zoom) — жёсткая привязка при любом зуме/панораме.
+    // Векторы (KML/GeoJSON полигоны) — тем же аффинным geo→screen преобразованием.
+    {
+      const tacticalLayers = project.tacticalOverlays || [];
+      if (tacticalLayers.length > 0) {
+        const stT = useStore.getState() as unknown as { getTacticalOverlayPayload?: (id: string) => string | null };
+        const wpT = worldPxOf(canvasSize.height, vs.scale, vs.z0 ?? ZOOM_REF);
+        for (const tl of tacticalLayers) {
+          if (!tl.visible) continue;
+          if (tl.format === 'kml' || tl.format === 'geojson') {
+            if (project.map?.bounds && project.map.width > 0 && project.map.height > 0) {
+              drawTacticalVectorLayer(ctx, tl, makeRasterToScreen(vs, project.map.bounds, project.map.width, project.map.height));
+            } else if (tl.vectors?.length) {
+              // Тайловая подложка без растра: mercator-прямая привязка к миру
+              const toScr = (lat: number, lng: number) => ({
+                x: vs.offsetX + ((lng + 180) / 360) * wpT,
+                y: vs.offsetY + ((latToMerc(85.0511287798066) - latToMerc(lat)) / (latToMerc(85.0511287798066) - latToMerc(-85.0511287798066))) * wpT,
+              });
+              drawTacticalVectorLayer(ctx, tl, toScr);
+            }
+          }
+          if (tl.format === 'geotiff' || tl.format === 'image' || tl.format === 'kmz' || tl.format === 'mbtiles') {
+            const img = getCachedOverlayRaster(tl.id);
+            if (img) {
+              drawTacticalRasterLayer(ctx, tl, img, vs, wpT, canvasSize.width, canvasSize.height);
+            } else if (!overlayDecodeInflightRef.current.has(tl.id)) {
+              overlayDecodeInflightRef.current.add(tl.id);
+              const payload = typeof stT.getTacticalOverlayPayload === 'function' ? stT.getTacticalOverlayPayload(tl.id) : null;
+              ensureOverlayRaster(tl.id, payload)
+                .then((decoded) => { if (decoded) setRenderTick((t) => t + 1); })
+                .finally(() => overlayDecodeInflightRef.current.delete(tl.id));
+            }
+          }
+        }
+      }
+    }
 
     // Draw pending NFZ polygon drafts (вершины/контур на главной карте)
     drawPendingZones(ctx);

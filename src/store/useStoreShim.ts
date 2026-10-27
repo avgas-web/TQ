@@ -73,6 +73,9 @@ function buildSnapshot(): LegacySnapshot {
     googleMaps: m.googleMaps,
     yandexMaps: m.yandexMaps,
     openStreetMap: m.openStreetMap,
+    // Импортированные пользовательские тактические карты (Задача 2):
+    // метаданные живут в useMapStore (persist), бинарники — в IndexedDB.
+    tacticalOverlays: m.tacticalOverlays ?? [],
   };
   return {
     project,
@@ -304,6 +307,7 @@ export function readProjectView(): Project {
     googleMaps: m.googleMaps,
     yandexMaps: m.yandexMaps,
     openStreetMap: m.openStreetMap,
+    tacticalOverlays: m.tacticalOverlays ?? [],
   };
 }
 

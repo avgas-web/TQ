@@ -21,7 +21,7 @@ import { useMissionWizardStore } from '../../store/useMissionWizardStore';
 import { getProviderStatus } from '../../utils/mapProviders';
 import { TILE_SERVER_ORDER, normalizeTileServer, type TileServerId } from '../../utils/openStreetMap';
 import { ensureDefaultTileMap } from '../../hooks/useAppInitialization';
-import { screenToGeo } from '../../utils/mapGeoPick';
+import { wizardClickToGeo } from '../../utils/mapGeoPick';
 import { findBuildingAt, buildingPopupHtml, type BuildingResult } from '../../utils/buildingLookup';
 
 /**
@@ -158,9 +158,10 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
     if (target && target.closest('[data-wizard-map-ui]')) return;
 
     const r = el.getBoundingClientRect();
-    const geo = screenToGeo(e.clientX - r.left, e.clientY - r.top, r.height);
+    const geo = wizardClickToGeo(e.clientX - r.left, e.clientY - r.top, r.height);
     if (!geo) return;
-    const { lat, lon } = geo;
+    const { lat, lng } = geo;
+    const lon = lng; // legacy-алиас для последующего кода этапа (стандарт — lng, аудит 1.2)
 
     setStatusMsg('🔍 Поиск здания в этой точке...');
     setPopup(null);

@@ -8,7 +8,7 @@ import {
 import { WizardMapPanel } from './WizardMapPanel';
 import { WIZARD_MARKER_PREFIX, useWizardMapBridge } from './useWizardMapBridge';
 import { isMapReadyNow, useMapReadiness } from './mapReadiness';
-import { screenToGeo } from '../../utils/mapGeoPick';
+import { wizardClickToGeo } from '../../utils/mapGeoPick';
 import { osmGeocode } from '../../utils/openStreetMap';
 
 /** Клик по живой тайловой карте мастера → СТРОГИЕ реальные координаты WGS84.
@@ -27,9 +27,9 @@ export function readCanvasClick(e: RMouseEvent<HTMLDivElement>): { x: number; y:
   const sx = e.clientX - rect.left;
   const sy = e.clientY - rect.top;
   if (sx < 0 || sy < 0 || sx > rect.width || sy > rect.height) return null;
-  const geo = screenToGeo(sx, sy, rect.height);
+  const geo = wizardClickToGeo(sx, sy, rect.height);
   if (!geo) return null;
-  return { x: lonToPx(geo.lon), y: latToPy(geo.lat), lat: geo.lat, lon: geo.lon };
+  return { x: lonToPx(geo.lng), y: latToPy(geo.lat), lat: geo.lat, lon: geo.lng };
 }
 
 /** Результат поиска для UI: точка либо различимая причина отказа. */

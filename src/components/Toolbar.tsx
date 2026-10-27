@@ -126,17 +126,17 @@ const Toolbar: React.FC = () => {
         </span>
       )}
 
-      {/* Reset */}
+      {/* Abort Mission / Scrub Sector */}
       <button
         onClick={() => {
-          if (confirm('Сбросить проект? Будут удалены ВСЕ данные: карта, точки старта/цели, все маршруты, бесполётные зоны, парк дронов и настройки.')) {
+          if (confirm('ОТМЕНА БОЕВОЙ ЗАДАЧИ (Abort Mission / Scrub Sector): стереть сектор? Будут удалены ВСЕ данные: карта, точки старта/цели, все маршруты, зоны ПВО (ADIZ), парк боевых аппаратов и настройки.')) {
             resetProject();
           }
         }}
         className="px-3 py-2 bg-red-700 hover:bg-red-800 text-white rounded text-sm font-medium transition-colors"
         title="Полный сброс: карта, точки, маршруты, ограничения, дроны"
       >
-        🔄 Сброс
+        🔄 Abort Mission
       </button>
     </div>
   );

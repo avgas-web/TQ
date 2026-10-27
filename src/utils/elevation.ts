@@ -95,7 +95,7 @@ function readChunkResults(
   return results;
 }
 
-async function fetchElevationsBatch(points: ElevationPoint[], signal?: AbortSignal): Promise<(number | null)[]> {
+export async function fetchElevationsBatch(points: ElevationPoint[], signal?: AbortSignal): Promise<(number | null)[]> {
   const results: (number | null)[] = new Array(points.length).fill(null);
   const CHUNK = 100;
   for (let off = 0; off < points.length; off += CHUNK) {
@@ -133,13 +133,19 @@ async function fetchElevationsBatch(points: ElevationPoint[], signal?: AbortSign
           });
           if (retry.ok) {
             const json = (await retry.json()) as ElevationResponseShape;
-            return readChunkResults(json, chunk, results, off);
+            // Аудит 1.1: НЕ возвращаем результат досрочно — readChunkResults
+            // мутирует results по ссылке; цикл обязан пройти ВСЕ чанки
+            // (маршруты >100 точек раньше обрывались на первом батче).
+            readChunkResults(json, chunk, results, off);
+            continue; // повтор успешен — читаем исходный 429-ответ нельзя
           }
         }
       }
       if (!resp.ok) throw new Error(`Open-Elevation HTTP ${resp.status}`);
       const json = (await resp.json()) as ElevationResponseShape;
-      return readChunkResults(json, chunk, results, off);
+      // Аудит 1.1: без return внутри цикла for — иначе хвост маршрутов
+      // длиннее 100 точек оставался без высот (null).
+      readChunkResults(json, chunk, results, off);
     } catch (err) {
       if ((err as { name?: string })?.name === 'AbortError' && signal?.aborted) throw err; // явная отмена прогона — не глотаем
       console.warn('[elevation] запрос батча не выполнен:', (err as Error)?.message);
@@ -355,3 +361,7 @@ export function clampAltitudesToLimits(
   const changed = raised + lowered > 0;
   return { changed, next, raised, lowered };
 }
+
+// Алиасы для регрессионных тестов аудита 1.1 (elevationBatches.test.ts)
+export const __test_fetchElevationsBatch = fetchElevationsBatch;
+export const __test_clearElevationCache = __resetElevationCacheForTests;

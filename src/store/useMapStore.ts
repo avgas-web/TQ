@@ -7,16 +7,21 @@
 import { create } from 'zustand';
 import type { StateCreator } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 import { v4 as uuidv4 } from 'uuid';
 import type {
   Project,
   Marker, Restriction, Layer, ViewState, MapData, Point,
-  CalibrationPoint, MapBounds, Tool,
+  CalibrationPoint, MapBounds, Tool, TacticalOverlayLayer,
 } from '../types';
 
 /** Настройки карты/высот (подмножество Project['settings']). */
 export type ProjectSettings = Project['settings'];
-import { saveMapToIndexedDB, loadMapFromIndexedDB } from '../utils/storage';
+import {
+  saveMapToIndexedDB, loadMapFromIndexedDB,
+  saveTacticalOverlayToIndexedDB, deleteTacticalOverlayFromIndexedDB, loadTacticalOverlayFromIndexedDB,
+} from '../utils/storage';
+import { loadTacticalMapFile } from '../utils/tacticalMapLoader';
 import { mercatorYToLat, calculateBoundsFromCenter } from '../utils/googleMaps';
 import { sanitizeProjectData } from '../utils/projectSchema';
 
@@ -94,6 +99,10 @@ export interface MapState {
    *  при чтении нормализуется normalizeTileServer() (тип string — для совместимости со старыми проектами). */
   openStreetMap: { enabled: boolean; tileServer?: string };
   settings: ProjectSettings;
+  /** Пользовательские тактические карты (Задача 2): метаданные слоёв.
+   *  Бинарные payload-ы живут в IndexedDB ('tactical-overlays') и внешнем
+   *  кэше tacticalPayloadCache — НЕ в React-стейте (без лишних ре-рендеров). */
+  tacticalOverlays: TacticalOverlayLayer[];
   _currentMapId?: string; // ID текущей карты в IndexedDB
   // UI-состояние карты
   currentTool: Tool;
@@ -159,6 +168,16 @@ export interface MapActions {
   loadActiveTileMap: (center: { lat: number; lng: number }, zoom: number) => void;
   restoreMapFromStorage: () => Promise<void>;
   resetMapUi: () => void;
+  // ─── ЗАГРУЗ ПОЛЬЗОВАТЕЛЬСКИХ ТАКТИЧЕСКИХ КАРТ (Задача 2) ──────────────
+  /** Импорт файла: парсинг геопривязки -> метаданные в стор, payload в IDB.
+   *  Возвращает id созданного слоя; бросает Error при отсутствии bounds. */
+  importTacticalOverlay: (file: File | { name: string; arrayBuffer(): Promise<ArrayBuffer> }) => Promise<string>;
+  updateTacticalOverlay: (id: string, patch: Partial<Pick<TacticalOverlayLayer, 'visible' | 'opacity' | 'name'>>) => void;
+  removeTacticalOverlay: (id: string) => Promise<void>;
+  /** Гидрация payload-ов из IndexedDB (после старта/импорта метаданных). */
+  hydrateTacticalOverlays: () => Promise<void>;
+  /** Чтение декодированного payload (data URL / текст) из внешнего кэша. */
+  getTacticalOverlayPayload: (layerId: string) => string | null;
 }
 
 export type MapStore = MapState & MapActions;
@@ -174,8 +193,15 @@ export const defaultMapSettings: ProjectSettings = {
   altitudeClearanceM: 50,
 };
 
+// ─── Внешний кэш payload-ов тактических слоёв (Задача 2) ────────────────────
+// Бинарные/текстовые данные импортированных карт (data URL растров, KML/GeoJSON)
+// НЕ хранятся в React-стейте: стор держит только метаданные. Кэш — module-level
+// Map; invalidate при remove/import, заполняется при import/hydrate.
+export const tacticalPayloadCache = new Map<string, string>();
+
 const initialMapState: MapState = {
   map: null,
+  tacticalOverlays: [],
   markers: [],
   restrictions: [],
   layers: [{ id: 'default', name: 'Основной', visible: true, locked: false }],
@@ -503,6 +529,74 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
     redoDrawingStack: [],
     measurementPoints: [],
   }),
+
+  // ─── ЗАГРУЗ ПОЛЬЗОВАТЕЛЬСКИХ ТАКТИЧЕСКИХ КАРТ (Задача 2) ──────────────
+  // Импорт: парсинг геопривязки (tacticalMapLoader) -> метаданные в стор,
+  // payload в IndexedDB + внешний кэш. Жёсткий отказ при отсутствии bounds.
+  importTacticalOverlay: async (file) => {
+    // Загрузчик возвращает готовый слой (метаданные) + payload для хранилища.
+    const loaded = await loadTacticalMapFile(file);
+    const layer: TacticalOverlayLayer = {
+      ...loaded.layer,
+      visible: true,
+      opacity: 1,
+    };
+    // payload (data URL растра / текст KML/GeoJSON) — в IndexedDB и внешний
+    // кэш; React-стейт держит только метаданные (без тяжёлых base64).
+    tacticalPayloadCache.set(layer.id, loaded.payload);
+    if (loaded.payload) {
+      const saved = await saveTacticalOverlayToIndexedDB({
+        layerId: layer.id,
+        payload: loaded.payload,
+        kind: loaded.kind,
+        format: layer.format,
+        sizeBytes: layer.sizeBytes,
+        savedAt: Date.now(),
+      });
+      if (!saved) console.warn('[tactical] IndexedDB save failed (layer stays in-memory)');
+    }
+    set((s) => ({
+      tacticalOverlays: [...(s.tacticalOverlays ?? []), layer],
+      viewTick: s.viewTick + 1, // форсирует перерисовку оверлейного слоя
+    }));
+    return layer.id;
+  },
+
+  updateTacticalOverlay: (id, patch) => {
+    set((s) => ({
+      tacticalOverlays: (s.tacticalOverlays ?? []).map((l) =>
+        l.id === id ? { ...l, ...patch } : l,
+      ),
+      viewTick: s.viewTick + 1,
+    }));
+  },
+
+  removeTacticalOverlay: async (id) => {
+    tacticalPayloadCache.delete(id);
+    await deleteTacticalOverlayFromIndexedDB(id);
+    set((s) => ({
+      tacticalOverlays: (s.tacticalOverlays ?? []).filter((l) => l.id !== id),
+      viewTick: s.viewTick + 1,
+    }));
+  },
+
+  hydrateTacticalOverlays: async () => {
+    const layers = get().tacticalOverlays ?? [];
+    let changed = false;
+    for (const l of layers) {
+      if (tacticalPayloadCache.has(l.id)) continue;
+      const rec = await loadTacticalOverlayFromIndexedDB(l.id);
+      if (rec?.payload) {
+        tacticalPayloadCache.set(l.id, rec.payload);
+        changed = true;
+      }
+    }
+    if (changed) {
+      set((s) => ({ viewTick: s.viewTick + 1 }));
+    }
+  },
+
+  getTacticalOverlayPayload: (layerId) => tacticalPayloadCache.get(layerId) ?? null,
 });
 
 // ─── Стор + persist (миграция из legacy totalquadro-storage) ────────────────
@@ -525,6 +619,8 @@ export const useMapStore = create<MapStore>()(
       partialize: (s): Omit<MapState, 'mapLoaded'> => ({
         // Не сохраняем map.dataUrl в localStorage — он слишком большой
         map: s.map ? { ...s.map, dataUrl: '' } : null,
+        // Метаданные тактических слоёв (payload-ы — в IndexedDB/кэше)
+        tacticalOverlays: s.tacticalOverlays ?? [],
         markers: s.markers,
         restrictions: s.restrictions,
         layers: s.layers,

@@ -82,6 +82,9 @@ function tileUrlFor(server: TileServerId, z: number, x: number, y: number): stri
   }
 }
 
+/** Шаблон тайла Esri World Imagery (спутник) — экспорт для тестов привязки стилей. */
+export const ESRI_SAT_TEMPLATE = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+
 /** URL тайла для Esri-провайдеров с перебором зеркал */
 function esriUrl(host: string, service: string, z: number, x: number, y: number): string {
   return `${host}/ArcGIS/rest/services/${service}/MapServer/tile/${z}/${y}/${x}`; // у Esri порядок z/y/x
@@ -222,6 +225,16 @@ async function fetchNominatimJson(
           sawHttpError = true;
           continue; // пробуем следующее зеркало
         }
+        // ИСПРАВЛЕНИЕ АУДИТА 1.4 (обработка 404): статус 404 означает «адрес/объект
+        // не найден» — ШТАТНЫЙ ответ сервиса, а не сбой. Раньше он попадал в ветку
+        // `!response.ok -> kind:'http'`, что воспринималось вызывающим кодом как
+        // ошибка службы и триггерило лишний fallback (повторные раунды по всем
+        // зеркалам и резервному геокодеру Photon). Теперь 404/400 возвращают
+        // 'not_found' немедленно, без перебора зеркал; 429/5xx по-прежнему
+        // считаются сервисной ошибкой ('http') и приводят к ретраям.
+        if (response.status === 404 || response.status === 400) {
+          return { data: null, kind: 'not_found' };
+        }
         if (!response.ok) return { data: null, kind: 'http' };
         const json = await response.json();
         hostHealth.delete(host); // хост жив — снимаем метку, если была
@@ -248,6 +261,9 @@ export interface OsmGeocodeResult {
   /** 'ok' — успех; 'not_found' — адрес не найден; 'network'/'http' — сервисная ошибка */
   kind: 'ok' | 'not_found' | NominatimErrorKind;
 }
+
+/** Экспорт для юнит-тестов (регрессия аудита 1.4): различение 404/5xx без сети */
+export const __test_fetchNominatimJson = fetchNominatimJson;
 
 /**
  * Запрос к Photon (https://photon.komoot.io) — резервному геокодеру по аудиту
@@ -349,7 +365,14 @@ export function getOSMTileUrl(
   //  - legacy 'carto' → OSM France;
   //  - style 'satellite'/'hybrid' → Esri World Imagery (спутник, без ключа).
   // detectRetina (@2x) убран: тайлы @2x были доступны только удалённым OSM/Carto.
-  void style;
+  // ИСПРАВЛЕНИЕ АУДИТА 1.3 (игнорирование стиля): раньше параметр style уничтожался
+  // через `void style`, и спутниковые стили молча отдавали вектурную подложку.
+  // Теперь style='satellite'|'hybrid' (как и явный сервер 'esri-sat') жёстко
+  // маршрутизируется на провайдер Esri World Imagery (без ключа, HTTPS).
+  if (style === 'satellite' || style === 'hybrid') {
+    const zSat = Math.min(Math.max(Math.round(zoom), 0), TILE_PROVIDERS['esri-sat'].maxNativeZoom);
+    return esriUrl(ESRI_MIRRORS[0], 'World_Imagery', zSat, x, y);
+  }
   const server: TileServerId = normalizeTileServer(tileServer);
   // Нативный максимум берётся из реестра провайдеров — выше не поднимаемся
   // (нет данных, только растяжение). Общий потолок сетки — z19.
@@ -396,6 +419,22 @@ export type TileLoadHandle = {
   cancel(): void;
   readonly done: Promise<HTMLImageElement | null>;
 };
+
+/**
+ * Совместимость с legacy-API аудиторской ветки (регрессия аудита 1.5):
+ * `{ promise, cancel }` — тонкая обёртка над startTileLoad. Гарантии те же:
+ * после cancel() НЕ происходит ни resolve(img), ни последующего присваивания
+ * img.src (settled-флаг в startTileLoad + снятие обработчиков и сброс src в
+ * abortTileImage) — отменённая загрузка не оставляет in-flight Image.
+ */
+export interface CancellableTileLoad {
+  promise: Promise<HTMLImageElement | null>;
+  cancel: () => void;
+}
+export function loadTileImageCancellable(url: string, timeoutMs = 8000): CancellableTileLoad {
+  const handle = startTileLoad(url, timeoutMs);
+  return { promise: handle.done, cancel: () => handle.cancel() };
+}
 
 /**
  * Загрузка тайла с ЯВНЫМ ручкой-контролем (P0 «зависания/утечки»): вызывающая

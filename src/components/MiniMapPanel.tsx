@@ -321,7 +321,7 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       ctx.restore();
     }
 
-    // Точки (старт/цели дронов/путевые точки). Позиции сохраняются для hit-теста
+    // Точки (старт/цели дронов/узлы боевого курса). Позиции сохраняются для hit-теста
     // клика удаления (наведи и кликни по точке на активной карте — удалим).
     const pointHits: { id?: string; x: number; y: number }[] = [];
     for (const pt of points) {

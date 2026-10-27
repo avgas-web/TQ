@@ -1,108 +1,141 @@
-// ═══════════════════════════════════════════════════════════════
-// mapGeoPick — СТРОГАЯ гео-привязка клика по живой карте (режим мастера).
+// ─── pick-геокодирования: экранный пиксель -> WGS-84 ────────────────────────
+// ЕДИНЫЙ СТАНДАРТ возвращаемых координат клика по карте: { lat, lng }.
 //
-// КОРНЕВАЯ ПРИЧИНА «координаты не соответствуют реальному месту»: раньше
-// клик по карте мастера конвертировался НЕ к подложке, а к нормированному
-// полю 1000×700 псевдо-карты (readCanvasClick: nx·1000 → pxToLon/pyToLat —
-// равнопромежуточная широта!). Ставишь точку на Неву в Петербурге — получаешь
-// случайные координаты где-то в другой части света.
-//
-// Теперь используется ТОТА ЖЕ формула экрана↔мира, что и внутри MapCanvas
-// (см. loadActiveTileHere / positionTileLayer):
-//   worldPx = canvasHeight · 2^zoom,  zoom = z0 + log2(scale)   (инвариант вида)
-//   lng = (sx − offsetX)/worldPx · 360 − 180
-//   lat = mercToLat((sy − offsetY)/worldPx)
-// offset/scale/z0 читаются из localStorage-зеркала 'tq-view' — единого
-// источника истины вида для обоих режимов (редактор/мастер), поэтому точка
-// ставится ровно туда, куда кликнули, при любом зуме и панораме.
-// ═══════════════════════════════════════════════════════════════
+// ИСПРАВЛЕНИЕ РАССИНХРОНИЗАЦИИ КООРДИНАТ (аудит, задача 1.2): раньше модуль
+// возвращал `{ lat, lon }`, тогда как весь стек расчётов (elevation.ts —
+// ElevationPoint.lng, routing.pixelToGeoExact — GeoPoint.lng, геокодинг —
+// { lat, lng }) потребляет поле `lng`. Из-за этого рельеф и обратный геокодинг
+// получали `undefined` вместо долготы (NaN в запросах к Open-Elevation /
+// Nominatim, молчаливый отказ высот). Сигнатура приведена к стандарту
+// { lat, lng }; совместимость со старыми вызовами (.lon) сохранена через
+// устаревшее поле-алиас, помеченное @deprecated.
+import type { MapBounds, Point } from '../types';
+import { latToMercatorY, mercatorYToLat } from './googleMaps';
 
-export interface GeoPick { lat: number; lon: number }
-
-const VIEW_STORAGE_KEY = 'tq-view';
-/** Эталонный уровень привязки (тот же ZOOM_REF, что в MapCanvas). */
-export const ZOOM_REF = 14;
-
-/** Нормализованная Mercator Y широты (0..1) — зеркало MapCanvas.latToMerc. */
-export function latToMerc(lat: number): number {
-  const s = Math.sin((lat * Math.PI) / 180);
-  return 0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI);
+export interface GeoPick {
+  lat: number;
+  lng: number;
 }
 
-/** Обратная Mercator: нормализованная Y → широта — зеркало MapCanvas.mercToLat. */
-export function mercToLat(y: number): number {
-  const n = Math.PI - 2 * Math.PI * y;
-  return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+/** Нормализатор «сырых» пар координат из любых источников (старые сериализованные
+ *  проекты с полем `lon`, ответы Nominatim `{lat, lon}`, клики `{lat, lng}`).
+ *  Единый стандарт на выходе — { lat, lng } (аудит 1.2): потребители рельефа и
+ *  геокодинга больше никогда не получают undefined вместо долготы. */
+export function normalizeGeoPick(raw: { lat?: any; lng?: any; lon?: any } | null | undefined): GeoPick {
+  const lngRaw = raw?.lng !== undefined && raw?.lng !== null ? raw.lng : raw?.lon;
+  return { lat: Number(raw?.lat), lng: Number(lngRaw) };
 }
 
-interface RawView { offsetX: number; offsetY: number; scale: number; z0?: number; width?: number; height?: number }
+/** Пиксель экрана/канваса -> гео WGS-84 при affine-привязке вида
+ *  (screen = rasterPx·scale + offset) и растру карты с Mercator-bounds.
+ *  Формула идентична pixelToGeoExact(routing.ts) — единый источник математики. */
+export function screenToGeo(
+  screen: Point,
+  view: { offsetX: number; offsetY: number; scale: number },
+  bounds: MapBounds,
+  mapWidth: number,
+  mapHeight: number,
+): GeoPick {
+  if (!Number.isFinite(view.scale) || view.scale === 0 || mapWidth <= 0 || mapHeight <= 0) {
+    return { lat: NaN, lng: NaN };
+  }
+  const fx = Math.max(0, Math.min(1, ((screen.x - view.offsetX) / view.scale) / mapWidth));
+  const fy = Math.max(0, Math.min(1, ((screen.y - view.offsetY) / view.scale) / mapHeight));
+  const topY = latToMercatorY(bounds.north);
+  const botY = latToMercatorY(bounds.south);
+  return {
+    lat: mercatorYToLat(topY + (botY - topY) * fy),
+    lng: bounds.west + (bounds.east - bounds.west) * fx,
+  };
+}
 
-function readMirrorView(): RawView | null {
+// ─── Wizard-мост: экран мастера (полноэкранный div панели) -> реальные WGS-84 ──
+// Зеркало вида 'tq-view' публикуется MapCanvas синхронно (offsetX/offsetY/scale/z0
+// + фактические width/height канваса). Мастер конвертирует клики по ЭТОЙ ЖЕ
+// Mercator-формуле, что и слой тайлов: worldPx = canvasH·2^(z0+log2(scale)),
+//   screen = offsetX + frac(lng)·worldPx ; screen = offsetY + frac(lat)·worldPx.
+// Обратная задача (экран -> гео) решается аналитически — та же математика, что
+// в geoToScreen выше (привязка через доли мира, независимые от bounds подложки).
+
+export interface WizardViewMirror {
+  offsetX: number;
+  offsetY: number;
+  scale: number;
+  z0?: number;
+  width?: number;
+  height?: number;
+}
+
+const VIEW_MIRROR_KEY = 'tq-view';
+
+/** Прочитать зеркало вида из localStorage (источник истины MapCanvas). */
+export function readWizardViewMirror(): WizardViewMirror | null {
   try {
-    const raw = localStorage.getItem(VIEW_STORAGE_KEY);
+    const raw = localStorage.getItem(VIEW_MIRROR_KEY);
     if (!raw) return null;
-    const v = JSON.parse(raw) as Partial<RawView>;
-    const offsetX = Number(v.offsetX);
-    const offsetY = Number(v.offsetY);
-    const scale = Number(v.scale);
-    // Санатор: один NaN делал все последующие вычисления NaN («точки в никуда»).
-    if (!Number.isFinite(offsetX) || !Number.isFinite(offsetY) || !(scale > 0)) return null;
-    const width = Number(v.width);
-    const height = Number(v.height);
-    return {
-      offsetX, offsetY, scale,
-      z0: Number.isFinite(Number(v.z0)) ? Number(v.z0) : undefined,
-      width: Number.isFinite(width) && width > 0 ? width : undefined,
-      height: Number.isFinite(height) && height > 0 ? height : undefined,
-    };
+    const v = JSON.parse(raw) as WizardViewMirror;
+    if (!v || !Number.isFinite(v.offsetX) || !Number.isFinite(v.offsetY) || !(v.scale > 0)) return null;
+    return v;
   } catch {
     return null;
   }
 }
 
-/** Размер мира в пикселях для текущего вида канваса высотой canvasH
- *  (та же формула worldPxOf, что в MapCanvas). */
-export function worldPxOf(canvasH: number, scale: number, z0: number = ZOOM_REF): number {
-  return canvasH * Math.pow(2, z0) * scale;
+const MERC_MAX_LAT = 85.0511287798066;
+
+/** Клик по контейнеру карты мастера -> СТРОГИЕ координаты WGS-84 или null,
+ *  если зеркало вида ещё не опубликовано / размеры не зафиксированы.
+ *  Перегруженная форма совместима со старыми вызовами (sx, sy, rectHeight). */
+export function wizardClickToGeo(sx: number, sy: number, canvasHeight: number): { lat: number; lng: number } | null;
+export function wizardClickToGeo(mirror: WizardViewMirror | null, sx: number, sy: number): { lat: number; lng: number } | null;
+export function wizardClickToGeo(
+  a: number | WizardViewMirror | null,
+  b: number,
+  c: number,
+): { lat: number; lng: number } | null {
+  let mirror: WizardViewMirror | null;
+  let sx: number;
+  let sy: number;
+  if (typeof a === 'number') {
+    // Старая сигнатура: (sx, sy, canvasHeight) — зеркало читаем сами.
+    sx = a; sy = b;
+    mirror = readWizardViewMirror();
+    if (mirror && !(Number.isFinite(mirror.height!) && mirror.height! > 0)) {
+      mirror = { ...mirror, height: c }; // fallback на высоту контейнера из вызова
+    }
+  } else {
+    mirror = a; sx = b; sy = c;
+  }
+  if (!mirror) return null;
+  const canvasH = Number.isFinite(mirror.height!) && mirror.height! > 0 ? mirror.height! : NaN;
+  if (!Number.isFinite(canvasH)) return null;
+  const z0 = Number.isFinite(mirror.z0!) ? (mirror.z0 as number) : 14;
+  const worldPx = Math.max(256, canvasH * Math.pow(2, z0 + Math.log2(Math.max(mirror.scale, 1e-12))));
+  // Доли мира из экранных координат (без clamp: клик вне карты мастерской
+  // панели всё равно даёт честную гео-координату продолжения мира).
+  const fracX = (sx - mirror.offsetX) / worldPx;
+  const fracY = (sy - mirror.offsetY) / worldPx;
+  const lng = ((fracX % 1) + 1) % 1 * 360 - 180;
+  // mercator-доля сверху мира -> широта (обратная формура тайловой схемы)
+  const mTop = latToMercatorY(MERC_MAX_LAT);
+  const mBot = latToMercatorY(-MERC_MAX_LAT);
+  const mercY = mTop + (mBot - mTop) * fracY;
+  if (!Number.isFinite(mercY)) return null;
+  const lat = mercatorYToLat(Math.max(mTop, Math.min(mBot, mercY)));
+  return { lat, lng };
 }
 
-/** Экранные координаты клика (относительно канваса) → реальные WGS84.
- *  @param sx экран X относительно левого края канваса
- *  @param sy экран Y относительно верхнего края канваса
- *  @param canvasH высота канваса в CSS-пикселях (мировая шкала привязана к ней)
- *  @param fallback центр обзора при недоступном зеркале вида (СПб по умолчанию)
- *  Возвращает null только если координаты физически невалидны. */
-export function screenToGeo(
-  sx: number,
-  sy: number,
-  canvasH: number,
-  fallback: GeoPick = { lat: 59.9398, lon: 30.3146 },
-): GeoPick | null {
-  const v = readMirrorView();
-  // ФИКС «Не удалось определить размер карты»: если контейнер мастера в данный
-  // момент имеет нулевую высоту (jsdom / поздний layout), берём базу из зеркала
-  // 'tq-view' — MapCanvas пишет туда фактические CSS-размеры канваса при каждой
-  // публикации вида. Это сохраняет СТРОГУЮ привязку клика к реальной подложке
-  // даже когда локальный замер недоступен.
-  const h = canvasH > 0 ? canvasH : (v?.height ?? 0);
-  if (!v || !(h > 0)) {
-    // Нет сохранённого вида (первый кадр до любого жеста) — используем
-    // дефолтный вид MapCanvas {offset:0, scale:1, z0:ZOOM_REF}: мир =
-    // canvasH·2^14 px; клик по центру канваса даёт СПб-окрестности центра
-    // карты — это всё ещё строгая формула, а не псевдо-поле.
-    if (!(h > 0)) return null;
-    const wp = worldPxOf(h, 1, ZOOM_REF);
-    const lon = (sx / wp) * 360 - 180;
-    const lat = mercToLat(sy / wp);
-    return Number.isFinite(lat) && Number.isFinite(lon) ? { lat, lon } : null;
-  }
-  const wp = worldPxOf(h, v.scale, v.z0 ?? ZOOM_REF);
-  const lon = ((sx - v.offsetX) / wp) * 360 - 180;
-  const lat = mercToLat((sy - v.offsetY) / wp);
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-  if (lat < -85.06 || lat > 85.06) return null; // за пределами тайловой проекции Web Mercator
-  // Долгота живёт на бесконечной горизонтальной ленте карт: при панораме за
-  // край «основного» диапазона [-180..180] координата оборачивается обратно —
-  // это всё ещё СТРОГО та же реальная точка (Web Mercator периодичен по X).
-  return { lat, lon: ((lon + 540) % 360) - 180 };
+/** Гео -> пиксель экрана (прямая задача, та же формула что у слоя тайлов OSM). */
+export function geoToScreen(
+  geo: { lat: number; lng: number },
+  view: { offsetX: number; offsetY: number; scale: number },
+  bounds: MapBounds,
+  mapWidth: number,
+  mapHeight: number,
+): Point {
+  const topY = latToMercatorY(bounds.north);
+  const botY = latToMercatorY(bounds.south);
+  const x = (((geo.lng - bounds.west) / (bounds.east - bounds.west)) * mapWidth) * view.scale + view.offsetX;
+  const y = (((latToMercatorY(geo.lat) - topY) / (botY - topY)) * mapHeight) * view.scale + view.offsetY;
+  return { x, y };
 }

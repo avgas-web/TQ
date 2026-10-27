@@ -25,12 +25,12 @@ import {
 import {
   ConnectionError,
   HardwareError,
-  DroneSim,
+  CombatAssetSim,
   FleetManager,
   haversineM,
   estimateBatteryFor,
   validateGeoPoint,
-} from '../src/utils/droneSim';
+} from '../src/utils/combatAssetSim';
 
 let passed = 0;
 let failed = 0;
@@ -145,7 +145,7 @@ async function main(): Promise<void> {
   console.log('droneSim.ts');
 
   await test('полётный цикл happy path: preflight→arm→takeoff→mode→RTL', async () => {
-    const sim = new DroneSim('uav-1', { lat: 59.93, lon: 30.33, batteryPct: 90, altM: 0 });
+    const sim = new CombatAssetSim('uav-1', { lat: 59.93, lon: 30.33, batteryPct: 90, altM: 0 });
     const pf = await sim.preflightCheck();
     assert(pf.ok, 'preflight ok');
     await sim.arm();
@@ -160,7 +160,7 @@ async function main(): Promise<void> {
   });
 
   await test('arm отклоняется при плохом preflight (батарея 10%)', async () => {
-    const sim = new DroneSim('uav-2', { batteryPct: 10 });
+    const sim = new CombatAssetSim('uav-2', { batteryPct: 10 });
     const pf = await sim.preflightCheck();
     assert(!pf.ok, 'preflight must fail on low battery');
     let threw = false;
@@ -170,7 +170,7 @@ async function main(): Promise<void> {
   });
 
   await test('disarm в воздухе запрещён (проверка безопасности)', async () => {
-    const sim = new DroneSim('uav-3', { lat: 1, lon: 1, batteryPct: 80 });
+    const sim = new CombatAssetSim('uav-3', { lat: 1, lon: 1, batteryPct: 80 });
     await sim.arm();
     await sim.takeoff(30, 5000);
     let threw = false;
@@ -179,7 +179,7 @@ async function main(): Promise<void> {
   });
 
   await test('ConnectionError при обрыве канала связи', async () => {
-    const sim = new DroneSim('uav-4', { batteryPct: 80 });
+    const sim = new CombatAssetSim('uav-4', { batteryPct: 80 });
     sim.setConnection(false);
     let threw = false;
     try { await sim.arm(); } catch (e) { threw = e instanceof ConnectionError; }
@@ -187,7 +187,7 @@ async function main(): Promise<void> {
   });
 
   await test('недопустимый режим полёта отклоняется', async () => {
-    const sim = new DroneSim('uav-5');
+    const sim = new CombatAssetSim('uav-5');
     let threw = false;
     try { await sim.setFlightMode('Turbo' as never); } catch { threw = true; }
     assert(threw, 'invalid mode rejected');
@@ -315,8 +315,8 @@ async function main(): Promise<void> {
     assert(!dlBad.ok && dlBad.error === 'checksum_mismatch', 'download mismatch');
   });
 
-  await test('DroneSim.loadMission сверяет чексумму; trackTarget+processFrame обновляет цель', async () => {
-    const sim = new DroneSim('d-cv', { lat: 59.93, lon: 30.33, altM: 0 });
+  await test('CombatAssetSim.loadMission сверяет чексумму; trackTarget+processFrame обновляет цель', async () => {
+    const sim = new CombatAssetSim('d-cv', { lat: 59.93, lon: 30.33, altM: 0 });
     const wps: RouteNode3D[] = [{ lat: 59.93, lon: 30.33, altM: 100 }, { lat: 59.94, lon: 30.34, altM: 100 }];
     const ok = sim.loadMission('m1', wps);
     assert(ok.ok && ok.checksum === missionChecksum(wps), 'loadMission computes checksum');
