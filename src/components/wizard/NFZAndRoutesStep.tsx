@@ -33,7 +33,7 @@ export function NFZAndRoutesStep() {
 
   const finishPolygon = () => {
     if (drawing.length >= 3) {
-      s.addNoFlyZone({ name: `NFZ ${s.noFlyZones.length + 1}`, polygon: drawing });
+      s.addNoFlyZone({ name: `Зона ПВО (ADIZ) ${s.noFlyZones.length + 1}`, polygon: drawing });
     } else {
       s.runValidationAndPublish();
     }
@@ -120,7 +120,7 @@ export function NFZAndRoutesStep() {
           </div>
         )}
       </div>
-      <aside className="w-72 shrink-0 overflow-auto border-l border-slate-800 p-2 text-xs" aria-label="Список NFZ">
+      <aside className="w-72 shrink-0 overflow-auto border-l border-slate-800 p-2 text-xs" aria-label="Список зон ПВО (ADIZ)">
         <h3 className="font-bold text-red-300">Бесполётные зоны ({s.noFlyZones.length})</h3>
         <ul>
           {s.noFlyZones.map((z) => (

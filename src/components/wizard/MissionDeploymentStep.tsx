@@ -74,7 +74,7 @@ export function MissionDeploymentStep() {
             <li>Подключите дрон к наземной станции через QGroundControl / Mission Planner (USB или телеметрия 57600 8N1).</li>
             <li>Откройте скачанный файл маршрута в разделе «Полётное задание» (Flight Tasks).</li>
             <li>Проверьте точки на карте, затем «Загрузить» (Upload) → дождитесь подтверждения MAV_ACK.</li>
-            <li>Перед пуском убедитесь, что NFZ загружены в геозоны полётного контроллера.</li>
+            <li>Перед пуском убедитесь, что зоны ПВО (ADIZ) загружены в геозоны полётного контроллера.</li>
           </ol>
           <button type="button" data-testid="send-to-drone" className="btn-secondary mt-2"
             onClick={() => useMissionWizardStore.setState((st) => ({ deploymentLog: [...st.deploymentLog, 'ℹ Прямая отправка недоступна: используйте инструкцию выше (нет подключённого MAVLink-устройства).'] }))}>

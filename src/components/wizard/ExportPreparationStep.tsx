@@ -41,7 +41,7 @@ export function ExportPreparationStep() {
     { ok: s.startPoints.length > 0, text: `Все точки старта валидны (${s.startPoints.length})` },
     { ok: s.targetPoints.length > 0, text: `Все цели валидны (${s.targetPoints.length})` },
     { ok: s.fleetGroups.length > 0 && s.fleetGroups.reduce((a, g) => a + g.totalCraft, 0) === s.totalCraft, text: `Группы сформированы корректно (${s.fleetGroups.length}, суммарно ${s.fleetGroups.reduce((a, g) => a + g.totalCraft, 0)}/${s.totalCraft})` },
-    { ok: s.calculatedRoutes.length > 0 && !s.calculatedRoutes.some((r) => r.blockedByNfz), text: `Маршруты пересчитаны, обход NFZ выполнен (${s.calculatedRoutes.length})` },
+    { ok: s.calculatedRoutes.length > 0 && !s.calculatedRoutes.some((r) => r.blockedByNfz), text: `Маршруты пересчитаны, обход зон ПВО (ADIZ) выполнен (${s.calculatedRoutes.length})` },
     { ok: !s.calculatedRoutes.some((r) => r.exceedsRange && !r.acknowledged), text: 'Превышения дальности подтверждены или отсутствуют' },
     { ok: true, text: `Высоты скорректированы (точек: ${s.altitudeProfiles.reduce((a, p) => a + p.points.filter((x) => !x.belowTerrainWarning).length, 0)})` },
   ]), [s]);

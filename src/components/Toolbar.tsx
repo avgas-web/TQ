@@ -53,7 +53,7 @@ const Toolbar: React.FC = () => {
     { id: 'pan', label: 'Пан', icon: '✋', title: 'Панорамирование (пробел+ЛКМ)' },
     { id: 'select', label: 'Выбор', icon: '👆', title: 'Выбор и перемещение точек' },
     { id: 'addMarker', label: 'Точка', icon: '📍', title: 'Добавить точку' },
-    { id: 'drawPolygon', label: 'NFZ', icon: '⬡', title: 'Бесполетная зона (произвольный полигон; двойной клик — завершить)' },
+    { id: 'drawPolygon', label: 'ADIZ', icon: '⬡', title: 'Зона ПВО / Эшелонированная зона запрета полётов (ADIZ; произвольный полигон; двойной клик — завершить)' },
     { id: 'measure', label: 'Линейка', icon: '📏', title: 'Измерение расстояний' },
   ];
 
