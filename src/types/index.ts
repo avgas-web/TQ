@@ -5,6 +5,20 @@ export interface Point {
   y: number;
 }
 
+/**
+ * Единый стандарт гео-координат приложения (аудит 1.2): WGS-84, поля { lat, lng }.
+ * Все модули клика по карте, рельефа (elevation), маршрутизации и геокодинга
+ * оперируют этим типом; поле `lon` допускается ТОЛЬКО в легаси-интерфейсах
+ * (Marker, DroneAssignment) и нормализуется через mapGeoPick.normalizeGeoPick.
+ */
+export interface GeoPoint {
+  lat: number;
+  lng: number;
+}
+
+/** Маркер = Точка Боевого Применения (Target Designator). Терминология T3. */
+export type TargetDesignator = Marker;
+
 export interface Marker {
   id: string;
   name: string;
@@ -78,6 +92,9 @@ export interface Project {
   createdAt: string;
   updatedAt: string;
   map: MapData | null;
+  /** Импортированные пользовательские тактические карты (Задача 2).
+   *  Метаданные + векторы — здесь; растровые бинарники — в IndexedDB. */
+  tacticalOverlays?: TacticalOverlayLayer[];
   calibration: {
     enabled: boolean;
     points: CalibrationPoint[];
@@ -210,3 +227,59 @@ export interface ImportLists {
 }
 
 export const MAX_ROUTES = 10000;
+
+// ─── ЗАГРУЗЧИК ПОЛЬЗОВАТЕЛЬСКИХ ТАКТИЧЕСКИХ КАРТ (Задача 2) ─────────────────
+// Импортированные пользователем карты в геодезических форматах с ЖЁСТКИМ
+// сохранением координатной привязки (georeferencing). Метаданные хранятся в
+// Zustand-сторе (project.tacticalOverlays, персистится), бинарные данные —
+// в IndexedDB (store 'tactical-overlays', см. utils/storage.ts).
+
+/** Поддерживаемые форматы пользовательских тактических карт */
+export type TacticalOverlayFormat = 'geotiff' | 'kml' | 'kmz' | 'geojson' | 'mbtiles' | 'image';
+
+/** Кодировка растра после декодирования (PNG — канонический внутренний формат) */
+export type TacticalOverlayEncoding = 'png' | 'jpeg' | 'webp';
+
+/** EPSG-код projection: только Web Mercator и гео-координаты WGS-84 */
+export type TacticalOverlayProjection = 'EPSG:4326' | 'EPSG:3857';
+
+/** Границы слоя: ЗОНАЛЬНО-УГЛОВОЙ порядок [west, south, east, north] (GeoJSON/KML/GDAL convention) */
+export type BBox4 = [number, number, number, number];
+
+/** Привязка растрового слоя к географии (Web Mercator, та же математика что у тайлов OSM) */
+export interface TacticalOverlayGeoref {
+  /** bounding box слоя в EPSG:4326 (lon/lat, градусы) */
+  boundsWgs84: MapBounds;
+  /** родная проекция исходного файла */
+  projection: TacticalOverlayProjection;
+  /** размер растра в пикселях */
+  widthPx: number;
+  heightPx: number;
+}
+
+/** Полигон/линия из KML/GeoJSON как оверлей-вектор поверх подложки */
+export interface TacticalOverlayVector {
+  kind: 'polygon' | 'line';
+  name: string;
+  color: string;
+  /** замкнутый полигон или разомкнутая линия, { lat, lng } (стандарт аудита 1.2) */
+  ring: GeoPoint[];
+}
+
+/** Метаданные импортированного слоя (бинарник — по layerId в IndexedDB) */
+export interface TacticalOverlayLayer {
+  id: string;
+  /** layerId в IndexedDB store 'tactical-overlays' */
+  blobKey: string;
+  name: string;
+  format: TacticalOverlayFormat;
+  encoding: TacticalOverlayEncoding;
+  visible: boolean;
+  opacity: number; // 0..1
+  georef: TacticalOverlayGeoref;
+  vectors?: TacticalOverlayVector[];
+  /** TileMatrixSetLinks для MBTiles (zoom range) */
+  zoomRange?: { min: number; max: number };
+  importedAt: string; // ISO
+  sizeBytes: number;
+}

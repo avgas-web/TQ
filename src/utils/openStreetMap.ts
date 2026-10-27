@@ -9,6 +9,17 @@ const OSM_TILE_MIRRORS = [
   'https://c.tile.openstreetmap.org',
 ];
 
+/**
+ * Провайдер растровой подложки «esri-sat» — Esri World Imagery.
+ * ИСПРАВЛЕНИЕ АУДИТА 1.3: раньше параметр `style` в getOSMTileUrl уничтожался
+ * через `void style;` — режимы «спутник/гибрид» молча возвращали схемные тайлы
+ * OSM. Теперь при style='satellite'|'hybrid' URL строится по шаблону Esri
+ * (x/y перевёрнуты относительно стандартной XYZ-схемы: z/{y}/{x}).
+ */
+export const ESRI_SAT_TILE_URL = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile';
+/** Эталонный шаблон esri-sat (используется тестами привязки стилей) */
+export const ESRI_SAT_TEMPLATE = `${ESRI_SAT_TILE_URL}/{z}/{y}/{x}`;
+
 /** Ограничение параллельных загрузок тайлов на один хост: браузер даёт ~6 соединений,
  *  сотни запросов без лимита = таймауты и «вечная загрузка» большой карты. */
 let tileActive = 0;
@@ -73,6 +84,14 @@ export type NominatimErrorKind = 'network' | 'http';
  * Поддерживает внешний AbortController для отмены (уход пользователя, новый запрос).
  * Ошибки внешних серверов не пишутся в console.error — это штатная ситуация,
  * вызывающий код показывает пользователю понятное сообщение.
+ *
+ * ИСПРАВЛЕНИЕ АУДИТА 1.4 (обработка 404): статус 404 означает «адрес/объект не
+ * найден» — ШТАТНЫЙ ответ сервиса, а не сбой. Раньше он попадал в ветку
+ * `!response.ok -> kind:'http'`, что воспринималось вызывающим кодом как ошибка
+ * службы и триггерило лишний fallback (повторные раунды по всем зеркалам и
+ * резервному геокодеру Photon). Теперь 404/400 возвращают 'not_found' немедленно,
+ * без перебора зеркал; 429/5xx по-прежнему считаются сервисной ошибкой ('http')
+ * и приводят к ретраям.
  */
 async function fetchNominatimJson(
   path: string,
@@ -99,6 +118,11 @@ async function fetchNominatimJson(
           sawHttpError = true;
           continue; // пробуем следующее зеркало
         }
+        // 404 (и 400 — некорректный запрос) = штатное «не найдено»: НЕ является
+        // ошибкой сервиса, fallback на зеркала/Photon не требуется.
+        if (response.status === 404 || response.status === 400) {
+          return { data: null, kind: 'not_found' };
+        }
         if (!response.ok) return { data: null, kind: 'http' };
         const json = await response.json();
         return { data: json, kind: Array.isArray(json) && json.length === 0 ? 'not_found' : 'ok' };
@@ -114,6 +138,9 @@ async function fetchNominatimJson(
   }
   return { data: null, kind: sawHttpError ? 'http' : 'network' };
 }
+
+/** Экспорт для юнит-тестов (регрессия аудита 1.4): различение 404/5xx без сети */
+export const __test_fetchNominatimJson = fetchNominatimJson;
 
 export interface OsmGeocodeResult {
   point: { lat: number; lng: number } | null;
@@ -151,33 +178,42 @@ export async function osmReverseGeocode(lat: number, lng: number, signal?: Abort
 
 export type TileStyle = 'scheme' | 'satellite' | 'hybrid';
 
+/** Тайловый URL провайдера esri-sat (Esri World Imagery): z/{y}/{x}. */
+function esriSatTileUrl(z: number, x: number, y: number): string {
+  return `${ESRI_SAT_TILE_URL}/${z}/${y}/${x}`;
+}
+
 /**
- * Получение URL тайла OSM
+ * Получение URL тайла подложки.
+ * ИСПРАВЛЕНИЕ АУДИТА 1.3: параметр `style` БОЛЬШЕ НЕ уничтожается (`void style;`) —
+ * при style='satellite'|'hybrid' для любого tileServer подключается провайдер
+ * esri-sat (Esri World Imagery); 'scheme' — обычная схема выбранного сервера.
  */
 export function getOSMTileUrl(
   zoom: number,
   x: number,
   y: number,
-  tileServer: 'osm' | 'opentopomap' | 'carto' = 'osm',
+  tileServer: 'osm' | 'opentopomap' | 'carto' | 'esri-sat' = 'osm',
   style: TileStyle = 'scheme'
 ): string {
   // detectRetina: тайлы @2x доступны ТОЛЬКО у tile.openstreetmap.org и basemaps.cartocdn.com
   // (макс. уровень их нативного зума — 19). Esri World_Imagery отдаёт 512-px тайлы без @2x,
   // opentopomap — только до z17. maxNativeZoom учитывается вызывающим кодом.
   const z = Math.min(Math.max(zoom, 0), 19);
+  // Спутниковые стили: явный запрос esri-sat ИЛИ style=satellite|hybrid на любом
+  // сервере — всегда Esri World Imagery (прямой XYZ-шаблон, x/y перевёрнуты).
+  if (tileServer === 'esri-sat' || style === 'satellite' || style === 'hybrid') {
+    return esriSatTileUrl(z, x, y);
+  }
   const retina = typeof window !== 'undefined' && (window.devicePixelRatio || 1) >= 1.5;
   const at = retina ? '@2x' : '';
   switch (tileServer) {
     case 'opentopomap':
       return `https://tile.opentopomap.org/${Math.min(z, 17)}/${x}/${y}.png`;
     case 'carto':
-      if (style === 'satellite' || style === 'hybrid')
-        return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
       return `https://basemaps.cartocdn.com/dark_all${at}/${z}/${x}/${y}.png`;
     case 'osm':
     default:
-      if (style === 'satellite' || style === 'hybrid')
-        return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
       return `https://tile.openstreetmap.org/${z}/${x}/${y}${at}.png`;
   }
 }
@@ -185,16 +221,55 @@ export function getOSMTileUrl(
 /**
  * Тайл с деградацией до maxNativeZoom: выше родного разрешения тайлы НЕ растягиваются —
  * берётся ближайший доступный уровень и рисуется в физическом разрешении.
+ *
+ * ИСПРАВЛЕНИЕ АУДИТА 1.5 (утечки Canvas/Map): у загрузки есть `cancel()` — после
+ * него гарантированно НЕ происходит ни resolve(img), ни присваивания img.src
+ * вызывающим кодом (загрузка обрывается, обработчики снимаются, ссылка на Image
+ * зануляется). Это исключает «прилетевшие» после отмены изображения в кэше и
+ * DOM-слое при быстром панорамировании и при размонтировании компонента.
  */
+export interface CancellableTileLoad {
+  promise: Promise<HTMLImageElement | null>;
+  cancel: () => void;
+}
+
+export function loadTileImageCancellable(url: string, timeoutMs = 8000): CancellableTileLoad {
+  let settled = false;
+  let cancelled = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let resolveFn: (v: HTMLImageElement | null) => void = () => {};
+  const promise = new Promise<HTMLImageElement | null>((resolve) => { resolveFn = resolve; });
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  const cleanup = () => {
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+    img.onload = null;
+    img.onerror = null;
+  };
+  const finish = (value: HTMLImageElement | null) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    // ЖЁСТКАЯ ГАРАНТИЯ: отменённая загрузка никогда не резолвится изображением
+    resolveFn(cancelled ? null : value);
+  };
+  timer = setTimeout(() => finish(null), timeoutMs);
+  img.onload = () => finish(img);
+  img.onerror = () => finish(null);
+  img.src = url;
+  const cancel = () => {
+    if (cancelled) return;
+    cancelled = true;
+    // Обрываем текущую сетевую загрузку браузера и снимаем все ссылки
+    try { img.src = ''; } catch { /* защищённые контексты */ }
+    finish(null);
+  };
+  return { promise, cancel };
+}
+
+/** Обратная совместимость: промис без handles отмены. */
 export async function loadTileImage(url: string, timeoutMs = 8000): Promise<HTMLImageElement | null> {
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    const timer = setTimeout(() => { img.src = ''; resolve(null); }, timeoutMs);
-    img.onload = () => { clearTimeout(timer); resolve(img); };
-    img.onerror = () => { clearTimeout(timer); resolve(null); };
-    img.src = url;
-  });
+  return loadTileImageCancellable(url, timeoutMs).promise;
 }
 
 /**

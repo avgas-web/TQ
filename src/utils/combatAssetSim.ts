@@ -104,7 +104,7 @@ function assertFinite(name: string, v: number): void {
  * Все публичные методы async, защищают общее состояние «замком» очереди
  * (одновременные команды сериализуются) и имеют таймаут + retry.
  */
-export class DroneSim {
+export class CombatAssetSim {
   readonly droneId: string;
   private state: Telemetry;
   private geofence: Geofence | null = null;
@@ -455,7 +455,7 @@ export class DroneSim {
   /** Запретная зона (add_no_fly_zone) cylinder/polygon/sphere. */
   addNoFlyZone(zone: Omit<NoFlyZone, 'ceilingM'> & { ceilingM?: number }): string {
     const shapes: NoFlyShape[] = ['cylinder', 'polygon', 'sphere'];
-    if (!shapes.includes(zone.shape)) throw new ValidationError(`Форма NFZ недопустима: ${String(zone.shape)}`);
+    if (!shapes.includes(zone.shape)) throw new ValidationError(`Форма зоны ПВО (ADIZ) недопустима: ${String(zone.shape)}`);
     if ((zone.shape === 'cylinder' || zone.shape === 'sphere') && !(zone.radiusM && zone.center)) {
       throw new ValidationError('Для cylinder/sphere нужны center и radiusM');
     }
@@ -464,7 +464,7 @@ export class DroneSim {
     }
     const id = zone.id || `nfz-${Date.now()}`;
     this.noFlyZones.push({ ...zone, id, ceilingM: zone.ceilingM ?? MAX_ALTITUDE_M });
-    this.pushLog('INFO', `NFZ ${id} (${zone.shape}) добавлена`);
+    this.pushLog('INFO', `Зона ПВО (ADIZ) ${id} (${zone.shape}) добавлена`);
     return id;
   }
 

@@ -3,6 +3,8 @@
 const STORAGE_KEY = 'totalquadro-storage';
 const MAP_DB_NAME = 'totalquadro-maps';
 const MAP_STORE_NAME = 'maps';
+/** Store импортированных тактических карт (Задача 2) — создаётся в апгрейде версии */
+const TACTICAL_STORE_NAME = 'tactical-overlays';
 
 /**
  * Проверка доступного места в localStorage
@@ -99,7 +101,10 @@ export function safeSetItem(key: string, value: string): boolean {
  */
 export function initMapDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(MAP_DB_NAME, 1);
+    // Версия 2: добавлен store 'tactical-overlays' (Задача 2 — загрузка
+    // пользовательских тактических карт). Апгрейд идемпотентен: старые БД v1
+    // получают новый store в onupgradeneeded, существующие данные не трогаются.
+    const request = indexedDB.open(MAP_DB_NAME, 2);
     
     request.onerror = () => {
       reject(new Error('Не удалось открыть IndexedDB'));
@@ -122,8 +127,72 @@ export function initMapDatabase(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(MAP_STORE_NAME)) {
         db.createObjectStore(MAP_STORE_NAME, { keyPath: 'id' });
       }
+      // Store пользовательских тактических карт (Задача 2): бинарные данные
+      // импортированных слоёв (растр GeoTIFF/PNG/JPEG, KML/GeoJSON) — по layerId.
+      if (!db.objectStoreNames.contains(TACTICAL_STORE_NAME)) {
+        db.createObjectStore(TACTICAL_STORE_NAME, { keyPath: 'layerId' });
+      }
     };
   });
+}
+
+// ─── Тактические оверлеи (Загрузка пользовательских карт, Задача 2) ────────
+
+export interface TacticalOverlayBlob {
+  layerId: string;
+  /** base64 data URL растра (PNG/JPEG/WebP) или текст KML/GeoJSON */
+  payload: string;
+  kind: 'raster' | 'vector';
+  format: string;
+  sizeBytes: number;
+  savedAt: number;
+}
+
+/** Сохранить бинарник/текст импортированного слоя (метаданные живут в сторе Zustand) */
+export async function saveTacticalOverlayToIndexedDB(rec: TacticalOverlayBlob): Promise<boolean> {
+  try {
+    const db = await initMapDatabase();
+    return await new Promise((resolve) => {
+      const transaction = db.transaction([TACTICAL_STORE_NAME], 'readwrite');
+      const store = transaction.objectStore(TACTICAL_STORE_NAME);
+      store.put({ ...rec, savedAt: Date.now() });
+      transaction.oncomplete = () => resolve(true);
+      transaction.onerror = () => { console.error('Ошибка сохранения тактического слоя'); resolve(false); };
+    });
+  } catch (error) {
+    console.error('Ошибка сохранения тактического слоя:', error);
+    return false;
+  }
+}
+
+export async function loadTacticalOverlayFromIndexedDB(layerId: string): Promise<TacticalOverlayBlob | null> {
+  try {
+    const db = await initMapDatabase();
+    return await new Promise((resolve) => {
+      const transaction = db.transaction([TACTICAL_STORE_NAME], 'readonly');
+      const store = transaction.objectStore(TACTICAL_STORE_NAME);
+      const request = store.get(layerId);
+      request.onsuccess = () => resolve(request.result ?? null);
+      request.onerror = () => { console.error('Ошибка загрузки тактического слоя'); resolve(null); };
+    });
+  } catch (error) {
+    console.error('Ошибка загрузки тактического слоя:', error);
+    return null;
+  }
+}
+
+export async function deleteTacticalOverlayFromIndexedDB(layerId: string): Promise<boolean> {
+  try {
+    const db = await initMapDatabase();
+    return await new Promise((resolve) => {
+      const transaction = db.transaction([TACTICAL_STORE_NAME], 'readwrite');
+      transaction.objectStore(TACTICAL_STORE_NAME).delete(layerId);
+      transaction.oncomplete = () => resolve(true);
+      transaction.onerror = () => resolve(false);
+    });
+  } catch {
+    return false;
+  }
 }
 
 /**

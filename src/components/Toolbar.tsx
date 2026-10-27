@@ -128,17 +128,17 @@ const Toolbar: React.FC = () => {
         </span>
       )}
 
-      {/* Reset */}
+      {/* Abort Mission / Scrub Sector */}
       <button
         onClick={() => {
-          if (confirm('Сбросить проект? Все данные будут потеряны.')) {
+          if (confirm('ОТМЕНА БОЕВОЙ ЗАДАЧИ: стереть сектор? Все данные будут потеряны.')) {
             resetProject();
           }
         }}
         className="px-3 py-2 bg-red-700 hover:bg-red-800 text-white rounded text-sm font-medium transition-colors"
         title="Новый проект"
       >
-        🔄 Сброс
+        🔄 Abort Mission
       </button>
     </div>
   );

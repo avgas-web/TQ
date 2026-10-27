@@ -13,7 +13,9 @@ import {
   type WaypointParams,
   type OptimizeAlgorithm,
 } from '../utils/mission';
-import { saveMapToIndexedDB, loadMapFromIndexedDB, deleteMapFromIndexedDB } from '../utils/storage';
+import { saveMapToIndexedDB, loadMapFromIndexedDB, deleteMapFromIndexedDB, saveTacticalOverlayToIndexedDB, deleteTacticalOverlayFromIndexedDB, loadTacticalOverlayFromIndexedDB } from '../utils/storage';
+import { loadTacticalMapFile } from '../utils/tacticalMapLoader';
+import type { TacticalOverlayLayer } from '../types';
 import { geoToPixelFromBounds, calculateBoundsFromCenter, latToMercatorY, mercatorYToLat } from '../utils/googleMaps';
 import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, geoToPixelExact, smoothPolyline, routeLengthM, requiredAbsFromZones } from '../utils/routing';
 import { fetchElevations, computeRouteAltitude } from '../utils/elevation';
@@ -336,7 +338,7 @@ export function normalizeViewState(v: any): ViewState {
 
 interface AppState {
   project: Project;
-  /** Назначения дронам/группам: старт, цель, маршрут (персистится в project-агностичном ключе). */
+  /** Назначения Боевым Аппаратам/группам: старт, цель, маршрут (персистится в project-агностичном ключе). */
   droneAssignments: DroneAssignment[];
   setDroneAssignment: (droneId: string, patch: Partial<Omit<DroneAssignment, 'droneId'>>) => void;
   removeDroneAssignment: (droneId: string) => void;
@@ -386,11 +388,11 @@ interface AppState {
    *  на i-й точке черновика. При задании высоты черновик автоматически
    *  утверждается как маршрут проекта (если точек >= 2). */
   setDraftPointAltitude: (i: number, stepM: number) => void;
-  /** Черновик маршрута мастера (гео-точки + ручные AGL-высоты этапов по
+  /** Проекция Маршрута (Оперативного Планировщика) (гео-точки + ручные AGL-высоты этапов по
    *  индексу точки); null = черновика нет. Пишется MapCanvas при редактиро-
    *  вании, читается approveTripleStep / setDraftPointAltitude. */
   routeDraft: { geo: { lat: number; lng: number }[]; agl: Record<number, number>; routeId?: string | null };
-  /** Утвердить черновик маршрута как маршрут проекта (общий код мастера:
+  /** Утвердить черновик маршрута как маршрут проекта (общий код Оперативного Планировщика:
    *  перенос ручных высот этапов, обход зон, пересчёт высот). idToReplace —
    *  существующий маршрут дрона (редактирование), иначе создаётся новый. */
   commitRouteDraft: (opts: { idToReplace?: string | null; name?: string; color?: string }) => string | null;
@@ -456,7 +458,24 @@ interface AppState {
   /** Активная тайловая карта без снимка: центр (lat/lng) + зум 10..19 */
   loadActiveTileMap: (center: { lat: number; lng: number }, zoom: number) => void;
   restoreMapFromStorage: () => Promise<void>;
+
+  // Actions — ЗАГРУЗ ПОЛЬЗОВАТЕЛЬСКИХ ТАКТИЧЕСКИХ КАРТ (Задача 2)
+  /** Импортировать файл тактической карты (GeoTIFF/KML/KMZ/GeoJSON/MBTiles/PNG/JPEG):
+   *  парсинг геопривязки -> метаданные в стор (project.tacticalOverlays, persist),
+   *  бинарник/текст — в IndexedDB. Возвращает id слоя; ошибка — throw Error. */
+  importTacticalOverlay: (file: File | { name: string; arrayBuffer(): Promise<ArrayBuffer> }) => Promise<string>;
+  updateTacticalOverlay: (id: string, patch: Partial<Pick<TacticalOverlayLayer, 'visible' | 'opacity' | 'name'>>) => void;
+  removeTacticalOverlay: (id: string) => Promise<void>;
+  /** Гидрация payload-ов импортированных слоёв из IndexedDB при старте приложения */
+  hydrateTacticalOverlays: () => Promise<void>;
+  /** Синхронный доступ к декодированному payload слоя (data URL растра / текст KML/GeoJSON).
+   *  Используется Canvas-рендерером оверлеев; null — если данные ещё не гидрированы. */
+  getTacticalOverlayPayload: (layerId: string) => string | null;
 }
+
+/** Кэш payload-ов тактических слоёв вне React-стейта: base64-строки огромны,
+ *  их хранение в сторе вызывало бы лишние ре-рендеры всей карты. */
+const tacticalPayloadCache = new Map<string, string>();
 
 const defaultProject: Project = {
   version: '1.1',
@@ -471,6 +490,7 @@ const defaultProject: Project = {
   restrictions: [],
   markers: [],
   routes: [],
+  tacticalOverlays: [],
   layers: [
     { id: 'default', name: 'Основной', visible: true, locked: false },
   ],
@@ -536,7 +556,7 @@ export const useStore = create<AppState>()(
         set((state) => ({ droneAssignments: state.droneAssignments.filter((d) => d.droneId !== droneId) })),
 
       commitRouteDraft: ({ idToReplace, name, color }) => {
-        // Общий код мастера этапов: зафиксировать черновик маршрута как маршрут
+        // Общий код Оперативного Планировщика этапов: зафиксировать черновик маршрута как маршрут
         // проекта. Ручные высоты этапов (agl по индексу точки) переносятся в
         // altitudeAGL соответствующих RoutePoint; затем — немедленный обход
         // ограничений и пересчёт высот (terrain + запас / полом-потолок зон).
@@ -574,7 +594,7 @@ export const useStore = create<AppState>()(
         // Регулировка высоты ЭТАПА на промежуточной точке ещё не утверждённого
         // черновика: шаг ±stepM метров AGL. Черновик хранится в routeDraft;
         // если он уже перенесён в проект — высота применяется к маршруту с
-        // ТОЧНОЙ привязкой по id (routeId из мастера), без эвристики «первый
+        // ТОЧНОЙ привязкой по id (routeId из Планировщика), без эвристики «первый
         // маршрут с таким же набором координат» (могла применить высоту к
         // чужому маршруту роя с идентичными точками).
         const st = get();
@@ -1401,7 +1421,7 @@ export const useStore = create<AppState>()(
       })),
 
       resetProject: () => set({
-        project: { ...defaultProject, routes: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+        project: { ...defaultProject, routes: [], tacticalOverlays: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
         currentTool: 'pan',
         activeRestrictionId: null,
         selectedMarkerId: null,
@@ -1599,6 +1619,73 @@ export const useStore = create<AppState>()(
           get().refreshAllRoutesAfterMapChange();
         }
       },
+
+      // ─── ЗАГРУЗ ПОЛЬЗОВАТЕЛЬСКИХ ТАКТИЧЕСКИХ КАРТ (Задача 2) ──────────────
+      importTacticalOverlay: async (file) => {
+        const loaded = await loadTacticalMapFile(file);
+        // ЖЁСТКАЯ привязка: georef обязан быть валидным — без bounds слой не сохраняется
+        const b = loaded.layer.georef.boundsWgs84;
+        if (![b.north, b.south, b.east, b.west].every(Number.isFinite)) {
+          throw new Error('Файл не содержит корректной координатной привязки (bounding box)');
+        }
+        set((cur) => ({
+          project: {
+            ...cur.project,
+            tacticalOverlays: [...(cur.project.tacticalOverlays || []), loaded.layer],
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+        // Бинарные данные/текст — в IndexedDB (персистентность после перезагрузки).
+        // Ошибка записи не откатывает слой: метаданные останутся, рендер деградирует мягко.
+        if (loaded.payload) {
+          tacticalPayloadCache.set(loaded.layer.id, loaded.payload);
+          await saveTacticalOverlayToIndexedDB({
+            layerId: loaded.layer.id,
+            payload: loaded.payload,
+            kind: loaded.kind,
+            format: loaded.layer.format,
+            sizeBytes: loaded.layer.sizeBytes,
+            savedAt: Date.now(),
+          });
+        }
+        return loaded.layer.id;
+      },
+
+      updateTacticalOverlay: (id, patch) => set((cur) => ({
+        project: {
+          ...cur.project,
+          tacticalOverlays: (cur.project.tacticalOverlays || []).map((l) => (l.id === id ? { ...l, ...patch } : l)),
+          updatedAt: new Date().toISOString(),
+        },
+      })),
+
+      removeTacticalOverlay: async (id) => {
+        tacticalPayloadCache.delete(id);
+        set((cur) => ({
+          project: {
+            ...cur.project,
+            tacticalOverlays: (cur.project.tacticalOverlays || []).filter((l) => l.id !== id),
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+        await deleteTacticalOverlayFromIndexedDB(id);
+      },
+
+      // Гидрация payload-ов из IndexedDB: метаданные слоёв приходят из localStorage
+      // (persist), бинарники — из IDB. После загрузки канвас-рендерер получает
+      // data URL / текст и рисует слой поверх подложки. bump viewTick — чтобы
+      // MapCanvas перерисовался с новыми данными.
+      hydrateTacticalOverlays: async () => {
+        const layers = get().project.tacticalOverlays || [];
+        for (const l of layers) {
+          if (tacticalPayloadCache.has(l.id)) continue;
+          const rec = await loadTacticalOverlayFromIndexedDB(l.blobKey || l.id);
+          if (rec && rec.payload) tacticalPayloadCache.set(l.id, rec.payload);
+        }
+        useStore.setState((s) => ({ viewTick: s.viewTick + 1 }));
+      },
+
+      getTacticalOverlayPayload: (layerId) => tacticalPayloadCache.get(layerId) ?? null,
     }),
     {
       name: 'totalquadro-storage',
@@ -1682,6 +1769,10 @@ export const useStore = create<AppState>()(
         // Миграция для старых проектов без маршрутов
         if (persistedState.project && !Array.isArray(persistedState.project.routes)) {
           persistedState.project.routes = [];
+        }
+        // Миграция v2: старые проекты без импортированных тактических карт (Задача 2)
+        if (persistedState.project && !Array.isArray(persistedState.project.tacticalOverlays)) {
+          persistedState.project.tacticalOverlays = [];
         }
         // Нормализация viewState: старые версии хранилища могли записать вид без
         // поля z0 (или с «грязным» значением null/строкой). Все потребители вида

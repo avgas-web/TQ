@@ -1,13 +1,13 @@
 // Панель миссий: планирование (оптимизация порядка точек, «змейка» сканирования),
 // параметры путевых точек (задержка/угол камеры/скорость/радиус принятия),
-// метаданные миссии и назначения дронам (старт/цель/маршрут).
-// Работает поверх существующего zustand-стора; симулятор полёта — DroneSim.
+// метаданные миссии и назначения Боевым Аппаратам (старт/цель/маршрут).
+// Работает поверх существующего zustand-стора; модуль Боевого Моделирования — CombatAssetSim.
 
 import React, { useMemo, useState } from 'react';
 import { useStore } from '../store/useStore';
 import type { OptimizeAlgorithm } from '../utils/mission';
 import { DEFAULT_WAYPOINT_PARAMS } from '../utils/mission';
-import { DroneSim, type Telemetry } from '../utils/droneSim';
+import { CombatAssetSim, type Telemetry } from '../utils/combatAssetSim';
 
 const ALGORITHMS: Array<{ id: OptimizeAlgorithm; label: string }> = [
   { id: 'nearest_neighbor', label: 'Ближайший сосед' },
@@ -62,9 +62,9 @@ const MissionPanel: React.FC = () => {
     }
   };
 
-  /** Демонстрация цикла управления из Блоков 2/6 на симуляторе DroneSim. */
+  /** Демонстрация Цикла Боевого Моделирования из Блоков 2/6 в модуле Боевого Моделирования на CombatAssetSim. */
   const runSimCycle = async (): Promise<void> => {
-    const sim = new DroneSim('demo-uav', { lat: 59.93, lon: 30.33, batteryPct: 90 });
+    const sim = new CombatAssetSim('demo-uav', { lat: 59.93, lon: 30.33, batteryPct: 90 });
     const logs: string[] = [];
     try {
       const pf = await sim.preflightCheck();
@@ -198,9 +198,9 @@ const MissionPanel: React.FC = () => {
         </div>
       )}
 
-      {/* Назначения дронам */}
+      {/* Назначения Боевым Аппаратам */}
       <div className="border-t border-gray-700 pt-2">
-        <div className="text-xs text-gray-400 mb-1">Дроны: старт / цель / маршрут</div>
+        <div className="text-xs text-gray-400 mb-1">Боевые Аппараты: старт / цель / узлы боевого курса</div>
         <div className="flex items-center gap-2 mb-2">
           <label className="text-[11px] text-gray-500">кол-во</label>
           <input
@@ -257,7 +257,7 @@ const MissionPanel: React.FC = () => {
       {/* Симуляция цикла управления */}
       <div className="border-t border-gray-700 pt-2">
         <button onClick={() => void runSimCycle()} className="w-full px-3 py-1 bg-amber-600 hover:bg-amber-700 rounded text-white">
-          ▶ Прогнать цикл на симуляторе (preflight → arm → takeoff → RTL)
+          ▶ Прогнать цикл в модуле Боевого Моделирования на (preflight → arm → takeoff → RTL)
         </button>
         {simLog.length > 0 && (
           <pre className="mt-2 p-2 bg-gray-900 rounded text-[11px] text-gray-300 whitespace-pre-wrap">{simLog.join('\n')}</pre>

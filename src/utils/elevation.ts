@@ -39,9 +39,19 @@ function dedupe(points: ElevationPoint[]): ElevationPoint[] {
 
 /** Запрос батча высот к Open-Elevation. Батчи разбиваются по ≤100 точек
  *  (защита от слишком больших URL/таймаутов), выполняются последовательно
- *  (публичный API бесплатно троттлит частые запросы). */
-async function fetchElevationsBatch(points: ElevationPoint[], signal?: AbortSignal): Promise<(number | null)[]> {
-  const results: (number | null)[] = new Array(points.length).fill(null);
+ *  (публичный API бесплатно троттлит частые запросы).
+ *  ВАЖНО (исправление аудита 1.1): цикл обрабатывает ВСЕ чанки — досрочный
+ *  `return readChunkResults(...)` внутри цикла раньше обрывал маршруты длиннее
+ *  100 точек (второй и последующие батчи не запрашивались, хвост оставался без
+ *  высот). Здесь нет return в теле цикла: функция заполняет массив результатов
+ *  по ссылке (`target`, если передан) и возвращает его только после прохода
+ *  всех батчей. */
+async function fetchElevationsBatch(
+  points: ElevationPoint[],
+  signal?: AbortSignal,
+  target?: (number | null)[],
+): Promise<(number | null)[]> {
+  const results: (number | null)[] = target ?? new Array(points.length).fill(null);
   const CHUNK = 100;
   for (let off = 0; off < points.length; off += CHUNK) {
     const chunk = points.slice(off, off + CHUNK);
@@ -85,6 +95,9 @@ export async function fetchElevations(points: ElevationPoint[], signal?: AbortSi
   const out: (number | null)[] = new Array(points.length).fill(null);
   const uniq = dedupe(points);
   const missing = uniq.filter((p) => !elevCache.has(cacheKey(p.lat, p.lng)));
+  // ВАЖНО (аудит 1.1): один вызов покрывает ВСЕ недостающие точки независимо
+  // от их количества — разбиение на чанки ≤100 и последовательная обработка
+  // находятся внутри fetchElevationsBatch (без досрочного return в цикле).
   const fetched = missing.length > 0 ? await fetchElevationsBatch(missing, signal) : [];
   missing.forEach((p, i) => {
     const v = fetched[i];
@@ -96,6 +109,11 @@ export async function fetchElevations(points: ElevationPoint[], signal?: AbortSi
   });
   return out;
 }
+
+/** Экспорт для юнит-тестов батчевой загрузки высот (>100 точек). */
+export const __test_fetchElevationsBatch = fetchElevationsBatch;
+/** Экспорт для юнит-тестов: сброс кэша высот между тестами. */
+export function __test_clearElevationCache(): void { elevCache.clear(); }
 
 /** Высота одной точки (или null, если сервис недоступен) */
 export async function fetchElevation(lat: number, lng: number, signal?: AbortSignal): Promise<number | null> {

@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
@@ -16,5 +16,12 @@ export default defineConfig(() => ({
     hmr: {
       port: 3000,
     },
+  },
+  // Юнит-тесты (Vitest): математика координат, батчи высот, парсеры тактических карт
+  test: {
+    environment: "node",
+    include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
+    // тесты Nominatim проходят реальные паузы очереди/ретраев (1s + round delay)
+    testTimeout: 20000,
   },
 }));

@@ -4,7 +4,15 @@ import { isPointInsideAnyRestriction, distanceBetween } from '../utils/geometry'
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
 import { pixelToGeoExact, geoToPixelExact, routeLengthM, zonesCrossedBy, planPathAroundZones, smoothPolyline } from '../utils/routing';
-import { getOSMTileUrl, loadTileImage } from '../utils/openStreetMap';
+import { getOSMTileUrl, loadTileImageCancellable } from '../utils/openStreetMap';
+import {
+  overlayRasterRect,
+  ensureOverlayRaster,
+  getCachedOverlayRaster,
+  drawTacticalRasterLayer,
+  drawTacticalVectorLayer,
+  makeRasterToScreen,
+} from '../utils/tacticalOverlayRender';
 import MiniMapPanel, { MiniOverlayLine, MiniOverlayPoint, type MiniZone } from './MiniMapPanel';
 import { zoomForGroundMpp, GROUND_MPP_1CM_2KM } from '../utils/pannelli';
 import type { Point, Route, RoutePoint, MapBounds } from '../types';
@@ -215,7 +223,14 @@ const MapCanvas: React.FC = () => {
   const lastCursorUpdateRef = useRef(0);
   // pending-загрузки тайлов: url -> промис (дедупликация — один запрос на тайл)
   const tilePending = useRef<Map<string, Promise<void>>>(new Map());
+  // Аудит 1.5 (утечки Canvas/Map): активные отменяемые загрузки тайлов.
+  // При размонтировании компонента каждая из них вызывает cancel(): сетевая
+  // загрузка обрывается, onload/onerror снимаются, img.src зануляется — ни одна
+  // «прилетевшая» картинка не остаётся в памяти/DOM после unmount.
+  const tileLoadsRef = useRef<Set<{ cancel: () => void }>>(new Set());
   const [tilesVersion, setTilesVersion] = useState(0);
+  // Счётчик перерисовки при асинхронном декодировании растра тактических слоёв
+  const [overlayTick, setOverlayTick] = useState(0);
   // Геолокация пользователя
   const [userPos, setUserPos] = useState<{ lat: number; lng: number; acc: number } | null>(null);
 
@@ -430,7 +445,13 @@ const MapCanvas: React.FC = () => {
           // Тайл больше не виден (ушёл с экрана) или уже загружен — пропускаем без запроса
           if (!imgEl || tilePending.current.has(u) || tileCache.current.has(u)) continue;
           activeTilesRef.current++;
-          const p = loadTileImage(u, 10000) // таймаут: зависший тайл не блокирует очередь
+          // Аудит 1.5: загрузка через loadTileImageCancellable — после cancel()
+          // промис резолвится ТОЛЬКО null, поэтому присвоение imgEl.src ниже
+          // невозможно для отменённого/размонтированного тайла (проверка
+          // tileElsRef.get(u) === imgEl дополнительно страхует ссылку на элемент).
+          const handle = loadTileImageCancellable(u, 10000); // таймаут: зависший тайл не блокирует очередь
+          tileLoadsRef.current.add(handle);
+          const p = handle.promise
             .then((loaded) => {
               tileCache.current.set(u, loaded || undefined);
               if (tileCache.current.size > TILE_CACHE_MAX) {
@@ -440,6 +461,7 @@ const MapCanvas: React.FC = () => {
               if (loaded && tileElsRef.current.get(u) === imgEl) imgEl.src = u;
             })
             .finally(() => {
+              tileLoadsRef.current.delete(handle);
               tilePending.current.delete(u);
               activeTilesRef.current--;
               setTilesVersion((t2) => t2 + 1);
@@ -461,6 +483,31 @@ const MapCanvas: React.FC = () => {
     syncTileDom();
   }, [renderTick, tilesEnabled, tileServer, project.map?.bounds, canvasSize, syncTileDom]);
 
+  // Аудит 1.5: при размонтировании компонента ОБЯЗАТЕЛЬНО освобождаем все
+  // активные загрузки тайлов (cancel(): обрыв сети, снятие onload/onerror,
+  // зануление img.src), дебаунс-таймер очереди и ссылки кэшей — иначе
+  // «прилетевшие» изображения остаются в памяти после ухода с экрана карты.
+  useEffect(() => {
+    const loads = tileLoadsRef.current;
+    return () => {
+      for (const h of loads) { try { h.cancel(); } catch { /* уже завершена */ } }
+      loads.clear();
+      if (tileDebounceRef.current) { clearTimeout(tileDebounceRef.current); tileDebounceRef.current = null; }
+      tileQueueRef.current.length = 0;
+      tilePending.current.clear();
+      for (const img of tileElsRef.current.values()) img.remove();
+      tileElsRef.current.clear();
+      tileCache.current.clear();
+    };
+  }, []);
+
+  // Гидрация пользовательских тактических карт из IndexedDB при монтировании
+  // (метаданные — в Zustand-persist, payload-ы растров — в IDB store
+  // 'tactical-overlays'; после загрузки bump viewTick -> перерисовка слоёв).
+  useEffect(() => {
+    useStore.getState().hydrateTacticalOverlays();
+  }, []);
+
   // Геолокация пользователя (по требованию — кнопка 📍)
   const locateUser = useCallback(() => {
     if (!navigator.geolocation) { alert('Геолокация не поддерживается браузером'); return; }
@@ -477,8 +524,8 @@ const MapCanvas: React.FC = () => {
   // со строгой Mercator-привязкой, полным зумом/панорамой, редактированием
   // (точки старта/цели, маршрут, зоны ограничений) и удалением объектов кликом.
   // Все функции доступны ВО ВСЕХ ТРЁХ ОКНАХ. После ЗАПУСКА миссия передаётся
-  // в дроны, и кнопка «🆕 Новая миссия» очищает данные для следующего полёта.
-  // Рой дронов: у всех дронов один старт; общая цель ИЛИ индивидуальные цели.
+  // на Боевые Аппараты, и кнопка «🆕 Новая боевая задача» очищает данные для следующей боевой задачи.
+  // Групповой удар (рой Боевых Аппаратов): у всех Боевых Аппаратов один старт; общая цель ИЛИ индивидуальные цели.
   const tripleMode = true;
   // ─── Режимы работы с окнами (отдельные пункты меню):
   //  'restrictions' — Установка ограничений (клик по ЛЮБОЙ карте ставит зону);
@@ -489,13 +536,13 @@ const MapCanvas: React.FC = () => {
   useEffect(() => { workModeRef.current = tripleWorkMode; }, [tripleWorkMode]);
   const [droneCount, setDroneCount] = useState(4);
   const [sharedGoal, setSharedGoal] = useState(true);
-  // Общий старт для всего роя (по умолчанию) — либо индивидуальные старты дронов
+  // Общий старт для всего роя (по умолчанию) — либо индивидуальные старты Боевых Аппаратов
   const [sharedStart, setSharedStart] = useState(true);
   const [activeUav, setActiveUav] = useState(0);
   const [startGeo, setStartGeo] = useState<{ lat: number; lng: number } | null>(null);
   const [goalGeo, setGoalGeo] = useState<{ lat: number; lng: number } | null>(null);
-  // Индивидуальные старты дронов (при выключенном «общем старте»): индекс → гео.
-  // Маршрут i-го дрона начинается в startForUav(i) — так же, как цель берётся
+  // Индивидуальные старты Боевых Аппаратов (при выключенном «общем старте»): индекс → гео.
+  // Маршрут i-го Боевого Аппарата начинается в startForUav(i) — так же, как целеуказание берётся
   // из последней точки его маршрута (goalForUav).
   const [droneStarts, setDroneStarts] = useState<( { lat: number; lng: number } | null )[]>([]);
   // Индивидуальная цель текущего дрона при «индивидуальных целях»: клик по
@@ -504,7 +551,7 @@ const MapCanvas: React.FC = () => {
   const [pickWhat, setPickWhat] = useState<'none' | 'start' | 'goal'>('none');
   const pickWhatRef = useRef(pickWhat);
   useEffect(() => { pickWhatRef.current = pickWhat; }, [pickWhat]);
-  // Автозапуск мастера: как только данные этапа заданы — этап утверждается сам,
+  // Автозапуск Оперативного Планировщика: как только данные этапа заданы — этап утверждается сам,
   // фокус автоматически переходит к следующему окну (редактирование доступно и
   // вручную через кнопки этапов / перенос окна наверх).
   const autoApproveTimerRef = useRef<number | null>(null);
@@ -533,7 +580,7 @@ const MapCanvas: React.FC = () => {
     return out;
   }, [tripleRoutes, startGeo, goalGeo]);
 
-  // ─── Пошаговый мастер: старт → маршрут → цель → ЗАПУСК ──────────────────────
+  // ─── Оперативный Планировщик (пошаговый): старт → маршрут → цель → ЗАПУСК ──────────────────────
   // step: 0 = выбор старта (панель СТАРТ сфокусирована), 1 = редактирование
   // маршрута (панель ВЕСЬ МАРШРУТ), 2 = выбор цели (панель ЦЕЛЬ),
   // 3 = всё утверждено — активна кнопка «🚀 ЗАПУСК».
@@ -680,7 +727,7 @@ const MapCanvas: React.FC = () => {
   }, [tripleStep]);
 
   // Клик по карте ПАНЕЛИ: все функции доступны во всех трёх окнах одновременно —
-  // любое окно ставит/переносит старт, цель и путевые точки маршрута; зоны
+  // любое окно ставит/переносит старт, цель и узлы боевого курса маршрута; зоны
   // ограничения ставятся на ЛЮБОЙ карте без переноса окон и без сбивания фокуса.
   const handlePanelMapClick = useCallback((geo: { lat: number; lng: number; panelIdx?: number }) => {
     if (launchStateRef.current !== 'idle') return;
@@ -787,7 +834,7 @@ const MapCanvas: React.FC = () => {
     useStore.getState().flushReroute();
   }, []);
 
-  // «ЗАПУСК»: загрузка данных миссии в дроны (имитация телеметрической загрузки)
+  // «ЗАПУСК»: загрузка данных миссии на Боевые Аппараты (имитация телеметрической загрузки)
   const launchMission = useCallback(async () => {
     if (launchState !== 'idle') return;
     setLaunchState('uploading');
@@ -835,7 +882,7 @@ const MapCanvas: React.FC = () => {
     setActiveUav(0);
     // маршруты предыдущей миссии удаляем из проекта (зоны-ограничения остаются)
     useStore.setState((cur) => ({ project: { ...cur.project, routes: [] } }));
-    setPopup({ x: canvasSize.width / 2 - 160, y: 60, title: '🆕 Новая миссия', lines: ['Данные предыдущего полёта очищены.', 'Окно «Старт» активно — кликните по карте, чтобы задать точку старта.'] });
+    setPopup({ x: canvasSize.width / 2 - 160, y: 60, title: '🆕 Новая боевая задача', lines: ['Данные предыдущего полёта очищены.', 'Окно «Старт» активно — кликните по карте, чтобы задать точку старта.'] });
   }, [launchState, canvasSize]);
 
   // Перенос гео-объектов проекта (маршруты/маркеры/зоны) в виртуальный растр
@@ -1323,6 +1370,13 @@ const MapCanvas: React.FC = () => {
       ctx.restore();
     }
 
+    // ── ПОЛЬЗОВАТЕЛЬСКИЕ ТАКТИЧЕСКИЕ КАРТЫ (Задача 2, п.3): слои поверх подложки ──
+    // Единая математика Web Mercator с тайловым слоем: worldPx того же вида —
+    // идеальное наложение при любом зуме/панораме. Растровые payload-ы хранятся
+    // в IndexedDB; декодированные изображения — во внешнем LRU-кэше модуля
+    // tacticalOverlayRender (вне React-стейта — без лишних ре-рендеров).
+    drawTacticalOverlays(ctx);
+
     // Draw restrictions
     drawRestrictions(ctx);
 
@@ -1564,6 +1618,49 @@ const MapCanvas: React.FC = () => {
       g.font = 'bold 11px sans-serif';
       g.fillText(`${scaleLabel(mpp)} · ${rulerScaleText(mpp)}`, canvasSize.width - 12, ry - 28);
       g.restore();
+    }
+
+    // ─── Рендер пользовательских тактических карт (Задача 2, п.3) ───
+    // Растровые слои (GeoTIFF/PNG/JPEG) привязываются к georef.boundsWgs84 через
+    // overlayRasterRect — ту же mercator-формулу мира (worldPx), что и тайлы OSM;
+    // векторные (KML/KMZ/GeoJSON) — через makeRasterToScreen (geo->screen).
+    // MBTiles без декодированного растра рисует контур bounding box слоя.
+    function drawTacticalOverlays(g: CanvasRenderingContext2D) {
+      const layers = (project.tacticalOverlays || []).filter((l) => l.visible);
+      if (layers.length === 0) return;
+      const map = project.map;
+      for (const layer of layers) {
+        if (layer.format === 'kml' || layer.format === 'kmz' || layer.format === 'geojson') {
+          if (map?.bounds && layer.vectors?.length) {
+            drawTacticalVectorLayer(g, layer, makeRasterToScreen(vs, map.bounds, map.width, map.height));
+          }
+          continue;
+        }
+        const img = getCachedOverlayRaster(layer.id);
+        if (img) {
+          drawTacticalRasterLayer(g, layer, img, vs, worldPx, canvasSize.width, canvasSize.height);
+        } else {
+          // растр ещё декодируется (или payload не в кэше) — показываем рамку области слоя
+          const r = overlayRasterRect(layer, vs, worldPx);
+          if (!r) continue;
+          if (r.x + r.w < 0 || r.y + r.h < 0 || r.x > canvasSize.width || r.y > canvasSize.height) continue;
+          g.save();
+          g.globalAlpha = Math.max(0.15, Math.min(1, layer.opacity));
+          g.strokeStyle = '#22d3ee';
+          g.setLineDash([6, 4]);
+          g.lineWidth = 1.5;
+          g.strokeRect(r.x, r.y, r.w, r.h);
+          g.fillStyle = '#22d3ee';
+          g.font = '11px sans-serif';
+          g.fillText(`⏳ ${layer.name}`, r.x + 4, r.y + 14);
+          g.restore();
+          // инициируем асинхронное декодирование из хранилища (дедуп по pending)
+          const st = useStore.getState();
+          ensureOverlayRaster(layer.id, st.getTacticalOverlayPayload(layer.id)).then((loaded) => {
+            if (loaded) setOverlayTick((t) => t + 1);
+          });
+        }
+      }
     }
 
     function drawRestrictions(ctx: CanvasRenderingContext2D) {
@@ -1965,7 +2062,7 @@ const MapCanvas: React.FC = () => {
       ctx.restore();
     }
 
-  }, [project, renderTick, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, tilesVersion, userPos]);
+  }, [project, renderTick, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, tilesVersion, userPos, overlayTick]);
 
   // Mouse wheel zoom (к колесу курсора; границы minZoom/maxZoom внутри zoomAt)
   // ВАЖНО: React навешивает on-wheel/on-touch как passive-слушатели, и вызов
@@ -2409,7 +2506,7 @@ const MapCanvas: React.FC = () => {
     if (r && r.geo.length > 0) return r.geo[r.geo.length - 1];
     return goalGeo;
   };
-  // Стартовая точка i-го дрона: общая (весь рой взлетает с одной точки) или
+  // Стартовая точка i-го Боевого Аппарата: общая (весь рой взлетает с одной точки) или
   // индивидуальная (задана кликом по окну «Старт», когда общий старт выключен).
   const startForUav = (i: number): { lat: number; lng: number } | null => {
     if (sharedStart) return startGeo;
@@ -2512,7 +2609,7 @@ const MapCanvas: React.FC = () => {
         <button className={btnCls} aria-label="Полный экран" title="Полный экран (F)" onClick={toggleFullscreen}>⛶</button>
       </div>
 
-      {/* ─── Три отдельных окна карты + пошаговый мастер: СТАРТ → МАРШРУТ → ЦЕЛЬ → ЗАПУСК ─── */}
+      {/* ─── Три отдельных окна карты + пошаговый Оперативный Планировщик: СТАРТ → МАРШРУТ → ЦЕЛЬ → ЗАПУСК ─── */}
       {tripleMode && (() => {
         // гео-зоны проекта (для отрисовки ограничений на активной панели)
         const zoneGeoList = (() => {
@@ -2582,7 +2679,7 @@ const MapCanvas: React.FC = () => {
         <div id="triple-route-top" className="absolute inset-0 z-30">
           <MiniMapPanel key={`top-${topPanelIdx}`} {...panelPropsFor(topPanelIdx)} />
         </div>
-        {/* НИЗ: две неактивные карты + панель мастера */}
+        {/* НИЗ: две неактивные карты + панель Оперативного Планировщика */}
         <div id="triple-map-row" className="absolute left-2 right-2 bottom-2 z-40 rounded-xl border border-cyan-700/60 bg-gray-900/95 shadow-2xl p-2">
           <div className="flex flex-wrap items-center gap-2 mb-2 text-xs">
             <span className="font-bold text-cyan-300">Карта миссии роя</span>
@@ -2643,7 +2740,7 @@ const MapCanvas: React.FC = () => {
               />
             ))}
           </div>
-          {/* Нижняя панель мастера: назад / утвердить / ЗАПУСК */}
+          {/* Нижняя панель Оперативного Планировщика: назад / утвердить / ЗАПУСК */}
           <div className="flex items-center gap-2 mt-2 text-xs">
             <button
               className="px-3 py-1 rounded bg-gray-800 hover:bg-gray-700 border border-gray-600 text-gray-200 disabled:opacity-40"
@@ -2662,22 +2759,22 @@ const MapCanvas: React.FC = () => {
                 className={`px-4 py-1 rounded font-bold border text-white transition-all ${launchState === 'done' ? 'bg-emerald-600 border-emerald-400 cursor-default' : launchState === 'uploading' ? 'bg-amber-700 border-amber-500 animate-pulse cursor-wait' : 'bg-red-700 hover:bg-red-600 border-red-400 shadow-[0_0_14px_rgba(239,68,68,0.5)]'}`}
                 onClick={launchMission}
                 disabled={launchState !== 'idle'}
-                title="Все данные миссии утверждены — загрузить полётные задания в дроны"
-              >{launchState === 'uploading' ? '⏳ Загрузка в дроны…' : launchState === 'done' ? '✅ Задания загружены' : '🚀 ЗАПУСК'}</button>
+                title="Все данные миссии утверждены — загрузить полётные задания на Боевые Аппараты"
+              >{launchState === 'uploading' ? '⏳ Загрузка на Боевые Аппараты…' : launchState === 'done' ? '✅ Задания загружены' : '🚀 ЗАПУСК'}</button>
             ) : null}
             {launchState === 'done' && (
               <button
                 className="px-4 py-1 rounded font-bold border text-white bg-cyan-700 hover:bg-cyan-600 border-cyan-400 shadow-[0_0_14px_rgba(34,211,238,0.45)]"
                 onClick={newMission}
                 title="Очистить данные предыдущего полёта и начать новую миссию"
-              >🆕 Новая миссия</button>
+              >🆕 Новая боевая задача</button>
             )}
             <span className="text-gray-400">
               {tripleStep === 0 && 'Кликните по подсвеченной карте «Старт», чтобы выбрать точку старта.'}
-              {tripleStep === 1 && 'Кликами по карте «Маршрут» добавляйте путевые точки; перетащите карту/зум для обзора.'}
+              {tripleStep === 1 && 'Кликами по карте «Маршрут» добавляйте узлы боевого курса; перетащите карту/зум для обзора.'}
               {tripleStep === 2 && 'На карте «Цель»: ставьте цель (🎯) и ограничения зон (⛔).'}
               {tripleStep === 3 && 'Проверьте карты и нажмите «ЗАПУСК» — задания уйдут в рой.'}
-              {launchState === 'done' && ' ✅ Задания загружены в дроны. Нажмите «Новая миссия», чтобы начать следующий полёт.'}
+              {launchState === 'done' && ' ✅ Задания загружены на Боевые Аппараты. Нажмите «Новая миссия», чтобы начать следующий полёт.'}
             </span>
           </div>
         </div>
