@@ -19,13 +19,13 @@ beforeEach(() => {
 describe('Toolbar: инструменты и подсказки', () => {
   it('кнопка NFZ имеет tooltip с инструкцией по завершению', () => {
     render(React.createElement(Toolbar));
-    const btn = screen.getByTitle(/NFZ|бесполетная/i) as HTMLElement;
+    const btn = screen.getByTitle(/NFZ|ADIZ|Зоны ПВО|бесполетная/i) as HTMLElement;
     expect(btn.getAttribute('title')).toMatch(/двойной клик/i);
   });
 
   it('выбор инструмента "NFZ" переключает currentTool из Toolbar', () => {
     render(React.createElement(Toolbar));
-    const btn = screen.getByTitle(/NFZ|бесполетная/i);
+    const btn = screen.getByTitle(/NFZ|ADIZ|Зоны ПВО|бесполетная/i);
     fireEvent.click(btn);
     expect(useStore.getState().currentTool).toBe('drawPolygon');
   });
