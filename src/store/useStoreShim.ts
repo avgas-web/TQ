@@ -14,7 +14,13 @@ import type { Project, Tool, ViewState, Point } from '../types';
 import { useMapStore, invalidateZoneCache as invalidateZoneCacheLocal, selectViewForRender as selectMapView, defaultMapSettings } from './useMapStore';
 import { useMissionStore, rerouteAllNow } from './useMissionStore';
 import { useFleetStore } from './useFleetStore';
-import { clearAllStoredMaps } from '../utils/storage';
+import {
+  clearAllStoredMaps,
+  saveUserLayerToIndexedDB, loadUserLayerFromIndexedDB, deleteUserLayerFromIndexedDB,
+  listUserLayerIds,
+} from '../utils/storage';
+import type { UserMapLayer, UserMapLayerRecord } from '../types';
+import { latToMercatorY } from '../utils/googleMaps';
 import { sanitizeProjectData } from '../utils/projectSchema';
 
 // Реэкспорт публичных утилит старого модуля — компоненты/тесты импортируют их из './useStore'
@@ -24,6 +30,23 @@ export { scheduleRerouteAll } from './useMissionStore';
 type MapS = ReturnType<typeof useMapStore.getState>;
 type MisS = ReturnType<typeof useMissionStore.getState>;
 type FltS = ReturnType<typeof useFleetStore.getState>;
+
+// ─── Пользовательские тактические карты (ЭТАП 2) ─────────────────────────────
+// Метаданные слоёв живут здесь (module-level mirror: useMapStore из main их не
+// знает), тяжёлые payload'ы — в IndexedDB store «userlayers». Реестр blobKnownIds
+// позволяет userLayerRecords() определять наличие данных без чтения IDB.
+const MIN_MAP_ZOOM_FLOOR = 6;
+const userLayersRef: UserMapLayer[] = [];
+const blobKnownIds = new Set<string>();
+export const __userLayerBlobRegistry = blobKnownIds;
+
+/** Последний известный размер канваса карты (пишет MapCanvas при resize). */
+let lastCanvasSizeForView = { width: 1200, height: 800 };
+export function setCanvasSizeForView(w: number, h: number): void {
+  if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+    lastCanvasSizeForView = { width: w, height: h };
+  }
+}
 
 /** Агрегат = прежний AppState проекта + UI-состояние (для selector-совместимости). */
 export interface LegacySnapshot {
@@ -76,6 +99,10 @@ function buildSnapshot(): LegacySnapshot {
     // Импортированные пользовательские тактические карты (Задача 2):
     // метаданные живут в useMapStore (persist), бинарники — в IndexedDB.
     tacticalOverlays: m.tacticalOverlays ?? [],
+    // Слайс ЭТАПа 2: реестр слоёв в module-level mirror (userLayersRef).
+    // Всегда массив (пустой, если слоёв нет) — потребители не должны
+    // проверять наличие (тесты и UI обращаются к project.userLayers напрямую).
+    userLayers: [...userLayersRef],
   };
   return {
     project,
@@ -188,6 +215,11 @@ function applyPatch(patch: Partial<LegacySnapshot>): void {
         if (proj.projectName !== undefined) projectNameRef.value = proj.projectName;
         if (proj.createdAt) projectNameRef.createdAt = proj.createdAt;
         if (proj.updatedAt) projectNameRef.updatedAt = proj.updatedAt;
+        // Слайс ЭТАПа 2: project.userLayers — прямой mirror (см. userLayersRef).
+        if (Array.isArray(proj.userLayers)) {
+          userLayersRef.length = 0;
+          for (const l of proj.userLayers) userLayersRef.push(l);
+        }
         m.map = proj.map; m.markers = proj.markers; m.restrictions = proj.restrictions;
         m.layers = proj.layers; m.calibration = proj.calibration; m.googleMaps = proj.googleMaps;
         m.yandexMaps = proj.yandexMaps; m.openStreetMap = proj.openStreetMap; m.settings = proj.settings;
@@ -308,6 +340,7 @@ export function readProjectView(): Project {
     yandexMaps: m.yandexMaps,
     openStreetMap: m.openStreetMap,
     tacticalOverlays: m.tacticalOverlays ?? [],
+    userLayers: [...userLayersRef],
   };
 }
 
@@ -618,6 +651,105 @@ export function installMissionGuards(): void {
   }
 }
 installMissionGuards();
+
+// ─── Слайс «Пользовательские тактические карты» (ЭТАП 2) ────────────────────
+// Метаданные слоёв — в module-level mirror userLayersRef (попадает в project
+// через buildSnapshot/readProjectView), тяжёлые payload'ы (imageDataUrl /
+// sourceBlob) — в IndexedDB store «userlayers». Экшены навешаны на фасад,
+// поэтому доступны и как useStore().xxx(), и как useStore.getState().xxx().
+
+/** Кладёт слой в реестр; растровые данные принудительно выгружаются в IDB,
+ *  из стора вычищаются (в persist не должны попадать base64/ArrayBuffer). */
+shimActions.addOrUpdateUserLayer = async (layer: UserMapLayer): Promise<void> => {
+  const hasPayload = !!layer.imageDataUrl || !!layer.sourceBlob;
+  if (hasPayload) {
+    const ok = await saveUserLayerToIndexedDB({
+      id: layer.id,
+      imageDataUrl: layer.imageDataUrl,
+      sourceBlob: layer.sourceBlob,
+      bytes: layer.meta.fileSize || 0,
+      timestamp: Date.now(),
+    });
+    if (ok) blobKnownIds.add(layer.id);
+  }
+  const stored: UserMapLayer = { ...layer };
+  delete stored.imageDataUrl;
+  delete stored.sourceBlob;
+  const idx = userLayersRef.findIndex((x) => x.id === layer.id);
+  if (idx >= 0) userLayersRef[idx] = stored; else userLayersRef.push(stored);
+  emit();
+};
+
+/** Удаляет слой из реестра и соответствующую запись из IndexedDB. */
+shimActions.removeUserLayer = async (id: string): Promise<void> => {
+  const i = userLayersRef.findIndex((x) => x.id === id);
+  if (i >= 0) userLayersRef.splice(i, 1);
+  blobKnownIds.delete(id);
+  await deleteUserLayerFromIndexedDB(id);
+  emit();
+};
+
+shimActions.setUserLayerVisible = (id: string, visible: boolean): void => {
+  const l = userLayersRef.find((x) => x.id === id);
+  if (!l) return;
+  l.visible = visible;
+  emit();
+};
+
+shimActions.setUserLayerOpacity = (id: string, opacity: number): void => {
+  const l = userLayersRef.find((x) => x.id === id);
+  if (!l) return;
+  if (!Number.isFinite(opacity)) return; // NaN игнорируется — прежнее значение
+  l.opacity = Math.min(1, Math.max(0, opacity));
+  emit();
+};
+
+/** После гидрации из localStorage (метаданные без данных) подтягивает
+ *  imageDataUrl/sourceBlob из IndexedDB для слоёв, отсутствующих в реестре blob. */
+shimActions.restoreUserLayers = async (): Promise<void> => {
+  let changed = false;
+  for (const l of userLayersRef) {
+    if (blobKnownIds.has(l.id) && !l.imageDataUrl && !l.sourceBlob) {
+      const rec = await loadUserLayerFromIndexedDB(l.id);
+      if (rec?.imageDataUrl || rec?.sourceBlob) {
+        if (rec.imageDataUrl) l.imageDataUrl = rec.imageDataUrl;
+        if (rec.sourceBlob) l.sourceBlob = rec.sourceBlob;
+        changed = true;
+      }
+    }
+  }
+  if (changed) emit();
+};
+
+/** Бинарные данные слоя: сначала in-memory, иначе из IndexedDB. */
+shimActions.loadUserLayerSource = async (id: string): Promise<ArrayBuffer | null> => {
+  const l = userLayersRef.find((x) => x.id === id);
+  if (l?.sourceBlob instanceof ArrayBuffer) return l.sourceBlob;
+  const rec = await loadUserLayerFromIndexedDB(id);
+  return rec?.sourceBlob ?? null;
+};
+
+/** Сборка GC: удаляет записи IDB, чьи id отсутствуют в реестре проекта. */
+shimActions.gcUserLayerStorage = async (): Promise<void> => {
+  const ids = await listUserLayerIds();
+  const known = new Set(userLayersRef.map((x) => x.id));
+  for (const id of ids) {
+    if (!known.has(id)) {
+      await deleteUserLayerFromIndexedDB(id);
+      blobKnownIds.delete(id);
+    }
+  }
+};
+
+/** Только метаданные + флаги наличия данных (для панели списков без чтения blob). */
+shimActions.userLayerRecords = (): UserMapLayerRecord[] =>
+  userLayersRef.map((l) => {
+    const hasBlob = blobKnownIds.has(l.id) || !!l.imageDataUrl || !!l.sourceBlob;
+    const rec: UserMapLayerRecord = { layer: { ...l }, hasBlob, bytes: l.meta.fileSize || 0 };
+    delete rec.layer.imageDataUrl;
+    delete rec.layer.sourceBlob;
+    return rec;
+  });
 
 
 /** Селектор вида для React-компонентов (прежний API, делегирует map-стор). */

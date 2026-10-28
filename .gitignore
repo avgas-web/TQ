@@ -1,13 +1,4 @@
 node_modules/
 dist/
-build/
-.env
-.env.local
-.env.*.local
-.vscode/
-.idea/
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
+*.log
+*.tmp

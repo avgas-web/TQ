@@ -76,7 +76,7 @@ export function exportToGeoJSON(markers: Marker[], project?: Project): string {
  * Экспорт маркеров в GPX
  */
 export function exportToGPX(markers: Marker[], project?: Project): string {
-  const waypoints = markers
+  const tacticalNodes = markers
     .map(m => {
       const geo = getMarkerGeoCoords(m, project);
       if (geo.lat === null || geo.lon === null) return null;
@@ -91,7 +91,7 @@ export function exportToGPX(markers: Marker[], project?: Project): string {
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" creator="TotalQuadro Coordinate Marker">
-${waypoints}
+${tacticalNodes}
 </gpx>`;
 }
 
@@ -216,9 +216,11 @@ export function importProject(json: string): Project | null {
       gridSize: num(data.settings?.gridSize, 100),
       showCoordinates: !!(data.settings?.showCoordinates),
       theme: data.settings?.theme === 'light' ? 'light' : 'dark',
-      // Внешние слои и режимы спутника/гибрида удалены из приложения —
-      // при импорте старых проектов нормализуем к стандартной схеме.
-      tileStyle: 'scheme' as const,
+      // Стиль подложки из импортируемого проекта; внешние Overpass-слои удалены —
+      // нормализуем к схеме, спутник/гибрид сохраняем.
+      tileStyle: (data.settings?.tileStyle === 'satellite' || data.settings?.tileStyle === 'hybrid')
+        ? (data.settings.tileStyle as 'satellite' | 'hybrid')
+        : ('scheme' as const),
       tilesEnabled: data.settings?.tilesEnabled,
     },
     googleMaps: {
@@ -231,7 +233,8 @@ export function importProject(json: string): Project | null {
     },
     openStreetMap: {
       enabled: !!(data.openStreetMap && data.openStreetMap.enabled),
-      tileServer: ['osm', 'opentopomap', 'carto'].includes(data.openStreetMap?.tileServer)
+      // legacy-значения ('osm', 'carto') и новые ('esri', 'esri-sat') — все валидны
+      tileServer: ['osm', 'opentopomap', 'carto', 'esri', 'esri-sat'].includes(data.openStreetMap?.tileServer)
         ? data.openStreetMap.tileServer : 'osm',
     },
   };

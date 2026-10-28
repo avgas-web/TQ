@@ -97,6 +97,8 @@ export interface Project {
   /** Импортированные пользовательские тактические карты (Задача 2).
    *  Метаданные + векторы — здесь; растровые бинарники — в IndexedDB. */
   tacticalOverlays?: TacticalOverlayLayer[];
+  /** Пользовательские тактические карты (ЭТАП 2: GeoJSON/KML/KMZ/GeoTIFF/MBTiles/PNG-JPG) */
+  userLayers?: UserMapLayer[];
   calibration: {
     enabled: boolean;
     points: CalibrationPoint[];
@@ -112,7 +114,7 @@ export interface Project {
     showCoordinates: boolean;
     theme: 'dark' | 'light';
     // Стиль тайловой подложки: только стандартная схема OSM (режимы удалены из приложения)
-    tileStyle?: 'scheme';
+    tileStyle?: 'scheme' | 'satellite' | 'hybrid';
     tilesEnabled?: boolean;
     /** Автозапрос высот ландшафта (Open-Elevation) для точек маршрутов/маркеров */
     elevationAuto?: boolean;
@@ -335,3 +337,84 @@ export interface TacticalOverlayLayer {
 export const MAX_FLEET_SIZE = 10000;
 /** Максимум боевых аппаратов в одной группе (группа летит по одному боевому курсу). */
 export const MAX_GROUP_SIZE = 10000;
+export type UserMapFormat = 'geojson' | 'kml' | 'kmz' | 'geotiff' | 'mbtiles' | 'image';
+
+/** Тип геометрии слоя: вектор (полигоны/линии/точки) либо растр (оверлей) */
+export type UserMapKind = 'vector' | 'raster';
+
+/** Привязка растра к географии: границы в WGS-84 (lat/lng) */
+export interface RasterCalibration {
+  bounds: MapBounds;
+}
+
+/** Геометрия элемента слоя — координаты ВСЕГДА в WGS-84 (lat/lng).
+ *  rings: [внешний, дырка1, ...] для Polygon; для MultiPolygon — массив колец
+ *  всех полигонов (индексы дырок задаются holes). */
+export interface UserMapFeatureGeometry {
+  kind: 'polygon' | 'line' | 'point';
+  /** [lat, lng][] — кольца полигона / вершины линии */
+  rings: [number, number][][];
+  /** Индексы колец, являющихся дырками (для polygon) */
+  holes?: number[];
+  /** Точки (kind === 'point') */
+  points?: [number, number][];
+}
+
+/** Элемент пользовательской тактической карты (полигон зоны, линия курса, точка) */
+export interface UserMapFeature {
+  id: string;
+  geometry: UserMapFeatureGeometry;
+  name?: string;
+  color?: string;
+  fillOpacity?: number;
+}
+
+/** Метаданные слоя (название, дата загрузки, автор) */
+export interface UserMapMeta {
+  name: string;
+  loadedAt: string; // ISO 8601
+  author: string;
+  fileName: string;
+  fileSize: number;
+  sourceFormat: UserMapFormat;
+}
+
+/** Пользовательский тактический слой поверх базовой подложки */
+export interface UserMapLayer {
+  id: string;
+  kind: UserMapKind;
+  format: UserMapFormat;
+  meta: UserMapMeta;
+  /** Bounding box слоя в WGS-84 */
+  bbox: MapBounds;
+  /** Проекция исходника: EPSG:4326 / EPSG:3857 (растровые форматы) */
+  projection: 'EPSG:4326' | 'EPSG:3857';
+  visible: boolean;
+  /** Прозрачность 0..1 */
+  opacity: number;
+  /** Векторная геометрия (kind === 'vector') */
+  features?: UserMapFeature[];
+  /** Растровые пиксели (kind === 'raster'): data URL PNG/JPEG.
+   *  В zustand-сторе и persist не хранится — тяжёлый payload живёт только в
+   *  IndexedDB и подгружается лениво при первой отрисовке слоя. */
+  imageDataUrl?: string;
+  /** Пиксельные размеры растра */
+  imageWidth?: number;
+  imageHeight?: number;
+  /** Привязка растра (bounds + способ) */
+  calibration?: RasterCalibration & { method?: 'geotransform' | 'tiepoints' | 'manual' | 'metadata' };
+  /** Параметры тайловой схемы MBTiles (для доменной отрисовки) */
+  tileInfo?: { minZoom: number; maxZoom: number; format: string };
+  /** Исходный бинарник MBTiles (SQLite). В persist не попадает — живёт в IndexedDB,
+   *  восстанавливается лениво при первой отрисовке слоя. */
+  sourceBlob?: ArrayBuffer;
+}
+
+/** Минимальный набор, сохраняемый в localStorage (сами данные — в IndexedDB) */
+export interface UserMapLayerRecord {
+  layer: UserMapLayer;
+  /** Признак наличия бинарных данных (blob/dataUrl) в IndexedDB */
+  hasBlob: boolean;
+  bytes: number;
+}
+

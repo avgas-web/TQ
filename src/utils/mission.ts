@@ -189,6 +189,8 @@ export type OptimizeAlgorithm = 'nearest_neighbor' | 'genetic' | 'simulated_anne
 
 export interface OptimizeResult<T> {
   waypoints: T[];
+  /** Алиас для ЭТАПОВ 1–3 (militerminology): то же поле, что и waypoints. */
+  tacticalNodes: T[];
   distanceBefore: number;
   distanceAfter: number;
   improvementPct: number;
@@ -229,7 +231,7 @@ export function optimizeRoute<T extends { lat: number; lon: number }>(
 ): OptimizeResult<T> {
   if (waypoints.length <= 1) {
     const d = pathLength(waypoints);
-    return { waypoints: [...waypoints], distanceBefore: d, distanceAfter: d, improvementPct: 0, algorithm };
+    return { waypoints, tacticalNodes: [...waypoints], distanceBefore: d, distanceAfter: d, improvementPct: 0, algorithm };
   }
   const before = pathLength(waypoints);
   let order: T[];
@@ -249,7 +251,7 @@ export function optimizeRoute<T extends { lat: number; lon: number }>(
   const after = pathLength(order);
   const improvementPct = before > 0 ? ((before - after) / before) * 100 : 0;
   return {
-    waypoints: order,
+    waypoints: order, tacticalNodes: order,
     distanceBefore: before,
     distanceAfter: after,
     improvementPct: Math.max(0, Math.round(improvementPct * 10) / 10),
@@ -868,4 +870,12 @@ function segmentsIntersect(poly: Point[]): boolean {
     }
   }
   return false;
+}
+
+// ===== Совместимость с ЭТАПАМИ 1–3 (militerminology): tactical-алиасы для waypoint-API =====
+export type TacticalNodeParamKey = WaypointParamKey;
+export interface TacticalNodeParams extends WaypointParams {}
+export const DEFAULT_TACTICAL_NODE_PARAMS: TacticalNodeParams = DEFAULT_WAYPOINT_PARAMS;
+export function sanitizeTacticalNodeParams(raw?: Partial<TacticalNodeParams> | null): TacticalNodeParams {
+  return sanitizeWaypointParams(raw);
 }

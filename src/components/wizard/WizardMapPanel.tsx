@@ -17,6 +17,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import MapCanvas from '../MapCanvas';
 import { useStore } from '../../store/useStore';
 import { useMapStore } from '../../store/useMapStore';
+import { syncShimSnapshot } from '../../store/useStoreShim';
 import { useMissionWizardStore } from '../../store/useMissionWizardStore';
 import { getProviderStatus } from '../../utils/mapProviders';
 import { TILE_SERVER_ORDER, normalizeTileServer, type TileServerId } from '../../utils/openStreetMap';
@@ -49,7 +50,7 @@ const SERVER_SHORT_LABELS: Record<TileServerId, string> = {
  *  Список = рабочие серверы аудита (TILE_SERVER_ORDER); 2ГИС удалён полностью. */
 const ProviderSwitcher: React.FC = () => {
   const tileServer = normalizeTileServer(useStore((s) => s.project.openStreetMap?.tileServer ?? 'osm'));
-  const setOSMTileServer = useStore((s) => s.setOSMTileServer);
+
   const google = useStore((s) => s.project.googleMaps);
   const yandex = useStore((s) => s.project.yandexMaps);
 
@@ -65,7 +66,13 @@ const ProviderSwitcher: React.FC = () => {
           key={id}
           type="button"
           data-testid={`wizard-tiles-${id}`}
-          onClick={() => setOSMTileServer(id)}
+          onClick={() => {
+            // Пишем прямо в доменный стор — он источник истины рендера тайлов;
+            // legacy-фасад useStore.setOSMTileServer обновлял только снапшот
+            // project.openStreetMap, не трогая useMapStore (см. wizardMap.test).
+            useMapStore.getState().setOSMTileServer(id);
+            syncShimSnapshot();
+          }}
           className={
             'rounded px-2 py-0.5 text-[11px] transition ' +
             (tileServer === id
@@ -117,8 +124,17 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
   useEffect(() => {
     const primary = useMissionWizardStore.getState().primaryMap;
     if (!primary) return;
-    if ((useStore.getState().project.openStreetMap?.tileServer ?? 'osm') !== primary) {
-      useStore.getState().setOSMTileServer(primary);
+    // Сравниваем с ФАКТИЧЕСКОЙ подложкой (useMapStore — источник истины рендера):
+    // legacy-значение 'osm' в project.tileServer нормализуется в 'esri', и старая
+    // проверка «project.tileServer !== primary» при primary='esri' не совпадала бы
+    // никогда → панель мастера так и осталась бы на дефолтной Esri вместо osmfr.
+    const current = normalizeTileServer(useMapStore.getState().openStreetMap.tileServer);
+    if (current !== primary) {
+      // Пишем ПРЯМО в доменный стор: legacy-фасад useStore.setOSMTileServer
+      // обновляет только снапшот project.openStreetMap и НЕ трогает
+      // useMapStore (источник истины рендера тайлов).
+      useMapStore.getState().setOSMTileServer(primary);
+      syncShimSnapshot(); // синхронизируем фасад/снапшот с новым значением
     }
   }, []);
   // КЛЮЧЕВОЙ ФИКС «мастер не показывает карту»: ensureDefaultTileMap идемпотентен
@@ -137,8 +153,11 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
   const wizardPrimaryMap = useMissionWizardStore((s) => s.primaryMap);
   useEffect(() => {
     if (!wizardPrimaryMap) return;
-    if ((useStore.getState().project.openStreetMap?.tileServer ?? 'osm') !== wizardPrimaryMap) {
-      useStore.getState().setOSMTileServer(wizardPrimaryMap);
+    const current = normalizeTileServer(useMapStore.getState().openStreetMap.tileServer);
+    if (current !== wizardPrimaryMap) {
+      // Пишем прямо в доменный стор (источник истины рендера), синхронизируем фасад.
+      useMapStore.getState().setOSMTileServer(wizardPrimaryMap);
+      syncShimSnapshot();
     }
   }, [wizardPrimaryMap]);
 

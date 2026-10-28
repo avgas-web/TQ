@@ -28,11 +28,13 @@ export interface TileProviderInfo {
   maxNativeZoom: number;
   /** Верхняя граница зума в UI */
   maxZoom: number;
+  /** Текст атрибуции (для UI и экспорта) */
   attribution: string;
 }
 
 const OSM_ATTR = '© OpenStreetMap contributors';
 
+/** Реестр рабочих провайдеров — единственный источник истины (main). */
 export const TILE_PROVIDERS: Record<TileServerId, TileProviderInfo> = {
   esri:        { label: 'Esri — улицы (стабильный)', maxNativeZoom: 19, maxZoom: 19, attribution: 'Tiles © Esri' },
   'esri-sat':  { label: 'Esri — спутник',            maxNativeZoom: 19, maxZoom: 19, attribution: 'Tiles © Esri' },
@@ -57,8 +59,13 @@ export const DEFAULT_TILE_SERVER: TileServerId = 'esri';
  *  2ГИС закрыт (tile-b01.2gis.com не резолвится) — старые сохранения с этим
  *  значением нормализуются в Esri Streets (он и рендерился вместо него). */
 export function normalizeTileServer(v: unknown): TileServerId {
-  if (typeof v === 'string' && (v in TILE_PROVIDERS)) return v as TileServerId;
-  if (v === 'carto') return 'osmfr';
+  if (typeof v === 'string') {
+    const s = v.trim().toLowerCase();
+    if (s in TILE_PROVIDERS) return s as TileServerId;
+    if (s === 'carto') return 'osmfr';
+    // Алиасы спутника из ЭТАПА 1 (регистронезависимо, с пробелами по краям)
+    if (s === 'satellite' || s === 'imagery' || s === 'esri-sat') return 'esri-sat';
+  }
   return DEFAULT_TILE_SERVER; // 'osm', '2gis' и всё неизвестное → Esri Streets
 }
 
@@ -582,20 +589,16 @@ export async function loadOSMStaticMap(
   console.log(`Загрузка карты OSM: сервер=${tileServer}, центр=(${center.lat}, ${center.lng}), зум=${zoom}, размер=${width}x${height}`);
   
   // Вычисляем границы (приблизительные — для совместимости сигнатуры)
-  void calculateOSMBoundsFromCenter;
-
   // === ТОЧНАЯ Mercator-привязка снимка к географии (исправление «сбившегося масштаба») ===
   // Снимок покрывает ровно окно обзора: world px на данном зуме = 256*2^z, из них
   // по X видно width px => долготный размах симметричен центру; по Y — через Mercator.
   const zClamped = Math.min(Math.max(Math.round(zoom), 1), 19);
   const worldPxZ = 256 * Math.pow(2, zClamped);
-  const mercC = latToMercatorY(Math.max(-85, Math.min(85, center.lat)));
-  const halfSpanY = (height / 2) / worldPxZ;
-  const north = tileToLatLng(0, Math.max(0, Math.min(1, mercC - halfSpanY)), zClamped).lat;
-  const south = tileToLatLng(0, Math.max(0, Math.min(1, mercC + halfSpanY)), zClamped).lat;
-  const lngHalf = (width / 2 / worldPxZ) * 360;
-  const west = center.lng - lngHalf;
-  const east = center.lng + lngHalf;
+  // Единая Mercator-формула с calculateBoundsFromCenter (googleMaps.ts): раньше
+  // здесь был независимый расчёт через tileToLatLng — из-за этого привязка
+  // снимка расходилась с живой подложкой MapCanvas (баг «сбившийся масштаб»).
+  const b = calculateOSMBoundsFromCenter(center, zClamped, width, height);
+  const { north, south, east, west } = b;
   const bounds = { north, south, east, west };
 
   // Пиксельные границы тайловой сетки, точно соответствующие видимой области
@@ -697,3 +700,13 @@ const calculateOSMBoundsFromCenter = calculateBoundsFromCenter;
 export function isOSMLoaded(): boolean {
   return osmConfig.loaded;
 }
+
+/**
+ * LEGACY-СОВМЕСТИМОСТЬ (наша ветка ЭТАП 1): таблица нативных зумов.
+ * В main она выражена полем maxNativeZoom в TILE_PROVIDERS; MapCanvas и
+ * тесты ЭТАПА 1 обращаются по имени NATIVE_MAX_ZOOM_BY_SERVER — отдаём ту же
+ * таблицу, производную от реестра main (без второго источника истины).
+ */
+export const NATIVE_MAX_ZOOM_BY_SERVER: Record<string, number> = Object.fromEntries(
+  Object.entries(TILE_PROVIDERS).map(([id, p]) => [id, p.maxNativeZoom]),
+) as Record<string, number>;

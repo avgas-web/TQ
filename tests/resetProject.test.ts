@@ -79,8 +79,9 @@ describe('resetProject (кнопка Сброс)', () => {
 
     // Постусловие 3: legacy-ключи удалены (иначе App.restoreMapFromStorage
     // после F5 вернёт старые данные — исходный баг «Сброс не работает»).
-    await Promise.resolve(); // дождаться микротask-цепочки finally
-    await Promise.resolve();
+    // clearAllStoredMaps().finally(...) асинхронен (IndexedDB-транзакция),
+    // два await Promise.resolve() её не дожидаются — ждём реально.
+    await new Promise((r) => setTimeout(r, 50));
     assert(localStorage.getItem('totalquadro-storage') === null, 'legacy totalquadro-storage удалён');
     assert(localStorage.getItem('totalquadro-backup-1') === null, 'backup-ключ удалён');
   });
