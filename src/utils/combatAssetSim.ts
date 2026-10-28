@@ -1,6 +1,6 @@
 // Симулятор полётного контроллера (Блоки 2, 3, 4, 5, 6).
 // Прототип работает в браузере без реального железа, поэтому команды
-// управления выполняются против in-memory модели дрона с очередью команд,
+// управления выполняются против in-memory модели боевого аппарата с очередью команд,
 // таймаутами, retry-логикой и журналированием. Публичный API повторяет
 // имена функций из ТЗ (preflight_check, arm, takeoff, ...), стиль — camelCase.
 
@@ -10,7 +10,7 @@ export type FlightMode = 'Manual' | 'Stabilize' | 'Loiter' | 'Guided' | 'Auto' |
 export const FLIGHT_MODES: readonly FlightMode[] = ['Manual', 'Stabilize', 'Loiter', 'Guided', 'Auto', 'RTL', 'Land'];
 
 export type GeofenceAction = 'report' | 'loiter' | 'rtl' | 'land';
-export type NoFlyShape = 'cylinder' | 'polygon' | 'sphere';
+export type AdizShape = 'cylinder' | 'polygon' | 'sphere';
 export type TargetType = 'person' | 'vehicle' | 'structure';
 export type PayloadAction = 'release' | 'siren_on' | 'siren_off' | 'laser_fire' | 'laser_stop';
 export type FormationType = 'line' | 'v_shape' | 'grid';
@@ -60,9 +60,9 @@ export interface Geofence {
   actionOnBreach: GeofenceAction;
 }
 
-export interface NoFlyZone {
+export interface AdizZone {
   id: string;
-  shape: NoFlyShape;
+  shape: AdizShape;
   center?: { lat: number; lon: number; altM?: number };
   radiusM?: number;
   polygon?: Array<{ lat: number; lon: number }>;
@@ -100,15 +100,15 @@ function assertFinite(name: string, v: number): void {
 }
 
 /**
- * Одна модель дрона: состояние, геозоны, failsafe, журнал телеметрии.
+ * Одна модель боевого аппарата: состояние, геозоны, failsafe, журнал телеметрии.
  * Все публичные методы async, защищают общее состояние «замком» очереди
  * (одновременные команды сериализуются) и имеют таймаут + retry.
  */
-export class DroneSim {
-  readonly droneId: string;
+export class CombatAssetSim {
+  readonly assetId: string;
   private state: Telemetry;
   private geofence: Geofence | null = null;
-  private noFlyZones: NoFlyZone[] = [];
+  private adizZones: AdizZone[] = [];
   private failsafes: Failsafes = {
     battery: { rtlPct: 30, landPct: 15, criticalPct: 5 },
     gcs: { timeoutSec: 10, action: 'rtl' },
@@ -123,8 +123,8 @@ export class DroneSim {
   private connectionUp = true;
   private lockChain: Promise<unknown> = Promise.resolve();
 
-  constructor(droneId: string, start: Partial<Telemetry> = {}) {
-    this.droneId = droneId;
+  constructor(assetId: string, start: Partial<Telemetry> = {}) {
+    this.assetId = assetId;
     this.state = {
       lat: 0,
       lon: 0,
@@ -162,7 +162,7 @@ export class DroneSim {
   }
 
   private requireConnection(): void {
-    if (!this.connectionUp) throw new ConnectionError(`Нет связи с дроном ${this.droneId}`);
+    if (!this.connectionUp) throw new ConnectionError(`Нет связи с боевым аппаратом ${this.assetId}`);
   }
 
   /** Сериализация команд через «замок» промисов (потокобезопасность). */
@@ -212,7 +212,7 @@ export class DroneSim {
       checks.compass = 'ok';
       if (this.state.batteryPct <= MIN_BATTERY_ARM_PCT) checks.battery = `Заряд ${this.state.batteryPct}% ≤ ${MIN_BATTERY_ARM_PCT}%`;
       checks.link = 'ok';
-      if (this.state.armed && !this.state.airborne) checks.state = 'Дрон захвачен на земле';
+      if (this.state.armed && !this.state.airborne) checks.state = 'Боевой аппарат захвачен на земле';
       const ok = Object.values(checks).every((v) => v === 'ok');
       this.pushLog(ok ? 'INFO' : 'WARNING', `preflight: ${ok ? 'готов' : 'отказ'}`);
       return { ok, checks };
@@ -224,8 +224,8 @@ export class DroneSim {
     return this.withLock(() =>
       this.withRetry('arm', async () => {
         this.requireConnection();
-        if (this.state.armed) throw new ValidationError('Дрон уже вооружён');
-        if (this.state.airborne) throw new ValidationError('Нельзя вооружить дрон в воздухе повторно');
+        if (this.state.armed) throw new ValidationError('Боевой аппарат уже вооружён');
+        if (this.state.airborne) throw new ValidationError('Нельзя вооружить боевой аппарат в воздухе повторно');
         const pf = await this.preflightCheck();
         if (!pf.ok) throw new HardwareError(`Preflight не пройден: ${Object.values(pf.checks).filter((v) => v !== 'ok').join('; ')}`);
         this.state.armed = true;
@@ -239,7 +239,7 @@ export class DroneSim {
     return this.withLock(() =>
       this.withRetry('disarm', async () => {
         this.requireConnection();
-        if (!this.state.armed) throw new ValidationError('Дрон не вооружён');
+        if (!this.state.armed) throw new ValidationError('Боевой аппарат не вооружён');
         if (this.state.airborne) throw new ValidationError('Нельзя снять вооружение в воздухе');
         this.state.armed = false;
         this.pushLog('INFO', 'Моторы сброшены');
@@ -257,7 +257,7 @@ export class DroneSim {
       this.withRetry('takeoff', async () => {
         this.requireConnection();
         if (!this.state.armed) throw new HardwareError('Вооружите моторы перед взлётом');
-        if (this.state.airborne) throw new ValidationError('Дрон уже в воздухе');
+        if (this.state.airborne) throw new ValidationError('Боевой аппарат уже в воздухе');
         this.setModeInternal('Guided');
         this.state.altM = altitudeM;
         this.state.airborne = true;
@@ -272,7 +272,7 @@ export class DroneSim {
     return this.withLock(() =>
       this.withRetry('land', async () => {
         this.requireConnection();
-        if (!this.state.airborne) throw new ValidationError('Дрон не в воздухе');
+        if (!this.state.airborne) throw new ValidationError('Боевой аппарат не в воздухе');
         if (location) {
           validateGeoPoint(location.lat, location.lon);
           this.state.lat = location.lat;
@@ -334,7 +334,7 @@ export class DroneSim {
     return this.withLock(() =>
       this.withRetry('set_velocity', async () => {
         this.requireConnection();
-        if (!this.state.airborne) throw new HardwareError('Дрон на земле — velocity невозможен');
+        if (!this.state.airborne) throw new HardwareError('Боевой аппарат на земле — velocity невозможен');
         const dtH = durationMs / 3600000; // м/с → град/час упрощённо
         this.state.lat += vy * dtH;
         this.state.lon += vx * dtH;
@@ -394,7 +394,7 @@ export class DroneSim {
     this.pushLog('DEBUG', `Подвес: p=${this.gimbal.pitch} r=${this.gimbal.roll} y=${this.gimbal.yaw}`);
   }
 
-  /** Разворот дрона и камеры на цель (point_camera_at_target). */
+  /** Разворот боевого аппарата и камеры на цель (point_camera_at_target). */
   pointCameraAtTarget(targetId: string): { yawDeg: number; gimbalPitchDeg: number } {
     const t = this.targets.get(targetId);
     if (!t) throw new ValidationError(`Цель ${targetId} не найдена`);
@@ -452,19 +452,19 @@ export class DroneSim {
     this.pushLog('INFO', `Геозона задана (${polygon.length - 1} вершин, ${actionOnBreach})`);
   }
 
-  /** Запретная зона (add_no_fly_zone) cylinder/polygon/sphere. */
-  addNoFlyZone(zone: Omit<NoFlyZone, 'ceilingM'> & { ceilingM?: number }): string {
-    const shapes: NoFlyShape[] = ['cylinder', 'polygon', 'sphere'];
-    if (!shapes.includes(zone.shape)) throw new ValidationError(`Форма NFZ недопустима: ${String(zone.shape)}`);
+  /** Запретная зона (add_adiz_zone) cylinder/polygon/sphere. */
+  addAdizZone(zone: Omit<AdizZone, 'ceilingM'> & { ceilingM?: number }): string {
+    const shapes: AdizShape[] = ['cylinder', 'polygon', 'sphere'];
+    if (!shapes.includes(zone.shape)) throw new ValidationError(`Форма ADIZ недопустима: ${String(zone.shape)}`);
     if ((zone.shape === 'cylinder' || zone.shape === 'sphere') && !(zone.radiusM && zone.center)) {
       throw new ValidationError('Для cylinder/sphere нужны center и radiusM');
     }
     if (zone.shape === 'polygon' && (!zone.polygon || zone.polygon.length < 3)) {
       throw new ValidationError('Для polygon нужно >=3 вершин');
     }
-    const id = zone.id || `nfz-${Date.now()}`;
-    this.noFlyZones.push({ ...zone, id, ceilingM: zone.ceilingM ?? MAX_ALTITUDE_M });
-    this.pushLog('INFO', `NFZ ${id} (${zone.shape}) добавлена`);
+    const id = zone.id || `adiz-${Date.now()}`;
+    this.adizZones.push({ ...zone, id, ceilingM: zone.ceilingM ?? MAX_ALTITUDE_M });
+    this.pushLog('INFO', `ADIZ ${id} (${zone.shape}) добавлена`);
     return id;
   }
 
@@ -588,7 +588,7 @@ export class DroneSim {
     this.pushLog('INFO', 'Миссия продолжена');
   }
 
-  skipWaypoint(): number {
+  skipTacticalNode(): number {
     if (this.mission.status !== 'running') throw new ValidationError('Миссия не выполняется');
     this.mission.wpIndex += 1;
     this.pushLog('WARNING', `Пропущена точка ${this.mission.wpIndex - 1}`);
@@ -634,51 +634,51 @@ export function estimateBatteryFor(distanceM: number, windMs: number): number {
 
 // ──────────────────────── Блок 5: управление парком ────────────────────────
 
-export interface FleetDrone {
-  droneId: string;
+export interface CombatAssetUnit {
+  assetId: string;
   connectionString: string;
   capabilities: string[];
 }
 
-/** Реестр парка дронов (register_drone / assign / auto_assign / formation / handoff). */
+/** Реестр парка боевых аппаратов (register_combat_asset / assign / auto_assign / formation / handoff). */
 export class FleetManager {
-  private drones = new Map<string, FleetDrone>();
-  private assignments = new Map<string, string>(); // targetId -> droneId
+  private combatAssets = new Map<string, CombatAssetUnit>();
+  private assignments = new Map<string, string>(); // targetId -> assetId
 
-  registerDrone(droneId: string, connectionString: string, capabilities: string[]): void {
-    if (!droneId.trim()) throw new ValidationError('drone_id пуст');
+  registerCombatAsset(assetId: string, connectionString: string, capabilities: string[]): void {
+    if (!assetId.trim()) throw new ValidationError('asset_id пуст');
     if (!/^[\w.-]+@[\w.-]+(:\d+)?$/.test(connectionString)) throw new ValidationError(`Некорректный connection_string: ${connectionString}`);
     if (!capabilities.length) throw new ValidationError('capabilities пусты');
-    this.drones.set(droneId, { droneId, connectionString, capabilities });
+    this.combatAssets.set(assetId, { assetId, connectionString, capabilities });
   }
 
-  listDrones(): FleetDrone[] {
-    return [...this.drones.values()];
+  listCombatAssets(): CombatAssetUnit[] {
+    return [...this.combatAssets.values()];
   }
 
-  assignDroneToTarget(droneId: string, targetId: string): void {
-    if (!this.drones.has(droneId)) throw new ValidationError(`Дрон ${droneId} не зарегистрирован`);
-    this.assignments.set(targetId, droneId);
+  assignCombatAssetToTarget(assetId: string, targetId: string): void {
+    if (!this.combatAssets.has(assetId)) throw new ValidationError(`Боевой аппарат ${assetId} не зарегистрирован`);
+    this.assignments.set(targetId, assetId);
   }
 
   /** Автоназначение целей: greedy по расстоянию (аналог hungarian для малых n). */
-  autoAssignTargets(targets: Array<{ id: string; lat: number; lon: number }>, drones: Array<{ droneId: string; lat: number; lon: number }>): Array<{ targetId: string; droneId: string; costM: number }> {
-    if (!targets.length || !drones.length) return [];
+  autoAssignTargets(targets: Array<{ id: string; lat: number; lon: number }>, combatAssets: Array<{ assetId: string; lat: number; lon: number }>): Array<{ targetId: string; assetId: string; costM: number }> {
+    if (!targets.length || !combatAssets.length) return [];
     targets.forEach((t) => validateGeoPoint(t.lat, t.lon));
-    const free = new Set(drones.map((d) => d.droneId));
-    const pairs: Array<{ targetId: string; droneId: string; costM: number }> = [];
+    const free = new Set(combatAssets.map((d) => d.assetId));
+    const pairs: Array<{ targetId: string; assetId: string; costM: number }> = [];
     const sorted = [...targets].sort((a, b) => a.id.localeCompare(b.id));
     for (const t of sorted) {
-      let best: { droneId: string; costM: number } | null = null;
-      for (const d of drones) {
-        if (!free.has(d.droneId)) continue;
+      let best: { assetId: string; costM: number } | null = null;
+      for (const d of combatAssets) {
+        if (!free.has(d.assetId)) continue;
         const c = haversineM(t, d);
-        if (!best || c < best.costM) best = { droneId: d.droneId, costM: c };
+        if (!best || c < best.costM) best = { assetId: d.assetId, costM: c };
       }
-      if (!best) break; // дроны кончились
-      free.delete(best.droneId);
+      if (!best) break; // боевые аппараты кончились
+      free.delete(best.assetId);
       pairs.push({ targetId: t.id, ...best });
-      this.assignments.set(t.id, best.droneId);
+      this.assignments.set(t.id, best.assetId);
     }
     return pairs;
   }
@@ -708,11 +708,11 @@ export class FleetManager {
     return out;
   }
 
-  /** Передача цели между дронами (handoff_target). */
-  handoffTarget(fromDrone: string, toDrone: string, targetId: string): void {
-    if (this.assignments.get(targetId) !== fromDrone) throw new ValidationError(`Цель ${targetId} не назначена дрону ${fromDrone}`);
-    if (!this.drones.has(toDrone)) throw new ValidationError(`Дрон ${toDrone} не зарегистрирован`);
-    this.assignments.set(targetId, toDrone);
+  /** Передача цели между боевого аппаратами (handoff_target). */
+  handoffTarget(fromAsset: string, toAsset: string, targetId: string): void {
+    if (this.assignments.get(targetId) !== fromAsset) throw new ValidationError(`Цель ${targetId} не назначена боевому аппарату ${fromAsset}`);
+    if (!this.combatAssets.has(toAsset)) throw new ValidationError(`Боевой аппарат ${toAsset} не зарегистрирован`);
+    this.assignments.set(targetId, toAsset);
   }
 
   assignmentFor(targetId: string): string | undefined {

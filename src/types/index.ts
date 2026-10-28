@@ -72,12 +72,98 @@ export interface MapData {
   mapId?: string; // Стабильный ID изображения в IndexedDB (для восстановления после перезагрузки)
 }
 
+// ─── Пользовательские тактические карты (дополнительные слои поверх подложки) ─
+
+/** Формат источника пользовательского слоя */
+export type UserMapFormat = 'geojson' | 'kml' | 'kmz' | 'geotiff' | 'mbtiles' | 'image';
+
+/** Тип геометрии слоя: вектор (полигоны/линии/точки) либо растр (оверлей) */
+export type UserMapKind = 'vector' | 'raster';
+
+/** Привязка растра к географии: границы в WGS-84 (lat/lng) */
+export interface RasterCalibration {
+  bounds: MapBounds;
+}
+
+/** Геометрия элемента слоя — координаты ВСЕГДА в WGS-84 (lat/lng).
+ *  rings: [внешний, дырка1, ...] для Polygon; для MultiPolygon — массив колец
+ *  всех полигонов (индексы дырок задаются holes). */
+export interface UserMapFeatureGeometry {
+  kind: 'polygon' | 'line' | 'point';
+  /** [lat, lng][] — кольца полигона / вершины линии */
+  rings: [number, number][][];
+  /** Индексы колец, являющихся дырками (для polygon) */
+  holes?: number[];
+  /** Точки (kind === 'point') */
+  points?: [number, number][];
+}
+
+/** Элемент пользовательской тактической карты (полигон зоны, линия курса, точка) */
+export interface UserMapFeature {
+  id: string;
+  geometry: UserMapFeatureGeometry;
+  name?: string;
+  color?: string;
+  fillOpacity?: number;
+}
+
+/** Метаданные слоя (название, дата загрузки, автор) */
+export interface UserMapMeta {
+  name: string;
+  loadedAt: string; // ISO 8601
+  author: string;
+  fileName: string;
+  fileSize: number;
+  sourceFormat: UserMapFormat;
+}
+
+/** Пользовательский тактический слой поверх базовой подложки */
+export interface UserMapLayer {
+  id: string;
+  kind: UserMapKind;
+  format: UserMapFormat;
+  meta: UserMapMeta;
+  /** Bounding box слоя в WGS-84 */
+  bbox: MapBounds;
+  /** Проекция исходника: EPSG:4326 / EPSG:3857 (растровые форматы) */
+  projection: 'EPSG:4326' | 'EPSG:3857';
+  visible: boolean;
+  /** Прозрачность 0..1 */
+  opacity: number;
+  /** Векторная геометрия (kind === 'vector') */
+  features?: UserMapFeature[];
+  /** Растровые пиксели (kind === 'raster'): data URL PNG/JPEG.
+   *  В zustand-сторе и persist не хранится — тяжёлый payload живёт только в
+   *  IndexedDB и подгружается лениво при первой отрисовке слоя. */
+  imageDataUrl?: string;
+  /** Пиксельные размеры растра */
+  imageWidth?: number;
+  imageHeight?: number;
+  /** Привязка растра (bounds + способ) */
+  calibration?: RasterCalibration & { method?: 'geotransform' | 'tiepoints' | 'manual' | 'metadata' };
+  /** Параметры тайловой схемы MBTiles (для доменной отрисовки) */
+  tileInfo?: { minZoom: number; maxZoom: number; format: string };
+  /** Исходный бинарник MBTiles (SQLite). В persist не попадает — живёт в IndexedDB,
+   *  восстанавливается лениво при первой отрисовке слоя. */
+  sourceBlob?: ArrayBuffer;
+}
+
+/** Минимальный набор, сохраняемый в localStorage (сами данные — в IndexedDB) */
+export interface UserMapLayerRecord {
+  layer: UserMapLayer;
+  /** Признак наличия бинарных данных (blob/dataUrl) в IndexedDB */
+  hasBlob: boolean;
+  bytes: number;
+}
+
 export interface Project {
   version: string;
   projectName: string;
   createdAt: string;
   updatedAt: string;
   map: MapData | null;
+  /** Пользовательские тактические карты (GeoJSON/KML/KMZ/GeoTIFF/MBTiles/PNG-JPG) */
+  userLayers?: UserMapLayer[];
   calibration: {
     enabled: boolean;
     points: CalibrationPoint[];
@@ -92,8 +178,8 @@ export interface Project {
     gridSize: number;
     showCoordinates: boolean;
     theme: 'dark' | 'light';
-    // Стиль тайловой подложки: только стандартная схема OSM (режимы удалены из приложения)
-    tileStyle?: 'scheme';
+    // Стиль тайловой подложки: схема либо спутник/гибрид (Esri World Imagery)
+    tileStyle?: 'scheme' | 'satellite' | 'hybrid';
     tilesEnabled?: boolean;
     /** Автозапрос высот ландшафта (Open-Elevation) для точек маршрутов/маркеров */
     elevationAuto?: boolean;
@@ -110,7 +196,9 @@ export interface Project {
   };
   openStreetMap: {
     enabled: boolean;
-    tileServer: 'osm' | 'opentopomap' | 'carto';
+    /** Провайдер тайлов. Legacy-значения ('osm', 'carto') читаются из старых
+     *  проектов и нормализуются в normalizeTileServer (openStreetMap.ts). */
+    tileServer: 'osm' | 'opentopomap' | 'carto' | 'esri' | 'esri-sat';
   };
 }
 
@@ -132,7 +220,7 @@ export interface Measurement {
 
 // ─── Маршруты (режим действий) ──────────────────────────────────────────────
 
-/** Точка маршрута: гео-координаты WGS-84 первичны, пиксели — производные */
+/** Узел боевого курса: гео-координаты WGS-84 первичны, пиксели — производные */
 export interface RoutePoint {
   lat: number;
   lng: number;
@@ -168,8 +256,8 @@ export interface Route {
   rangeM?: number;             // предельная дистанция в метрах
   /** Метаданные миссии (create_mission): автор/название/дата */
   missionMeta?: MissionMetaLite;
-  /** Параметры путевых точек по индексам (add_waypoint params) */
-  waypointParams?: Record<number, WaypointParamsLite>;
+  /** Параметры узлов боевого курса по индексам (add_tactical_node params) */
+  tacticalNodeParams?: Record<number, TacticalNodeParamsLite>;
 }
 
 /** Метаданные миссии (минимальная версия для сериализации проекта). */
@@ -178,17 +266,17 @@ export interface MissionMetaLite {
   createdAt: string; // ISO 8601
 }
 
-/** Параметры путевой точки: задержка, угол камеры, скорость, радиус принятия. */
-export interface WaypointParamsLite {
+/** Параметры узла боевого курса: задержка, угол камеры, скорость, радиус принятия. */
+export interface TacticalNodeParamsLite {
   holdSec: number;
   cameraAngleDeg: number;
   speedMs: number;
   acceptanceRadiusM: number;
 }
 
-/** Назначение дрону/группе: старт, цель, маршрут (Блок 5 + ТЗ пользователя). */
-export interface DroneAssignment {
-  droneId: string;
+/** Назначение боевому аппарату/группе: старт, цель, маршрут (Блок 5 + ТЗ пользователя). */
+export interface CombatAssetAssignment {
+  assetId: string;
   startId?: string | null;  // id из importLists.starts
   goalId?: string | null;   // id из importLists.goals
   routeId?: string | null;

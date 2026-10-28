@@ -1,19 +1,22 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { v4 as uuidv4 } from 'uuid';
-import type { Project, Marker, Restriction, Layer, Tool, ViewState, MapData, Point, CalibrationPoint, MapBounds, Route, RoutePoint, DroneAssignment } from '../types';
+import type { Project, Marker, Restriction, Layer, Tool, ViewState, MapData, Point, CalibrationPoint, MapBounds, Route, RoutePoint, CombatAssetAssignment } from '../types';
 import { MAX_ROUTES } from '../types';
-import type { WaypointParamsLite, MissionMetaLite } from '../types';
+import type { TacticalNodeParamsLite, MissionMetaLite } from '../types';
 import {
-  sanitizeWaypointParams,
+  sanitizeTacticalNodeParams,
   createMissionMeta,
   optimizeRoute,
   generateScanLawnmower,
   ValidationError,
-  type WaypointParams,
+  type TacticalNodeParams,
   type OptimizeAlgorithm,
 } from '../utils/mission';
-import { saveMapToIndexedDB, loadMapFromIndexedDB, deleteMapFromIndexedDB } from '../utils/storage';
+import { saveMapToIndexedDB, loadMapFromIndexedDB, deleteMapFromIndexedDB,
+  saveUserLayerToIndexedDB, loadUserLayerFromIndexedDB, deleteUserLayerFromIndexedDB,
+  listUserLayerIds, migratePersistedState } from '../utils/storage';
+import type { UserMapLayer, UserMapLayerRecord } from '../types';
 import { geoToPixelFromBounds, calculateBoundsFromCenter, latToMercatorY, mercatorYToLat } from '../utils/googleMaps';
 import { planPathAroundZones, zonesCrossedBy, recomputeRoutePixels, pixelToGeoExact, geoToPixelExact, smoothPolyline, routeLengthM, requiredAbsFromZones } from '../utils/routing';
 import { fetchElevations, computeRouteAltitude } from '../utils/elevation';
@@ -22,12 +25,24 @@ import type { RouteShape, RangeLimitMode, ImportPoint, ImportLists } from '../ty
 
 const MIN_MAP_ZOOM_FLOOR = 6;
 
+/** Последний известный размер канваса карты (пишет MapCanvas при resize).
+ *  Нужен стору для «фокус на слое»: offset считается от центра экрана. */
+let lastCanvasSizeForView = { width: 1200, height: 800 };
+export function setCanvasSizeForView(w: number, h: number): void {
+  if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+    lastCanvasSizeForView = { width: w, height: h };
+  }
+}
+function canvasSizeRefForView(): { width: number; height: number } {
+  return lastCanvasSizeForView;
+}
+
 const ROUTE_COLORS = ['#00d0ff', '#ff9500', '#a78bfa', '#34d399', '#f472b6', '#facc15', '#fb7185', '#60a5fa'];
 
 // ─── Высоты полёта (Open-Elevation) и вертикальные ограничения ──────────────
 
 /** Ссылка на последний незавершённый прогон updateRouteAltitudes — повторный
- *  вызов отменяет предыдущий запрос (drag точки маршрута не должен копить
+ *  вызов отменяет предыдущий запрос (drag узлы боевого курса не должен копить
  *  обращения к медленному публичному API). */
 let altitudeRunId = 0;
 /** Активный AbortController последнего прогона высот — для отмены сетевых
@@ -45,7 +60,7 @@ function drawableZones(restrictions: Restriction[]): Restriction[] {
 }
 
 /**
- * Автокоррекция ВЕРТИКАЛЬНЫХ ограничений: для каждой точки маршрута считаем
+ * Автокоррекция ВЕРТИКАЛЬНЫХ ограничений: для каждой узлы боевого курса считаем
  * требуемую ABS-высоту (над уровнем моря):
  *   required = max( terrain + clearance,                — не ниже рельефа
  *                   zoneFloor = terrain + minHeightAGL, — выше «пола» зоны
@@ -114,6 +129,15 @@ function pixelToGeoStrict(p: Point, bounds: MapBounds, mapW: number, mapH: numbe
 // объекте стейта: запись в get() напрямую (вне set()) нарушает иммутабельность
 // zustand и теряется при HMR/ре-гидратации persist-стора — из-за этого
 // плановая перестройка маршрутов могла молча не выполняться.
+/**
+ * Синхронный реестр слоёв, для которых в IndexedDB есть запись с тяжёлыми
+ * данными (imageDataUrl и/или sourceBlob). Нужен потому, что сам слой в сторе
+ * хранится «обнулённым» — иначе признак hasBlob для userLayerRecords/persist
+ * был бы всегда ложным. Заполняется при записи/чтении IDB и при гидрации.
+ */
+const blobKnownIds = new Set<string>();
+export const __userLayerBlobRegistry = blobKnownIds;
+
 const REROUTE_THROTTLE_MS = 250;
 let rerouteTimer: number | null = null;
 
@@ -336,10 +360,10 @@ export function normalizeViewState(v: any): ViewState {
 
 interface AppState {
   project: Project;
-  /** Назначения дронам/группам: старт, цель, маршрут (персистится в project-агностичном ключе). */
-  droneAssignments: DroneAssignment[];
-  setDroneAssignment: (droneId: string, patch: Partial<Omit<DroneAssignment, 'droneId'>>) => void;
-  removeDroneAssignment: (droneId: string) => void;
+  /** Назначения боевого аппаратам/группам: старт, цель, маршрут (персистится в project-агностичном ключе). */
+  combatAssetAssignments: CombatAssetAssignment[];
+  setCombatAssetAssignment: (assetId: string, patch: Partial<Omit<CombatAssetAssignment, 'assetId'>>) => void;
+  removeCombatAssetAssignment: (assetId: string) => void;
   currentTool: Tool;
   activeRestrictionId: string | null;
   selectedMarkerId: string | null;
@@ -374,26 +398,26 @@ interface AppState {
    *  точки. Требуемая ABS = рельеф под точкой + AGL (или просто AGL, если
    *  рельеф ещё не определён). */
   setRoutePointAltitude: (id: string, index: number, aglM: number | null) => void;
-  /** Параметры путевой точки (задержка/угол камеры/скорость/радиус принятия). */
-  setWaypointParams: (routeId: string, index: number, params: Partial<WaypointParams>) => void;
+  /** Параметры узла боевого курса (задержка/угол камеры/скорость/радиус принятия). */
+  setTacticalNodeParams: (routeId: string, index: number, params: Partial<TacticalNodeParams>) => void;
   /** Метаданные миссии маршрута (create_mission: автор + дата). */
   setMissionMeta: (routeId: string, author: string) => void;
   /** Оптимизация порядка точек маршрута; возвращает % сокращения пути. */
   optimizeRouteOrder: (routeId: string, algorithm: OptimizeAlgorithm) => number | null;
-  /** Генерация «змейки» по полигону области (px-координаты) как нового маршрута. */
+  /** Генерация «змейки» по полигону района (px-координаты) как нового маршрута. */
   generateScanRoute: (polygonPx: Point[], spacingPx: number) => string | null;
-  /** Ручная высота этапа на ЧЕРНОВИКЕ маршрута (до «Утвердить»): шаг AGL ±stepM
-   *  на i-й точке черновика. При задании высоты черновик автоматически
+  /** Ручная высота этапа на ПРОЕКЦИИ МАРШРУТА (до «Утвердить»): шаг AGL ±stepM
+   *  на i-м узле боевого курса проекции. При задании высоты проекция автоматически
    *  утверждается как маршрут проекта (если точек >= 2). */
-  setDraftPointAltitude: (i: number, stepM: number) => void;
-  /** Черновик маршрута мастера (гео-точки + ручные AGL-высоты этапов по
-   *  индексу точки); null = черновика нет. Пишется MapCanvas при редактиро-
-   *  вании, читается approveTripleStep / setDraftPointAltitude. */
-  routeDraft: { geo: { lat: number; lng: number }[]; agl: Record<number, number>; routeId?: string | null };
-  /** Утвердить черновик маршрута как маршрут проекта (общий код мастера:
+  setTacticalProjectionPointAltitude: (i: number, stepM: number) => void;
+  /** Проекция маршрута Оперативного Планировщика (гео-узлы + ручные AGL-высоты
+   *  этапов по индексу узла); null = проекция не строится. Пишется MapCanvas при редактировании,
+   *  читается approveTripleStep / setTacticalProjectionPointAltitude. */
+  tacticalProjection: { geo: { lat: number; lng: number }[]; agl: Record<number, number>; routeId?: string | null };
+  /** Утвердить Проекцию Маршрута как маршрут проекта (общий код Оперативного Планировщика:
    *  перенос ручных высот этапов, обход зон, пересчёт высот). idToReplace —
-   *  существующий маршрут дрона (редактирование), иначе создаётся новый. */
-  commitRouteDraft: (opts: { idToReplace?: string | null; name?: string; color?: string }) => string | null;
+   *  существующий маршрут боевого аппарата (редактирование), иначе создаётся новый. */
+  commitTacticalProjection: (opts: { idToReplace?: string | null; name?: string; color?: string }) => string | null;
   /** Кнопка «Автокоррекция маршрута»: немедленный обход всех ограничений
    *  (геометрия — planPathAroundZones по всем зонам + вертикальные лимиты).
    *  id omitted/null — все маршруты. */
@@ -440,7 +464,7 @@ interface AppState {
   importProject: (project: Project) => void;
   setProjectName: (name: string) => void;
   exportProject: () => Project;
-  resetProject: () => void;
+  abortMission: () => void;
   addCalibrationPoint: (point: CalibrationPoint) => void;
   removeCalibrationPoint: (index: number) => void;
   toggleCalibration: (enabled: boolean) => void;
@@ -451,11 +475,31 @@ interface AppState {
   setYandexMapsApiKey: (apiKey: string) => void;
   toggleYandexMaps: (enabled: boolean) => void;
   toggleOpenStreetMap: (enabled: boolean) => void;
-  setOSMTileServer: (server: 'osm' | 'opentopomap' | 'carto') => void;
+  setOSMTileServer: (server: 'osm' | 'opentopomap' | 'carto' | 'esri' | 'esri-sat') => void;
+  /** Стиль подложки: схема / спутник / гибрид (спутник и гибрид ведут на Esri World Imagery) */
+  setTileStyle: (style: 'scheme' | 'satellite' | 'hybrid') => void;
   loadMapWithStorage: (mapData: MapData) => Promise<void>;
   /** Активная тайловая карта без снимка: центр (lat/lng) + зум 10..19 */
   loadActiveTileMap: (center: { lat: number; lng: number }, zoom: number) => void;
   restoreMapFromStorage: () => Promise<void>;
+
+  // ─── Пользовательские тактические карты (доп. слои поверх подложки) ────────
+  /** Добавить/заменить слой; бинарные данные уходят в IndexedDB, в localStorage — только метаданные */
+  addOrUpdateUserLayer: (layer: UserMapLayer) => Promise<void>;
+  /** Удалить слой вместе с его данными из IndexedDB */
+  removeUserLayer: (id: string) => Promise<void>;
+  setUserLayerVisible: (id: string, visible: boolean) => void;
+  setUserLayerOpacity: (id: string, opacity: number) => void;
+  /** Фокус вида на границах слоя (вписывает bbox в экран) */
+  focusUserLayer: (id: string) => void;
+  /** Восстановление содержимого слоёв (растры/тайлы) из IndexedDB после перезагрузки */
+  restoreUserLayers: () => Promise<void>;
+  /** Ленивое чтение бинарного источника слоя (MBTiles SQLite) из IndexedDB */
+  loadUserLayerSource: (id: string) => Promise<ArrayBuffer | null>;
+  /** Сборка мусора: удалить записи слоёв, которых больше нет в проекте */
+  gcUserLayerStorage: () => Promise<void>;
+  /** Только метаданные слоёв для персистентности (без больших dataUrl) */
+  userLayerRecords: () => UserMapLayerRecord[];
 }
 
 const defaultProject: Project = {
@@ -499,6 +543,10 @@ const defaultProject: Project = {
     enabled: false,
     tileServer: 'osm',
   },
+  // Пользовательские тактические карты: по умолчанию пусто. Данные слоёв
+  // живут в IndexedDB (store «userlayers»), здесь — только сами слои без
+  // тяжёлых dataUrl (см. partialize).
+  userLayers: [],
 };
 
 export const useStore = create<AppState>()(
@@ -520,35 +568,35 @@ export const useStore = create<AppState>()(
       activeRouteId: null,
       routeWarnings: {},
       redoDrawingStack: [],
-      routeDraft: { geo: [], agl: {} },
-      droneAssignments: [],
+      tacticalProjection: { geo: [], agl: {} },
+      combatAssetAssignments: [],
 
-      setDroneAssignment: (droneId, patch) =>
+      setCombatAssetAssignment: (assetId, patch) =>
         set((state) => {
-          const idx = state.droneAssignments.findIndex((d) => d.droneId === droneId);
-          const next = [...state.droneAssignments];
+          const idx = state.combatAssetAssignments.findIndex((d) => d.assetId === assetId);
+          const next = [...state.combatAssetAssignments];
           if (idx >= 0) next[idx] = { ...next[idx], ...patch };
-          else next.push({ droneId, startId: null, goalId: null, routeId: null, ...patch });
-          return { droneAssignments: next };
+          else next.push({ assetId, startId: null, goalId: null, routeId: null, ...patch });
+          return { combatAssetAssignments: next };
         }),
 
-      removeDroneAssignment: (droneId) =>
-        set((state) => ({ droneAssignments: state.droneAssignments.filter((d) => d.droneId !== droneId) })),
+      removeCombatAssetAssignment: (assetId) =>
+        set((state) => ({ combatAssetAssignments: state.combatAssetAssignments.filter((d) => d.assetId !== assetId) })),
 
-      commitRouteDraft: ({ idToReplace, name, color }) => {
-        // Общий код мастера этапов: зафиксировать черновик маршрута как маршрут
+      commitTacticalProjection: ({ idToReplace, name, color }) => {
+        // Общий код Оперативного Планировщика этапов: зафиксировать проекция маршрута как маршрут
         // проекта. Ручные высоты этапов (agl по индексу точки) переносятся в
         // altitudeAGL соответствующих RoutePoint; затем — немедленный обход
         // ограничений и пересчёт высот (terrain + запас / полом-потолок зон).
         const st = get();
         const map = st.project.map;
-        const draft = st.routeDraft;
+        const projection = st.tacticalProjection;
         if (!map?.bounds || map.width <= 0 || map.height <= 0) return null;
-        if (draft.geo.length < 2) return null;
-        const pts: RoutePoint[] = draft.geo.map((g, i) => ({
+        if (projection.geo.length < 2) return null;
+        const pts: RoutePoint[] = projection.geo.map((g, i) => ({
           ...geoToPixelExact(g.lat, g.lng, map.bounds!, map.width, map.height),
           lat: g.lat, lng: g.lng,
-          altitudeAGL: draft.agl[i] !== undefined ? draft.agl[i] : null,
+          altitudeAGL: projection.agl[i] !== undefined ? projection.agl[i] : null,
         }));
         let targetId = idToReplace ?? null;
         if (targetId && !(st.project.routes || []).some((r) => r.id === targetId)) targetId = null;
@@ -570,21 +618,21 @@ export const useStore = create<AppState>()(
         return targetId;
       },
 
-      setDraftPointAltitude: (i, stepM) => {
+      setTacticalProjectionPointAltitude: (i, stepM) => {
         // Регулировка высоты ЭТАПА на промежуточной точке ещё не утверждённого
-        // черновика: шаг ±stepM метров AGL. Черновик хранится в routeDraft;
+        // черновика: шаг ±stepM метров AGL. Черновик хранится в tacticalProjection;
         // если он уже перенесён в проект — высота применяется к маршруту с
-        // ТОЧНОЙ привязкой по id (routeId из мастера), без эвристики «первый
+        // ТОЧНОЙ привязкой по id (routeId из Оперативного Планировщика), без эвристики «первый
         // маршрут с таким же набором координат» (могла применить высоту к
         // чужому маршруту роя с идентичными точками).
         const st = get();
-        const draft = st.routeDraft;
-        if (i < 0 || i >= draft.geo.length) return;
-        const cur = draft.agl[i] ?? (st.project.settings.altitudeClearanceM ?? 50);
+        const projection = st.tacticalProjection;
+        if (i < 0 || i >= projection.geo.length) return;
+        const cur = projection.agl[i] ?? (st.project.settings.altitudeClearanceM ?? 50);
         const next = Math.max(0, Math.round((cur + stepM) * 10) / 10);
-        const agl = { ...draft.agl, [i]: next };
-        set({ routeDraft: { ...draft, agl } });
-        const rid = draft.routeId;
+        const agl = { ...projection.agl, [i]: next };
+        set({ tacticalProjection: { ...projection, agl } });
+        const rid = projection.routeId;
         if (rid && (st.project.routes || []).some((r) => r.id === rid)) {
           get().setRoutePointAltitude(rid, i, next);
         }
@@ -600,7 +648,7 @@ export const useStore = create<AppState>()(
           return null;
         }
         if (!state.project.map) {
-          alert('⚠️ Сначала загрузите карту — точки маршрута привязываются к её координатам.');
+          alert('⚠️ Сначала загрузите карту — узлы боевого курса привязываются к её координатам.');
           return null;
         }
         const id = uuidv4();
@@ -776,19 +824,19 @@ export const useStore = create<AppState>()(
         void get().updateRouteAltitudes(id);
       },
 
-      setWaypointParams: (routeId, index, params) => {
-        // add_waypoint(lat, lon, alt, params): задержка/угол камеры/скорость/
-        // радиус принятия хранятся по индексу точки маршрута. Некорректные
+      setTacticalNodeParams: (routeId, index, params) => {
+        // add_tactical_node(lat, lon, alt, params): задержка/угол камеры/скорость/
+        // радиус принятия хранятся по индексу узлы боевого курса. Некорректные
         // значения санитизируются (clamp), а не бросают исключение — UI может
         // передавать промежуточные состояния полей ввода.
-        const clean = sanitizeWaypointParams(params);
+        const clean = sanitizeTacticalNodeParams(params);
         set((cur) => ({
           project: {
             ...cur.project,
             routes: (cur.project.routes || []).map((r) => {
               if (r.id !== routeId) return r;
-              const wp: Record<number, WaypointParamsLite> = { ...(r.waypointParams || {}), [index]: clean };
-              return { ...r, waypointParams: wp };
+              const wp: Record<number, TacticalNodeParamsLite> = { ...(r.tacticalNodeParams || {}), [index]: clean };
+              return { ...r, tacticalNodeParams: wp };
             }),
             updatedAt: new Date().toISOString(),
           },
@@ -818,7 +866,7 @@ export const useStore = create<AppState>()(
       },
 
       optimizeRouteOrder: (routeId, algorithm) => {
-        // optimize_route(waypoints, algorithm): перестановка путевых точек
+        // optimize_route(tacticalNodes, algorithm): перестановка узлов боевого курса
         // (первая — старт — фиксирована). Параметры точек переносятся вместе
         // с точками. Возвращает % сокращения пути или null. После перестановки
         // — обход зон и пересчёт высот.
@@ -829,17 +877,17 @@ export const useStore = create<AppState>()(
         const indexed = route.points.map((p, i) => ({ lat: p.lat, lon: p.lng, __i: i }));
         const res = optimizeRoute(indexed, algorithm);
         const newPoints: RoutePoint[] = [];
-        const newWp: Record<number, WaypointParamsLite> = {};
-        res.waypoints.forEach((p, newIndex) => {
+        const newWp: Record<number, TacticalNodeParamsLite> = {};
+        res.tacticalNodes.forEach((p, newIndex) => {
           newPoints.push(route.points[p.__i]);
-          const old = route.waypointParams?.[p.__i];
+          const old = route.tacticalNodeParams?.[p.__i];
           if (old) newWp[newIndex] = old;
         });
         set((cur) => ({
           project: {
             ...cur.project,
             routes: (cur.project.routes || []).map((r) =>
-              r.id === routeId ? { ...r, points: newPoints, waypointParams: newWp } : r
+              r.id === routeId ? { ...r, points: newPoints, tacticalNodeParams: newWp } : r
             ),
             updatedAt: new Date().toISOString(),
           },
@@ -1400,7 +1448,7 @@ export const useStore = create<AppState>()(
         project: { ...state.project, projectName: name, updatedAt: new Date().toISOString() },
       })),
 
-      resetProject: () => set({
+      abortMission: () => set({
         project: { ...defaultProject, routes: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
         currentTool: 'pan',
         activeRestrictionId: null,
@@ -1509,6 +1557,16 @@ export const useStore = create<AppState>()(
         },
       })),
 
+      /** Стиль подложки (схема/спутник/гибрид). Спутник и гибрид в getOSMTileUrl
+       *  принудительно ведут на Esri World Imagery — см. src/utils/openStreetMap.ts */
+      setTileStyle: (style) => set((state) => ({
+        project: {
+          ...state.project,
+          settings: { ...state.project.settings, tileStyle: style },
+          updatedAt: new Date().toISOString(),
+        },
+      })),
+
       loadMapWithStorage: async (mapData) => {
         // Сохраняем карту в IndexedDB под стабильным ID — старые карты не затираются
         const mapId = uuidv4();
@@ -1599,6 +1657,181 @@ export const useStore = create<AppState>()(
           get().refreshAllRoutesAfterMapChange();
         }
       },
+
+      // ─── Пользовательские тактические карты (ЭТАП 2) ────────────────────────
+
+      /**
+       * Добавить/заменить слой. Тяжёлые данные (imageDataUrl / бинарник MBTiles)
+       * уходят в IndexedDB (store «userlayers»), в localStorage через persist —
+       * только метаданные без dataUrl (см. userLayerRecords).
+       */
+      addOrUpdateUserLayer: async (layer) => {
+        // В сторе слой без тяжёлых payload'ов: imageDataUrl подгружается из
+        // IndexedDB в restoreUserLayers, sourceBlob (MBTiles) читается лениво.
+        const clean: UserMapLayer = { ...layer, imageDataUrl: undefined, sourceBlob: undefined };
+        set((state) => {
+          const list = state.project.userLayers ?? [];
+          const exists = list.some((l) => l.id === clean.id);
+          return {
+            project: {
+              ...state.project,
+              userLayers: exists ? list.map((l) => (l.id === clean.id ? clean : l)) : [...list, clean],
+              updatedAt: new Date().toISOString(),
+            },
+          };
+        });
+        // Бинарные части слоя: растр (data URL) и/или исходный SQLite MBTiles.
+        // Для векторных слоёв записей нет — геометрия живёт в самом проекте.
+        const hasBlob = !!layer.imageDataUrl || !!layer.sourceBlob;
+        if (hasBlob) {
+          await saveUserLayerToIndexedDB({
+            id: layer.id,
+            imageDataUrl: layer.imageDataUrl,
+            sourceBlob: layer.sourceBlob,
+            bytes: layer.meta.fileSize,
+            timestamp: Date.now(),
+          });
+          blobKnownIds.add(layer.id);
+        } else {
+          await deleteUserLayerFromIndexedDB(layer.id);
+          blobKnownIds.delete(layer.id);
+        }
+      },
+
+      removeUserLayer: async (id) => {
+        set((state) => ({
+          project: {
+            ...state.project,
+            userLayers: (state.project.userLayers ?? []).filter((l) => l.id !== id),
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+        await deleteUserLayerFromIndexedDB(id);
+        blobKnownIds.delete(id);
+      },
+
+      setUserLayerVisible: (id, visible) => set((state) => ({
+        project: {
+          ...state.project,
+          userLayers: (state.project.userLayers ?? []).map((l) => (l.id === id ? { ...l, visible } : l)),
+        },
+      })),
+
+      /** Прозрачность 0..1 с защитой от NaN/выхода за диапазон */
+      setUserLayerOpacity: (id, opacity) => set((state) => ({
+        project: {
+          ...state.project,
+          userLayers: (state.project.userLayers ?? []).map((l) =>
+            l.id === id
+              ? { ...l, opacity: Number.isFinite(opacity) ? Math.min(1, Math.max(0, opacity)) : l.opacity }
+              : l
+          ),
+        },
+      })),
+
+      /** Фокус вида на bbox слоя: центр + зум, при котором слой целиком вписан в экран */
+      focusUserLayer: (id) => {
+        const st = get();
+        const layer = (st.project.userLayers ?? []).find((l) => l.id === id);
+        if (!layer) return;
+        const b = layer.bbox;
+        const latCenter = (b.north + b.south) / 2;
+        const lngCenter = (b.east + b.west) / 2;
+        const spanLat = Math.abs(b.north - b.south);
+        const spanLng = Math.abs(b.east - b.west);
+        const span = Math.max(spanLat, spanLng, 1e-6);
+        // world px at zoom z = 256*2^z; слой в ~80% экрана → подбираем z из Mercator-угла
+        let z = Math.floor(Math.log2(360 / span)) - 1;
+        z = Math.max(MIN_MAP_ZOOM_FLOOR, Math.min(19, z));
+        const worldPx = 256 * Math.pow(2, z);
+        const x = ((lngCenter + 180) / 360) * worldPx;
+        const y = latToMercatorY(latCenter) * worldPx;
+        // setViewState — единственный легальный путь смены вида: он инкрементит
+        // viewTick, и MapCanvas гарантированно перерисует сцену на новом масштабе
+        const cw = canvasSizeRefForView().width;
+        const ch = canvasSizeRefForView().height;
+        get().setViewState({
+          offsetX: cw / 2 - x,
+          offsetY: ch / 2 - y,
+          scale: 1,
+          z0: z,
+        });
+      },
+
+      /**
+       * Восстановление содержимого растровых слоёв из IndexedDB после перезагрузки
+       * страницы (в localStorage живут только метаданные). Векторные слои не требуют
+       * восстановления — их геометрия сериализуется вместе с проектом.
+       * MBTiles: бинарник SQLite НЕ кладём в стор целиком (десятки МБ) — MapCanvas
+       * читает его лениво через loadUserLayerSource(id) при первой отрисовке.
+       */
+      restoreUserLayers: async () => {
+        const layers = get().project.userLayers ?? [];
+        // синхронизируем реестр слоёв с внешней памятью: после перезагрузки
+        // страницы blobKnownIds пуст, а записи в IndexedDB уже есть
+        for (const id of await listUserLayerIds()) blobKnownIds.add(id);
+        if (layers.length === 0) return;
+        // одна запись на слой + батчевое обновление стора: N последовательных
+        // set() вызывали бы N полных перерисовок канваса при гидрации
+        const updates = new Map<string, Partial<UserMapLayer>>();
+        for (const layer of layers) {
+          if (layer.kind !== 'vector' && !layer.imageDataUrl) {
+            const rec = await loadUserLayerFromIndexedDB(layer.id);
+            if (!rec) continue;
+            const patch: Partial<UserMapLayer> = {};
+            if (rec.imageDataUrl) patch.imageDataUrl = rec.imageDataUrl;
+            // sourceBlob в сторе не храним (тяжёлый): рендер достанет его
+            // лениво через loadUserLayerSource / прямой read из IndexedDB
+            if (Object.keys(patch).length) updates.set(layer.id, patch);
+          }
+        }
+        if (updates.size > 0) {
+          set((cur) => ({
+            project: {
+              ...cur.project,
+              userLayers: (cur.project.userLayers ?? []).map((l) =>
+                updates.has(l.id) ? { ...l, ...updates.get(l.id)! } : l
+              ),
+            },
+          }));
+        }
+        // любой слой мог получить imageDataUrl — перерисовываем сцену
+        set((s) => ({ viewTick: s.viewTick + 1 }));
+      },
+
+      /** Ленивое чтение бинарного источника слоя (MBTiles SQLite) из IndexedDB */
+      loadUserLayerSource: async (id) => {
+        const rec = await loadUserLayerFromIndexedDB(id);
+        return rec?.sourceBlob ?? null;
+      },
+
+      /** Сборка мусора: удаляем из IndexedDB записи слоёв, отсутствующих в проекте */
+      gcUserLayerStorage: async () => {
+        const ids = new Set((get().project.userLayers ?? []).map((l) => l.id));
+        const stored = await listUserLayerIds();
+        for (const id of stored) {
+          if (!ids.has(id)) {
+            await deleteUserLayerFromIndexedDB(id);
+            blobKnownIds.delete(id);
+          }
+        }
+      },
+
+      /**
+       * Только метаданные для персистентности: без тяжёлых dataUrl и бинарников.
+       * hasBlob — это признак того, что для слоя ЕСТЬ внешние данные (растровые
+       * пиксели или SQLite-источник), т.е. запись в IndexedDB. В сторе слои
+       * хранятся уже «обнулёнными» (см. addOrUpdateUserLayer), поэтому факт
+       * наличия проверяем по записям IndexedDB, а не по полям самого слоя.
+       */
+      userLayerRecords: (): UserMapLayerRecord[] => {
+        const layers = get().project.userLayers ?? [];
+        return layers.map((layer) => ({
+          layer: { ...layer, imageDataUrl: undefined, sourceBlob: undefined },
+          hasBlob: !!(layer.imageDataUrl || layer.sourceBlob) || blobKnownIds.has(layer.id),
+          bytes: layer.meta?.fileSize ?? 0,
+        }));
+      },
     }),
     {
       name: 'totalquadro-storage',
@@ -1617,9 +1850,13 @@ export const useStore = create<AppState>()(
             ...state.project.map,
             dataUrl: '', // Очищаем dataUrl перед сохранением
           } : null,
+          // Пользовательские тактические карты: в localStorage — только метаданные
+          // (без тяжёлых imageDataUrl; сами данные живут в IndexedDB «userlayers»
+          // и восстанавливаются через restoreUserLayers)
+          userLayers: (state.project.userLayers ?? []).map((l) => ({ ...l, imageDataUrl: undefined, sourceBlob: undefined })),
         },
         _currentMapId: state._currentMapId, // Сохраняем ID карты для восстановления
-        droneAssignments: state.droneAssignments, // старт/цель/маршрут каждого дрона
+        combatAssetAssignments: state.combatAssetAssignments, // старт/цель/маршрут каждого боевого аппарата
       }),
       onRehydrateStorage: () => (state, error) => {
         if (error) console.warn('[persist] rehydration failed:', error);
@@ -1631,6 +1868,10 @@ export const useStore = create<AppState>()(
         } catch { /* стор ещё не создан (первичная синхронная гидрация) — не страшно */ }
       },
       migrate: (persistedState: any, version: number) => {
+        // ЭТАП 3 (боевая терминология): перенос легаси-полей в новые имена.
+        // Идемпотентно и обратимо-совместимо: старые записи читаются,
+        // при следующей записи persist сохранит уже новые имена полей.
+        persistedState = migratePersistedState(persistedState ?? {});
         // Миграция для старых проектов без googleMaps
         if (persistedState.project && !persistedState.project.googleMaps) {
           persistedState.project.googleMaps = {
@@ -1672,9 +1913,11 @@ export const useStore = create<AppState>()(
         } else if (persistedState.project?.settings) {
           // существующие проекты: включаем активную тайловую карту по умолчанию
           if (persistedState.project.settings.tilesEnabled === undefined) persistedState.project.settings.tilesEnabled = true;
-          // Режимы «спутник/гибрид» и внешние Overpass-слои удалены из приложения:
-          // нормализуем сохранённые настройки к стандартной схеме.
-          persistedState.project.settings.tileStyle = 'scheme';
+          // Стиль подложки: схема / спутник / гибрид. Legacy-значения ('standard',
+          // внешние слои) нормализуем к схеме; сохранённый спутник — легален.
+          const savedStyle = (persistedState.project.settings as any).tileStyle;
+          persistedState.project.settings.tileStyle =
+            savedStyle === 'satellite' || savedStyle === 'hybrid' ? savedStyle : 'scheme';
           delete (persistedState.project.settings as any).airportsLayer;
           delete (persistedState.project.settings as any).geozonesLayer;
           delete (persistedState.project.settings as any).notamLayer;
@@ -1682,6 +1925,17 @@ export const useStore = create<AppState>()(
         // Миграция для старых проектов без маршрутов
         if (persistedState.project && !Array.isArray(persistedState.project.routes)) {
           persistedState.project.routes = [];
+        }
+        // Пользовательские тактические карты: приводим к массиву метаданных
+        // (imageDataUrl не персистится в localStorage — см. partialize)
+        if (persistedState.project && !Array.isArray(persistedState.project.userLayers)) {
+          persistedState.project.userLayers = [];
+        } else if (Array.isArray(persistedState.project?.userLayers)) {
+          persistedState.project.userLayers = persistedState.project.userLayers.map((l: any) => ({
+            ...l,
+            imageDataUrl: undefined,
+            sourceBlob: undefined,
+          }));
         }
         // Нормализация viewState: старые версии хранилища могли записать вид без
         // поля z0 (или с «грязным» значением null/строкой). Все потребители вида

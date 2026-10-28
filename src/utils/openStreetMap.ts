@@ -152,32 +152,89 @@ export async function osmReverseGeocode(lat: number, lng: number, signal?: Abort
 export type TileStyle = 'scheme' | 'satellite' | 'hybrid';
 
 /**
- * Получение URL тайла OSM
+ * Идентификатор тайлового провайдера.
+ * 'esri' / 'esri-sat' — Esri ArcGIS Online (World_Street_Map / World_Imagery);
+ * 'osm' / 'carto' — legacy-значения из ранее сохранённых проектов: принимаются
+ * на вход и нормализуются (см. normalizeTileServer), наружу не отдаются.
+ */
+export type TileServerId = 'osm' | 'carto' | 'opentopomap' | 'esri' | 'esri-sat';
+
+const TILE_SERVER_ALIASES: Record<string, TileServerId> = {
+  osm: 'osm',
+  openstreetmap: 'osm',
+  carto: 'carto',
+  cartocdn: 'carto',
+  dark: 'carto',
+  opentopomap: 'opentopomap',
+  topo: 'opentopomap',
+  esri: 'esri',
+  'esri-street': 'esri',
+  street: 'esri',
+  'esri-sat': 'esri-sat',
+  'esri-imagery': 'esri-sat',
+  imagery: 'esri-sat',
+  satellite: 'esri-sat',
+};
+
+/** Нормализация провайдера: неизвестное / legacy / пустое значение → 'osm'. */
+export function normalizeTileServer(tileServer?: string | null): TileServerId {
+  const id = (tileServer ?? '').trim().toLowerCase();
+  return TILE_SERVER_ALIASES[id] ?? 'osm';
+}
+
+/** Нативный максимальный уровень зума провайдера (сверх него тайлы не запрашиваем) */
+export const NATIVE_MAX_ZOOM_BY_SERVER: Record<TileServerId, number> = {
+  osm: 19,
+  carto: 18,
+  opentopomap: 17,
+  esri: 19,
+  'esri-sat': 19,
+};
+
+const ESRI_IMAGERY_BASE =
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile';
+const ESRI_STREET_BASE =
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile';
+
+/**
+ * Получение URL тайла для выбранного провайдера и стиля подложки.
+ *
+ * Стиль участвует в выборе сервера: 'satellite' | 'hybrid' принудительно
+ * переключают провайдера на Esri Imagery ('esri-sat'), поэтому спутник
+ * работает при любом значении tileServer (в т.ч. legacy 'osm' / 'carto').
  */
 export function getOSMTileUrl(
   zoom: number,
   x: number,
   y: number,
-  tileServer: 'osm' | 'opentopomap' | 'carto' = 'osm',
+  tileServer: TileServerId | 'osm' | 'opentopomap' | 'carto' | string = 'osm',
   style: TileStyle = 'scheme'
 ): string {
+  // Спутниковый/гибридный стиль принудительно переключает провайдер на Esri Imagery
+  const effectiveServer: TileServerId =
+    style === 'satellite' || style === 'hybrid' ? 'esri-sat' : normalizeTileServer(tileServer);
+  const server = effectiveServer;
+
   // detectRetina: тайлы @2x доступны ТОЛЬКО у tile.openstreetmap.org и basemaps.cartocdn.com
-  // (макс. уровень их нативного зума — 19). Esri World_Imagery отдаёт 512-px тайлы без @2x,
-  // opentopomap — только до z17. maxNativeZoom учитывается вызывающим кодом.
-  const z = Math.min(Math.max(zoom, 0), 19);
+  // (макс. уровень их нативного зума — 19). Esri World_Imagery / World_Street_Map отдают
+  // 512-px тайлы без @2x, opentopomap — только до z17. maxNativeZoom учитывается
+  // вызывающим кодом (NATIVE_MAX_ZOOM_BY_SERVER).
+  const nativeMax = NATIVE_MAX_ZOOM_BY_SERVER[server];
+  const z = Math.min(Math.max(Math.round(zoom), 0), nativeMax);
   const retina = typeof window !== 'undefined' && (window.devicePixelRatio || 1) >= 1.5;
   const at = retina ? '@2x' : '';
-  switch (tileServer) {
+  switch (server) {
     case 'opentopomap':
-      return `https://tile.opentopomap.org/${Math.min(z, 17)}/${x}/${y}.png`;
+      return `https://tile.opentopomap.org/${z}/${x}/${y}.png`;
     case 'carto':
-      if (style === 'satellite' || style === 'hybrid')
-        return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
       return `https://basemaps.cartocdn.com/dark_all${at}/${z}/${x}/${y}.png`;
+    case 'esri':
+      // Esri: тайлы всегда отдаются как .../{z}/{y}/{x}, без @2x
+      return `${ESRI_STREET_BASE}/${z}/${y}/${x}`;
+    case 'esri-sat':
+      return `${ESRI_IMAGERY_BASE}/${z}/${y}/${x}`;
     case 'osm':
     default:
-      if (style === 'satellite' || style === 'hybrid')
-        return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
       return `https://tile.openstreetmap.org/${z}/${x}/${y}${at}.png`;
   }
 }
@@ -253,27 +310,21 @@ export async function loadOSMStaticMap(
 ): Promise<{ dataUrl: string; bounds: { north: number; south: number; east: number; west: number } }> {
   console.log(`Загрузка карты OSM: сервер=${tileServer}, центр=(${center.lat}, ${center.lng}), зум=${zoom}, размер=${width}x${height}`);
   
-  // Вычисляем границы (приблизительные — для совместимости сигнатуры)
-  void calculateOSMBoundsFromCenter;
-
   // === ТОЧНАЯ Mercator-привязка снимка к географии (исправление «сбившегося масштаба») ===
-  // Снимок покрывает ровно окно обзора: world px на данном зуме = 256*2^z, из них
-  // по X видно width px => долготный размах симметричен центру; по Y — через Mercator.
+  // Границы берутся общей Web Mercator-функцией проекта (googleMaps.ts) — той же,
+  // что использует Google-подложка и живой рендер MapCanvas, поэтому привязка
+  // снимка и интерактивной карты не могут разойтись. Размах окна пересчитывается
+  // в world-pixel на зуме zClamped, поэтому зум сначала ограничивается
+  // рабочим диапазоном провайдера (1..19).
   const zClamped = Math.min(Math.max(Math.round(zoom), 1), 19);
-  const worldPxZ = 256 * Math.pow(2, zClamped);
-  const mercC = latToMercatorY(Math.max(-85, Math.min(85, center.lat)));
-  const halfSpanY = (height / 2) / worldPxZ;
-  const north = tileToLatLng(0, Math.max(0, Math.min(1, mercC - halfSpanY)), zClamped).lat;
-  const south = tileToLatLng(0, Math.max(0, Math.min(1, mercC + halfSpanY)), zClamped).lat;
-  const lngHalf = (width / 2 / worldPxZ) * 360;
-  const west = center.lng - lngHalf;
-  const east = center.lng + lngHalf;
-  const bounds = { north, south, east, west };
+  const bounds = calculateBoundsFromCenter(center, zClamped, width, height);
 
-  // Пиксельные границы тайловой сетки, точно соответствующие видимой области
+  // Пиксельные границы тайловой сетки, точно соответствующие видимой области.
+  // Отсчёт идёт от западной/северной границы снимка (EPSG:3857), поэтому левый
+  // верхний пиксель canvas соответствует ровно bounds.west / bounds.north.
   const nTiles = Math.pow(2, zClamped);
-  const xMinWorld = ((west + 180) / 360) * nTiles;
-  const yMinWorld = latToMercatorY(north) * nTiles;
+  const xMinWorld = ((bounds.west + 180) / 360) * nTiles;
+  const yMinWorld = latToMercatorY(bounds.north) * nTiles;
 
   // Создаем canvas и рисуем тайлы
   const canvas = document.createElement('canvas');
@@ -359,9 +410,6 @@ export async function loadOSMStaticMap(
   const dataUrl = canvas.toDataURL('image/png');
   return { dataUrl, bounds };
 }
-
-// Границы считаются через общую Web Mercator-функцию (googleMaps.ts)
-const calculateOSMBoundsFromCenter = calculateBoundsFromCenter;
 
 /**
  * Проверка статуса инициализации OSM

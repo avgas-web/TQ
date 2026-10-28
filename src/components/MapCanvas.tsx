@@ -4,7 +4,15 @@ import { isPointInsideAnyRestriction, distanceBetween } from '../utils/geometry'
 import { pixelToGeoFromBounds } from '../utils/googleMaps';
 import { haversineDistanceM, bearingDeg, boundsFromPoints } from '../utils/actionMode';
 import { pixelToGeoExact, geoToPixelExact, routeLengthM, zonesCrossedBy, planPathAroundZones, smoothPolyline } from '../utils/routing';
-import { getOSMTileUrl, loadTileImage } from '../utils/openStreetMap';
+import { getOSMTileUrl, loadTileImage, normalizeTileServer, NATIVE_MAX_ZOOM_BY_SERVER } from '../utils/openStreetMap';
+import {
+  getUserLayerImage, isUserLayerImageReady, setUserLayerImageListener, dropUserLayerImage,
+  drawVectorLayer, drawRasterLayer, layerIsVisibleOnScreen,
+  requestMbtilesTiles, getMbtilesTileImages, drawMbtilesTiles, drawLayerOutline,
+} from '../utils/userMapRender';
+import { decodeMbtilesTilesForRender } from '../utils/userMapLoader';
+import { safeSetItem } from '../utils/storage';
+import type { UserMapLayer } from '../types';
 import MiniMapPanel, { MiniOverlayLine, MiniOverlayPoint, type MiniZone } from './MiniMapPanel';
 import { zoomForGroundMpp, GROUND_MPP_1CM_2KM } from '../utils/pannelli';
 import type { Point, Route, RoutePoint, MapBounds } from '../types';
@@ -18,8 +26,8 @@ const MAX_ZOOM = 19;
 /** Палитра цветов маршрутов (повторяется циклически при большом числе маршрутов) */
 const ROUTE_PALETTE = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#fb923c', '#38bdf8', '#e879f9'];
 
-/** Нативный max zoom тайловых серверов (выше НЕ поднимаемся — нет данных, только растяжение) */
-const NATIVE_MAX_BY_SERVER: Record<string, number> = { osm: 19, carto: 18, opentopomap: 17 };
+/** Нативный max zoom тайловых серверов (выше НЕ поднимаемся — нет данных, только растяжение).
+ *  Единый источник истины — NATIVE_MAX_ZOOM_BY_SERVER из openStreetMap.ts. */
 // Параметры аккуратной очереди загрузки тайлов (как на openstreetmap.org):
 // максимум параллельных загрузок и дебаунс новых волн во время жеста.
 const MAX_PARALLEL = 6;
@@ -65,7 +73,7 @@ function worldPxForMetersPerPixel(mpp: number, latRef: number): number {
 /** Границы scale для minZoom..maxNativeZoom (не выше нативного уровня сервера) */
 function scaleBoundsForZooms(canvasH: number, z0: number | undefined, server: string): { min: number; max: number } {
   void canvasH; // границы задаются zoom'ом, а не размером окна — scale относительна z0=14
-  const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[server] ?? MAX_ZOOM);
+  const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_ZOOM_BY_SERVER[normalizeTileServer(server)] ?? MAX_ZOOM);
   return {
     min: Math.pow(2, MIN_ZOOM - (z0 ?? ZOOM_REF)),
     max: Math.pow(2, nativeMax - (z0 ?? ZOOM_REF)),
@@ -189,7 +197,7 @@ const MapCanvas: React.FC = () => {
   useEffect(() => { canvasSizeRef.current = canvasSize; }, [canvasSize]);
   const [draggingMarker, setDraggingMarker] = useState<string | null>(null);
   const [mapLoaded, setMapLoaded] = useState(false);
-  // Перетаскивание точки маршрута: id + индекс (для moveRoutePoint)
+  // Перетаскивание узлы боевого курса: id + индекс (для moveRoutePoint)
   const [draggingRoute, setDraggingRoute] = useState<{ routeId: string; index: number } | null>(null);
   // Popup по клику на объект (координаты, высота, расстояние)
   const [popup, setPopup] = useState<{ x: number; y: number; title: string; lines: string[] } | null>(null);
@@ -273,14 +281,19 @@ const MapCanvas: React.FC = () => {
   // Актуальный вид для РЕНДЕРА (обновлён в последнем кадре)
   const vs = viewRef.current;
 
+  // id слоёв пользовательских карт на прошлом рендере — чтобы чистить кэш
+  // изображений/тайлов удалённых слоёв (см. useEffect после канвас-рендера)
+  const prevLayerIdsRef = useRef<Set<string>>(new Set());
+
   // devicePixelRatio — для чёткого рендера на Retina/HiDPI экранах
   const dpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
 
   // ===== Тайловая подложка: карта активна, а НЕ статичная фотография =====
   // Кэш тайлов, дозагрузка при изменении вида; maxNativeZoom — выше не растягиваем.
   const tilesEnabled = !!project.settings?.tilesEnabled && !!project.map?.bounds;
-  // Только стандартная схема OSM (режимы «спутник/гибрид» удалены из приложения)
-  const tileStyle: 'scheme' = 'scheme';
+  // Стиль подложки из настроек проекта: 'scheme' | 'satellite' | 'hybrid'.
+  // Спутник/гибрид внутри getOSMTileUrl принудительно ведут на Esri World Imagery.
+  const tileStyle = project.settings?.tileStyle ?? 'scheme';
   const tileServer = (project.openStreetMap?.tileServer as any) || 'osm';
   // ЕДИНАЯ инвариантная привязка вида (см. комментарий над worldPxOf):
   //   zoom = z0 + log2(scale),  worldPx = canvasHeight · 2^zoom.
@@ -312,7 +325,7 @@ const MapCanvas: React.FC = () => {
     if (!tilesOn || !mapBounds || cs.height <= 0) { el.style.display = 'none'; return; }
     const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
     const zoom = clampZoom(zoomAtWorldPx(wp));
-    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[(st.project.openStreetMap?.tileServer as any) || 'osm'] ?? MAX_ZOOM);
+    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_ZOOM_BY_SERVER[normalizeTileServer((st.project.openStreetMap?.tileServer as any) || 'osm')] ?? MAX_ZOOM);
     const level = Math.max(MIN_ZOOM, Math.min(nativeMax, Math.round(zoom)));
     const n = Math.pow(2, level);
     // ── СТРОГАЯ привязка DOM-слоя к инварианту вида ───────────────────────────
@@ -368,7 +381,9 @@ const MapCanvas: React.FC = () => {
     const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
     const zoom = clampZoom(zoomAtWorldPx(wp));
     const server = (st.project.openStreetMap?.tileServer as any) || 'osm';
-    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_BY_SERVER[server] ?? MAX_ZOOM);
+    // Стиль берём из настроек: satellite/hybrid → Esri World Imagery (см. getOSMTileUrl)
+    const style = st.project.settings?.tileStyle ?? 'scheme';
+    const nativeMax = Math.min(MAX_ZOOM, NATIVE_MAX_ZOOM_BY_SERVER[normalizeTileServer(server)] ?? MAX_ZOOM);
     const level = Math.max(MIN_ZOOM, Math.min(nativeMax, Math.round(zoom)));
     const n = Math.pow(2, level);
     // World-пиксели ВЫБРАННОГО уровня: та же формула привязки, что у объектов
@@ -384,7 +399,7 @@ const MapCanvas: React.FC = () => {
       for (let ty = tyMin; ty <= tyMax && budget > 0; ty++) {
         if (tx < 0 || ty < 0 || tx >= n || ty >= n) continue;
         budget--;
-        const url = getOSMTileUrl(level, tx, ty, server, 'scheme');
+        const url = getOSMTileUrl(level, tx, ty, server, style);
         keep.add(url);
         if (tileElsRef.current.has(url)) continue;
         const img = document.createElement('img');
@@ -459,7 +474,7 @@ const MapCanvas: React.FC = () => {
   // Пересинхронизация DOM-слоя при смене вида (rAF-троттлинг), карты и настроек
   useEffect(() => {
     syncTileDom();
-  }, [renderTick, tilesEnabled, tileServer, project.map?.bounds, canvasSize, syncTileDom]);
+  }, [renderTick, tilesEnabled, tileServer, tileStyle, project.map?.bounds, canvasSize, syncTileDom]);
 
   // Геолокация пользователя (по требованию — кнопка 📍)
   const locateUser = useCallback(() => {
@@ -477,8 +492,8 @@ const MapCanvas: React.FC = () => {
   // со строгой Mercator-привязкой, полным зумом/панорамой, редактированием
   // (точки старта/цели, маршрут, зоны ограничений) и удалением объектов кликом.
   // Все функции доступны ВО ВСЕХ ТРЁХ ОКНАХ. После ЗАПУСКА миссия передаётся
-  // в дроны, и кнопка «🆕 Новая миссия» очищает данные для следующего полёта.
-  // Рой дронов: у всех дронов один старт; общая цель ИЛИ индивидуальные цели.
+  // в боевые аппараты, и кнопка «🆕 Новая миссия» очищает данные для следующего полёта.
+  // Рой боевых аппаратов: у всех боевых аппаратов один старт; общая цель ИЛИ индивидуальные цели.
   const tripleMode = true;
   // ─── Режимы работы с окнами (отдельные пункты меню):
   //  'restrictions' — Установка ограничений (клик по ЛЮБОЙ карте ставит зону);
@@ -487,31 +502,31 @@ const MapCanvas: React.FC = () => {
   const [tripleWorkMode, setTripleWorkMode] = useState<TripleMode>('route');
   const workModeRef = useRef(tripleWorkMode);
   useEffect(() => { workModeRef.current = tripleWorkMode; }, [tripleWorkMode]);
-  const [droneCount, setDroneCount] = useState(4);
+  const [assetCount, setAssetCount] = useState(4);
   const [sharedGoal, setSharedGoal] = useState(true);
-  // Общий старт для всего роя (по умолчанию) — либо индивидуальные старты дронов
+  // Общий старт для всего роя (по умолчанию) — либо индивидуальные старты боевых аппаратов
   const [sharedStart, setSharedStart] = useState(true);
-  const [activeUav, setActiveUav] = useState(0);
+  const [activeAsset, setActiveAsset] = useState(0);
   const [startGeo, setStartGeo] = useState<{ lat: number; lng: number } | null>(null);
   const [goalGeo, setGoalGeo] = useState<{ lat: number; lng: number } | null>(null);
-  // Индивидуальные старты дронов (при выключенном «общем старте»): индекс → гео.
-  // Маршрут i-го дрона начинается в startForUav(i) — так же, как цель берётся
-  // из последней точки его маршрута (goalForUav).
-  const [droneStarts, setDroneStarts] = useState<( { lat: number; lng: number } | null )[]>([]);
-  // Индивидуальная цель текущего дрона при «индивидуальных целях»: клик по
-  // окну «Цель» задаёт её; переносится на последнюю точку маршрута этого дрона.
-  const [droneGoals, setDroneGoals] = useState<( { lat: number; lng: number } | null )[]>([]);
+  // Индивидуальные старты боевых аппаратов (при выключенном «общем старте»): индекс → гео.
+  // Маршрут i-го боевого аппарата начинается в startForAsset(i) — так же, как цель берётся
+  // из последней точки его маршрута (goalForAsset).
+  const [combatAssetStarts, setCombatAssetStarts] = useState<( { lat: number; lng: number } | null )[]>([]);
+  // Индивидуальная цель текущего боевого аппарата при «индивидуальных целях»: клик по
+  // окну «Цель» задаёт её; переносится на последнюю точку маршрута этого боевого аппарата.
+  const [strikeObjectives, setStrikeObjectives] = useState<( { lat: number; lng: number } | null )[]>([]);
   const [pickWhat, setPickWhat] = useState<'none' | 'start' | 'goal'>('none');
   const pickWhatRef = useRef(pickWhat);
   useEffect(() => { pickWhatRef.current = pickWhat; }, [pickWhat]);
-  // Автозапуск мастера: как только данные этапа заданы — этап утверждается сам,
+  // Автозапуск Оперативного Планировщика: как только данные этапа заданы — этап утверждается сам,
   // фокус автоматически переходит к следующему окну (редактирование доступно и
   // вручную через кнопки этапов / перенос окна наверх).
   const autoApproveTimerRef = useRef<number | null>(null);
 
-  const uavColors = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#fb923c', '#38bdf8', '#e879f9'];
+  const assetColors = ['#22d3ee', '#a78bfa', '#f472b6', '#4ade80', '#facc15', '#fb923c', '#38bdf8', '#e879f9'];
   // Гео-данные проекта (из пикселей текущего виртуального растра) — источник
-  // точек для панелей «весь маршрут» и целей дронов
+  // точек для панелей «весь маршрут» и целей боевых аппаратов
   const tripleRoutes = React.useMemo(() => {
     if (!tripleMode) return [] as { id: string; name: string; color: string; geo: { lat: number; lng: number }[] }[];
     const map = project.map;
@@ -533,7 +548,7 @@ const MapCanvas: React.FC = () => {
     return out;
   }, [tripleRoutes, startGeo, goalGeo]);
 
-  // ─── Пошаговый мастер: старт → маршрут → цель → ЗАПУСК ──────────────────────
+  // ─── Пошаговый планировщик: старт → маршрут → цель → ЗАПУСК ──────────────────────
   // step: 0 = выбор старта (панель СТАРТ сфокусирована), 1 = редактирование
   // маршрута (панель ВЕСЬ МАРШРУТ), 2 = выбор цели (панель ЦЕЛЬ),
   // 3 = всё утверждено — активна кнопка «🚀 ЗАПУСК».
@@ -541,7 +556,7 @@ const MapCanvas: React.FC = () => {
   const [tripleStep, setTripleStep] = useState<TripleStep>(0);
   const [approvedSteps, setApprovedSteps] = useState<boolean[]>([false, false, false]);
   const [launchState, setLaunchState] = useState<'idle' | 'uploading' | 'done'>('idle');
-  const [draftRoutePts, setDraftRoutePts] = useState<{ lat: number; lng: number }[] | null>(null);
+  const [projectionNodePts, setProjectionNodePts] = useState<{ lat: number; lng: number }[] | null>(null);
   const [routeShape, setRouteShape] = useState<'straight' | 'curve'>('straight');
   const routeShapeRef = useRef(routeShape);
   useEffect(() => { routeShapeRef.current = routeShape; }, [routeShape]);
@@ -559,11 +574,11 @@ const MapCanvas: React.FC = () => {
   const addRoute = useStore((s) => s.addRoute);
   const mapBounds = project.map?.bounds;
 
-  // Черновик маршрута из реальных маршрутов проекта при входе в шаг 1
+  // Проекция маршрута из реальных маршрутов проекта при входе в шаг 1
   useEffect(() => {
-    if (tripleStep === 1 && draftRoutePts === null) {
-      const r = tripleRoutes[Math.min(activeUav, Math.max(0, tripleRoutes.length - 1))];
-      setDraftRoutePts(r ? r.geo : (startGeo && goalGeo ? [startGeo, goalGeo] : []));
+    if (tripleStep === 1 && projectionNodePts === null) {
+      const r = tripleRoutes[Math.min(activeAsset, Math.max(0, tripleRoutes.length - 1))];
+      setProjectionNodePts(r ? r.geo : (startGeo && goalGeo ? [startGeo, goalGeo] : []));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tripleStep, approvedSteps]);
@@ -576,8 +591,8 @@ const MapCanvas: React.FC = () => {
     radiusM: pz.radiusM, centerGeo: pz.center, color: '#fb923c',
   }));
   const canApproveStep = (st: TripleStep): boolean => {
-    if (st === 0) return sharedStart ? !!startGeo : droneStarts.some((s) => !!s) || !!startGeo;
-    if (st === 1) return (draftRoutePts?.length ?? 0) >= 2 || tripleRoutes.length > 0;
+    if (st === 0) return sharedStart ? !!startGeo : combatAssetStarts.some((s) => !!s) || !!startGeo;
+    if (st === 1) return (projectionNodePts?.length ?? 0) >= 2 || tripleRoutes.length > 0;
     if (st === 2) return !!goalGeo || !sharedGoal; // зоны-кандидаты утверждаются автоматически при переходе к следующему этапу
     return false;
   };
@@ -604,18 +619,18 @@ const MapCanvas: React.FC = () => {
   }, [project.map]);
 
   const approveTripleStep = useCallback(() => {
-    if (tripleStep === 1 && draftRoutePts && draftRoutePts.length >= 2 && mapBounds && project.map) {
+    if (tripleStep === 1 && projectionNodePts && projectionNodePts.length >= 2 && mapBounds && project.map) {
       // зафиксировать отредактированный маршрут в проект (пиксели — из точной гео-привязки).
-      // ВАЖНО: черновик НЕ сбрасываем сразу — он участвует в fitPoints окна МАРШРУТ;
+      // ВАЖНО: Проекцию Маршрута НЕ сбрасываем сразу — она участвует в fitPoints окна МАРШРУТ;
       // после записи маршрута в проект тройные данные обновятся атомарно, и окно
       // не «прыгнет» на СПб. Сброс — только при смене активного этапа.
-      let keyGeo = curveGeo(draftRoutePts);
-      // Индивидуальный старт дрона: первый ключевой узел маршрута привязываем
-      // к старту этого дрона (при индивидуальных стартах роя).
-      const myStart = sharedStart ? startGeo : (droneStarts[activeUav] ?? startGeo);
+      let keyGeo = curveGeo(projectionNodePts);
+      // Индивидуальный старт боевого аппарата: первый ключевой узел маршрута привязываем
+      // к старту этого боевого аппарата (при индивидуальных стартах роя).
+      const myStart = sharedStart ? startGeo : (combatAssetStarts[activeAsset] ?? startGeo);
       if (myStart) keyGeo = [{ lat: myStart.lat, lng: myStart.lng }, ...keyGeo.filter((g) => Math.hypot(g.lat - myStart.lat, g.lng - myStart.lng) > 1e-7)];
       const pts: RoutePoint[] = keyGeo.map((g) => ({ ...geoToPixelExact(g.lat, g.lng, mapBounds, project.map!.width, project.map!.height), lat: g.lat, lng: g.lng }));
-      const existing = tripleRoutes[Math.min(activeUav, tripleRoutes.length - 1)];
+      const existing = tripleRoutes[Math.min(activeAsset, tripleRoutes.length - 1)];
       if (existing) {
         useStore.setState((cur) => ({
           project: {
@@ -627,7 +642,7 @@ const MapCanvas: React.FC = () => {
         // обход ограничений + высоты для этого маршрута (async)
         void useStore.getState().updateRouteAltitudes(existing.id);
       } else {
-        addRoute(pts, `Маршрут дрона ${activeUav + 1}`, uavColors[activeUav % uavColors.length]);
+        addRoute(pts, `Маршрут боевого аппарата ${activeAsset + 1}`, assetColors[activeAsset % assetColors.length]);
       }
     }
     // Ограничения утверждаются на ЛЮБОМ этапе (зоны ставятся на любой карте).
@@ -636,14 +651,14 @@ const MapCanvas: React.FC = () => {
     setApprovedSteps((a) => { const n = [...a]; n[tripleStep] = true; return n; });
     if (tripleStep < 2) setTripleStep((tripleStep + 1) as TripleStep);
     else setTripleStep(3);
-  }, [tripleStep, draftRoutePts, mapBounds, project.map, tripleRoutes, activeUav, addRoute, pendingZones, commitPendingZones, sharedStart, startGeo, droneStarts]);
+  }, [tripleStep, projectionNodePts, mapBounds, project.map, tripleRoutes, activeAsset, addRoute, pendingZones, commitPendingZones, sharedStart, startGeo, combatAssetStarts]);
 
-  // Безопасный сброс черновика маршрута: если маршрут уже записан в проект
-  // (третий источник данных — tripleRoutes), черновик убираем только когда
+  // Безопасный сброс проекции маршрута: если маршрут уже записан в проект
+  // (третий источник данных — tripleRoutes), проекцию убираем только когда
   // его точки совпадают с данными проекта — иначе fit-вид окна не изменится.
   useEffect(() => {
-    if (tripleStep !== 1 && draftRoutePts !== null) {
-      setDraftRoutePts(null);
+    if (tripleStep !== 1 && projectionNodePts !== null) {
+      setProjectionNodePts(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-exhaustive-deps
   }, [tripleStep]);
@@ -659,7 +674,7 @@ const MapCanvas: React.FC = () => {
     autoApproveTimerRef.current = window.setTimeout(() => approveTripleStep(), 700);
     return () => { if (autoApproveTimerRef.current) window.clearTimeout(autoApproveTimerRef.current); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tripleStep, approvedSteps, startGeo, goalGeo, draftRoutePts, tripleRoutes.length, launchState]);
+  }, [tripleStep, approvedSteps, startGeo, goalGeo, projectionNodePts, tripleRoutes.length, launchState]);
 
   // Снятие утверждения при возврате к этапу (перенос окна наверх в режиме правки)
   const reopenStepForEdit = useCallback((idx: number) => {
@@ -671,7 +686,7 @@ const MapCanvas: React.FC = () => {
   }, []);
 
   const backTripleStep = useCallback(() => {
-    setDraftRoutePts(null); setPendingZones([]);
+    setProjectionNodePts(null); setPendingZones([]);
     if (tripleStep === 3) { setTripleStep(2); setApprovedSteps((a) => [a[0], a[1], false]); }
     else if (tripleStep > 0) {
       setTripleStep((tripleStep - 1) as TripleStep);
@@ -680,7 +695,7 @@ const MapCanvas: React.FC = () => {
   }, [tripleStep]);
 
   // Клик по карте ПАНЕЛИ: все функции доступны во всех трёх окнах одновременно —
-  // любое окно ставит/переносит старт, цель и путевые точки маршрута; зоны
+  // любое окно ставит/переносит старт, цель и узлы боевого курса; зоны
   // ограничения ставятся на ЛЮБОЙ карте без переноса окон и без сбивания фокуса.
   const handlePanelMapClick = useCallback((geo: { lat: number; lng: number; panelIdx?: number }) => {
     if (launchStateRef.current !== 'idle') return;
@@ -692,25 +707,25 @@ const MapCanvas: React.FC = () => {
     }
     // Режим «Редактирование маршрута»: точки старта/цели/маршрута — во всех окнах.
     if (panelIdx === 0) {
-      // Индивидуальные старты: клик по окну «Старт» задаёт старт ВЫБРАННОГО дрона
+      // Индивидуальные старты: клик по окну «Старт» задаёт старт ВЫБРАННОГО боевого аппарата
       if (!sharedStart) {
-        setDroneStarts((prev) => { const n = [...prev]; n[activeUavRef.current] = { lat: geo.lat, lng: geo.lng }; return n; });
+        setCombatAssetStarts((prev) => { const n = [...prev]; n[activeAssetRef.current] = { lat: geo.lat, lng: geo.lng }; return n; });
       } else {
         setStartGeo({ lat: geo.lat, lng: geo.lng });
       }
       reopenStepForEdit(0);
     } else if (panelIdx === 1) {
-      setDraftRoutePts((prev) => [...(prev || []), { lat: geo.lat, lng: geo.lng }]);
+      setProjectionNodePts((prev) => [...(prev || []), { lat: geo.lat, lng: geo.lng }]);
       reopenStepForEdit(1);
     } else {
-      // Индивидуальная цель: клик по окну «Цель» переносит цель текущего дрона —
+      // Индивидуальная цель: клик по окну «Цель» переносит цель текущего боевого аппарата —
       // смещаем последний узел его маршрута (маршрут = старт→…→цель).
       if (!sharedGoal) {
         const g = { lat: geo.lat, lng: geo.lng };
-        setDroneGoals((prev) => { const n = [...prev]; n[activeUavRef.current] = g; return n; });
+        setStrikeObjectives((prev) => { const n = [...prev]; n[activeAssetRef.current] = g; return n; });
         const st = useStore.getState();
         const map = st.project.map;
-        const r = (st.project.routes || [])[activeUavRef.current];
+        const r = (st.project.routes || [])[activeAssetRef.current];
         if (r && map?.bounds && r.points.length >= 2) {
           // пиксели — из точной гео-привязки текущего растра
           const px = geoToPixelExact(g.lat, g.lng, map.bounds, map.width, map.height);
@@ -729,9 +744,9 @@ const MapCanvas: React.FC = () => {
   useEffect(() => { tripleStepRef.current = tripleStep; }, [tripleStep]);
   const launchStateRef = useRef(launchState);
   useEffect(() => { launchStateRef.current = launchState; }, [launchState]);
-  // Индекс активного дрона для стабильных колбэков панелей (клик/drag)
-  const activeUavRef = useRef(activeUav);
-  useEffect(() => { activeUavRef.current = activeUav; }, [activeUav]);
+  // Индекс активного боевого аппарата для стабильных колбэков панелей (клик/drag)
+  const activeAssetRef = useRef(activeAsset);
+  useEffect(() => { activeAssetRef.current = activeAsset; }, [activeAsset]);
 
   // Смена вкладок из бокового меню: активная карта ВСЕГДА сверху (на месте
   // большой карты). Кнопки этапов работают как вкладки: клик по окну или по
@@ -749,8 +764,8 @@ const MapCanvas: React.FC = () => {
   }, [reopenStepForEdit]);
 
   // ─── Удаление введённых точек/объектов кликом по ✛ на активной карте ───────
-  // id форматы: 'triple:start' | 'triple:goal' | 'draft:N' | 'zone:<restrictionId>' |
-  //             'pendingZone:<uid>' | 'drone-goal:<routeId>'
+  // id форматы: 'triple:start' | 'triple:goal' | 'projection:N' | 'zone:<restrictionId>' |
+  //             'pendingZone:<uid>' | 'combatAsset-goal:<routeId>'
   const handlePanelPointDelete = useCallback((id: string) => {
     if (id === 'triple:start') { setStartGeo(null); return; }
     if (id === 'triple:goal') { setGoalGeo(null); return; }
@@ -759,9 +774,9 @@ const MapCanvas: React.FC = () => {
       setPendingZones((prev) => prev.filter((pz) => pz.uid !== uid));
       return;
     }
-    if (id.startsWith('draft:')) {
+    if (id.startsWith('projection:')) {
       const i = Number(id.slice(6));
-      setDraftRoutePts((prev) => (prev ? prev.filter((_, j) => j !== i) : prev));
+      setProjectionNodePts((prev) => (prev ? prev.filter((_, j) => j !== i) : prev));
       return;
     }
     if (id.startsWith('zone:')) {
@@ -769,9 +784,9 @@ const MapCanvas: React.FC = () => {
       useStore.getState().flushReroute();
       return;
     }
-    if (id.startsWith('drone-goal:')) {
-      // удаление цели дрона = удаление последней путевой точки его маршрута
-      const rid = id.slice('drone-goal:'.length);
+    if (id.startsWith('combatAsset-goal:')) {
+      // удаление цели боевого аппарата = удаление последней узла боевого курса его маршрута
+      const rid = id.slice('combatAsset-goal:'.length);
       const st = useStore.getState();
       const r = (st.project.routes || []).find((rr) => rr.id === rid);
       if (r && r.points.length > 0) st.removeRoutePoint(rid, r.points.length - 1);
@@ -787,16 +802,16 @@ const MapCanvas: React.FC = () => {
     useStore.getState().flushReroute();
   }, []);
 
-  // «ЗАПУСК»: загрузка данных миссии в дроны (имитация телеметрической загрузки)
+  // «ЗАПУСК»: загрузка данных миссии в боевые аппараты (имитация телеметрической загрузки)
   const launchMission = useCallback(async () => {
     if (launchState !== 'idle') return;
     setLaunchState('uploading');
     const st = useStore.getState();
     const mission = {
-      start: startGeo, goal: goalGeo, sharedGoal, droneCount,
+      start: startGeo, goal: goalGeo, sharedGoal, assetCount,
       routes: (st.project.routes || []).filter((r) => r.visible !== false).map((r) => ({
         id: r.id, name: r.name,
-        waypoints: r.points.map((p) => ({ lat: p.lat, lng: p.lng })),
+        tacticalNodes: r.points.map((p) => ({ lat: p.lat, lng: p.lng })),
       })),
       // все поставленные зоны (флаг active устарел — см. types/Restriction)
       zones: st.project.restrictions.filter((z) => z.points.length > 0).map((z) => ({
@@ -810,29 +825,31 @@ const MapCanvas: React.FC = () => {
     };
     try {
       await new Promise((res) => setTimeout(res, 1200)); // имитация последовательной загрузки полётных заданий в рой
-      localStorage.setItem(`mission-launch-${Date.now()}`, JSON.stringify(mission));
+      // safeSetItem: при переполнении localStorage значение уходит в IndexedDB
+      // (spill), поэтому большие пакеты заданий не теряются из-за браузерной квоты.
+      await safeSetItem(`mission-launch-${Date.now()}`, JSON.stringify(mission));
       setLaunchState('done');
       setPopup({ x: canvasSize.width / 2 - 160, y: 60, title: '🚀 ЗАПУСК выполнен', lines: [
-        `Полётные задания загружены в ${droneCount} БПЛА`,
+        `Полётные задания загружены в ${assetCount} БПЛА`,
         `Старт: ${startGeo ? `${startGeo.lat.toFixed(5)}, ${startGeo.lng.toFixed(5)}` : '—'}`,
-        `Цель: ${sharedGoal ? (goalGeo ? `${goalGeo.lat.toFixed(5)}, ${goalGeo.lng.toFixed(5)} (общая)` : '—') : `${Math.min(droneCount, tripleRoutes.length)} индив. целей`}`,
+        `Цель: ${sharedGoal ? (goalGeo ? `${goalGeo.lat.toFixed(5)}, ${goalGeo.lng.toFixed(5)} (общая)` : '—') : `${Math.min(assetCount, tripleRoutes.length)} индив. целей`}`,
         `Маршрутов: ${mission.routes.length} · Активных зон: ${mission.zones.length}`,
       ] });
     } catch {
       setLaunchState('idle');
     }
-  }, [launchState, startGeo, goalGeo, sharedGoal, droneCount, mapBounds, canvasSize, tripleRoutes]);
+  }, [launchState, startGeo, goalGeo, sharedGoal, assetCount, mapBounds, canvasSize, tripleRoutes]);
 
   // Готовность миссии к запуску: все данные утверждены (шаг 3) либо заданы вручную
-  const missionReady = (sharedStart ? !!startGeo : droneStarts.some((s) => !!s) || !!startGeo) && ((draftRoutePts?.length ?? 0) >= 2 || tripleRoutes.length > 0) && (!!goalGeo || !sharedGoal);
+  const missionReady = (sharedStart ? !!startGeo : combatAssetStarts.some((s) => !!s) || !!startGeo) && ((projectionNodePts?.length ?? 0) >= 2 || tripleRoutes.length > 0) && (!!goalGeo || !sharedGoal);
   const canLaunch = tripleStep === 3 || missionReady;
 
   // «НОВАЯ МИССИЯ»: после ЗАПУСКА очищаем данные — можно начинать следующий полёт.
   const newMission = useCallback(() => {
     if (launchState !== 'done') return;
-    setStartGeo(null); setGoalGeo(null); setDraftRoutePts([]); setPendingZones([]);
+    setStartGeo(null); setGoalGeo(null); setProjectionNodePts([]); setPendingZones([]);
     setApprovedSteps([false, false, false]); setTripleStep(0); setLaunchState('idle');
-    setActiveUav(0);
+    setActiveAsset(0);
     // маршруты предыдущей миссии удаляем из проекта (зоны-ограничения остаются)
     useStore.setState((cur) => ({ project: { ...cur.project, routes: [] } }));
     setPopup({ x: canvasSize.width / 2 - 160, y: 60, title: '🆕 Новая миссия', lines: ['Данные предыдущего полёта очищены.', 'Окно «Старт» активно — кликните по карте, чтобы задать точку старта.'] });
@@ -918,17 +935,17 @@ const MapCanvas: React.FC = () => {
   const panelZoomFor2km = (lat: number): number =>
     clampZoom(zoomForGroundMpp(GROUND_MPP_1CM_2KM, lat));
 
-  // Перенос путевой точки маршрута drag-ом на любой из карт (редактирование маршрута)
+  // Перенос узлов боевого курса drag-ом на любой из карт (редактирование маршрута)
   const handlePanelPointMove = useCallback((id: string, lat: number, lng: number) => {
-    if (!id.startsWith('draft:')) return;
+    if (!id.startsWith('projection:')) return;
     const i = Number(id.slice(6));
-    setDraftRoutePts((prev) => {
+    setProjectionNodePts((prev) => {
       if (!prev || i < 0 || i >= prev.length) return prev;
       const n = [...prev]; n[i] = { lat, lng }; return n;
     });
   }, []);
 
-  // (curveGeo определён ниже — см. объявление перед мастером этапов)
+  // (curveGeo определён ниже — см. объявление перед планировщиком этапов)
 
   // Экспорт PNG высокого разрешения: композитинг трёх панелей + легенда
   const exportTriplePng = useCallback(async () => {
@@ -954,13 +971,13 @@ const MapCanvas: React.FC = () => {
       ctx.fillText(titles[i] || '', x + 4, 24);
     });
     ctx.fillStyle = '#94a3b8'; ctx.font = `${Math.round(11 * S / 2)}px sans-serif`;
-    const leg = `Рой: ${droneCount} БПЛА · ${sharedGoal ? 'общая цель' : `${Math.min(droneCount, Math.max(1, tripleRoutes.length))} индив. цели`} · Старт: ${startGeo ? `${startGeo.lat.toFixed(5)}, ${startGeo.lng.toFixed(5)}` : 'не выбран'} · Цель: ${goalGeo ? `${goalGeo.lat.toFixed(5)}, ${goalGeo.lng.toFixed(5)}` : 'не выбрана'}`;
+    const leg = `Рой: ${assetCount} БПЛА · ${sharedGoal ? 'общая цель' : `${Math.min(assetCount, Math.max(1, tripleRoutes.length))} индив. цели`} · Старт: ${startGeo ? `${startGeo.lat.toFixed(5)}, ${startGeo.lng.toFixed(5)}` : 'не выбран'} · Цель: ${goalGeo ? `${goalGeo.lat.toFixed(5)}, ${goalGeo.lng.toFixed(5)}` : 'не выбрана'}`;
     ctx.fillText(leg, 10, out.height - 12);
     const a = document.createElement('a');
     a.download = `route-maps-${Date.now()}.png`;
     a.href = out.toDataURL('image/png');
     a.click();
-  }, [droneCount, sharedGoal, startGeo, goalGeo, tripleRoutes]);
+  }, [assetCount, sharedGoal, startGeo, goalGeo, tripleRoutes]);
 
 
   // Полный экран
@@ -1322,6 +1339,45 @@ const MapCanvas: React.FC = () => {
       ctx.drawImage(mapImageRef.current, 0, 0, project.map!.width, project.map!.height);
       ctx.restore();
     }
+
+    // ─── Пользовательские тактические карты: СРАЗУ ПОСЛЕ базовой подложки ────
+    // Векторные слои (GeoJSON/KML/KMZ) и растровые (GeoTIFF/привязанный PNG-JPG)
+    // рисуются по той же Web-Mercator-формуле worldPx = offsetY + lngFrac·worldPx,
+    // что и вся остальная сцена — слой «приклеен» к географии на любом зуме.
+    const drawUserMapLayers = (g: CanvasRenderingContext2D) => {
+      const layers = project.userLayers ?? [];
+      if (!layers.length) return;
+      for (const layer of layers) {
+        if (!layer.visible) continue;
+        if (!layerIsVisibleOnScreen(layer, worldPx, vs.offsetX, vs.offsetY,
+          canvasSize.width, canvasSize.height)) continue;
+        if (layer.kind === 'vector') {
+          drawVectorLayer(g, layer, worldPx, vs.offsetX, vs.offsetY);
+          continue;
+        }
+        // MBTiles: доменные тайлы из SQLite (ленивая волна запроса + кэш картинок)
+        if (layer.format === 'mbtiles' && layer.tileInfo) {
+          const started = requestMbtilesTiles(
+            layer, contZoom, worldPx, vs.offsetX, vs.offsetY,
+            canvasSize.width, canvasSize.height,
+            (id) => useStore.getState().loadUserLayerSource(id),
+            (buf, keys) => decodeMbtilesTilesForRender(buf, keys, layer.tileInfo?.format ?? 'png'),
+          );
+          void started; // волна асинхронная — перерисуемся через imageReadyCb
+          drawMbtilesTiles(g, layer, getMbtilesTileImages(layer.id), contZoom,
+            worldPx, vs.offsetX, vs.offsetY);
+          continue;
+        }
+        // Растр (PNG/JPG с ручной привязкой или GeoTIFF-превью): image-оверлей
+        const img = getUserLayerImage(layer);
+        if (img && isUserLayerImageReady(layer)) {
+          drawRasterLayer(g, layer, img, worldPx, vs.offsetX, vs.offsetY);
+        }
+        // пока изображение не декодировано — хотя бы рамка области слоя
+        drawLayerOutline(g, layer, worldPx, vs.offsetX, vs.offsetY);
+      }
+    };
+    drawUserMapLayers(ctx);
 
     // Draw restrictions
     drawRestrictions(ctx);
@@ -1871,7 +1927,7 @@ const MapCanvas: React.FC = () => {
           ctx.setLineDash([]);
         }
 
-        // Точки маршрута: ключевые (ставит пользователь) — цветные и чуть
+        // Узлы боевого курса: ключевые (ставит пользователь) — цветные и чуть
         // крупнее; авто-обходные (результат обхода ограничений) — мелкие
         // полупрозрачные, их видно как «цепочку» вокруг зон.
         const drawR = (isActive ? 5 : 3.5) / s;
@@ -1966,6 +2022,34 @@ const MapCanvas: React.FC = () => {
     }
 
   }, [project, renderTick, canvasSize, selectedMarkerId, activeRouteId, drawingPoints, measurementPoints, mapLoaded, currentTool, dpr, tilesVersion, userPos]);
+
+  // ─── Пользовательские тактические карты: перерисовка по событиям слоя ──────
+  // Изображения слоёв (растр/тайлы MBTiles) декодируются асинхронно; когда
+  // слой становится готовым, канвас должен перерисоваться. Плюс гидрация
+  // imageDataUrl из IndexedDB после перезагрузки страницы и очистка кэша
+  // удалённых слоёв. setRenderTick — тот же троттлинг-механизм рендера (rAF-колбэк).
+  useEffect(() => {
+    setUserLayerImageListener((layerId) => {
+      void layerId;
+      setRenderTick((t) => t + 1);
+    });
+    return () => setUserLayerImageListener(null);
+  }, []);
+
+  useEffect(() => {
+    // Смена состава слоёв: перерисовка сцены + очистка кэшей изображений
+    // удалённых слоёв (список «было/стало» сравниваем через ref).
+    const prev = prevLayerIdsRef.current;
+    const now = new Set((project.userLayers ?? []).map((l) => l.id));
+    for (const id of prev) if (!now.has(id)) dropUserLayerImage(id);
+    prevLayerIdsRef.current = now;
+    setRenderTick((t) => t + 1);
+  }, [project.userLayers]);
+
+  useEffect(() => {
+    // Гидрация бинарных данных (imageDataUrl) из IndexedDB после перезагрузки
+    void useStore.getState().restoreUserLayers();
+  }, []);
 
   // Mouse wheel zoom (к колесу курсора; границы minZoom/maxZoom внутри zoomAt)
   // ВАЖНО: React навешивает on-wheel/on-touch как passive-слушатели, и вызов
@@ -2295,7 +2379,7 @@ const MapCanvas: React.FC = () => {
       }
     }
 
-    // Перетаскивание точки маршрута («цепляем за точку») — гео-привязка пересчитывается в store
+    // Перетаскивание узлы боевого курса («цепляем за точку») — гео-привязка пересчитывается в store
     if (draggingRoute && project.map) {
       const clampedX = Math.max(0, Math.min(project.map.width, mapPoint.x));
       const clampedY = Math.max(0, Math.min(project.map.height, mapPoint.y));
@@ -2399,39 +2483,39 @@ const MapCanvas: React.FC = () => {
   const btnCls = 'w-9 h-9 flex items-center justify-center rounded-md bg-gray-800/90 hover:bg-gray-700 text-gray-100 border border-gray-600 shadow text-base select-none';
 
   // ─── Данные для трёх окон карты ─────────────────────────────────────────────
-  const goalForUav = (i: number): { lat: number; lng: number } | null => {
+  const goalForAsset = (i: number): { lat: number; lng: number } | null => {
     if (sharedGoal) return goalGeo;
-    // Индивидуальная цель дрона: явная (клик по окну «Цель») иначе — последняя
+    // Индивидуальная цель боевого аппарата: явная (клик по окну «Цель») иначе — последняя
     // точка его маршрута (маршрут всегда заканчивается в цели).
-    const dg = droneGoals[i];
+    const dg = strikeObjectives[i];
     if (dg) return dg;
     const r = tripleRoutes[i];
     if (r && r.geo.length > 0) return r.geo[r.geo.length - 1];
     return goalGeo;
   };
-  // Стартовая точка i-го дрона: общая (весь рой взлетает с одной точки) или
+  // Стартовая точка i-го боевого аппарата: общая (весь рой взлетает с одной точки) или
   // индивидуальная (задана кликом по окну «Старт», когда общий старт выключен).
-  const startForUav = (i: number): { lat: number; lng: number } | null => {
+  const startForAsset = (i: number): { lat: number; lng: number } | null => {
     if (sharedStart) return startGeo;
-    return droneStarts[i] ?? startGeo;
+    return combatAssetStarts[i] ?? startGeo;
   };
   // Изначальная фокусировка всех окон карты — Санкт-Петербург. Ключевой источник
   // данных окна: старт/цель — их точка (пока не задана — СПб); маршрут — точки
-  // маршрута (проект + черновик; пока пусто — СПб). Только ЭТОТ источник участвует
+  // маршрута (проект + проекция; пока пусто — СПб). Только ЭТОТ источник участвует
   // в center/fit панели: добавление точек на других окнах (например, цели при
   // редактировании старта) НЕ сбивает фокус текущего окна.
   const SPB_GEO = { lat: 59.9398, lng: 30.3146 };
 
   const startCenter = startGeo || SPB_GEO;
-  const goalCenter = goalForUav(activeUav) || goalGeo || startGeo || SPB_GEO;
+  const goalCenter = goalForAsset(activeAsset) || goalGeo || startGeo || SPB_GEO;
   const routeGeoPts = React.useMemo(() => {
     const out: { lat: number; lng: number }[] = [];
     for (const r of tripleRoutes) out.push(...r.geo);
-    if (draftRoutePts) out.push(...draftRoutePts);
+    if (projectionNodePts) out.push(...projectionNodePts);
     return out;
-  }, [tripleRoutes, draftRoutePts]);
+  }, [tripleRoutes, projectionNodePts]);
   const routeLineGeo = tripleRoutes.length > 0
-    ? (activeUav < tripleRoutes.length ? tripleRoutes[activeUav].geo : tripleRoutes.flatMap((r) => r.geo))
+    ? (activeAsset < tripleRoutes.length ? tripleRoutes[activeAsset].geo : tripleRoutes.flatMap((r) => r.geo))
     : [];
   const linesOut: MiniOverlayLine[] = [
     ...tripleRoutes.map((r) => ({ pts: r.geo, color: r.color, width: 2 })),
@@ -2440,9 +2524,9 @@ const MapCanvas: React.FC = () => {
   const pointsOut: MiniOverlayPoint[] = [
     ...(startGeo ? [{ id: 'triple:start', lat: startGeo.lat, lng: startGeo.lng, label: 'СТАРТ', color: '#4ade80' }] : []),
     ...(goalGeo ? [{ id: 'triple:goal', lat: goalGeo.lat, lng: goalGeo.lng, label: sharedGoal ? 'ЦЕЛЬ (общая)' : 'ЦЕЛЬ (выбранная)', color: '#f87171' }] : []),
-    ...(!sharedGoal ? tripleRoutes.slice(0, droneCount).map((r, i) => {
+    ...(!sharedGoal ? tripleRoutes.slice(0, assetCount).map((r, i) => {
       const g = r.geo[r.geo.length - 1];
-      return g ? { id: `drone-goal:${r.id}`, lat: g.lat, lng: g.lng, label: `Дрон ${i + 1}`, color: uavColors[i % uavColors.length] } : null;
+      return g ? { id: `combatAsset-goal:${r.id}`, lat: g.lat, lng: g.lng, label: `Боевой аппарат ${i + 1}`, color: assetColors[i % assetColors.length] } : null;
     }).filter(Boolean) as MiniOverlayPoint[] : []),
   ];
   const panelH = 260;
@@ -2512,7 +2596,7 @@ const MapCanvas: React.FC = () => {
         <button className={btnCls} aria-label="Полный экран" title="Полный экран (F)" onClick={toggleFullscreen}>⛶</button>
       </div>
 
-      {/* ─── Три отдельных окна карты + пошаговый мастер: СТАРТ → МАРШРУТ → ЦЕЛЬ → ЗАПУСК ─── */}
+      {/* ─── Три отдельных окна карты + пошаговый планировщик: СТАРТ → МАРШРУТ → ЦЕЛЬ → ЗАПУСК ─── */}
       {tripleMode && (() => {
         // гео-зоны проекта (для отрисовки ограничений на активной панели)
         const zoneGeoList = (() => {
@@ -2528,13 +2612,13 @@ const MapCanvas: React.FC = () => {
             return { id: `zone:${z.id}`, pts: geoPts, color: '#f87171' };
           });
         })();
-        const draftLine: MiniOverlayLine[] = draftRoutePts && draftRoutePts.length >= 2
-          ? [{ pts: curveGeo(draftRoutePts), color: '#34d399', width: 3 }] : [];
-        const draftPoints: MiniOverlayPoint[] = (draftRoutePts || []).map((g, i) => ({ id: `draft:${i}`, lat: g.lat, lng: g.lng, label: `${i + 1}`, color: '#34d399' }));
+        const projectionLine: MiniOverlayLine[] = projectionNodePts && projectionNodePts.length >= 2
+          ? [{ pts: curveGeo(projectionNodePts), color: '#34d399', width: 3 }] : [];
+        const projectionNodes: MiniOverlayPoint[] = (projectionNodePts || []).map((g, i) => ({ id: `projection:${i}`, lat: g.lat, lng: g.lng, label: `${i + 1}`, color: '#34d399' }));
         const stepDefs = [
           { idx: 0, title: 'СТАРТ (масштаб 1 см = 2 км)', icon: '🟢' },
           { idx: 1, title: 'ВЕСЬ МАРШРУТ (высокая детализация)', icon: '🧭' },
-          { idx: 2, title: sharedGoal ? 'ЦЕЛЬ — общая для роя (1 см = 2 км)' : `ЦЕЛЬ дрона ${Math.min(activeUav + 1, droneCount)} (1 см = 2 км)`, icon: '🔴' },
+          { idx: 2, title: sharedGoal ? 'ЦЕЛЬ — общая для роя (1 см = 2 км)' : `ЦЕЛЬ боевого аппарата ${Math.min(activeAsset + 1, assetCount)} (1 см = 2 км)`, icon: '🔴' },
         ] as const;
         const panelPropsFor = (idx: number): React.ComponentProps<typeof MiniMapPanel> => {
           // общие пропсы панелей: фокус, редактирование, удаление кликом —
@@ -2562,7 +2646,7 @@ const MapCanvas: React.FC = () => {
             // изначальная фокусировка — Санкт-Петербург; после ввода данных — авто-fit по маршруту
             center: routeGeoPts.length > 0 ? routeGeoPts[0] : SPB_GEO, zoom: 10,
             fitPoints: routeGeoPts.length > 0 ? routeGeoPts : undefined,
-            points: [...pointsOut, ...draftPoints], lines: [...tripleRoutes.map((r) => ({ pts: curveGeo(r.geo), color: r.color, width: 2 })), ...(startGeo && goalGeo ? [{ pts: [startGeo, goalGeo], color: '#facc15', width: 2, dashed: true }] : []), ...draftLine.map((l) => ({ ...l, pts: curveGeo(l.pts) }))], height: '100%',
+            points: [...pointsOut, ...projectionNodes], lines: [...tripleRoutes.map((r) => ({ pts: curveGeo(r.geo), color: r.color, width: 2 })), ...(startGeo && goalGeo ? [{ pts: [startGeo, goalGeo], color: '#facc15', width: 2, dashed: true }] : []), ...projectionLine.map((l) => ({ ...l, pts: curveGeo(l.pts) }))], height: '100%',
           };
           return {
             ...base,
@@ -2582,7 +2666,7 @@ const MapCanvas: React.FC = () => {
         <div id="triple-route-top" className="absolute inset-0 z-30">
           <MiniMapPanel key={`top-${topPanelIdx}`} {...panelPropsFor(topPanelIdx)} />
         </div>
-        {/* НИЗ: две неактивные карты + панель мастера */}
+        {/* НИЗ: две неактивные карты + панель Оперативного Планировщика */}
         <div id="triple-map-row" className="absolute left-2 right-2 bottom-2 z-40 rounded-xl border border-cyan-700/60 bg-gray-900/95 shadow-2xl p-2">
           <div className="flex flex-wrap items-center gap-2 mb-2 text-xs">
             <span className="font-bold text-cyan-300">Карта миссии роя</span>
@@ -2611,9 +2695,9 @@ const MapCanvas: React.FC = () => {
                 onClick={() => setRouteShape((sh) => (sh === 'straight' ? 'curve' : 'straight'))}
                 title="Форма линии маршрута: ломаная (по точкам) ⇄ сглаженная кривая (Catmull-Rom)">〰️ {routeShape === 'straight' ? 'Ломаная' : 'Кривая'}</button>
             </div>
-            <label className="flex items-center gap-1 text-gray-300">Дронов:
-              <input type="number" min={1} max={8} value={droneCount} disabled={launchState !== 'idle'}
-                onChange={(e) => setDroneCount(Math.max(1, Math.min(8, Number(e.target.value) || 1)))}
+            <label className="flex items-center gap-1 text-gray-300">Боевых аппаратов:
+              <input type="number" min={1} max={8} value={assetCount} disabled={launchState !== 'idle'}
+                onChange={(e) => setAssetCount(Math.max(1, Math.min(8, Number(e.target.value) || 1)))}
                 className="w-12 px-1 bg-gray-800 border border-gray-600 rounded text-white" />
             </label>
             <label className="flex items-center gap-1 text-gray-300 cursor-pointer">
@@ -2622,13 +2706,13 @@ const MapCanvas: React.FC = () => {
             </label>
             {!sharedGoal && tripleRoutes.length > 0 && (
               <select
-                value={Math.min(activeUav, tripleRoutes.length - 1)}
-                onChange={(e) => setActiveUav(Number(e.target.value))}
+                value={Math.min(activeAsset, tripleRoutes.length - 1)}
+                onChange={(e) => setActiveAsset(Number(e.target.value))}
                 className="px-1 py-0.5 bg-gray-800 border border-gray-600 rounded text-white"
-                title="Выбрать дрон (его маршрут и цель — в окне «Цель»)"
+                title="Выбрать боевой аппарат (его маршрут и цель — в окне «Цель»)"
               >
-                {tripleRoutes.slice(0, droneCount).map((r, i) => (
-                  <option key={r.id} value={i}>Дрон {i + 1}: {r.name}</option>
+                {tripleRoutes.slice(0, assetCount).map((r, i) => (
+                  <option key={r.id} value={i}>Боевой аппарат {i + 1}: {r.name}</option>
                 ))}
               </select>
             )}
@@ -2643,7 +2727,7 @@ const MapCanvas: React.FC = () => {
               />
             ))}
           </div>
-          {/* Нижняя панель мастера: назад / утвердить / ЗАПУСК */}
+          {/* Нижняя панель Оперативного Планировщика: назад / утвердить / ЗАПУСК */}
           <div className="flex items-center gap-2 mt-2 text-xs">
             <button
               className="px-3 py-1 rounded bg-gray-800 hover:bg-gray-700 border border-gray-600 text-gray-200 disabled:opacity-40"
@@ -2662,8 +2746,8 @@ const MapCanvas: React.FC = () => {
                 className={`px-4 py-1 rounded font-bold border text-white transition-all ${launchState === 'done' ? 'bg-emerald-600 border-emerald-400 cursor-default' : launchState === 'uploading' ? 'bg-amber-700 border-amber-500 animate-pulse cursor-wait' : 'bg-red-700 hover:bg-red-600 border-red-400 shadow-[0_0_14px_rgba(239,68,68,0.5)]'}`}
                 onClick={launchMission}
                 disabled={launchState !== 'idle'}
-                title="Все данные миссии утверждены — загрузить полётные задания в дроны"
-              >{launchState === 'uploading' ? '⏳ Загрузка в дроны…' : launchState === 'done' ? '✅ Задания загружены' : '🚀 ЗАПУСК'}</button>
+                title="Все данные миссии утверждены — загрузить полётные задания в боевые аппараты"
+              >{launchState === 'uploading' ? '⏳ Загрузка в боевые аппараты…' : launchState === 'done' ? '✅ Задания загружены' : '🚀 ЗАПУСК'}</button>
             ) : null}
             {launchState === 'done' && (
               <button
@@ -2674,10 +2758,10 @@ const MapCanvas: React.FC = () => {
             )}
             <span className="text-gray-400">
               {tripleStep === 0 && 'Кликните по подсвеченной карте «Старт», чтобы выбрать точку старта.'}
-              {tripleStep === 1 && 'Кликами по карте «Маршрут» добавляйте путевые точки; перетащите карту/зум для обзора.'}
+              {tripleStep === 1 && 'Кликами по карте «Маршрут» добавляйте узлы боевого курса; перетащите карту/зум для обзора.'}
               {tripleStep === 2 && 'На карте «Цель»: ставьте цель (🎯) и ограничения зон (⛔).'}
               {tripleStep === 3 && 'Проверьте карты и нажмите «ЗАПУСК» — задания уйдут в рой.'}
-              {launchState === 'done' && ' ✅ Задания загружены в дроны. Нажмите «Новая миссия», чтобы начать следующий полёт.'}
+              {launchState === 'done' && ' ✅ Задания загружены в боевые аппараты. Нажмите «Новая миссия», чтобы начать следующий полёт.'}
             </span>
           </div>
         </div>
