@@ -208,7 +208,7 @@ const App: React.FC = () => {
       {/* Header */}
       <div className={theme === "dark" ? "flex items-center px-3 py-1 bg-gray-900 border-b border-gray-700" : "flex items-center px-3 py-1 bg-white border-b border-gray-300"}>
         <h1 className="text-sm font-bold text-cyan-400">
-          🎯 TotalQuadro Coordinate Marker
+          🎯 TotalQuadro — Оперативный Планировщик Боевых Аппаратов
         </h1>
         <span className="ml-2 text-xs text-gray-500">v1.0</span>
         <div className="flex-1" />
@@ -269,11 +269,11 @@ const App: React.FC = () => {
               <div className="bg-gray-800/90 border border-gray-600 rounded-lg p-6 max-w-md text-center">
                 <h2 className="text-xl font-bold text-cyan-400 mb-3">Добро пожаловать!</h2>
                 <p className="text-gray-300 text-sm mb-4">
-                  Загрузите карту местности, затем добавляйте точки и ограничения.
+                  Загрузите карту местности, затем наносите Точки Боевого Применения и эшелонированные зоны запрета.
                 </p>
                 <div className="text-left text-xs text-gray-400 space-y-1">
                   <p>🗺️ <strong>Карта</strong> — загрузить изображение</p>
-                  <p>📍 <strong>Точка</strong> — кликнуть по карте для добавления</p>
+                  <p>📍 <strong>Точка боевого применения</strong> — кликнуть по карте для нанесения</p>
                   <p>▭ <strong>Прям.</strong> — нарисовать прямоугольное ограничение</p>
                   <p>⬡ <strong>Полиг.</strong> — нарисовать полигональное ограничение</p>
                   <p>⭕ <strong>Круг</strong> — нарисовать круглое ограничение</p>

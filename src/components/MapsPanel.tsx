@@ -3,6 +3,7 @@ import { useStore } from '../store/useStore';
 import { loadGoogleMapsApi, geocodeAddress, loadStaticMap, isGoogleMapsLoaded } from '../utils/googleMaps';
 import { loadYandexMapsApi, yandexGeocode, loadYandexStaticMap, isYandexMapsLoaded } from '../utils/yandexMaps';
 import { osmGeocode, loadOSMStaticMap } from '../utils/openStreetMap';
+import { useUserMaps, USER_MAP_ACCEPT, formatLabel } from '../hooks/useUserMaps';
 import type { MapProvider } from '../types';
 
 const MapsPanel: React.FC = () => {
@@ -13,7 +14,8 @@ const MapsPanel: React.FC = () => {
   const [zoomInput, setZoomInput] = useState('15');
   const [googleMapType, setGoogleMapType] = useState<'roadmap' | 'satellite' | 'hybrid' | 'terrain'>('satellite');
   const [yandexMapType, setYandexMapType] = useState<'map' | 'satellite' | 'hybrid'>('satellite');
-  const [osmTileServer, setOsmTileServer] = useState<'osm' | 'opentopomap' | 'carto'>('osm');
+  const [osmTileServer, setOsmTileServer] = useState<'osm' | 'opentopomap' | 'carto' | 'esri' | 'esri-sat'>('osm');
+  const [uiTileStyle, setUiTileStyle] = useState<'scheme' | 'satellite' | 'hybrid'>('scheme');
   const [widthInput, setWidthInput] = useState('2048');
   const [heightInput, setHeightInput] = useState('2048');
   const [loading, setLoading] = useState(false);
@@ -30,10 +32,27 @@ const MapsPanel: React.FC = () => {
     setYandexMapsApiKey,
     toggleYandexMaps,
     setOSMTileServer,
+    setTileStyle,
     loadMapWithStorage,
     loadActiveTileMap,
     setMapBounds,
   } = useStore();
+
+  // ─── Пользовательские тактические карты (GeoJSON/KML/KMZ/GeoTIFF/MBTiles/PNG-JPG)
+  const userMaps = useUserMaps();
+  const tacticalFileRef = useRef<HTMLInputElement | null>(null);
+
+  const handleTacticalFilePicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // можно выбрать тот же файл повторно
+    if (!file) return;
+    const layer = await userMaps.loadFile(file);
+    if (layer) {
+      setSuccess(`Тактическая карта «${layer.meta.name}» загружена (${formatLabel(layer.format)})`);
+    } else if (userMaps.error) {
+      setError(userMaps.error);
+    }
+  };
 
   // Инициализация API ключей из проекта
   React.useEffect(() => {
@@ -46,6 +65,8 @@ const MapsPanel: React.FC = () => {
     if (project.openStreetMap?.tileServer) {
       setOsmTileServer(project.openStreetMap.tileServer);
     }
+    // Стиль подложки (схема/спутник/гибрид) — синхронизируем с проектом
+    setUiTileStyle(project.settings?.tileStyle ?? 'scheme');
   }, [project]);
 
   const handleSaveGoogleApiKey = async () => {
@@ -421,7 +442,7 @@ const MapsPanel: React.FC = () => {
             <select
               value={osmTileServer}
               onChange={(e) => {
-                const value = e.target.value as 'osm' | 'opentopomap' | 'carto';
+                const value = e.target.value as 'osm' | 'opentopomap' | 'carto' | 'esri' | 'esri-sat';
                 setOsmTileServer(value);
                 setOSMTileServer(value);
               }}
@@ -430,8 +451,26 @@ const MapsPanel: React.FC = () => {
               <option value="osm">OSM Standard</option>
               <option value="opentopomap">Topo</option>
               <option value="carto">Light</option>
+              <option value="esri">Esri Street</option>
             </select>
           )}
+        </div>
+        {/* Стиль подложки: спутник/гибрид принудительно ведут на Esri World Imagery */}
+        <div>
+          <label className="text-xs text-gray-400 block mb-1">Стиль карты</label>
+          <select
+            value={uiTileStyle}
+            onChange={(e) => {
+              const value = e.target.value as 'scheme' | 'satellite' | 'hybrid';
+              setUiTileStyle(value);
+              useStore.getState().setTileStyle(value);
+            }}
+            className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white"
+          >
+            <option value="scheme">Схема</option>
+            <option value="satellite">Спутник (Esri Imagery)</option>
+            <option value="hybrid">Гибрид</option>
+          </select>
         </div>
         <div>
           <label className="text-xs text-gray-400 block mb-1">Ширина (px)</label>
@@ -499,6 +538,119 @@ const MapsPanel: React.FC = () => {
             <p>• Ограничения: 1 запрос/сек</p>
             <p>• Уважайте правила использования</p>
           </div>
+        )}
+      </div>
+
+      {/* ─── Импорт пользовательских тактических карт ─────────────────────── */}
+      <div className="border-t border-gray-700 pt-3 space-y-2">
+        <h4 className="text-xs font-medium text-cyan-400">🛰️ Тактические карты пользователя</h4>
+        <input
+          ref={tacticalFileRef}
+          type="file"
+          accept={USER_MAP_ACCEPT}
+          className="hidden"
+          data-testid="tactical-file-input"
+          onChange={handleTacticalFilePicked}
+        />
+        <button
+          onClick={() => tacticalFileRef.current?.click()}
+          disabled={userMaps.loading}
+          className="w-full px-2 py-1.5 rounded text-xs font-medium bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed text-white transition-colors"
+        >
+          {userMaps.loading ? 'Загрузка…' : 'Импорт тактической карты'}
+        </button>
+        <p className="text-[10px] text-gray-500">
+          GeoJSON · KML/KMZ · GeoTIFF · MBTiles · PNG/JPG (привязка по 4 углам)
+        </p>
+
+        {/* Индикатор прогресса для больших файлов (GeoTIFF/MBTiles) */}
+        {userMaps.loading && (
+          <div className="space-y-1">
+            <div className="h-1.5 w-full rounded bg-gray-700 overflow-hidden">
+              <div
+                className="h-full bg-cyan-500 transition-all"
+                style={{ width: `${Math.round(Math.max(0, Math.min(1, userMaps.progress.ratio)) * 100)}%` }}
+              />
+            </div>
+            <p className="text-[10px] text-gray-400">
+              {userMaps.progress.phase ?? 'read'} · {Math.round(userMaps.progress.ratio * 100)}%
+            </p>
+          </div>
+        )}
+
+        {/* Ошибки загрузки */}
+        {(userMaps.error || error) && (
+          <p className="text-[10px] text-red-400 break-words">{userMaps.error || error}</p>
+        )}
+
+        {/* Список загруженных слоёв: видимость + прозрачность */}
+        {userMaps.layers.length > 0 && (
+          <ul className="space-y-1.5" data-testid="user-layer-list">
+            {userMaps.layers.map((layer) => (
+              <li key={layer.id} className="rounded border border-gray-700 bg-gray-800/60 p-2 space-y-1">
+                <div className="flex items-center gap-2">
+                  <label className="flex items-center gap-1.5 text-xs text-gray-200 flex-1 min-w-0 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={layer.visible}
+                      onChange={(e) => userMaps.setVisible(layer.id, e.target.checked)}
+                      className="accent-cyan-500"
+                      aria-label={`Видимость слоя ${layer.meta.name}`}
+                    />
+                    <span className="truncate" title={`${layer.meta.name} · ${formatLabel(layer.format)}`}>
+                      {layer.meta.name}
+                    </span>
+                  </label>
+                  <span className="text-[10px] text-gray-500 shrink-0">{formatLabel(layer.format)}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <label className="text-[10px] text-gray-400 shrink-0" htmlFor={`op-${layer.id}`}>
+                    Прозрачность
+                  </label>
+                  <input
+                    id={`op-${layer.id}`}
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={layer.opacity}
+                    onChange={(e) => userMaps.setOpacity(layer.id, Number(e.target.value))}
+                    className="flex-1 accent-cyan-500"
+                  />
+                  <span className="text-[10px] text-gray-400 w-8 text-right">
+                    {Math.round(layer.opacity * 100)}%
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-[10px] text-gray-500">
+                  <span>
+                    {userMaps.formatBytes(layer.meta.fileSize)} · {layer.projection} ·{' '}
+                    {new Date(layer.meta.loadedAt).toLocaleDateString()}
+                  </span>
+                  <span className="flex gap-2">
+                    <button
+                      onClick={() => userMaps.focus(layer.id)}
+                      className="text-cyan-400 hover:underline"
+                      title="Навести вид на слой"
+                    >
+                      К слою
+                    </button>
+                    <button
+                      onClick={() => void userMaps.dropLayer(layer.id)}
+                      className="text-red-400 hover:underline"
+                      title="Удалить слой и его данные из хранилища"
+                    >
+                      Удалить
+                    </button>
+                  </span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+        {userMaps.layers.length > 0 && (
+          <p className="text-[10px] text-gray-500">
+            В хранилище: {userMaps.formatBytes(userMaps.totalBytes)} · слоёв {userMaps.layers.length}/{userMaps.limits.maxLayers}
+          </p>
         )}
       </div>
     </div>

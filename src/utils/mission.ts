@@ -1,21 +1,21 @@
-// Модуль планирования и оптимизации миссий (Блок 1).
-// Чистые функции: валидация, метаданные маршрута, параметры путевых точек,
-// алгоритмы оптимизации порядка точек, генерация «змейки» для сплошного
+// Оперативный планировщик (Combat Tactical Planner, Блок 1).
+// Чистые функции: валидация, метаданные маршрута, параметры узлов боевого курса,
+// алгоритмы оптимизации порядка узлов, генерация «змейки» для сплошного
 // сканирования полигона. Никаких новых npm-зависимостей.
 
 import type { Point } from '../types';
 
 /** Максимальная разрешённая высота полёта (м) — общий лимит проекта. */
 export const MAX_ALTITUDE_M = 500;
-/** Физически реализуемая максимальная скорость дрона (м/с). */
+/** Физически реализуемая максимальная скорость боевого аппарата (м/с). */
 export const MAX_SPEED_MS = 30;
 /** Диапазон допустимого радиуса принятия (м). */
 export const ACCEPTANCE_RADIUS_RANGE: readonly [number, number] = [0.5, 100];
 
-export type WaypointParamKey = 'hold' | 'cameraAngle' | 'speed' | 'acceptanceRadius';
+export type TacticalNodeParamKey = 'hold' | 'cameraAngle' | 'speed' | 'acceptanceRadius';
 
-/** Параметры путевой точки (задержка, угол камеры, скорость, радиус принятия). */
-export interface WaypointParams {
+/** Параметры узла боевого курса (задержка, угол камеры, скорость, радиус принятия). */
+export interface TacticalNodeParams {
   /** Задержка в точке, сек [0..3600]. */
   holdSec: number;
   /** Угол камеры, градусы [-90..90] (низ = -90). */
@@ -26,7 +26,7 @@ export interface WaypointParams {
   acceptanceRadiusM: number;
 }
 
-export const DEFAULT_WAYPOINT_PARAMS: WaypointParams = {
+export const DEFAULT_TACTICAL_NODE_PARAMS: TacticalNodeParams = {
   holdSec: 0,
   cameraAngleDeg: -90,
   speedMs: 0,
@@ -97,30 +97,30 @@ export function normalizeAngle360(angle: number): number {
 }
 
 /**
- * Санитизирует параметры путевой точки, подставляя безопасные значения
+ * Санитизирует параметры узла боевого курса, подставляя безопасные значения
  * вместо некорректных (без бросания исключений — пригодно для импорта).
  *
  * Args:
- *   raw (Partial<WaypointParams> | undefined): «сырые» параметры.
+ *   raw (Partial<TacticalNodeParams> | undefined): «сырые» параметры.
  *
  * Returns:
- *   WaypointParams: корректные параметры.
+ *   TacticalNodeParams: корректные параметры.
  */
-export function sanitizeWaypointParams(raw?: Partial<WaypointParams> | null): WaypointParams {
+export function sanitizeTacticalNodeParams(raw?: Partial<TacticalNodeParams> | null): TacticalNodeParams {
   const clamp = (v: unknown, lo: number, hi: number, dflt: number): number => {
     const n = typeof v === 'number' ? v : Number(v);
     if (!Number.isFinite(n)) return dflt;
     return Math.min(hi, Math.max(lo, n));
   };
   return {
-    holdSec: clamp(raw?.holdSec, 0, 3600, DEFAULT_WAYPOINT_PARAMS.holdSec),
-    cameraAngleDeg: clamp(raw?.cameraAngleDeg, -90, 90, DEFAULT_WAYPOINT_PARAMS.cameraAngleDeg),
-    speedMs: clamp(raw?.speedMs, 0, MAX_SPEED_MS, DEFAULT_WAYPOINT_PARAMS.speedMs),
+    holdSec: clamp(raw?.holdSec, 0, 3600, DEFAULT_TACTICAL_NODE_PARAMS.holdSec),
+    cameraAngleDeg: clamp(raw?.cameraAngleDeg, -90, 90, DEFAULT_TACTICAL_NODE_PARAMS.cameraAngleDeg),
+    speedMs: clamp(raw?.speedMs, 0, MAX_SPEED_MS, DEFAULT_TACTICAL_NODE_PARAMS.speedMs),
     acceptanceRadiusM: clamp(
       raw?.acceptanceRadiusM,
       ACCEPTANCE_RADIUS_RANGE[0],
       ACCEPTANCE_RADIUS_RANGE[1],
-      DEFAULT_WAYPOINT_PARAMS.acceptanceRadiusM,
+      DEFAULT_TACTICAL_NODE_PARAMS.acceptanceRadiusM,
     ),
   };
 }
@@ -167,7 +167,7 @@ function pathLength(pts: { lat: number; lon: number }[]): number {
 export type OptimizeAlgorithm = 'nearest_neighbor' | 'genetic' | 'simulated_annealing';
 
 export interface OptimizeResult<T> {
-  waypoints: T[];
+  tacticalNodes: T[];
   distanceBefore: number;
   distanceAfter: number;
   improvementPct: number;
@@ -187,10 +187,10 @@ function mulberry32(seed: number): () => number {
 }
 
 /**
- * Оптимизация порядка путевых точек (открытая цепь: первая точка фиксирована).
+ * Оптимизация порядка узлов боевого курса (открытая цепь: первая точка фиксирована).
  *
  * Args:
- *   waypoints (T[]): точки с полями lat/lon (минимум).
+ *   tacticalNodes (T[]): точки с полями lat/lon (минимум).
  *   algorithm ('nearest_neighbor' | 'genetic' | 'simulated_annealing'): метод.
  *   seed (number): зерно ГПСЧ для детерминизма stochastic-алгоритмов.
  *
@@ -202,25 +202,25 @@ function mulberry32(seed: number): () => number {
  *   ValidationError: неизвестный алгоритм.
  */
 export function optimizeRoute<T extends { lat: number; lon: number }>(
-  waypoints: T[],
+  tacticalNodes: T[],
   algorithm: OptimizeAlgorithm = 'nearest_neighbor',
   seed = 42,
 ): OptimizeResult<T> {
-  if (waypoints.length <= 1) {
-    const d = pathLength(waypoints);
-    return { waypoints: [...waypoints], distanceBefore: d, distanceAfter: d, improvementPct: 0, algorithm };
+  if (tacticalNodes.length <= 1) {
+    const d = pathLength(tacticalNodes);
+    return { tacticalNodes: [...tacticalNodes], distanceBefore: d, distanceAfter: d, improvementPct: 0, algorithm };
   }
-  const before = pathLength(waypoints);
+  const before = pathLength(tacticalNodes);
   let order: T[];
   switch (algorithm) {
     case 'nearest_neighbor':
-      order = nearestNeighbor(waypoints);
+      order = nearestNeighbor(tacticalNodes);
       break;
     case 'genetic':
-      order = genetic(waypoints, mulberry32(seed));
+      order = genetic(tacticalNodes, mulberry32(seed));
       break;
     case 'simulated_annealing':
-      order = simulatedAnnealing(waypoints, mulberry32(seed));
+      order = simulatedAnnealing(tacticalNodes, mulberry32(seed));
       break;
     default:
       throw new ValidationError(`Неизвестный алгоритм оптимизации: ${String(algorithm)}`);
@@ -228,7 +228,7 @@ export function optimizeRoute<T extends { lat: number; lon: number }>(
   const after = pathLength(order);
   const improvementPct = before > 0 ? ((before - after) / before) * 100 : 0;
   return {
-    waypoints: order,
+    tacticalNodes: order,
     distanceBefore: before,
     distanceAfter: after,
     improvementPct: Math.max(0, Math.round(improvementPct * 10) / 10),

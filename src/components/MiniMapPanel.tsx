@@ -300,7 +300,7 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       ctx.restore();
     }
 
-    // Точки (старт/цели дронов/путевые точки). Позиции сохраняются для hit-теста
+    // Точки (старт/цели боевых аппаратов/узлы боевого курса). Позиции сохраняются для hit-теста
     // клика удаления (наведи и кликни по точке на активной карте — удалим).
     const pointHits: { id?: string; x: number; y: number }[] = [];
     for (const pt of points) {
@@ -427,7 +427,7 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
         while (altAccumPx <= -12) { altAccumPx += 12; onPointAltitudeDragRef.current(draggingPtRef.current, -12); }
         return;
       }
-      // Drag точки маршрута/цели: карта стоит, точка «прилипает» к курсору
+      // Drag узлы боевого курса/цели: карта стоит, точка «прилипает» к курсору
       if (draggingPtRef.current && drag.moved && onPointMoveRef.current) {
         const { w, h } = sizeRef.current;
         const vb = viewBox(viewRef.current, w, h);
@@ -526,7 +526,7 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
         <div className="flex-1" />
         <button className={btn} title="Приблизить" onClick={() => zoomBy(1.5)}>＋</button>
         <button className={btn} title="Отдалить" onClick={() => zoomBy(1 / 1.5)}>－</button>
-        <button className={btn} title="Вписать объект / сбросить вид" onClick={recenter}>⌂</button>
+        <button className={btn} title="Вписать объект / вернуть стандартный вид" onClick={recenter}>⌂</button>
       </div>
       <div ref={wrapRef} className="relative w-full" style={{ height: `calc(100% - 30px)` }}>
         <canvas ref={canvasRef} style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none', cursor: focused && onMapClick ? 'crosshair' : 'grab' }} aria-label={`Карта: ${title}`} />

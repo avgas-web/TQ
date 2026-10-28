@@ -9,7 +9,7 @@ const Toolbar: React.FC = () => {
     project,
     setTool,
     loadMapWithStorage,
-    resetProject,
+    abortMission,
     clearDrawingPoints,
     setMeasurementPoints,
   } = useStore();
@@ -128,17 +128,17 @@ const Toolbar: React.FC = () => {
         </span>
       )}
 
-      {/* Reset */}
+      {/* Abort Mission */}
       <button
         onClick={() => {
-          if (confirm('Сбросить проект? Все данные будут потеряны.')) {
-            resetProject();
+          if (confirm('Отменить миссию? Все несохранённые данные сектора будут потеряны.')) {
+            abortMission();
           }
         }}
         className="px-3 py-2 bg-red-700 hover:bg-red-800 text-white rounded text-sm font-medium transition-colors"
-        title="Новый проект"
+        title="Отменить миссию — начать новый сектор планирования"
       >
-        🔄 Сброс
+        ⛔ Abort Mission
       </button>
     </div>
   );

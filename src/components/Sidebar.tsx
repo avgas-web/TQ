@@ -412,7 +412,7 @@ const Sidebar: React.FC = () => {
 
         {activeTab === 'export' && (
           <div className="p-3 space-y-3">
-            <h3 className="text-sm font-medium text-gray-300">Экспорт точек</h3>
+            <h3 className="text-sm font-medium text-gray-300">Экспорт Точек Боевого Применения</h3>
             <div className="grid grid-cols-2 gap-2">
               <button onClick={() => handleExport('csv')} className="px-3 py-2 bg-green-700 hover:bg-green-600 text-white rounded text-xs">CSV</button>
               <button onClick={() => handleExport('json')} className="px-3 py-2 bg-green-700 hover:bg-green-600 text-white rounded text-xs">JSON</button>
@@ -430,7 +430,7 @@ const Sidebar: React.FC = () => {
               </label>
             </div>
 
-            <h3 className="text-sm font-medium text-gray-300 mt-4">Импорт точек</h3>
+            <h3 className="text-sm font-medium text-gray-300 mt-4">Импорт Точек Боевого Применения</h3>
             <label className="block px-3 py-2 bg-blue-700 hover:bg-blue-600 text-white rounded text-xs text-center cursor-pointer">
               Импорт CSV / GeoJSON / JSON
               <input type="file" accept=".csv,.geojson,.json" className="hidden" onChange={handleImport} />
@@ -442,7 +442,7 @@ const Sidebar: React.FC = () => {
                 <li>• CSV — таблица с ; разделителем</li>
                 <li>• JSON — массив точек</li>
                 <li>• GeoJSON — FeatureCollection</li>
-                <li>• GPX — GPS waypoints</li>
+                <li>• GPX — GPS tacticalNodes</li>
                 <li>• KML — Google Earth</li>
               </ul>
             </div>
@@ -453,7 +453,7 @@ const Sidebar: React.FC = () => {
       {/* Selected marker properties */}
       {selectedMarker && (
         <div className="border-t border-gray-700 p-3 bg-gray-750">
-          <h3 className="text-sm font-medium text-cyan-400 mb-2">Свойства точки</h3>
+          <h3 className="text-sm font-medium text-cyan-400 mb-2">Свойства Точки Боевого Применения</h3>
           <div className="space-y-1 text-xs text-gray-300">
             <p><span className="text-gray-500">ID:</span> {selectedMarker.id.slice(0, 8)}...</p>
             <p><span className="text-gray-500">Имя:</span> {selectedMarker.name}</p>
