@@ -9,7 +9,7 @@ const Toolbar: React.FC = () => {
     project,
     setTool,
     loadMapWithStorage,
-    abortMission,
+    resetProject,
     clearDrawingPoints,
     setMeasurementPoints,
   } = useStore();
@@ -53,9 +53,7 @@ const Toolbar: React.FC = () => {
     { id: 'pan', label: 'Пан', icon: '✋', title: 'Панорамирование (пробел+ЛКМ)' },
     { id: 'select', label: 'Выбор', icon: '👆', title: 'Выбор и перемещение точек' },
     { id: 'addMarker', label: 'Точка', icon: '📍', title: 'Добавить точку' },
-    { id: 'drawRect', label: 'Прям.', icon: '▭', title: 'Нарисовать прямоугольник' },
-    { id: 'drawPolygon', label: 'Полиг.', icon: '⬡', title: 'Нарисовать полигон (двойной клик — завершить)' },
-    { id: 'drawCircle', label: 'Круг', icon: '⭕', title: 'Нарисовать круг' },
+    { id: 'drawPolygon', label: 'ADIZ', icon: '⬡', title: 'Зона ПВО / Эшелонированная зона запрета полётов (ADIZ; произвольный полигон; двойной клик — завершить)' },
     { id: 'measure', label: 'Линейка', icon: '📏', title: 'Измерение расстояний' },
   ];
 
@@ -128,17 +126,17 @@ const Toolbar: React.FC = () => {
         </span>
       )}
 
-      {/* Abort Mission */}
+      {/* Abort Mission / Scrub Sector */}
       <button
         onClick={() => {
-          if (confirm('Отменить миссию? Все несохранённые данные сектора будут потеряны.')) {
-            abortMission();
+          if (confirm('ОТМЕНА БОЕВОЙ ЗАДАЧИ (Abort Mission / Scrub Sector): стереть сектор? Будут удалены ВСЕ данные: карта, точки старта/цели, все маршруты, зоны ПВО (ADIZ), парк боевых аппаратов и настройки.')) {
+            resetProject();
           }
         }}
         className="px-3 py-2 bg-red-700 hover:bg-red-800 text-white rounded text-sm font-medium transition-colors"
-        title="Отменить миссию — начать новый сектор планирования"
+        title="Полный сброс: карта, точки, маршруты, ограничения, дроны"
       >
-        ⛔ Abort Mission
+        🔄 Abort Mission
       </button>
     </div>
   );

@@ -27,8 +27,9 @@ describe('ЭТАП 1: getOSMTileUrl учитывает style', () => {
   });
 
   it('scheme не трогает выбранный провайдер', () => {
-    expect(getOSMTileUrl(3, 1, 2, 'osm', 'scheme')).toContain('tile.openstreetmap.org/3/1/2');
-    expect(getOSMTileUrl(3, 1, 2, 'carto', 'scheme')).toContain('basemaps.cartocdn.com/dark_all/3/1/2');
+    // Реестр main: osm→Esri Streets (legacy-алиас), carto→OSM France
+    expect(getOSMTileUrl(3, 1, 2, 'osm', 'scheme')).toContain('World_Street_Map/MapServer/tile/3/2/1');
+    expect(getOSMTileUrl(3, 1, 2, 'carto', 'scheme')).toContain('tile.openstreetmap.fr/osmfr/3/1/2.png');
     expect(getOSMTileUrl(3, 1, 2, 'esri', 'scheme')).toContain('World_Street_Map/MapServer/tile/3/2/1');
     expect(getOSMTileUrl(3, 1, 2, 'esri-sat', 'scheme')).toContain('World_Imagery/MapServer/tile/3/2/1');
     expect(getOSMTileUrl(3, 1, 2, 'opentopomap', 'scheme')).toContain('tile.opentopomap.org/3/1/2.png');
@@ -45,27 +46,27 @@ describe('ЭТАП 1: getOSMTileUrl учитывает style', () => {
 });
 
 describe('normalizeTileServer: legacy-значения', () => {
-  it('корректно нормализует legacy и алиасы', () => {
-    expect(normalizeTileServer('osm')).toBe('osm');
-    expect(normalizeTileServer('carto')).toBe('carto');
+  it('корректно нормализует legacy и алиасы (реестр main)', () => {
+    expect(normalizeTileServer('osm')).toBe('esri');     // legacy osm → Esri Streets (аудит)
+    expect(normalizeTileServer('carto')).toBe('osmfr');  // legacy carto → OSM France
     expect(normalizeTileServer('opentopomap')).toBe('opentopomap');
     expect(normalizeTileServer('esri')).toBe('esri');
     expect(normalizeTileServer('esri-sat')).toBe('esri-sat');
     expect(normalizeTileServer('ESRI-SAT')).toBe('esri-sat');
     expect(normalizeTileServer(' satellite ')).toBe('esri-sat');
     expect(normalizeTileServer('imagery')).toBe('esri-sat');
-    expect(normalizeTileServer('openstreetmap')).toBe('osm');
+    expect(normalizeTileServer('openstreetmap')).toBe('esri');
   });
 
-  it('неизвестное/пустое/null -> osm (безопасный дефолт)', () => {
-    expect(normalizeTileServer(undefined)).toBe('osm');
-    expect(normalizeTileServer(null)).toBe('osm');
-    expect(normalizeTileServer('')).toBe('osm');
-    expect(normalizeTileServer('nonsense')).toBe('osm');
+  it('неизвестное/пустое/null -> esri (безопасный дефолт реестра main)', () => {
+    expect(normalizeTileServer(undefined)).toBe('esri');
+    expect(normalizeTileServer(null)).toBe('esri');
+    expect(normalizeTileServer('')).toBe('esri');
+    expect(normalizeTileServer('nonsense')).toBe('esri');
   });
 
-  it('NATIVE_MAX_ZOOM_BY_SERVER покрывает все id', () => {
-    const ids: TileServerId[] = ['osm', 'carto', 'opentopomap', 'esri', 'esri-sat'];
+  it('NATIVE_MAX_ZOOM_BY_SERVER покрывает все id реестра main', () => {
+    const ids: TileServerId[] = ['esri', 'esri-sat', 'osmfr', 'hot', 'osmde', 'opentopomap', 'cyclosm'];
     for (const id of ids) expect(NATIVE_MAX_ZOOM_BY_SERVER[id]).toBeGreaterThan(10);
   });
 

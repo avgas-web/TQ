@@ -63,10 +63,10 @@ describe('osmGeocode', () => {
     expect(res.point).toBeNull();
   });
 
-  it('HTTP 400 -> kind=http', async () => {
+  it('HTTP 400 -> kind=not_found (контракт main: 404/400 не перебирают зеркала)', async () => {
     mockFetch([{ status: 400, ok: false }]);
     const res = await runAll(osmGeocode('anything'));
-    expect(res.kind).toBe('http');
+    expect(res.kind).toBe('not_found');
     expect(res.point).toBeNull();
   });
 

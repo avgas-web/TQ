@@ -1,6 +1,7 @@
 // Юнит-тесты персистентности пользовательских тактических карт:
 // IndexedDB (fake-indexeddb) + zustand-слайс слоёв.
 import { describe, it, expect, beforeEach } from 'vitest';
+import 'fake-indexeddb/auto'; // fake IndexedDB для CRUD-тестов слоёв (в main-setup его нет)
 import type { UserMapLayer } from '../src/types';
 import {
   saveUserLayerToIndexedDB, loadUserLayerFromIndexedDB, deleteUserLayerFromIndexedDB,

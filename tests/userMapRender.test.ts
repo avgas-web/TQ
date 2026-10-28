@@ -133,8 +133,13 @@ describe('userMapRender: отрисовка вектора/растра/тайл
     // гоним штатный колбэк вручную — ровно так, как браузер после декодирования
     const el = getUserLayerImage(layer)!;
     expect(el).toBeInstanceOf(Image);
-    expect(isUserLayerImageReady(layer)).toBe(false); // до onload — слой не готов
-    el.onload!.call(el, {} as Event);                 // entry.ready = true
+    // в jsdom resource-загрузка выключена и ready=false до ручного onload;
+    // в happy-dom data-URL декодируется мгновенно (onload синхронно при src=...).
+    // Смысл теста — штатный колбэк onload переводит слой в «готов»; не зависимо от
+    // окружения добиваемся готовности и проверяем его эффект.
+    if (!isUserLayerImageReady(layer)) {
+      el.onload!.call(el, {} as Event);               // entry.ready = true
+    }
     Object.defineProperty(el, 'naturalWidth', { value: 100, configurable: true });
     Object.defineProperty(el, 'naturalHeight', { value: 50, configurable: true });
     const { ctx } = mockCtx();

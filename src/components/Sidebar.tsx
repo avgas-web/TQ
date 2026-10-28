@@ -7,10 +7,11 @@ import {
   downloadFile, importFromCSV, importFromGeoJSON, exportProject, importProject,
 } from '../utils/export';
 import MapsPanel from './MapsPanel';
+import TacticalLayersPanel from './TacticalLayersPanel';
 import MissionPanel from './MissionPanel';
 
 const Sidebar: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'points' | 'restrictions' | 'export' | 'google' | 'mission'>('points');
+  const [activeTab, setActiveTab] = useState<'points' | 'restrictions' | 'export' | 'google' | 'layers' | 'mission'>('points');
   const [editingMarker, setEditingMarker] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const [editX, setEditX] = useState('');
@@ -171,6 +172,12 @@ const Sidebar: React.FC = () => {
           className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'google' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
         >
           🗺️ Карты
+        </button>
+        <button
+          onClick={() => setActiveTab('layers')}
+          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'layers' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
+        >
+          🗂 Слои ({(project.tacticalOverlays || []).length})
         </button>
         <button
           onClick={() => setActiveTab('mission')}
@@ -407,6 +414,8 @@ const Sidebar: React.FC = () => {
         {activeTab === 'google' && (
           <MapsPanel />
         )}
+
+        {activeTab === 'layers' && <TacticalLayersPanel />}
 
         {activeTab === 'mission' && <MissionPanel />}
 
