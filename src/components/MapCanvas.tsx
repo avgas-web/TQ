@@ -2190,7 +2190,13 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   useEffect(() => {
     const tilesActive = !!project.settings?.tilesEnabled && !!project.map?.bounds;
     const map = project.map;
-    if (!map || !mapLoaded || canvasSize.width <= 0) return;
+    // ФИКС «1 окно: неверный масштаб/смещение» (этап 2): стартовый fit использует
+    // и width, и height контейнера (fit-to-bounds, worldPx = height·2^zoom). Если
+    // эффект стартует на промежуточном layout (height ещё не разрешён CSS-flex ⇒
+    // 0 или stale), битый вид фиксируется ОДИН раз (lastInitialFitRef) и больше не
+    // пересчитывается. Ждём оба валидных измерения — для режима 3 окон логика не
+    // меняется: MiniMapPanel имеет собственный рендер и этот эффект не использует.
+    if (!map || !mapLoaded || canvasSize.width <= 0 || canvasSize.height <= 0) return;
     const boundsKey = map.bounds ? `${map.bounds.north},${map.bounds.south}` : 'nobounds';
     const fitKey = `${map.dataUrl ? 'img' : 'tiles'}|${boundsKey}`;
     if (lastInitialFitRef.current === fitKey) return; // только ОДИН раз на карту — ресайз вид не трогает
@@ -2350,7 +2356,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // remount до ближайшего кадра/жеста читал бы зеркало со stale-видом или
     // без ключа карты → повторная подгонка → гонка стора и зеркала.
     writeMirrorNow();
-  }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled, mapLoaded, canvasSize.width]);
+  }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled, mapLoaded, canvasSize.width, canvasSize.height]);
 
   // Отдельный эффект: при ПЕРВОМ появлении объектов на новой карте —
   // автоматически подогнать вид под все объекты ровно один раз.
