@@ -9,11 +9,15 @@
     <!-- ЭТАП 1.3 (PWA): манифест и мета для установки/офлайн-режима.
          vite-plugin-pwa генерирует sw.js и manifest.webmanifest при сборке;
          в dev-режиме plugin devOptions включает SW автоматически. -->
-    <link rel="manifest" href="/manifest.webmanifest" />
+    <!-- ФИКС 404 на GitHub Pages: абсолютный путь /manifest.webmanifest резолвится
+         в корень домена (https://<user>.github.io/...), минуя подпапку /<repo>/,
+         где лежит собранный манифест. Относительный путь работает и на Pages
+         (<base href> из vite base:"./" подставляет /<repo>/), и с поддомена. -->
+    <link rel="manifest" href="manifest.webmanifest" />
     <meta name="theme-color" content="#111827" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+    <link rel="apple-touch-icon" href="icons/icon-192.png" />
     <style>
       /* Фоновый цвет сразу, чтобы не было «белого листа» до загрузки React */
       html,

@@ -2270,17 +2270,22 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       // растра, если bounds шире окна). Никакой зависимости от размеров окна,
       // никакого «полёта в космоса»: строгая привязка к координатам при любом
       // масштабе и панораме.
-      // ── ФИКС «В РЕЖИМЕ ОДНОГО ОКНА НЕВЕРНЫЙ МАСШТАБ/СМЕЩЕНИЕ» ─────────────
+      // ── ФИКС «В РЕЖИМЕ ОДНОГО ОКНА НЕВЕРНЫЙ МАСШТАБ/СМЕЩЕНИЕ» (v2) ────────
       // loadActiveTileMap фиксирует bounds как окно обзора под ЭТАЛОН 800×600
       // css px на зуме z. В режиме трёх окон контейнеры близки к эталону —
       // баг маскировался; в редакторе-«одном окне» flex-колонка даёт другой
       // размер ⇒ fit-to-bounds (zb) открывал карту на масштабе, отличном от
       // запрошенного z, со смещением центра. Исправление: для тайловой карты
-      // стартовый зум берётся НАПРЯМУЮ из геометрии виртуального растра
-      // (rasterWorldPx ≈ 256·2^z — ровно z загрузки), а не из размера окна;
-      // fit-to-bounds остаётся только фолбэком (неполный растр / bounds шире
-      // экрана). Формула инвариантна к размеру контейнера: worldPx = vh·2^zoom,
-      // центр bounds всегда в центре экрана.
+      // виртуального растра (loadActiveTileMap: dataUrl === '', растр = полный
+      // мир уровня z, width === height === 256·2^z) стартовый зум берётся
+      // НАПРЯМУЮ из геометрии растра — ровно z загрузки — и НЕ зависит от
+      // размера контейнера. Фолбэк fit-to-bounds остаётся для снимков с
+      // включёнными тайлами (dataUrl ≠ '') и неполных растров.
+      // ⚠ ПРЕДУПРЕЖДЕНИЕ v1: условие вида «rasterWorldPx >= 256·2^MIN_ZOOM»
+      // всегда истинно при clampZoom(zb) ≥ MIN_ZOOM ⇒ ветка fit-to-bounds
+      // была мертва, а первый же вызов с фиксированным z открывал карту на
+      // неправильном масштабе («карта также не работает»). Теперь признак
+      // проверяется структурно (полный мир ⇔ virtualRaster), без догадок.
       const b = map.bounds;
       const topM = latToMerc(b.north);
       const botM = latToMerc(b.south);
@@ -2302,17 +2307,28 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       // (worldPx = 256·2^z): это заявленный диапазон масштаба без догадок.
       // Иначе (bounds больше экрана) — fit-to-bounds: базовый зум растр-геометрии.
       const rasterWorldPx = (map.width / spanFx + map.height / spanFy) / 2; // ≈ 256·2^z
-      const rasterFitsScreen = map.width <= canvasSize.width && map.height <= canvasSize.height;
       let zoom: number;
-      if (rasterFitsScreen && Number.isFinite(rasterWorldPx) && rasterWorldPx >= 256 * Math.pow(2, MIN_ZOOM)) {
-        // Тайловая карта loadActiveTileMap: bounds — окно обзора под эталон
-        // 800×600, а не фактический контейнер. Стартовый зум = ровно z загрузки
-        // (инвариант worldPx = 256·2^z), НЕ fit-to-bounds от размера окна:
-        // иначе в «одном окне» при контейнере ≠ 800×600 масштаб и центр
-        // уезжают (в трёх окнах баг маскировался близостью к эталону).
+      // Структурный признак карты loadActiveTileMap: снимка нет (dataUrl === '')
+      // и виртуальный растр = полный мир уровня z (width === height = 256·2^z,
+      // z ∈ [6..19] ⇒ worldPx кратно 256·2^6). Для такой карты стартовый зум
+      // = ровно z загрузки (инвариант worldPx = 256·2^z), НЕ fit-to-bounds от
+      // размера окна: bounds — эталонное окно обзора 800×600, а не фактический
+      // контейнер, иначе в «одном окне» масштаб и центр уезжают.
+      const virtualRaster =
+        !map.dataUrl &&
+        Number.isFinite(map.width) &&
+        map.width === map.height &&
+        map.width >= 256 * Math.pow(2, 6) &&
+        Math.abs(map.width / (256 * Math.pow(2, 6)) - Math.round(map.width / (256 * Math.pow(2, 6)))) < 1e-9;
+      if (virtualRaster && Number.isFinite(rasterWorldPx)) {
         zoom = Math.log2(rasterWorldPx / 256); // ровно z загрузки
       } else {
-        zoom = zb; // фолбэк: подогнать область bounds под экран
+        const rasterFitsScreen = map.width <= canvasSize.width && map.height <= canvasSize.height;
+        if (rasterFitsScreen && Number.isFinite(rasterWorldPx) && rasterWorldPx >= 256 * Math.pow(2, MIN_ZOOM)) {
+          zoom = Math.log2(rasterWorldPx / 256); // весь растр в окне — открываемся на его z
+        } else {
+          zoom = zb; // фолбэк: подогнать область bounds под экран
+        }
       }
       zoom = clampZoom(zoom);
       const zFix = ZOOM_REF; // ЭТАЛОН для инварианта worldPx = canvasHeight·2^(zFix+log2 scale)
