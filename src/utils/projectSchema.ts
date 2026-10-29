@@ -146,10 +146,15 @@ export const ProjectSchema = z.object({
     showGrid: true, gridSize: 0, showCoordinates: true, theme: 'dark',
     tilesEnabled: true, elevationAuto: true, altitudeClearanceM: 50,
   }),
-  googleMaps: z.object({ apiKey: z.string().default(''), enabled: z.boolean().default(false) })
-    .default({ apiKey: '', enabled: false }),
-  yandexMaps: z.object({ apiKey: z.string().default(''), enabled: z.boolean().default(false) })
-    .default({ apiKey: '', enabled: false }),
+  // ЭТАП 1.2: apiKey принудительно выбрасывается из любых внешних/legacy
+  // данных (transform), а не только дефолтится — секрет не переживает
+  // импорт проекта и гидрацию старых снапшотов.
+  googleMaps: z.object({ apiKey: z.string().optional(), enabled: z.boolean().default(false) })
+    .transform((v) => ({ enabled: v.enabled }))
+    .default({ enabled: false }),
+  yandexMaps: z.object({ apiKey: z.string().optional(), enabled: z.boolean().default(false) })
+    .transform((v) => ({ enabled: v.enabled }))
+    .default({ enabled: false }),
   openStreetMap: z.object({
     enabled: z.boolean().default(false),
     // Рабочие id из TILE_PROVIDERS (esri, esri-sat, osmfr, hot, osmde, opentopomap,

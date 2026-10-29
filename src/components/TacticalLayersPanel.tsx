@@ -4,6 +4,7 @@
 // слоёв поверх базовой карты. Метаданные — Zustand (persist), payload-ы — IndexedDB.
 import React, { useRef, useState } from 'react';
 import { useStore } from '../store/useStore';
+import { getMapParsersTransport, lastWorkerNotice } from '../hooks/useMapParsersWorker';
 
 const ACCEPT_FORMATS = '.tif,.tiff,.kml,.kmz,.geojson,.json,.mbtiles,.png,.jpg,.jpeg';
 
@@ -20,7 +21,15 @@ const TacticalLayersPanel: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  // ЭТАП 1.1: если Web Worker недоступен — честное предупреждение в UI
+  // (парсинг пойдёт в основном потоке), а не зависший интерфейс.
+  const [notice, setNotice] = useState<string | null>(null);
   const layers = project.tacticalOverlays || [];
+
+  React.useEffect(() => {
+    const r = getMapParsersTransport();
+    if (!r.workerAvailable) setNotice(lastWorkerNotice() ?? 'Фоновая обработка карт недоступна — парсинг идёт в основном потоке.');
+  }, []);
 
   const handleFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
@@ -29,9 +38,9 @@ const TacticalLayersPanel: React.FC = () => {
     for (const f of Array.from(files)) {
       try {
         await importTacticalOverlay(f);
-      } catch (e: any) {
+      } catch (e) {
         // ЖЁСТКОЕ требование: слой без корректного bounding box не импортируется
-        setError(`«${f.name}»: ${e?.message || 'ошибка импорта'}`);
+        setError(`«${f.name}»: ${e instanceof Error ? e.message : 'ошибка импорта'}`);
       }
     }
     setBusy(false);
@@ -60,6 +69,11 @@ const TacticalLayersPanel: React.FC = () => {
         {busy ? 'Импорт…' : '⬆ Импортировать карту (GeoTIFF/KML/KMZ/GeoJSON/MBTiles/PNG/JPEG)'}
       </button>
       {error && <div className="text-red-400 text-xs whitespace-pre-wrap">{error}</div>}
+      {notice && (
+        <div role="alert" className="text-amber-300 text-xs bg-amber-900/30 border border-amber-700 rounded p-1.5">
+          ⚠ {notice}
+        </div>
+      )}
 
       {layers.length === 0 && (
         <div className="text-slate-400 text-xs">

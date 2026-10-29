@@ -172,8 +172,9 @@ export function migrateLegacyStorage(): void {
       restrictions: p.restrictions ?? [],
       layers: p.layers?.length ? p.layers : [{ id: 'default', name: 'Основной', visible: true, locked: false }],
       calibration: p.calibration ?? { enabled: false, points: [] },
-      googleMaps: p.googleMaps ?? { apiKey: '', enabled: false },
-      yandexMaps: p.yandexMaps ?? { apiKey: '', enabled: false },
+      // ЭТАП 1.2: из legacy-снапшота берём ТОЛЬКО enabled; apiKey вырезается.
+      googleMaps: { enabled: !!p.googleMaps?.enabled },
+      yandexMaps: { enabled: !!p.yandexMaps?.enabled },
       openStreetMap: p.openStreetMap ?? { enabled: false, tileServer: 'osm' as const },
       settings: p.settings ?? undefined,
       _currentMapId: st._currentMapId,
@@ -468,8 +469,9 @@ shimActions.importProject = (project: Project) => {
     restrictions: p.restrictions ?? [],
     layers: p.layers?.length ? p.layers : [{ id: 'default', name: 'Основной', visible: true, locked: false }],
     calibration: p.calibration ?? { enabled: false, points: [] },
-    googleMaps: p.googleMaps ?? { apiKey: '', enabled: false },
-    yandexMaps: p.yandexMaps ?? { apiKey: '', enabled: false },
+    // ЭТАП 1.2: секрет не мигрирует — только флаг enabled.
+    googleMaps: { enabled: !!p.googleMaps?.enabled },
+    yandexMaps: { enabled: !!p.yandexMaps?.enabled },
     openStreetMap: p.openStreetMap ?? { enabled: false, tileServer: 'osm' },
     settings: p.settings ?? useMapStore.getState().settings,
     viewState: { offsetX: 0, offsetY: 0, scale: 1 },

@@ -22,8 +22,22 @@ import {
   saveTacticalOverlayToIndexedDB, deleteTacticalOverlayFromIndexedDB, loadTacticalOverlayFromIndexedDB,
 } from '../utils/storage';
 import { loadTacticalMapFile } from '../utils/tacticalMapLoader';
+// ЭТАП 1.1: фоновый транспорт парсеров (Web Worker + sync-фолбэк)
+import { getMapParsersTransport, lastWorkerNotice } from '../hooks/useMapParsersWorker';
 import { mercatorYToLat, calculateBoundsFromCenter } from '../utils/googleMaps';
 import { sanitizeProjectData } from '../utils/projectSchema';
+// ЭТАП 1.2 (безопасность): API-ключи живут ТОЛЬКО в сессионном сторе
+// useApiKeysStore (память текущей вкладки). В persist-стор они НЕ пишутся:
+// тип провайдерского среза — PersistedProviderPrefs без поля apiKey.
+import type { MapsProviderId } from './useApiKeysStore';
+
+/** Персистимые настройки провайдера карт БЕЗ секретов (ЭТАП 1.2). */
+export interface PersistedProviderPrefs { enabled: boolean }
+
+/** Нормализация legacy-slice: {apiKey,enabled} → {enabled}; ключ выбрасывается. */
+function toProviderPrefs(p: unknown): PersistedProviderPrefs {
+  return { enabled: !!(p as { enabled?: boolean } | null)?.enabled };
+}
 
 const MIN_MAP_ZOOM_FLOOR = 6;
 
@@ -93,8 +107,10 @@ export interface MapState {
   restrictions: Restriction[];
   layers: Layer[];
   calibration: { enabled: boolean; points: CalibrationPoint[] };
-  googleMaps: { apiKey: string; enabled: boolean };
-  yandexMaps: { apiKey: string; enabled: boolean };
+  /** ЭТАП 1.2: персистится ТОЛЬКО флаг enabled. Секретный apiKey живёт
+   *  в сессионном useApiKeysStore / .env и никогда не попадает сюда. */
+  googleMaps: PersistedProviderPrefs;
+  yandexMaps: PersistedProviderPrefs;
   /** tileServer — рабочий id из TILE_PROVIDERS либо legacy-значение ('osm', 'carto');
    *  при чтении нормализуется normalizeTileServer() (тип string — для совместимости со старыми проектами). */
   openStreetMap: { enabled: boolean; tileServer?: string };
@@ -153,8 +169,12 @@ export interface MapActions {
   removeCalibrationPoint: (index: number) => void;
   toggleCalibration: (enabled: boolean) => void;
   updateSettings: (settings: Partial<ProjectSettings>) => void;
+  /** @deprecated ЭТАП 1.2: ключи больше НЕ хранятся в persist-сторе.
+   *  Метод перенаправляет ввод в сессионный useApiKeysStore и всегда пишет
+   *  '' в легаси-срез (совместимость вызывающих мест на переходный период). */
   setGoogleMapsApiKey: (apiKey: string) => void;
   toggleGoogleMaps: (enabled: boolean) => void;
+  /** @deprecated — см. setGoogleMapsApiKey */
   setYandexMapsApiKey: (apiKey: string) => void;
   toggleYandexMaps: (enabled: boolean) => void;
   toggleOpenStreetMap: (enabled: boolean) => void;
@@ -206,8 +226,8 @@ const initialMapState: MapState = {
   restrictions: [],
   layers: [{ id: 'default', name: 'Основной', visible: true, locked: false }],
   calibration: { enabled: false, points: [] },
-  googleMaps: { apiKey: '', enabled: false },
-  yandexMaps: { apiKey: '', enabled: false },
+  googleMaps: { enabled: false },
+  yandexMaps: { enabled: false },
   openStreetMap: { enabled: false, tileServer: 'osm' },
   settings: { ...defaultMapSettings },
   currentTool: 'pan',
@@ -425,9 +445,19 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
     }
   },
 
-  setGoogleMapsApiKey: (apiKey) => set((state) => ({ googleMaps: { ...state.googleMaps, apiKey } })),
+  // ─── ЭТАП 1.2: ключевые сеттеры — тонкая проксия в СЕССИОННЫЙ стор ──────
+  // Секрет никогда не пишется в persist-срез googleMaps/yandexMaps: там
+  // остаётся только enabled. Динамический import сохраняет направление
+  // зависимостей (store → store) и не создаёт цикла на этапе инициализации.
+  setGoogleMapsApiKey: (apiKey) => {
+    void import('./useApiKeysStore').then((m) => m.useApiKeysStore.getState().setManualKey('google' as MapsProviderId, apiKey));
+    set((state) => ({ googleMaps: { ...state.googleMaps } }));
+  },
   toggleGoogleMaps: (enabled) => set((state) => ({ googleMaps: { ...state.googleMaps, enabled } })),
-  setYandexMapsApiKey: (apiKey) => set((state) => ({ yandexMaps: { ...state.yandexMaps, apiKey } })),
+  setYandexMapsApiKey: (apiKey) => {
+    void import('./useApiKeysStore').then((m) => m.useApiKeysStore.getState().setManualKey('yandex' as MapsProviderId, apiKey));
+    set((state) => ({ yandexMaps: { ...state.yandexMaps } }));
+  },
   toggleYandexMaps: (enabled) => set((state) => ({ yandexMaps: { ...state.yandexMaps, enabled } })),
   toggleOpenStreetMap: (enabled) => set((state) => ({ openStreetMap: { ...state.openStreetMap, enabled } })),
   setOSMTileServer: (server) => {
@@ -533,9 +563,18 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
   // ─── ЗАГРУЗ ПОЛЬЗОВАТЕЛЬСКИХ ТАКТИЧЕСКИХ КАРТ (Задача 2) ──────────────
   // Импорт: парсинг геопривязки (tacticalMapLoader) -> метаданные в стор,
   // payload в IndexedDB + внешний кэш. Жёсткий отказ при отсутствии bounds.
+  // ЭТАП 1.1: GeoTIFF/MBTiles парсятся в Web Worker (main thread свободен);
+  // при недоступности воркера транспорт сам деградирует в синхронный режим.
   importTacticalOverlay: async (file) => {
+    // ЭТАП 1.1: тяжёлые форматы (GeoTIFF/MBTiles) парсятся в Web Worker;
+    // если воркер недоступен — транспорт прозрачно деградирует в sync-режим,
+    // а причину видит UI (баннер TacticalLayersPanel / console.warn).
+    const runner = getMapParsersTransport();
+    if (!runner.workerAvailable) {
+      console.warn('[maps] Фоновый обработчик недоступен:', lastWorkerNotice() ?? 'Web Workers не поддерживаются');
+    }
     // Загрузчик возвращает готовый слой (метаданные) + payload для хранилища.
-    const loaded = await loadTacticalMapFile(file);
+    const loaded = await loadTacticalMapFile(file, runner);
     const layer: TacticalOverlayLayer = {
       ...loaded.layer,
       visible: true,
@@ -625,8 +664,9 @@ export const useMapStore = create<MapStore>()(
         restrictions: s.restrictions,
         layers: s.layers,
         calibration: s.calibration,
-        googleMaps: s.googleMaps,
-        yandexMaps: s.yandexMaps,
+        // ЭТАП 1.2: НИКОГДА не пишем apiKey — только флаг enabled (см. тип среза)
+        googleMaps: { enabled: s.googleMaps.enabled },
+        yandexMaps: { enabled: s.yandexMaps.enabled },
         openStreetMap: s.openStreetMap,
         settings: s.settings,
         _currentMapId: s._currentMapId,
@@ -650,7 +690,7 @@ export const useMapStore = create<MapStore>()(
         const proj = (p.project ?? p) as Partial<{
           map: MapData | null; markers: Marker[]; restrictions: Restriction[];
           layers: Layer[]; calibration: MapState['calibration'];
-          googleMaps: MapState['googleMaps']; yandexMaps: MapState['yandexMaps'];
+          googleMaps: { enabled?: boolean }; yandexMaps: { enabled?: boolean };
           openStreetMap: MapState['openStreetMap']; settings: ProjectSettings;
           currentTool: Tool; viewState: ViewState;
         }>;
@@ -660,10 +700,10 @@ export const useMapStore = create<MapStore>()(
         if (proj.layers?.length) p.layers = proj.layers;
         if (proj.calibration) p.calibration = proj.calibration;
         else if (!p.calibration) p.calibration = { enabled: false, points: [] };
-        if (proj.googleMaps) p.googleMaps = proj.googleMaps;
-        else if (!p.googleMaps) p.googleMaps = { apiKey: '', enabled: false };
-        if (proj.yandexMaps) p.yandexMaps = proj.yandexMaps;
-        else if (!p.yandexMaps) p.yandexMaps = { apiKey: '', enabled: false };
+        // ЭТАП 1.2: даже если в СТАРОМ снапшоте лежит apiKey — он вырезается
+        // (toProviderPrefs берёт только enabled). Секреты не переживают миграцию.
+        p.googleMaps = toProviderPrefs(proj.googleMaps);
+        p.yandexMaps = toProviderPrefs(proj.yandexMaps);
         if (proj.openStreetMap) p.openStreetMap = proj.openStreetMap;
         else if (!p.openStreetMap) p.openStreetMap = { enabled: false, tileServer: 'osm' };
         const st = (p.settings ?? {}) as Partial<ProjectSettings>;
@@ -694,7 +734,14 @@ export const useMapStore = create<MapStore>()(
         // viewTick и уведомление всех подписчиков — компоненты перерисуются уже
         // с полностью восстановленным состоянием.
         try {
-          useMapStore.setState((s) => ({ viewTick: s.viewTick + 1 }));
+          useMapStore.setState((s) => ({
+            viewTick: s.viewTick + 1,
+            // ЭТАП 1.2 (двойная страховка): если zustand успел in-place
+            // смёржить legacy-объект с apiKey — вырезаем секрет немедленно,
+            // до любого подписчика/следующей записи.
+            googleMaps: toProviderPrefs(s.googleMaps),
+            yandexMaps: toProviderPrefs(s.yandexMaps),
+          }));
         } catch { /* стор ещё не создан (первичная синхронная гидрация) — не страшно */ }
         invalidateZoneCache();
       },

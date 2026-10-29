@@ -121,12 +121,16 @@ export interface Project {
     /** Запас высоты полёта над рельефом, м (для определения АГЛ-высоты маршрута) */
     altitudeClearanceM?: number;
   };
+  /** ЭТАП 1.2: apiKey удалён из персистентной модели — секреты живут только
+   *  в сессионном useApiKeysStore / .env. Поле опционально и НЕ должно
+   *  записываться ни в один storage; legacy-снапшоты санитизируются
+   *  utils/apiKeySanitizer.ts. */
   googleMaps: {
-    apiKey: string;
+    apiKey?: string;
     enabled: boolean;
   };
   yandexMaps: {
-    apiKey: string;
+    apiKey?: string;
     enabled: boolean;
   };
   openStreetMap: {
