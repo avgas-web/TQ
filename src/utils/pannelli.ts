@@ -58,9 +58,11 @@ export function mercFracToGeo(fx: number, fy: number): { lat: number; lng: numbe
 /**
  * Расчёт вида «всё умещается в окно»: покрываем bbox точек с запасом,
  * но НЕ крупнее масштаба-эталона (1 см = 2 км) и не дальше maxZoom.
- * aspect = canvasWidth / canvasHeight; worldPx = maxSide·2^zoom (изотропный
- * квадратный мир — см. viewBox). Точные условия вписания bbox в окно любого
- * аспекта выводятся ниже (через max(aspect, 1)).
+ * aspect = canvasWidth / canvasHeight; изотропный мир viewBox задаётся
+ * ВЫСОТОЙ окна: worldPx = canvasHeight·2^z (эталон Leaflet/OSM/MapCanvas),
+ * ширина окна в тех же world-px равна aspect·canvasHeight. Условия вписания:
+ *   X: needW·worldPx ≤ W ⇔ 2^z ≤ aspect/needW
+ *   Y: needH·worldPx ≤ H ⇔ 2^z ≤ 1/needH
  */
 export function fitView(pts: { lat: number; lng: number }[], aspect: number, minZoom: number, maxZoom: number, pad = 0.12): PanelView | null {
   if (pts.length === 0 || !(aspect > 0)) return null;
@@ -72,13 +74,7 @@ export function fitView(pts: { lat: number; lng: number }[], aspect: number, min
   }
   const spanFx = Math.max(maxX - minX, 1e-9), spanFy = Math.max(maxY - minY, 1e-9);
   const needW = spanFx * (1 + pad), needH = spanFy * (1 + pad);
-  // Изотропный мир viewBox: worldPx = maxSide·2^z, maxSide = max(W, H).
-  // Стороны окна относительно maxSide: W = maxSide·(aspect/m), H = maxSide·(1/m),
-  // где m = max(aspect, 1). Вписывание bounds по каждой оси:
-  //   X: needW·worldPx ≤ W ⇔ 2^z ≤ (aspect/m)/needW
-  //   Y: needH·worldPx ≤ H ⇔ 2^z ≤ (1/m)/needH
-  const m = Math.max(aspect, 1); // maxSide / canvasHeight
-  const zoom = Math.max(minZoom, Math.min(maxZoom, Math.min(Math.log2((aspect / m) / needW), Math.log2((1 / m) / needH))));
+  const zoom = Math.max(minZoom, Math.min(maxZoom, Math.min(Math.log2(aspect / needW), Math.log2(1 / needH))));
   const latC = mercFracToGeo((minX + maxX) / 2, (minY + maxY) / 2).lat;
   // НЕ крупнее эталонного масштаба 1 см = 2 км (иначе «весь маршрут» был бы слишком приближён)
   const zoomFixed = Math.max(minZoom, Math.min(maxZoom, Math.min(zoom, zoomForGroundMpp(GROUND_MPP_1CM_2KM, latC))));
@@ -86,21 +82,22 @@ export function fitView(pts: { lat: number; lng: number }[], aspect: number, min
 }
 
 /** View вида в world-пиксели канваса (для прямой отрисовки тайлов на canvas).
- *  ФИКС ИСКАЖЕНИЯ КАРТ В РЕЖИМЕ МАСТЕРА: раньше масштаб считался ТОЛЬКО от
- *  высоты окна (wpx = hpx = canvasHeight·2^zoom), из-за чего в узкой высокой
- *  мастерской панели тот же самый mercator-масштаб, что у широкой основной
- *  карты режима планирования, растягивал изображение по горизонтали в
- *  canvasWidth/canvasHeight раз («загрузка есть, а отображение кривое»).
- *  Теперь эталон привязки — ЕДИНЫЙ инвариант Web-Mercator обоих режимов
- *  (MapCanvas.worldPxOf / mapGeoPick.wizardClickToGeo):
- *      worldPx = max(canvasWidth, canvasHeight) · 2^zoom,
- *  т.е. весь мир умещается по БОЛЬШЕЙ стороне окна (fit-by-max-side, как при
- *  автоподборе вида под bbox в режиме планирования). Обе оси получают ОДИНАКОВЫЙ
- *  масштаб ⇒ тайлы остаются квадратами, пропорции не искажаются ни при каком
- *  аспекте окна. Обратимость зума гарантируется zoomPanelAt (см. ниже). */
+ *  ФИКС «карта не отображается / отображается криво» (режим мастера):
+ *  ПРЕДЫДУЩАЯ версия (d64604d) брала базу мира по БОЛЬШЕЙ стороне окна —
+ *  worldPx = max(W, H)·2^zoom. Это «fit-by-max-side»: гео-область, подобранная
+ *  под стартовый зум (эталон — высота окна, как в Leaflet/OSM и MapCanvas),
+ *  оказывалась ВЫРЕЗАНОЙ по короткой оси — в узкой высокой мастерской панели
+ *  исчезали крайние точки маршрута, а сетка тайлов строилась с расходящимся
+ *  scale и панель выглядела «кривой загрузкой».
+ *  Теперь — ЕДИНЫЙ инвариант обоих режимов (MapCanvas.worldPxOf,
+ *  positionTileLayer, syncTileDom, mapGeoPick.screenToGeo):
+ *      worldPx = canvasHeight · 2^zoom   (эталон — ВЫСОТА окна),
+ *  обе оси получают ОДИНАКОВЫЙ изотропный масштаб ⇒ тайлы остаются квадратами
+ *  при любом аспекте окна, а формула screen = fx·worldPx + centerOffset строго
+ *  обратима (geoToScreenPx ⇔ screenPxToGeo, zoomPanelAt, panPanelBy). */
 export function viewBox(v: PanelView, canvasW: number, canvasH: number): PanelViewBox {
-  const base = Math.max(256, canvasW, canvasH);
-  const px = base * Math.pow(2, v.zoom);
+  void canvasW; // изотропный мир: масштаб задаётся высотой окна (эталон OSM/Leaflet)
+  const px = Math.max(256, canvasH) * Math.pow(2, v.zoom);
   return { ...v, wpx: px, hpx: px };
 }
 
