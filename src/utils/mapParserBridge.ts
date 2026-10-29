@@ -4,17 +4,59 @@
 //   • основной путь — выделенный module-воркер (main thread свободен);
 //   • graceful degradation — при недоступности воркера (SSR/тесты/жёсткие CSP)
 //     или его падении задача выполняется legacy-путём в main thread
-//     (dyn-import geotiff/sql.js — чанки грузятся только по нужде);
+//     (dyn-import userMapLoader -> geotiff/sql.js — чанки грузятся только по нужде);
 //   • ответы чужих taskId/clientId отбрасываются (защита от гонок);
 //   • «зависшую» задачу воркера ограничиваем таймаутом и фолбэчимся.
 // Обмен строго типизированными DTO (structured clone), без any в публичном API.
+//
+// ЗАЩИТА ОТ ЦИКЛОВ (регрессия после PR#117): userMapLoader НЕ импортируется
+// статически — иначе возникает цикл userMapLoader -> mapParserBridge ->
+// userMapLoader, при котором загрузчик карт не инициализируется и загрузка
+// пользовательских карт полностью выходит из строя. Типы DTO объявлены локально,
+// main-thread фолбэки подгружаются динамическим import() только при необходимости.
 // ═══════════════════════════════════════════════════════════════
-import type {
-  MapWorkerRequest, MapWorkerResponse,
-  ParseGeoTiffResponseData, MbtilesSummaryData,
-} from '../workers/mapParsers.worker';
 
-export type { ParseGeoTiffResponseData, MbtilesSummaryData };
+/** DTO: ответ воркера на parse-geotiff (зеркало workers/mapParsers.worker) */
+export interface ParseGeoTiffResponseData {
+  imageDataUrl: string;
+  widthPx: number;
+  heightPx: number;
+  bounds: [number, number, number, number];
+  projection: 'EPSG:4326' | 'EPSG:3857';
+  method: number;
+}
+
+/** DTO: метаданные MBTiles (зеркало workers/mapParsers.worker) */
+export interface MbtilesSummaryData {
+  tileCount: number;
+  bounds: [number, number, number, number] | null;
+  minZoom: number;
+  maxZoom: number;
+  format: string;
+  name: string;
+  description: string;
+}
+
+type MapWorkerKind = 'parse-geotiff' | 'parse-mbtiles-summary' | 'decode-mbtiles-tiles';
+
+interface MapWorkerRequest {
+  kind: MapWorkerKind;
+  taskId: number;
+  clientId: string;
+  buffer?: ArrayBuffer;
+  fileName?: string;
+  maxSide?: number;
+  keys?: string[];
+  format?: string;
+}
+
+interface MapWorkerResponse {
+  taskId: number;
+  clientId: string;
+  ok: boolean;
+  error?: string;
+  data?: unknown;
+}
 
 /** Таймаут ожидания ответа воркера (парсинг гигантских GeoTIFF + WASM-инит) */
 const WORKER_TASK_TIMEOUT_MS = 120_000;
