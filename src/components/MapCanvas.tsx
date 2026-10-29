@@ -909,6 +909,13 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     el.style.display = '';
     el.style.width = `${cs.width}px`;
     el.style.height = `${cs.height}px`;
+    // ФИКС «нечёткой карты» в режиме планирования: DOM-слой тайлов растягивается
+    // через CSS scale(tileCss/256) с ДРОБНЫМ коэффициентом (непрерывный зум), при
+    // этом браузер по умолчанию интерполирует увеличенные растры — подложка
+    // выглядит размытой. При увеличении (scale > 1) включаем резкую nearest-
+    // интерполяцию; при уменьшении оставляем стандартное сглаживание (иначе
+    // появились бы артефакты алиасинга на детализированных тайлах).
+    el.style.imageRendering = tileCss > 256 ? 'pixelated' : 'auto';
     el.style.transformOrigin = '0 0';
     el.style.transform = `translate(${baseX}px, ${baseY}px) scale(${tileCss / 256})`;
   }, []);

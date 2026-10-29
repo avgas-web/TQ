@@ -8,7 +8,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { getTileUrlVariantsFor, loadTileImage, normalizeTileServer, TILE_PROVIDERS } from '../utils/openStreetMap';
 import type { TileServerId } from '../utils/openStreetMap';
 import {
-  PanelView, viewBox, geoToScreenPx, zoomPanelAt, panPanelBy,
+  PanelView, PanelViewBox, viewBox, geoToScreenPx, screenPxToGeo, zoomPanelAt, panPanelBy,
   metersPerPixel, fitView, panelViewOf, GROUND_MPP_1CM_2KM,
 } from '../utils/pannelli';
 
@@ -64,18 +64,11 @@ interface MiniMapPanelProps {
 export interface MiniZone { pts: { lat: number; lng: number }[]; color?: string; radiusM?: number; centerGeo?: { lat: number; lng: number }; id?: string }
 
 /** Обратное преобразование экран→гео для панели (нужно для кликов редактирования).
- *  Совпадает с screenPxToGeo из pannelli.ts (центр канваса как точка отсчёта);
- *  vb.hpx используется для оси Y — раньше обе оси делились на wpx, что при
- *  неквадратном мире давало бы ошибку гео-привязки клика. */
-export function screenPxToGeoPanel(vb: { fx: number; fy: number; wpx: number; hpx?: number }, sx: number, sy: number, canvasW: number, canvasH: number): { lat: number; lng: number } {
-  const hpx = vb.hpx ?? vb.wpx; // изотропный мир: hpx === wpx (см. viewBox)
-  const fx = vb.fx + (sx - canvasW / 2) / vb.wpx;
-  const fy = vb.fy + (sy - canvasH / 2) / hpx;
-  const lng = fx * 360 - 180;
-  const nn = Math.PI - 2 * Math.PI * fy;
-  const lat = (180 / Math.PI) * Math.atan(0.5 * (Math.exp(nn) - Math.exp(-nn)));
-  return { lat, lng };
-}
+ *  Реализация — screenPxToGeo из pannelli.ts (единый источник математики вида:
+ *  центр канваса как точка отсчёта, vb.hpx для оси Y); раньше здесь лежала
+ *  копия функции — потенциальное расхождение прямой/обратной привязок. */
+export const screenPxToGeoPanel = (vb: PanelViewBox, sx: number, sy: number, canvasW: number, canvasH: number) =>
+  screenPxToGeo(sx, sy, vb, canvasW, canvasH);
 
 /** Общий LRU-кэш изображений тайлов для ВСЕХ мини-панелей (экономит трафик OSM) */
 const sharedTileCache = new Map<string, HTMLImageElement | null>();
@@ -115,35 +108,18 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   const tickRef = useRef(0);
   const bump = useCallback(() => { tickRef.current++; forceTick(tickRef.current); }, []);
 
-  // ─── ФИКС «загрузка есть, а отображение кривое» (режим мастера) ─────────────
-  // Раньше мир панелей масштабировался ТОЛЬКО от высоты окна
-  // (wpx = hpx = canvasHeight·2^zoom), из-за чего в узкой высокой мастерской
-  // панели тайлы растягивались по горизонтали в W/H раз. Теперь единый
-  // изотропный инвариант viewBox: worldPx = maxSide·2^zoom,
-  // maxSide = max(canvasW, canvasH). Чтобы ОДНА и та же гео-область выглядела
-  // одинаково в окне ЛЮБОГО аспекта, стартовый зум prop'а пересчитывается из
-  // эталонной стороны старой системы (высота) в новую базу:
-  //     z_new = z_prop + log2(refSide / maxSide).
-  // Пересчёт выполняется ОДИН РАЗ при первом реальном измерении размера;
-  // ручная панорама/зум пользователя после этого никогда не перехватывается.
-  const baseZoomRef = useRef(zoom);
-  baseZoomRef.current = zoom;
-  const aspectAdjustedRef = useRef(false);
+  // ─── ФИКС «карта не отображается / отображается криво» (режим мастера) ──────
+  // ПРЕДЫДУЩАя версия (d64604d) добавляла «однократную корректировку стартового
+  // зума» под аспект окна (z += log2(refSide/maxSide)) — она расходилась с
+  // реальным аспектом канваса после ResizeObserver'а, и гео-область вида
+  // оказывалась вырезанной/смещённой («загрузка есть, а отображения нет»).
+  // Теперь база привязки ЕДИНАЯ для обоих режимов и НЕ зависит от ширины окна
+  // (viewBox: worldPx = canvasHeight·2^zoom), поэтому стартовый зум prop
+  // применяется как есть — никаких пересчётов и перехватов пользовательского
+  // жеста не требуется.
   const startZoomForCurrentSize = useCallback((): number => {
-    const { w, h } = sizeRef.current;
-    const refSide = h > 0 ? h : baseZoomRef.current; // высота — эталон старой системы
-    const maxSide = Math.max(256, w, h);
-    return Math.max(minZoom, Math.min(maxZoom, baseZoomRef.current + Math.log2(Math.max(1, refSide) / maxSide)));
-  }, [minZoom, maxZoom]);
-  const applyAspectStartZoomOnce = useCallback((): void => {
-    if (aspectAdjustedRef.current) return;
-    const { w, h } = sizeRef.current;
-    if (w <= 0 || h <= 0) return;
-    aspectAdjustedRef.current = true;
-    const nz = startZoomForCurrentSize();
-    const v = viewRef.current;
-    if (nz !== v.zoom) { viewRef.current = { ...v, zoom: nz }; bump(); }
-  }, [bump, startZoomForCurrentSize]);
+    return Math.max(minZoom, Math.min(maxZoom, zoom));
+  }, [minZoom, maxZoom, zoom]);
 
   // ─── Авто-фокус на введённых данных ─────────────────────────────────────────
   // Панель загружается сразу (центр/зум по умолчанию), а при вводе пользователем
@@ -187,10 +163,9 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     const first = lastDataKeyRef.current === null;
     if (lastDataKeyRef.current === dataKey) return;
     lastDataKeyRef.current = dataKey;
-    // Стартовый вид при первом эффекте — с учётом фактического аспекта окна
-    // (иначе узкая мастерская панель получает растянутую карту до первого
-    // изменения данных). applyAspectStartZoomOnce идемпотентен.
-    applyAspectStartZoomOnce();
+    // Стартовый вид при первом эффекте — база привязки единая для любого
+    // аспекта окна (viewBox: worldPx = canvasHeight·2^zoom), пересчёт зума
+    // под аспект больше не нужен.
     if (fitPoints && fitPoints.length > 0) {
       const aspect = sizeRef.current.w > 0 && sizeRef.current.h > 0 ? sizeRef.current.w / sizeRef.current.h : 1.5;
       const v = fitView(fitPoints, aspect, minZoom, maxZoom);
@@ -230,10 +205,6 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     return () => ro.disconnect();
   }, []);
 
-  // Первый замер размера → корректировка стартового зума под аспект окна
-  // (однократно; ручные жесты пользователя после этого не перехватываются).
-  useEffect(() => { applyAspectStartZoomOnce(); }, [size, applyAspectStartZoomOnce]);
-
   // Отрисовка: тайлы + оверлеи, строгая привязка координат
   const drawAll = useCallback(() => {
     const canvas = canvasRef.current;
@@ -261,9 +232,12 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     const srcLevel = Math.min(level, nativeMax); // реальный уровень тайлов у провайдера
     const upscale = Math.pow(2, level - srcLevel); // во сколько раз растягиваем тайл
     const n = Math.pow(2, level);
-    // ФИКС «кривой загрузки»: экранный px на тайл = worldPx / 2^level, где
-    // worldPx — ЕДИНЫЙ изотропный масштаб обеих осей (viewBox: wpx === hpx).
-    // tileW/tileH теперь совпадают; раньше оба брали hpx при неквадратном мире.
+    // ФИКС «кривой загрузки» + «нечёткости»: экранный px на тайл уровня `level`
+    // = worldPx / 2^level (изотропный: tileW === tileH, см. viewBox). При дробном
+    // зуме масштаб тайла нецелый — для РЕШЁТОЧНЫХ уровней (upscale === 1) тайлы
+    // ставятся на ЦЕЛЫЕ экранные координаты без перекрытия (резкая отрисовка),
+    // а увеличенные нативные тайлы (upscale > 1) рисуются с субпиксельной
+    // привязкой и высоким сглаживанием (иначе появились бы «дырки» между ними).
     const tileW = vb.wpx / n; // px на тайл уровня `level` по X
     const tileH = vb.hpx / n; // px на тайл уровня `level` по Y (== tileW)
     // привязка строго от mercator-долей центра вида (та же формула, что и для объектов)
@@ -290,7 +264,23 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
         // Экранное положение тайла уровня `level`; для upscaled-тайлов — позиция
         // родительского тайла минус смещение внутри него (ровно 1/n мира).
         const p = toTileScreen(tx, ty);
-        ctx.drawImage(img, p.x, p.y, tileW * upscale + 0.5, tileH * upscale + 0.5);
+        if (upscale === 1) {
+          // РЕШЁТОЧНЫЙ уровень: ставим тайл на целые экранные координаты с
+          // целым размером и БЕЗ субпиксельного сдвига — соседние тайлы точно
+          // примыкают друг к другу без интерполяции на границах. Это и есть
+          // ФИКС «нечёткой карты»: раньше каждый тайл получал +0.5 px перекрытия
+          // при нецелом tile-size (дробный зум), из-за чего растры сливались
+          // в размытое изображение с видимыми «двойными» швами сетки.
+          ctx.imageSmoothingEnabled = false;
+          ctx.drawImage(img, Math.round(p.x - 0.5), Math.round(p.y - 0.5), Math.round(tileW), Math.round(tileH));
+        } else {
+          // Увеличенный нативный тайл (z > nativeMax): субпиксельная привязка +
+          // высокое сглаживание — иначе между растянутыми тайлами появились бы
+          // щели/дыры фона («кривая загрузка» на максимальном приближении).
+          ctx.imageSmoothingEnabled = true;
+          (ctx as any).imageSmoothingQuality = 'high';
+          ctx.drawImage(img, p.x - 0.5, p.y - 0.5, tileW * upscale, tileH * upscale);
+        }
         drawnCount++;
       }
     }
@@ -301,6 +291,14 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       ctx.fillText('Нет данных тайлов в этой области — вернитесь к объекту (⌂)', w / 2, h / 2);
       ctx.restore();
     }
+    // ВАЖНО: здесь НЕЛЬЗЯ делать глобальный ctx.translate(0.5, 0.5) «для чётких
+    // линий» — позиции оверлеев (pointHits/zoneHits), сохраняемые ниже для
+    // hit-теста кликов установки/удаления/перетаскивания точек, вычисляются без
+    // учёта этого сдвига ⇒ все точки рисовались бы со смещением +0.5px, а клик
+    // по точке попадал бы мимо («ошибки с установкой точек»). Приём crisp lines
+    // применяется локально: сдвиг на полпикселя только при stroke тонких линий
+    // (см. ниже), fill-объекты и текст остаются в точных гео-координатах.
+
     // Дозагрузка недостающих тайлов общей бережной очередью (Esri — с зеркалами)
     if (need.length > 0) {
       const cxw = w / 2, cyw = h / 2;
@@ -327,6 +325,9 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       ctx.lineWidth = ln.width || 2.5;
       ctx.lineCap = 'round'; ctx.lineJoin = 'round';
       if (ln.dashed) ctx.setLineDash([7, 5]);
+      // Crisp-линии: полупиксельный сдвиг ВНУТРИ save/restore — только для
+      // штриха линии; hit-позиции оверлеев (рисуются отдельно) не смещаются.
+      ctx.translate(0.5, 0.5);
       ctx.beginPath();
       ln.pts.forEach((p, i) => {
         const s = geoToScreenPx(p.lat, p.lng, vb, w, h);
@@ -349,11 +350,13 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
         const c = geoToScreenPx(zn.centerGeo.lat, zn.centerGeo.lng, vb, w, h);
         const mppPanel = metersPerPixel(v.zoom, mercLatOf(v));
         const rScreen = zn.radiusM / Math.max(mppPanel, 1e-9);
+        ctx.translate(0.5, 0.5); // crisp stroke (внутри save/restore, hit-позиции не смещаются)
         ctx.beginPath(); ctx.arc(c.x, c.y, Math.min(rScreen, 4000), 0, Math.PI * 2);
         ctx.fill(); ctx.stroke();
         zoneHits.push({ id: zn.id, x: c.x, y: c.y, r: Math.min(rScreen, 4000) });
       } else if (zn.pts.length >= 2) {
         let cxSum = 0, cySum = 0;
+        ctx.translate(0.5, 0.5); // crisp stroke (внутри save/restore, hit-позиции не смещаются)
         ctx.beginPath();
         zn.pts.forEach((p, i) => {
           const s = geoToScreenPx(p.lat, p.lng, vb, w, h);
