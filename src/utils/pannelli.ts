@@ -17,8 +17,8 @@ export function panelViewOf(lat: number, lng: number, zoom: number): PanelView {
 }
 
 export interface PanelViewBox extends PanelView {
-  wpx: number;    // мир в экранных px по ширине канваса (canvasWidth·2^zoom)
-  hpx: number;    // мир в экранных px по высоте канваса (canvasHeight·2^zoom) — ЭТАЛОН масштаба
+  wpx: number;    // мир в экранных px по X — ЕДИНЫЙ изотропный масштаб (см. viewBox)
+  hpx: number;    // мир в экранных px по Y — всегда равен wpx (Web-Mercator квадратный)
 }
 
 /** Масштаб «1 см экрана = 2 км местности» как target ground meters-per-pixel:
@@ -58,7 +58,9 @@ export function mercFracToGeo(fx: number, fy: number): { lat: number; lng: numbe
 /**
  * Расчёт вида «всё умещается в окно»: покрываем bbox точек с запасом,
  * но НЕ крупнее масштаба-эталона (1 см = 2 км) и не дальше maxZoom.
- * aspect = canvasWidth / canvasHeight; worldPx = canvasHeight·2^zoom (квадратный мир).
+ * aspect = canvasWidth / canvasHeight; worldPx = maxSide·2^zoom (изотропный
+ * квадратный мир — см. viewBox). Точные условия вписания bbox в окно любого
+ * аспекта выводятся ниже (через max(aspect, 1)).
  */
 export function fitView(pts: { lat: number; lng: number }[], aspect: number, minZoom: number, maxZoom: number, pad = 0.12): PanelView | null {
   if (pts.length === 0 || !(aspect > 0)) return null;
@@ -70,9 +72,13 @@ export function fitView(pts: { lat: number; lng: number }[], aspect: number, min
   }
   const spanFx = Math.max(maxX - minX, 1e-9), spanFy = Math.max(maxY - minY, 1e-9);
   const needW = spanFx * (1 + pad), needH = spanFy * (1 + pad);
-  // bounds вписываются: spanFx·worldPx ≤ canvasW ⇒ worldPx ≤ canvasW/spanFx;
-  // worldPx = canvasH·2^z ⇒ z ≤ log2(aspect/needW) и z ≤ log2(1/needH)
-  const zoom = Math.max(minZoom, Math.min(maxZoom, Math.min(Math.log2(aspect / needW), Math.log2(1 / needH))));
+  // Изотропный мир viewBox: worldPx = maxSide·2^z, maxSide = max(W, H).
+  // Стороны окна относительно maxSide: W = maxSide·(aspect/m), H = maxSide·(1/m),
+  // где m = max(aspect, 1). Вписывание bounds по каждой оси:
+  //   X: needW·worldPx ≤ W ⇔ 2^z ≤ (aspect/m)/needW
+  //   Y: needH·worldPx ≤ H ⇔ 2^z ≤ (1/m)/needH
+  const m = Math.max(aspect, 1); // maxSide / canvasHeight
+  const zoom = Math.max(minZoom, Math.min(maxZoom, Math.min(Math.log2((aspect / m) / needW), Math.log2((1 / m) / needH))));
   const latC = mercFracToGeo((minX + maxX) / 2, (minY + maxY) / 2).lat;
   // НЕ крупнее эталонного масштаба 1 см = 2 км (иначе «весь маршрут» был бы слишком приближён)
   const zoomFixed = Math.max(minZoom, Math.min(maxZoom, Math.min(zoom, zoomForGroundMpp(GROUND_MPP_1CM_2KM, latC))));
@@ -80,10 +86,21 @@ export function fitView(pts: { lat: number; lng: number }[], aspect: number, min
 }
 
 /** View вида в world-пиксели канваса (для прямой отрисовки тайлов на canvas).
- *  ЭТАЛОН — высота: hpx = canvasHeight·2^zoom; по X мир масштабируется так же
- *  (wpx = hpx) — квадратные mercator-доли, как в Leaflet/OSM и основном канвасе. */
-export function viewBox(v: PanelView, _canvasW: number, canvasH: number): PanelViewBox {
-  const px = Math.max(256, canvasH * Math.pow(2, v.zoom));
+ *  ФИКС ИСКАЖЕНИЯ КАРТ В РЕЖИМЕ МАСТЕРА: раньше масштаб считался ТОЛЬКО от
+ *  высоты окна (wpx = hpx = canvasHeight·2^zoom), из-за чего в узкой высокой
+ *  мастерской панели тот же самый mercator-масштаб, что у широкой основной
+ *  карты режима планирования, растягивал изображение по горизонтали в
+ *  canvasWidth/canvasHeight раз («загрузка есть, а отображение кривое»).
+ *  Теперь эталон привязки — ЕДИНЫЙ инвариант Web-Mercator обоих режимов
+ *  (MapCanvas.worldPxOf / mapGeoPick.wizardClickToGeo):
+ *      worldPx = max(canvasWidth, canvasHeight) · 2^zoom,
+ *  т.е. весь мир умещается по БОЛЬШЕЙ стороне окна (fit-by-max-side, как при
+ *  автоподборе вида под bbox в режиме планирования). Обе оси получают ОДИНАКОВЫЙ
+ *  масштаб ⇒ тайлы остаются квадратами, пропорции не искажаются ни при каком
+ *  аспекте окна. Обратимость зума гарантируется zoomPanelAt (см. ниже). */
+export function viewBox(v: PanelView, canvasW: number, canvasH: number): PanelViewBox {
+  const base = Math.max(256, canvasW, canvasH);
+  const px = base * Math.pow(2, v.zoom);
   return { ...v, wpx: px, hpx: px };
 }
 

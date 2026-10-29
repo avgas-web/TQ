@@ -64,10 +64,13 @@ interface MiniMapPanelProps {
 export interface MiniZone { pts: { lat: number; lng: number }[]; color?: string; radiusM?: number; centerGeo?: { lat: number; lng: number }; id?: string }
 
 /** Обратное преобразование экран→гео для панели (нужно для кликов редактирования).
- *  Совпадает с screenPxToGeo из pannelli.ts (центр канваса как точка отсчёта). */
-export function screenPxToGeoPanel(vb: { fx: number; fy: number; wpx: number }, sx: number, sy: number, canvasW: number, canvasH: number): { lat: number; lng: number } {
+ *  Совпадает с screenPxToGeo из pannelli.ts (центр канваса как точка отсчёта);
+ *  vb.hpx используется для оси Y — раньше обе оси делились на wpx, что при
+ *  неквадратном мире давало бы ошибку гео-привязки клика. */
+export function screenPxToGeoPanel(vb: { fx: number; fy: number; wpx: number; hpx?: number }, sx: number, sy: number, canvasW: number, canvasH: number): { lat: number; lng: number } {
+  const hpx = vb.hpx ?? vb.wpx; // изотропный мир: hpx === wpx (см. viewBox)
   const fx = vb.fx + (sx - canvasW / 2) / vb.wpx;
-  const fy = vb.fy + (sy - canvasH / 2) / vb.wpx;
+  const fy = vb.fy + (sy - canvasH / 2) / hpx;
   const lng = fx * 360 - 180;
   const nn = Math.PI - 2 * Math.PI * fy;
   const lat = (180 / Math.PI) * Math.atan(0.5 * (Math.exp(nn) - Math.exp(-nn)));
@@ -106,11 +109,41 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   const sizeRef = useRef(size);
   useEffect(() => { sizeRef.current = size; }, [size]);
 
-  // Вид панели — локальный ref (не трогает глобальный viewState основного канваса)
+  // Вид панели — локальный ref (не трогает глобальный viewState основного канваса).
   const viewRef = useRef<PanelView>({ zoom, fx: (center.lng + 180) / 360, fy: 0.5 - Math.log((1 + Math.sin(center.lat * Math.PI / 180)) / (1 - Math.sin(center.lat * Math.PI / 180))) / (4 * Math.PI) });
   const [, forceTick] = useState(0);
   const tickRef = useRef(0);
   const bump = useCallback(() => { tickRef.current++; forceTick(tickRef.current); }, []);
+
+  // ─── ФИКС «загрузка есть, а отображение кривое» (режим мастера) ─────────────
+  // Раньше мир панелей масштабировался ТОЛЬКО от высоты окна
+  // (wpx = hpx = canvasHeight·2^zoom), из-за чего в узкой высокой мастерской
+  // панели тайлы растягивались по горизонтали в W/H раз. Теперь единый
+  // изотропный инвариант viewBox: worldPx = maxSide·2^zoom,
+  // maxSide = max(canvasW, canvasH). Чтобы ОДНА и та же гео-область выглядела
+  // одинаково в окне ЛЮБОГО аспекта, стартовый зум prop'а пересчитывается из
+  // эталонной стороны старой системы (высота) в новую базу:
+  //     z_new = z_prop + log2(refSide / maxSide).
+  // Пересчёт выполняется ОДИН РАЗ при первом реальном измерении размера;
+  // ручная панорама/зум пользователя после этого никогда не перехватывается.
+  const baseZoomRef = useRef(zoom);
+  baseZoomRef.current = zoom;
+  const aspectAdjustedRef = useRef(false);
+  const startZoomForCurrentSize = useCallback((): number => {
+    const { w, h } = sizeRef.current;
+    const refSide = h > 0 ? h : baseZoomRef.current; // высота — эталон старой системы
+    const maxSide = Math.max(256, w, h);
+    return Math.max(minZoom, Math.min(maxZoom, baseZoomRef.current + Math.log2(Math.max(1, refSide) / maxSide)));
+  }, [minZoom, maxZoom]);
+  const applyAspectStartZoomOnce = useCallback((): void => {
+    if (aspectAdjustedRef.current) return;
+    const { w, h } = sizeRef.current;
+    if (w <= 0 || h <= 0) return;
+    aspectAdjustedRef.current = true;
+    const nz = startZoomForCurrentSize();
+    const v = viewRef.current;
+    if (nz !== v.zoom) { viewRef.current = { ...v, zoom: nz }; bump(); }
+  }, [bump, startZoomForCurrentSize]);
 
   // ─── Авто-фокус на введённых данных ─────────────────────────────────────────
   // Панель загружается сразу (центр/зум по умолчанию), а при вводе пользователем
@@ -154,12 +187,16 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     const first = lastDataKeyRef.current === null;
     if (lastDataKeyRef.current === dataKey) return;
     lastDataKeyRef.current = dataKey;
+    // Стартовый вид при первом эффекте — с учётом фактического аспекта окна
+    // (иначе узкая мастерская панель получает растянутую карту до первого
+    // изменения данных). applyAspectStartZoomOnce идемпотентен.
+    applyAspectStartZoomOnce();
     if (fitPoints && fitPoints.length > 0) {
       const aspect = sizeRef.current.w > 0 && sizeRef.current.h > 0 ? sizeRef.current.w / sizeRef.current.h : 1.5;
       const v = fitView(fitPoints, aspect, minZoom, maxZoom);
       if (v) { if (first) { viewRef.current = v; bump(); } else { animateTo(v); } }
     } else {
-      const v = panelViewOf(center.lat, center.lng, zoom);
+      const v = panelViewOf(center.lat, center.lng, startZoomForCurrentSize());
       if (first) { viewRef.current = v; bump(); } else { animateTo(v); }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -174,7 +211,7 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
         const v = fitView(fitPoints, aspect, minZoom, maxZoom);
         if (v) animateTo(v);
       } else {
-        animateTo(panelViewOf(center.lat, center.lng, zoom));
+        animateTo(panelViewOf(center.lat, center.lng, startZoomForCurrentSize()));
       }
     }
     focusedForAnimRef.current = focused;
@@ -192,6 +229,10 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
+
+  // Первый замер размера → корректировка стартового зума под аспект окна
+  // (однократно; ручные жесты пользователя после этого не перехватываются).
+  useEffect(() => { applyAspectStartZoomOnce(); }, [size, applyAspectStartZoomOnce]);
 
   // Отрисовка: тайлы + оверлеи, строгая привязка координат
   const drawAll = useCallback(() => {
@@ -220,16 +261,20 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     const srcLevel = Math.min(level, nativeMax); // реальный уровень тайлов у провайдера
     const upscale = Math.pow(2, level - srcLevel); // во сколько раз растягиваем тайл
     const n = Math.pow(2, level);
-    const tileSize = vb.hpx / n; // экранных px на тайл уровня `level` (мир квадратный: hpx)
+    // ФИКС «кривой загрузки»: экранный px на тайл = worldPx / 2^level, где
+    // worldPx — ЕДИНЫЙ изотропный масштаб обеих осей (viewBox: wpx === hpx).
+    // tileW/tileH теперь совпадают; раньше оба брали hpx при неквадратном мире.
+    const tileW = vb.wpx / n; // px на тайл уровня `level` по X
+    const tileH = vb.hpx / n; // px на тайл уровня `level` по Y (== tileW)
     // привязка строго от mercator-долей центра вида (та же формула, что и для объектов)
     const toTileScreen = (tx: number, ty: number): { x: number; y: number } => ({
-      x: (tx - v.fx * n) * tileSize + w / 2,
-      y: (ty - v.fy * n) * tileSize + h / 2,
+      x: (tx - v.fx * n) * tileW + w / 2,
+      y: (ty - v.fy * n) * tileH + h / 2,
     });
-    const tx0 = Math.floor(v.fx * n - w / tileSize / 2) - 1;
-    const tx1 = Math.ceil(v.fx * n + w / tileSize / 2) + 1;
-    const ty0 = Math.floor(v.fy * n - h / tileSize / 2) - 1;
-    const ty1 = Math.ceil(v.fy * n + h / tileSize / 2) + 1;
+    const tx0 = Math.floor(v.fx * n - w / tileW / 2) - 1;
+    const tx1 = Math.ceil(v.fx * n + w / tileW / 2) + 1;
+    const ty0 = Math.floor(v.fy * n - h / tileH / 2) - 1;
+    const ty1 = Math.ceil(v.fy * n + h / tileH / 2) + 1;
     const need: { url: string; tx: number; ty: number }[] = [];
     let drawnCount = 0;
     for (let tx = tx0; tx <= tx1; tx++) {
@@ -245,7 +290,7 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
         // Экранное положение тайла уровня `level`; для upscaled-тайлов — позиция
         // родительского тайла минус смещение внутри него (ровно 1/n мира).
         const p = toTileScreen(tx, ty);
-        ctx.drawImage(img, p.x, p.y, tileSize * upscale + 0.5, tileSize * upscale + 0.5);
+        ctx.drawImage(img, p.x, p.y, tileW * upscale + 0.5, tileH * upscale + 0.5);
         drawnCount++;
       }
     }
@@ -544,7 +589,7 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       const v = fitView(fitPoints, aspect, minZoom, maxZoom);
       if (v) { animateTo(v); return; }
     }
-    animateTo(panelViewOf(center.lat, center.lng, zoom));
+    animateTo(panelViewOf(center.lat, center.lng, startZoomForCurrentSize()));
   };
 
   useEffect(() => { onReady?.(); /* панель готова к экспорту PNG */ }, [onReady, size]);
