@@ -1,12 +1,18 @@
 // ─── MiniMapPanel: отдельное окно карты (старт / весь маршрут / цель) ────────
-// Полностью автономная канвас-панель со строгой Web-Mercator привязкой:
-//   worldPx = canvasSize·2^zoom, screen = geoFrac·worldPx + centerOffset.
-// Тайлы OSM рисуются прямо на canvas (без DOM-слоя) — три панели суммарно
-// потребляют минимум соединений (общий кэш тайлов + лимит параллельных загрузок).
+// Полностью автономная панель со строгой Web-Mercator привязкой:
+//   worldPx = canvasHeight·2^zoom, screen = geoFrac·worldPx + centerOffset.
+// ПРИНЦИП ОТОБРАЖЕНИЯ КАРТЫ — КАК В РЕЖИМЕ ПЛАНИРОВАНИЯ (MapCanvas): подложка
+// рисуется НЕ на canvas, а DOM-слоем настоящих <img>-тайлов с одним CSS
+// transform (utils/tileDomLayer — прямой перенос positionTileLayer/syncTileDom
+// большой карты). Canvas поверх слоя — только оверлеи (маршруты, зоны, точки),
+// позиционированные по ТОЙ ЖЕ формуле привязки ⇒ объекты «приклеены» к подложке.
+// Это устраняет дефекты прежней canvas-сетки drawImage: субпиксельные швы,
+// размытие при дробном зуме и «кривую загрузку» в режиме мастера.
 // Зум колесом/кнопками, панорама перетаскиванием — в любых пределах z3..z19+.
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { getTileUrlVariantsFor, loadTileImage, normalizeTileServer, TILE_PROVIDERS } from '../utils/openStreetMap';
+import { normalizeTileServer } from '../utils/openStreetMap';
 import type { TileServerId } from '../utils/openStreetMap';
+import { createTileDomLayer, type TileDomLayer } from '../utils/tileDomLayer';
 import {
   PanelView, PanelViewBox, viewBox, geoToScreenPx, screenPxToGeo, zoomPanelAt, panPanelBy,
   metersPerPixel, fitView, panelViewOf, GROUND_MPP_1CM_2KM,
@@ -70,22 +76,6 @@ export interface MiniZone { pts: { lat: number; lng: number }[]; color?: string;
 export const screenPxToGeoPanel = (vb: PanelViewBox, sx: number, sy: number, canvasW: number, canvasH: number) =>
   screenPxToGeo(sx, sy, vb, canvasW, canvasH);
 
-/** Общий LRU-кэш изображений тайлов для ВСЕХ мини-панелей (экономит трафик OSM) */
-const sharedTileCache = new Map<string, HTMLImageElement | null>();
-const SHARED_CACHE_MAX = 400;
-/** URL тайлов, уже загружаемые в данный момент (защита от дублей при перерисовках) */
-const tileInflight = new Set<string>();
-let sharedActiveLoads = 0;
-const SHARED_MAX_PARALLEL = 4; // щадим tile.openstreetmap.org (суммарно по всем панелям)
-
-function cacheTile(url: string, img: HTMLImageElement | null): void {
-  sharedTileCache.set(url, img);
-  if (sharedTileCache.size > SHARED_CACHE_MAX) {
-    const firstKey = sharedTileCache.keys().next().value as string | undefined;
-    if (firstKey !== undefined) sharedTileCache.delete(firstKey);
-  }
-}
-
 const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   title, icon, center, zoom = 11, fitPoints, minZoom = 3, maxZoom = 20,
   points = [], lines = [], height = 260, onReady,
@@ -93,11 +83,16 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   onPanelDoubleClick,
   tileServer = 'esri',
 }) => {
-  // Рабочий провайдер (legacy 'osm'/'carto' нормализуются) + его нативный максимум
+  // Рабочий провайдер (legacy 'osm'/'carto' нормализуются) — смена стиля должна
+  // сбрасывать слой; нативный максимум провайдера учитывает сам tileDomLayer.
   const serverId: TileServerId = normalizeTileServer(tileServer);
-  const nativeMax = TILE_PROVIDERS[serverId].maxNativeZoom;
   const wrapRef = useRef<HTMLDivElement>(null);
+  const tileHostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  // DOM-слой тайлов (создаётся один раз на монтирование; живёт внутри tileHostRef)
+  const layerRef = useRef<TileDomLayer | null>(null);
+  const serverRef = useRef<TileServerId | 'osm' | 'carto'>(tileServer);
+  useEffect(() => { serverRef.current = tileServer; }, [tileServer]);
   const [size, setSize] = useState({ w: 320, h: typeof height === 'number' ? height : 260 });
   const sizeRef = useRef(size);
   useEffect(() => { sizeRef.current = size; }, [size]);
@@ -205,7 +200,7 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     return () => ro.disconnect();
   }, []);
 
-  // Отрисовка: тайлы + оверлеи, строгая привязка координат
+  // Перерисовка кадров: canvas — ТОЛЬКО оверлеи (подложка — DOM-слой <img>).
   const drawAll = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -217,105 +212,16 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     if (canvas.width !== pw) canvas.width = pw;
     if (canvas.height !== ph) canvas.height = ph;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = '#0f1729';
-    ctx.fillRect(0, 0, w, h);
+    // Канвас прозрачен: подложку показывает DOM-слой тайлов ПОД ним (принцип
+    // режима планирования). fillRect здесь закрасил бы карту.
+    ctx.clearRect(0, 0, w, h);
 
     const v = viewRef.current;
+    // Подложка — синхронизация DOM-слоя (позиция + набор <img>), как syncTileDom
+    // большой карты. Вызывается из этого же effect'а (не из rAF-колбэков), поэтому
+    // безопасен прямой setState-путём bump() через onload слоя (очередь внутри).
+    layerRef.current?.sync(v);
     const vb = viewBox(v, w, h);
-    // Исправление «синего экрана»: уровень сетки НЕ должен обрезаться по maxZoom.
-    // Сетка тайлов строится по фактическому зуму (v.zoom), а запрашивается ближайший
-    // нативный уровень выбранного провайдера (как Leaflet maxNativeZoom): при
-    // z > nativeMax берём более мелкий нативный тайл и рисуем его увеличенным.
-    // Раньше worldPx (по фактическому зуму) не совпадал с сеткой тайлов (по clamp z19) —
-    // тайлы уезжали за экран, оставалась только тёмная подложка (#0f1729 ≈ синий экран).
-    const level = Math.max(minZoom, Math.floor(v.zoom));
-    const srcLevel = Math.min(level, nativeMax); // реальный уровень тайлов у провайдера
-    const upscale = Math.pow(2, level - srcLevel); // во сколько раз растягиваем тайл
-    const n = Math.pow(2, level);
-    // ФИКС «кривой загрузки» + «нечёткости»: экранный px на тайл уровня `level`
-    // = worldPx / 2^level (изотропный: tileW === tileH, см. viewBox). При дробном
-    // зуме масштаб тайла нецелый — для РЕШЁТОЧНЫХ уровней (upscale === 1) тайлы
-    // ставятся на ЦЕЛЫЕ экранные координаты без перекрытия (резкая отрисовка),
-    // а увеличенные нативные тайлы (upscale > 1) рисуются с субпиксельной
-    // привязкой и высоким сглаживанием (иначе появились бы «дырки» между ними).
-    const tileW = vb.wpx / n; // px на тайл уровня `level` по X
-    const tileH = vb.hpx / n; // px на тайл уровня `level` по Y (== tileW)
-    // привязка строго от mercator-долей центра вида (та же формула, что и для объектов)
-    const toTileScreen = (tx: number, ty: number): { x: number; y: number } => ({
-      x: (tx - v.fx * n) * tileW + w / 2,
-      y: (ty - v.fy * n) * tileH + h / 2,
-    });
-    const tx0 = Math.floor(v.fx * n - w / tileW / 2) - 1;
-    const tx1 = Math.ceil(v.fx * n + w / tileW / 2) + 1;
-    const ty0 = Math.floor(v.fy * n - h / tileH / 2) - 1;
-    const ty1 = Math.ceil(v.fy * n + h / tileH / 2) + 1;
-    const need: { url: string; tx: number; ty: number }[] = [];
-    let drawnCount = 0;
-    for (let tx = tx0; tx <= tx1; tx++) {
-      for (let ty = Math.max(0, ty0); ty <= Math.min(n - 1, ty1); ty++) {
-        if (tx < 0 || tx >= n) continue;
-        // Координаты тайла НА РЕАЛЬНОМ уровне srcLevel (для osmde/opentopomap при z>17)
-        const sTx = Math.floor(tx / upscale);
-        const sTy = Math.floor(ty / upscale);
-        const url = getTileUrlVariantsFor(serverId, srcLevel, sTx, sTy)[0];
-        const img = sharedTileCache.get(url);
-        if (img === undefined) { need.push({ url, tx: sTx, ty: sTy }); continue; }
-        if (img === null) continue; // ошибка загрузки — пропускаем (фон остаётся)
-        // Экранное положение тайла уровня `level`; для upscaled-тайлов — позиция
-        // родительского тайла минус смещение внутри него (ровно 1/n мира).
-        const p = toTileScreen(tx, ty);
-        if (upscale === 1) {
-          // РЕШЁТОЧНЫЙ уровень: ставим тайл на целые экранные координаты с
-          // целым размером и БЕЗ субпиксельного сдвига — соседние тайлы точно
-          // примыкают друг к другу без интерполяции на границах. Это и есть
-          // ФИКС «нечёткой карты»: раньше каждый тайл получал +0.5 px перекрытия
-          // при нецелом tile-size (дробный зум), из-за чего растры сливались
-          // в размытое изображение с видимыми «двойными» швами сетки.
-          ctx.imageSmoothingEnabled = false;
-          ctx.drawImage(img, Math.round(p.x - 0.5), Math.round(p.y - 0.5), Math.round(tileW), Math.round(tileH));
-        } else {
-          // Увеличенный нативный тайл (z > nativeMax): субпиксельная привязка +
-          // высокое сглаживание — иначе между растянутыми тайлами появились бы
-          // щели/дыры фона («кривая загрузка» на максимальном приближении).
-          ctx.imageSmoothingEnabled = true;
-          (ctx as any).imageSmoothingQuality = 'high';
-          ctx.drawImage(img, p.x - 0.5, p.y - 0.5, tileW * upscale, tileH * upscale);
-        }
-        drawnCount++;
-      }
-    }
-    if (drawnCount === 0 && need.length === 0) {
-      // ни одного тайла не отрисовано и дозагружать нечего — подсказка вместо синевы
-      ctx.save();
-      ctx.fillStyle = '#64748b'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
-      ctx.fillText('Нет данных тайлов в этой области — вернитесь к объекту (⌂)', w / 2, h / 2);
-      ctx.restore();
-    }
-    // ВАЖНО: здесь НЕЛЬЗЯ делать глобальный ctx.translate(0.5, 0.5) «для чётких
-    // линий» — позиции оверлеев (pointHits/zoneHits), сохраняемые ниже для
-    // hit-теста кликов установки/удаления/перетаскивания точек, вычисляются без
-    // учёта этого сдвига ⇒ все точки рисовались бы со смещением +0.5px, а клик
-    // по точке попадал бы мимо («ошибки с установкой точек»). Приём crisp lines
-    // применяется локально: сдвиг на полпикселя только при stroke тонких линий
-    // (см. ниже), fill-объекты и текст остаются в точных гео-координатах.
-
-    // Дозагрузка недостающих тайлов общей бережной очередью (Esri — с зеркалами)
-    if (need.length > 0) {
-      const cxw = w / 2, cyw = h / 2;
-      need.sort((a, b) => {
-        const pa = toTileScreen(a.tx * upscale, a.ty * upscale), pb = toTileScreen(b.tx * upscale, b.ty * upscale);
-        return ((pa.x - cxw) ** 2 + (pa.y - cyw) ** 2) - ((pb.x - cxw) ** 2 + (pb.y - cyw) ** 2);
-      });
-      for (const t of need.slice(0, 24)) { // жёсткий лимит запросов на перерисовку
-        if (sharedActiveLoads >= SHARED_MAX_PARALLEL) break;
-        if (tileInflight.has(t.url)) continue;
-        tileInflight.add(t.url);
-        sharedActiveLoads++;
-        loadTileImage(t.url, 10000)
-          .then((loaded) => { cacheTile(t.url, loaded); })
-          .finally(() => { tileInflight.delete(t.url); sharedActiveLoads--; bump(); });
-      }
-    }
 
     // Линии (маршруты)
     for (const ln of lines) {
@@ -422,10 +328,39 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     ctx.strokeStyle = '#7dd3fc'; ctx.lineWidth = 1.5;
     ctx.beginPath(); ctx.moveTo(w - barPx - 10, h - 14); ctx.lineTo(w - 10, h - 14); ctx.stroke();
     ctx.restore();
-  }, [lines, points, zones, minZoom, maxZoom, bump, focused, serverId, nativeMax]);
+  }, [lines, points, zones, bump, focused]);
 
-  // Смена стиля подложки — общая: кэш тайлов keyed по URL, достаточно перерисовки
-  useEffect(() => { bump(); }, [serverId, bump]);
+  // ─── DOM-слой тайлов (ПРИНЦИП РЕЖИМА ПЛАНИРОВАНИЯ) ──────────────────────────
+  // Создаётся один раз на монтирование панели; синхронизируется в drawAll.
+  // getView/getSize/getServer — живые ref'ы, поэтому слой всегда видит актуальный
+  // вид/размер/провайдер без пересоздания (как замыкания tileLayer в MapCanvas).
+  useEffect(() => {
+    const host = tileHostRef.current;
+    if (!host) return;
+    const layer = createTileDomLayer(
+      host,
+      () => viewRef.current,
+      () => sizeRef.current,
+      () => serverRef.current,
+    );
+    layerRef.current = layer;
+    layer.sync(viewRef.current);
+    return () => {
+      // unmount-safe: довести число ЖИВЫХ загрузок до нуля (тест wizardFreeze),
+      // удалить DOM-элементы слоя и обнулить ссылку (drawAll после cleanup — no-op)
+      layer.abortAll();
+      layer.reset();
+      host.querySelectorAll('div[aria-hidden="true"]').forEach((n) => n.remove());
+      if (layerRef.current === layer) layerRef.current = null;
+    };
+  }, []);
+
+  // Смена стиля подложки — полный сброс слоя + перерисовка кадра оверлеев
+  // (сам слой инвалидирует набор <img> внутри sync по смене getServer()).
+  useEffect(() => {
+    layerRef.current?.reset();
+    bump();
+  }, [serverId, bump]);
 
   function mercLatOf(v: PanelView): number {
     const nn = Math.PI - 2 * Math.PI * v.fy;
@@ -612,7 +547,11 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
         <button className={btn} title="Вписать объект / сбросить вид" onClick={recenter}>⌂</button>
       </div>
       <div ref={wrapRef} className="relative w-full" style={{ height: `calc(100% - 30px)` }}>
-        <canvas ref={canvasRef} style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none', cursor: focused && onMapClick ? 'crosshair' : 'grab' }} aria-label={`Карта: ${title}`} />
+        {/* Подложка карты — DOM-слой <img>-тайлов (принцип режима планирования,
+            utils/tileDomLayer). Хост ниже канваса в стопке; pointer-events отключены
+            на слое — все события принимает прозрачный canvas оверлеев поверх. */}
+        <div ref={tileHostRef} className="absolute inset-0 overflow-hidden bg-[#0f1729]" aria-hidden="true" />
+        <canvas ref={canvasRef} style={{ position: 'relative', zIndex: 1, width: '100%', height: '100%', display: 'block', touchAction: 'none', cursor: focused && onMapClick ? 'crosshair' : 'grab' }} aria-label={`Карта: ${title}`} />
       </div>
     </div>
   );
