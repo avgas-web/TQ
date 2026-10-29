@@ -17,6 +17,15 @@ import {
   boundsToWorldRect, isValidBounds, lngLatToWorldFrac,
   type CornerCalibration, type ProjectionId,
 } from './userMapGeo';
+// ЭТАП 1.1: тяжёлый парсинг GeoTIFF/MBTiles вынесен в mapParsers.worker
+// (мост сам выполняет graceful degradation на main thread при недоступности воркера)
+import {
+  parseGeoTiffViaWorker,
+  readMbtilesSummaryViaWorker,
+  decodeMbtilesTilesViaWorker,
+  disposeMapParserWorker,
+  type ParseGeoTiffResponseData,
+} from './mapParserBridge';
 
 /** Прогресс загрузки больших файлов (GeoTIFF/MBTiles): 0..1 + стадия */
 export interface LoadProgress { phase: 'read' | 'parse' | 'decode' | 'encode' | 'done'; ratio: number; note?: string }
@@ -360,51 +369,92 @@ export function geotiffBounds(
   return null;
 }
 
-/** Декодирование GeoTIFF: превью RGBA -> PNG data URL + bbox(WGS-84) + проекция */
+/**
+ * Декодирование GeoTIFF: геопривязка + превью PNG.
+ * ЭТАП 1.1: вся тяжёлая работа (geotiff.js, Downsampling, PNG-кодирование)
+ * выполняется в mapParsers.worker — main thread не блокируется даже для
+ * файлов >50MB. При недоступности воркера мост прозрачно фолбэчится на
+ * parseGeoTiffMainThreadFallback (тот же код в main thread).
+ */
 export async function loadGeoTiff(buffer: ArrayBuffer, opts: LoadOptions = {}): Promise<Partial<UserMapLayer>> {
   const onProgress = opts.onProgress;
   onProgress?.({ phase: 'parse', ratio: 0.05 });
-  // Динамический импорт: geotiff тянет WASM/Node-полифиллы — грузим только по нужде
-  const mod: any = await import('geotiff');
-  const GeoTIFF = mod.GeoTIFF ?? mod.default?.GeoTIFF;
-  const tiff = await GeoTIFF.fromArrayBuffer(buffer);
-  onProgress?.({ phase: 'decode', ratio: 0.35 });
-  const image = await tiff.getImage();
-  const width = image.getWidth();
-  const height = image.getHeight();
-  const md: any = {
-    ModelTransformation: readTag(image, 34264),
-    ModelTiepoint: readTag(image, 33922),
-    ModelPixelScale: readTag(image, 33550),
-  };
-  const geoKeys = readGeoKeys(readTag(image, 34735) as number[] | undefined);
-  const proj = projectionFromEpsg(geoKeys.projected ?? (geoKeys.geographic === 4326 ? 4326 : geoKeys.geographic));
-
-  const scaled = fitSize(width, height, opts.maxRasterSide ?? 4096);
-  const data = await image.readRasters({ width: scaled.w, height: scaled.h, interleave: true } as any);
+  const res = await parseGeoTiffViaWorker(buffer, '', opts.maxRasterSide ?? 4096);
   onProgress?.({ phase: 'encode', ratio: 0.75 });
-
-  const rgba = toRgba(data as ArrayLike<number>, scaled.w, scaled.h, image.samplesPerPixel ?? data.length / 4 / 1);
-  const imageDataUrl = await encodeRgbaPng(rgba, scaled.w, scaled.h, onProgress);
-
-  const raw = geotiffBounds(width, height, md);
-  const bbox = raw ? normalizeBoundsToWgs84(clampBounds(raw.bounds)) : null;
+  const bbox = normalizeBoundsToWgs84(clampBounds(res.bounds));
   onProgress?.({ phase: 'done', ratio: 1 });
   return {
     kind: 'raster' as UserMapKind,
     format: 'geotiff' as UserMapFormat,
-    projection: proj,
-    bbox: bbox ?? undefined,
-    imageDataUrl,
-    imageWidth: scaled.w,
-    imageHeight: scaled.h,
-    calibration: raw ? { bounds: bbox!, method: md.ModelTransformation ? 'geotransform' : 'tiepoints' } : undefined,
+    projection: res.projection === 'EPSG:3857' ? EPSG_3857 : EPSG_4326,
+    bbox,
+    imageDataUrl: res.imageDataUrl,
+    imageWidth: res.widthPx,
+    imageHeight: res.heightPx,
+    calibration: { bounds: bbox, method: res.method },
   } as Partial<UserMapLayer>;
 }
 
+/**
+ * Main-thread фолбэк парсинга GeoTIFF (используется mapParserBridge, когда
+ * Web Worker недоступен/упал/не ответил за таймаут). Legacy-путь: geotiff.js
+ * грузится динамическим импортом — чанк создаётся только по нужде.
+ */
+export async function parseGeoTiffMainThreadFallback(
+  buffer: ArrayBuffer, maxSide: number, onProgress?: ProgressCb,
+): Promise<ParseGeoTiffResponseData> {
+  onProgress?.({ phase: 'parse', ratio: 0.05 });
+  // Динамический импорт: geotiff тянет WASM/Node-полифиллы — грузим только по нужде
+  const mod = await import('geotiff');
+  const GeoTIFFCtor = (mod as { GeoTIFF?: unknown }).GeoTIFF
+    ?? (mod as { default?: { GeoTIFF?: unknown } }).default?.GeoTIFF;
+  if (typeof GeoTIFFCtor !== 'function') throw new Error('GeoTIFF: модуль geotiff не загрузился');
+  type Rasters = ArrayLike<number>[] | ArrayLike<number>;
+  interface TiffImageLike {
+    getWidth(): number;
+    getHeight(): number;
+    samplesPerPixel?: number;
+    fileDirectory?: Record<string, number[] | undefined>;
+    readRasters(opts: { width: number; height: number; interleave: boolean }): Promise<Rasters>;
+  }
+  interface TiffLike { getImage(): Promise<TiffImageLike> }
+  const tiff = await (GeoTIFFCtor as { fromArrayBuffer(b: ArrayBuffer): Promise<TiffLike> }).fromArrayBuffer(buffer);
+  onProgress?.({ phase: 'decode', ratio: 0.35 });
+  const image = await tiff.getImage();
+  const width = image.getWidth();
+  const height = image.getHeight();
+  const md = {
+    ModelTransformation: readTag(image, 34264),
+    ModelTiepoint: readTag(image, 33922),
+    ModelPixelScale: readTag(image, 33550),
+  };
+  const geoKeys = readGeoKeys(readTag(image, 34735));
+  const proj = projectionFromEpsg(geoKeys.projected ?? (geoKeys.geographic === 4326 ? 4326 : geoKeys.geographic));
+
+  const scaled = fitSize(width, height, maxSide);
+  const data = await image.readRasters({ width: scaled.w, height: scaled.h, interleave: true });
+  onProgress?.({ phase: 'encode', ratio: 0.75 });
+
+  const rgba = toRgba(data as ArrayLike<number>, scaled.w, scaled.h);
+  const imageDataUrl = await encodeRgbaPng(rgba, scaled.w, scaled.h, onProgress);
+
+  const raw = geotiffBounds(width, height, md);
+  if (!raw) throw new Error('GeoTIFF: отсутствуют теги геопривязки (ModelPixelScale/ModelTiepoint/ModelTransformation)');
+  const bbox = normalizeBoundsToWgs84(clampBounds(raw.bounds));
+  onProgress?.({ phase: 'done', ratio: 1 });
+  return {
+    widthPx: scaled.w,
+    heightPx: scaled.h,
+    projection: proj === EPSG_3857 ? 'EPSG:3857' : 'EPSG:4326',
+    bounds: bbox,
+    method: md.ModelTransformation && md.ModelTransformation.length >= 12 ? 'geotransform' : 'tiepoints',
+    imageDataUrl,
+  };
+}
+
 /** Чтение GeoTIFF-тега из fileDirectory (geotiff.js отдаёт значения по номеру тега) */
-function readTag(image: any, tag: number): any {
-  try { return image?.fileDirectory?.[tag]; }
+function readTag(image: { fileDirectory?: Record<string, number[] | undefined> }, tag: number): number[] | undefined {
+  try { return image?.fileDirectory?.[String(tag)]; }
   catch { return undefined; }
 }
 
@@ -506,32 +556,43 @@ export interface MbtilesSummary {
   description: string;
 }
 
-/** Чтение метаданных MBTiles через sql.js (WASM SQLite) */
+/**
+ * Чтение метаданных MBTiles. ЭТАП 1.1: sql.js/WASM SQLite работает внутри
+ * mapParsers.worker (инициализация WASM и полный проход по БД не блокируют
+ * main thread). Фолбэк при недоступности воркера — readMbtilesSummaryMainThread.
+ */
 export async function readMbtilesSummary(
   buffer: ArrayBuffer,
-  initSqlJs?: (config?: any) => Promise<any>,
   onProgress?: ProgressCb
 ): Promise<MbtilesSummary> {
-  const loader = initSqlJs ?? (async () => {
-    const mod: any = await import('sql.js');
-    const factory = mod.default ?? mod.initSqlJs ?? mod.initSqlJs;
-    const wasmPath = wasmUrlFor('sql-wasm.wasm');
-    const SQL = await (typeof factory === 'function' ? factory({ locateFile: () => wasmPath }) : factory);
-    return SQL;
-  });
   onProgress?.({ phase: 'parse', ratio: 0.1 });
-  const SQL = await loader();
-  onProgress?.({ phase: 'decode', ratio: 0.4 });
+  const s = await readMbtilesSummaryViaWorker(buffer);
+  onProgress?.({ phase: 'done', ratio: 1 });
+  return {
+    metadata: s.metadata,
+    bounds: s.bounds ? clampBounds(s.bounds) : null,
+    tileCount: s.tileCount,
+    minZoom: s.minZoom,
+    maxZoom: s.maxZoom,
+    format: s.format,
+    name: s.name,
+    description: s.description,
+  };
+}
+
+/** Main-thread фолбэк чтения метаданных MBTiles (используется mapParserBridge) */
+export async function readMbtilesSummaryMainThread(buffer: ArrayBuffer): Promise<MbtilesSummary> {
+  const SQL = await openSqlJsMain();
   const db = new SQL.Database(new Uint8Array(buffer));
   try {
     const meta: Record<string, string> = {};
-    const run = (sql: string) => {
+    const run = (sql: string): unknown[][] => {
       const res = db.exec(sql);
       return res.length ? res[0].values : [];
     };
-    let rows: any[][] = [];
+    let rows: unknown[][] = [];
     try { rows = run(MBTILES_SQL.metadata); } catch { rows = []; }
-    for (const [k, v] of rows) meta[String(k)] = String(v ?? '');
+    for (const r of rows) meta[String(r[0])] = String(r[1] ?? '');
 
     let tileCount = 0, minZoom = 0, maxZoom = 0;
     try {
@@ -542,10 +603,8 @@ export async function readMbtilesSummary(
       maxZoom = Number(z[0]?.[1] ?? minZoom);
     } catch { /* пустая БД */ }
 
-    const bounds = parseMbtilesBounds(meta.bounds);
-    onProgress?.({ phase: 'done', ratio: 1 });
     return {
-      metadata: meta, bounds, tileCount, minZoom, maxZoom,
+      metadata: meta, bounds: parseMbtilesBounds(meta.bounds), tileCount, minZoom, maxZoom,
       format: (meta.format || 'png').toLowerCase(),
       name: meta.name || '', description: meta.description || '',
     };
@@ -613,35 +672,59 @@ export function extractMbtilesTiles(
 }
 
 /**
- * Декодер тайлов для рендера: открывает SQLite-базу один раз на буфер
- * (кэшируется по ссылке ArrayBuffer), достраивает недостающие тайлы по запросу.
+ * Инициализация sql.js в main thread — ТОЛЬКО для graceful degradation,
+ * когда mapParsers.worker недоступен (жёсткие CSP/старые браузеры).
+ * В штатном режиме WASM SQLite живёт внутри воркера.
  */
-let cachedMbtilesDb: { buffer: ArrayBuffer; db: any } | null = null;
+type SqlJsDatabaseLike = {
+  exec(sql: string): { columns?: string[]; values: unknown[][] }[];
+  free?(): void;
+};
+type SqlJsLike = { Database: new (data?: Uint8Array) => SqlJsDatabaseLike };
+let sqlJsMainPromise: Promise<SqlJsLike> | null = null;
 
-async function openMbtilesDb(buffer: ArrayBuffer): Promise<any> {
-  if (cachedMbtilesDb && cachedMbtilesDb.buffer === buffer) return cachedMbtilesDb.db;
-  const mod: any = await import('sql.js');
-  const factory = mod.default ?? mod.initSqlJs ?? mod.initSqlJs;
-  const wasmPath = wasmUrlFor('sql-wasm.wasm');
-  const SQL = await (typeof factory === 'function' ? factory({ locateFile: () => wasmPath }) : factory);
+function openSqlJsMain(): Promise<SqlJsLike> {
+  if (!sqlJsMainPromise) {
+    sqlJsMainPromise = (async (): Promise<SqlJsLike> => {
+      const mod = await import('sql.js');
+      const factory = typeof mod.initSqlJs === 'function' ? mod.initSqlJs : (mod as unknown as { default?: typeof mod.initSqlJs }).default;
+      if (typeof factory !== 'function') throw new Error('MBTiles: модуль sql.js не загрузился');
+      const wasmPath = wasmUrlFor('sql-wasm.wasm');
+      return (await factory({ locateFile: () => wasmPath })) as unknown as SqlJsLike;
+    })().catch((err: unknown) => {
+      sqlJsMainPromise = null; // даём шанс повторной инициализации
+      throw err instanceof Error ? err : new Error(String(err));
+    });
+  }
+  return sqlJsMainPromise;
+}
+
+/** Main-thread фолбэк декода волны тайлов (используется mapParserBridge) */
+export async function decodeMbtilesTilesMainThread(
+  buffer: ArrayBuffer, keys: string[], format = 'png',
+): Promise<Record<string, string>> {
+  const SQL = await openSqlJsMain();
   const db = new SQL.Database(new Uint8Array(buffer));
-  cachedMbtilesDb?.db?.free?.();
-  cachedMbtilesDb = { buffer, db };
-  return db;
+  try {
+    return extractMbtilesTiles(db, keys, format);
+  } finally {
+    db.free?.();
+  }
 }
 
-/** Освобождение кэша SQLite (при удалении слоя) */
+/** Освобождение ресурсов парсера (при удалении слоя): main-thread кэш + воркер */
 export function closeMbtilesDbCache(): void {
-  cachedMbtilesDb?.db?.free?.();
-  cachedMbtilesDb = null;
+  disposeMapParserWorker();
 }
 
-/** Реализация decodeTile для requestMbtilesTiles (MapCanvas -> sql.js) */
+/**
+ * Реализация decodeTile для requestMbtilesTiles (MapCanvas): волна тайлов
+ * декодируется в mapParsers.worker, main thread не блокируется.
+ */
 export async function decodeMbtilesTilesForRender(
   buffer: ArrayBuffer, keys: string[], format = 'png',
 ): Promise<Record<string, string>> {
-  const db = await openMbtilesDb(buffer);
-  return extractMbtilesTiles(db, keys, format);
+  return decodeMbtilesTilesViaWorker(buffer, keys, format);
 }
 
 // ─── Растр с ручной привязкой по 4 углам ─────────────────────────────────────
@@ -751,9 +834,10 @@ export async function loadUserMapFile(file: File, opts: LoadOptions = {}): Promi
 
   if (format === 'mbtiles') {
     // Бинарник SQLite храним ЦЕЛИКОМ (sourceBlob): тайлы извлекаются лениво
-    // через sql.js только для видимой области (requestMbtilesTiles в MapCanvas).
+    // через sql.js в mapParsers.worker только для видимой области
+    // (requestMbtilesTiles в MapCanvas).
     const buffer = await file.arrayBuffer();
-    const summary = await readMbtilesSummary(buffer, undefined, onProgress);
+    const summary = await readMbtilesSummary(buffer, onProgress);
     if (!summary.tileCount) throw new Error('MBTiles не содержит тайлов');
     const bbox = summary.bounds ?? syntheticMbtilesBounds(summary.minZoom, summary.maxZoom);
     return base('raster', {

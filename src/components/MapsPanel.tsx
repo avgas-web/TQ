@@ -6,11 +6,13 @@ import { osmGeocode } from '../utils/openStreetMap';
 import { TILE_PROVIDERS, TILE_SERVER_ORDER, DEFAULT_TILE_SERVER, normalizeTileServer } from '../utils/openStreetMap';
 import type { TileServerId } from '../utils/openStreetMap';
 import type { MapProvider } from '../types';
+// ЭТАП 1.2: ключи живут только в памяти сессии (sessionSecrets) — компонент
+// не хранит полные значения в своём state и не читает их из localStorage.
+import { getSessionApiKey } from '../utils/sessionSecrets';
+import SessionApiKeyInput from './SessionApiKeyInput';
 
 const MapsPanel: React.FC = () => {
   const [activeProvider, setActiveProvider] = useState<MapProvider>('google');
-  const [googleApiKey, setGoogleApiKey] = useState('');
-  const [yandexApiKey, setYandexApiKey] = useState('');
   const [addressInput, setAddressInput] = useState('');
   const [zoomInput, setZoomInput] = useState('15');
   const [googleMapType, setGoogleMapType] = useState<'roadmap' | 'satellite' | 'hybrid' | 'terrain'>('satellite');
@@ -40,59 +42,57 @@ const MapsPanel: React.FC = () => {
     setMapBounds,
   } = useStore();
 
-  // Инициализация API ключей из проекта
+  // Инициализация UI по состоянию сессии (ЭТАП 1.2): полные ключи из
+  // localStorage больше не подтягиваются — apiKey в персисте всегда ''.
   React.useEffect(() => {
-    if (project.googleMaps?.apiKey) {
-      setGoogleApiKey(project.googleMaps.apiKey);
-    }
-    if (project.yandexMaps?.apiKey) {
-      setYandexApiKey(project.yandexMaps.apiKey);
-    }
     if (project.openStreetMap?.tileServer) {
       // legacy-значения ('osm', 'carto') нормализуются в рабочие серверы
       setOsmTileServer(normalizeTileServer(project.openStreetMap.tileServer));
     }
   }, [project]);
 
-  const handleSaveGoogleApiKey = async () => {
-    if (!googleApiKey.trim()) {
-      setError('Введите API ключ Google Maps');
-      return;
-    }
-
+  const handleApplyGoogleKey = async (key: string) => {
     setLoading(true);
     setError('');
     setSuccess('');
-
     try {
-      await loadGoogleMapsApi(googleApiKey.trim());
-      setGoogleMapsApiKey(googleApiKey.trim());
-      toggleGoogleMaps(true);
-      setSuccess('Google Maps API ключ сохранён');
+      setGoogleMapsApiKey(key);
+      if (key) {
+        await loadGoogleMapsApi(key);
+        toggleGoogleMaps(true);
+        setSuccess('Ключ Google Maps применён (только память текущей сессии)');
+      } else {
+        toggleGoogleMaps(false);
+        setSuccess('Ключ Google Maps удалён из памяти сессии');
+      }
     } catch (err) {
+      // откат флага, если API не загрузился (некорректный ключ)
+      setGoogleMapsApiKey('');
       setError(err instanceof Error ? err.message : 'Ошибка загрузки Google Maps');
+      throw err;
     } finally {
       setLoading(false);
     }
   };
 
-  const handleSaveYandexApiKey = async () => {
-    if (!yandexApiKey.trim()) {
-      setError('Введите API ключ Яндекс.Карт');
-      return;
-    }
-
+  const handleApplyYandexKey = async (key: string) => {
     setLoading(true);
     setError('');
     setSuccess('');
-
     try {
-      await loadYandexMapsApi(yandexApiKey.trim());
-      setYandexMapsApiKey(yandexApiKey.trim());
-      toggleYandexMaps(true);
-      setSuccess('Яндекс.Карты API ключ сохранён');
+      setYandexMapsApiKey(key);
+      if (key) {
+        await loadYandexMapsApi(key);
+        toggleYandexMaps(true);
+        setSuccess('Ключ Яндекс.Карт применён (только память текущей сессии)');
+      } else {
+        toggleYandexMaps(false);
+        setSuccess('Ключ Яндекс.Карт удалён из памяти сессии');
+      }
     } catch (err) {
+      setYandexMapsApiKey('');
       setError(err instanceof Error ? err.message : 'Ошибка загрузки Яндекс.Карт');
+      throw err;
     } finally {
       setLoading(false);
     }
@@ -182,7 +182,7 @@ const MapsPanel: React.FC = () => {
           zoom,
           width,
           height,
-          project.googleMaps?.apiKey || '',
+          project.googleMaps?.apiKey || getSessionApiKey('google'),
           googleMapType
         );
 
@@ -213,7 +213,7 @@ const MapsPanel: React.FC = () => {
           zoom,
           width,
           height,
-          project.yandexMaps?.apiKey || '',
+          project.yandexMaps?.apiKey || getSessionApiKey('yandex'),
           yandexMapType
         );
 
@@ -312,59 +312,15 @@ const MapsPanel: React.FC = () => {
         ))}
       </div>
 
-      {/* API Key section */}
+      {/* API Key section — ЭТАП 1.2: masked input + модалка о рисках,
+          значение уходит только в память сессии (sessionSecrets), не в state
+          компонента и не в localStorage. */}
       {activeProvider === 'google' && (
-        <form
-          onSubmit={(e) => { e.preventDefault(); handleSaveGoogleApiKey(); }}
-          autoComplete="off"
-        >
-          <label className="text-xs text-gray-400 block mb-1">API ключ Google Maps</label>
-          <div className="flex gap-1">
-            <input
-              type="password"
-              name="google-maps-key"
-              autoComplete="new-password"
-              value={googleApiKey}
-              onChange={(e) => setGoogleApiKey(e.target.value)}
-              placeholder="Введите API ключ"
-              className="flex-1 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white placeholder-gray-500"
-            />
-            <button
-              type="submit"
-              disabled={loading}
-              className="px-3 py-1 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white rounded text-xs"
-            >
-              {loading ? '...' : 'OK'}
-            </button>
-          </div>
-        </form>
+        <SessionApiKeyInput kind="google" onApply={handleApplyGoogleKey} disabled={loading} />
       )}
 
       {activeProvider === 'yandex' && (
-        <form
-          onSubmit={(e) => { e.preventDefault(); handleSaveYandexApiKey(); }}
-          autoComplete="off"
-        >
-          <label className="text-xs text-gray-400 block mb-1">API ключ Яндекс.Карт</label>
-          <div className="flex gap-1">
-            <input
-              type="password"
-              name="yandex-maps-key"
-              autoComplete="new-password"
-              value={yandexApiKey}
-              onChange={(e) => setYandexApiKey(e.target.value)}
-              placeholder="Введите API ключ"
-              className="flex-1 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white placeholder-gray-500"
-            />
-            <button
-              type="submit"
-              disabled={loading}
-              className="px-3 py-1 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white rounded text-xs"
-            >
-              {loading ? '...' : 'OK'}
-            </button>
-          </div>
-        </form>
+        <SessionApiKeyInput kind="yandex" onApply={handleApplyYandexKey} disabled={loading} />
       )}
 
       {activeProvider === 'osm' && (

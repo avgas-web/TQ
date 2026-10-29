@@ -224,12 +224,16 @@ export function importProject(json: string): Project | null {
       tilesEnabled: data.settings?.tilesEnabled,
     },
     googleMaps: {
-      apiKey: str(data.googleMaps?.apiKey, ''),
+      // ЭТАП 1.2: ключ не персистится и не импортируется из файла — только '' +
+      // флаги (hasKey подтягивается из памяти сессии при применении проекта).
+      apiKey: '',
       enabled: !!(data.googleMaps && data.googleMaps.enabled),
+      hasKey: typeof data.googleMaps?.hasKey === 'boolean' ? data.googleMaps.hasKey : undefined,
     },
     yandexMaps: {
-      apiKey: str(data.yandexMaps?.apiKey, ''),
+      apiKey: '',
       enabled: !!(data.yandexMaps && data.yandexMaps.enabled),
+      hasKey: typeof data.yandexMaps?.hasKey === 'boolean' ? data.yandexMaps.hasKey : undefined,
     },
     openStreetMap: {
       enabled: !!(data.openStreetMap && data.openStreetMap.enabled),

@@ -122,12 +122,16 @@ export interface Project {
     altitudeClearanceM?: number;
   };
   googleMaps: {
+    /** ЭТАП 1.2: всегда '' в персисте — ключ живёт только в памяти сессии */
     apiKey: string;
     enabled: boolean;
+    /** Флаг «ключ введён в текущей сессии» (реактивность UI без значения) */
+    hasKey?: boolean;
   };
   yandexMaps: {
     apiKey: string;
     enabled: boolean;
+    hasKey?: boolean;
   };
   openStreetMap: {
     enabled: boolean;

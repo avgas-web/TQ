@@ -146,10 +146,20 @@ export const ProjectSchema = z.object({
     showGrid: true, gridSize: 0, showCoordinates: true, theme: 'dark',
     tilesEnabled: true, elevationAuto: true, altitudeClearanceM: 50,
   }),
-  googleMaps: z.object({ apiKey: z.string().default(''), enabled: z.boolean().default(false) })
-    .default({ apiKey: '', enabled: false }),
-  yandexMaps: z.object({ apiKey: z.string().default(''), enabled: z.boolean().default(false) })
-    .default({ apiKey: '', enabled: false }),
+  // ЭТАП 1.2 (безопасность): apiKey в персисте всегда ''. Ключи Google/Яндекс
+  // хранятся только в памяти сессии (utils/sessionSecrets). hasKey — реактивный
+  // флаг для UI; sanitize принудительно затирает любое значение apiKey,
+  // подтягивая hasKey из фактического состояния сессии.
+  googleMaps: z.object({
+    apiKey: z.string().default(''),
+    enabled: z.boolean().default(false),
+    hasKey: z.boolean().optional(),
+  }).transform((v) => ({ ...v, apiKey: '' })).default({ apiKey: '', enabled: false }),
+  yandexMaps: z.object({
+    apiKey: z.string().default(''),
+    enabled: z.boolean().default(false),
+    hasKey: z.boolean().optional(),
+  }).transform((v) => ({ ...v, apiKey: '' })).default({ apiKey: '', enabled: false }),
   openStreetMap: z.object({
     enabled: z.boolean().default(false),
     // Рабочие id из TILE_PROVIDERS (esri, esri-sat, osmfr, hot, osmde, opentopomap,

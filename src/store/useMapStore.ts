@@ -24,6 +24,7 @@ import {
 import { loadTacticalMapFile } from '../utils/tacticalMapLoader';
 import { mercatorYToLat, calculateBoundsFromCenter } from '../utils/googleMaps';
 import { sanitizeProjectData } from '../utils/projectSchema';
+import { setSessionApiKey, hasSessionApiKey } from '../utils/sessionSecrets';
 
 const MIN_MAP_ZOOM_FLOOR = 6;
 
@@ -93,8 +94,10 @@ export interface MapState {
   restrictions: Restriction[];
   layers: Layer[];
   calibration: { enabled: boolean; points: CalibrationPoint[] };
-  googleMaps: { apiKey: string; enabled: boolean };
-  yandexMaps: { apiKey: string; enabled: boolean };
+  /** ЭТАП 1.2: apiKey всегда '' (ключ — в sessionSecrets, память сессии);
+   *  hasKey — реактивный флаг наличия ключа для UI. */
+  googleMaps: { apiKey: string; enabled: boolean; hasKey?: boolean };
+  yandexMaps: { apiKey: string; enabled: boolean; hasKey?: boolean };
   /** tileServer — рабочий id из TILE_PROVIDERS либо legacy-значение ('osm', 'carto');
    *  при чтении нормализуется normalizeTileServer() (тип string — для совместимости со старыми проектами). */
   openStreetMap: { enabled: boolean; tileServer?: string };
@@ -425,9 +428,18 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
     }
   },
 
-  setGoogleMapsApiKey: (apiKey) => set((state) => ({ googleMaps: { ...state.googleMaps, apiKey } })),
+  // ЭТАП 1.2 (безопасность): ключ живёт ТОЛЬКО в памяти сессии (sessionSecrets).
+  // В стор пишется лишь флаг hasKey для реактивности UI — partialize ниже
+  // принудительно затирает apiKey перед любой записью в localStorage.
+  setGoogleMapsApiKey: (apiKey) => {
+    setSessionApiKey('google', apiKey);
+    set((state) => ({ googleMaps: { ...state.googleMaps, apiKey: '', hasKey: apiKey.trim().length > 0 } }));
+  },
   toggleGoogleMaps: (enabled) => set((state) => ({ googleMaps: { ...state.googleMaps, enabled } })),
-  setYandexMapsApiKey: (apiKey) => set((state) => ({ yandexMaps: { ...state.yandexMaps, apiKey } })),
+  setYandexMapsApiKey: (apiKey) => {
+    setSessionApiKey('yandex', apiKey);
+    set((state) => ({ yandexMaps: { ...state.yandexMaps, apiKey: '', hasKey: apiKey.trim().length > 0 } }));
+  },
   toggleYandexMaps: (enabled) => set((state) => ({ yandexMaps: { ...state.yandexMaps, enabled } })),
   toggleOpenStreetMap: (enabled) => set((state) => ({ openStreetMap: { ...state.openStreetMap, enabled } })),
   setOSMTileServer: (server) => {
@@ -606,7 +618,7 @@ export const useMapStore = create<MapStore>()(
     (...a) => ({ ...initialMapState, ...createMapActions(...a) }),
     {
       name: 'tq-map',
-      version: 3,
+      version: 4,
       // Явная JSON-гидрация из localStorage. Важно: при default storage persist
       // записывает восстановленные поля через Object.assign (in-place мутация до
       // первого notify) — компонент мог отрендериться с частично гидрированным
@@ -625,8 +637,10 @@ export const useMapStore = create<MapStore>()(
         restrictions: s.restrictions,
         layers: s.layers,
         calibration: s.calibration,
-        googleMaps: s.googleMaps,
-        yandexMaps: s.yandexMaps,
+        // ЭТАП 1.2: в localStorage уходит только { apiKey: '', enabled, hasKey } —
+        // сам ключ не персистится никогда (sessionSecrets = память сессии).
+        googleMaps: { ...s.googleMaps, apiKey: '' },
+        yandexMaps: { ...s.yandexMaps, apiKey: '' },
         openStreetMap: s.openStreetMap,
         settings: s.settings,
         _currentMapId: s._currentMapId,
@@ -664,6 +678,21 @@ export const useMapStore = create<MapStore>()(
         else if (!p.googleMaps) p.googleMaps = { apiKey: '', enabled: false };
         if (proj.yandexMaps) p.yandexMaps = proj.yandexMaps;
         else if (!p.yandexMaps) p.yandexMaps = { apiKey: '', enabled: false };
+        // Миграция v3→v4 (ЭТАП 1.2, обратная совместимость): старые проекты
+        // могли содержать открытый apiKey в localStorage — безвозвратно удаляем
+        // значение из персиста, оставляя только флаг hasKey для UI-подсказки
+        // («ключ был сохранён ранее — введите его заново в этой сессии»).
+        for (const kind of ['google', 'yandex'] as const) {
+          const field = kind === 'google' ? 'googleMaps' : 'yandexMaps';
+          const sec = p[field] as { apiKey?: string; enabled?: boolean; hasKey?: boolean } | undefined;
+          if (!sec) continue;
+          if (typeof sec.apiKey === 'string' && sec.apiKey.length > 0) {
+            // помечаем «ключ был раньше» — UI подскажет, что нужно ввести заново
+            sec.hasKey = hasSessionApiKey(kind);
+            sec.apiKey = '';
+            console.warn(`[tq-map migrate] API-ключ ${kind} удалён из localStorage (ЭТАП 1.2). Введите его заново — ключ хранится только в памяти сессии.`);
+          }
+        }
         if (proj.openStreetMap) p.openStreetMap = proj.openStreetMap;
         else if (!p.openStreetMap) p.openStreetMap = { enabled: false, tileServer: 'osm' };
         const st = (p.settings ?? {}) as Partial<ProjectSettings>;

@@ -6,6 +6,9 @@
 // провайдера (ключ/включение) для graceful degradation UI.
 // ═══════════════════════════════════════════════════════════════
 import type { Project } from '../types';
+// ЭТАП 1.2: проверка наличия ключа — по памяти сессии (sessionSecrets),
+// т.к. в персисте apiKey всегда ''.
+import { hasSessionApiKey } from './sessionSecrets';
 
 /** Legacy-реестр провайдеров. «2gis» УДАЛЁН ПОЛНОСТЬЮ (ТЗ): слой убран из
  *  всех списков выбора; старые сохранения нормализует normalizeTileServer(). */
@@ -64,7 +67,9 @@ export function getProviderStatus(project: Pick<Project, 'googleMaps' | 'yandexM
   const base = { id, name: '', ready: true, requiresKey: providerRequiresKey(id) };
   switch (id) {
     case 'google': {
-      const hasKey = !!project.googleMaps?.apiKey && project.googleMaps.enabled;
+      // ЭТАП 1.2: apiKey в персисте всегда '' — актуальность ключа проверяется
+      // по памяти сессии (sessionSecrets), включая dev-ключ из .env.
+      const hasKey = (hasSessionApiKey('google') || !!project.googleMaps?.apiKey) && project.googleMaps.enabled;
       return {
         ...base,
         name: 'Google Maps',
@@ -75,7 +80,7 @@ export function getProviderStatus(project: Pick<Project, 'googleMaps' | 'yandexM
       };
     }
     case 'yandex': {
-      const hasKey = !!project.yandexMaps?.apiKey && project.yandexMaps.enabled;
+      const hasKey = (hasSessionApiKey('yandex') || !!project.yandexMaps?.apiKey) && project.yandexMaps.enabled;
       return {
         ...base,
         name: 'Яндекс.Карты',
