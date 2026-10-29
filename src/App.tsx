@@ -339,6 +339,11 @@ const App: React.FC = () => {
             const next = !wizardMode;
             setWizardMode(next);
             localStorage.setItem('tq-ui-mode', next ? 'wizard' : 'legacy');
+            // ФИКС (этап 4): событие для слушателя в MapCanvas — синхронизация
+            // wizardActive в том же окне ('storage' срабатывает только на ДРУГИЕ
+            // вкладки). Без этого оверлей трёх окон/стартовый fit основной карты
+            // работали на stale-значении режима.
+            window.dispatchEvent(new Event('tq-ui-mode-changed'));
           }}
           className="ml-3 px-2 py-0.5 bg-cyan-800 hover:bg-cyan-700 border border-cyan-600 rounded text-xs text-white"
           title="Переключить мастер планирования миссий / классический редактор"

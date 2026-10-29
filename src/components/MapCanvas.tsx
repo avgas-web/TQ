@@ -1143,9 +1143,26 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   // Единственный источник истины о режиме UI — localStorage-ключ 'tq-ui-mode'
   // (пишет App.tsx при переключении «Мастер миссий / Редактор»). Значение по
   // умолчанию — мастер (всё, кроме явного 'legacy').
-  const [wizardActive] = useState<boolean>(
+  // ФИКС: слушаем смену ключа ('storage' — другие вкладки; own-событие от
+  // App.tsx — то же окно). Раньше значение читалось ОДИН раз при монтировании
+  // useState-инициализатором: MapCanvas не remount'ится при переключении
+  // «Мастер ↔ Редактор» (App рендерит его условно, но хук жил бы stale при
+  // любом другом пути), из-за чего legacy-оверлей трёх окон мог не появляться/
+  // не скрываться, а стартовый fit основной карты работал на неверном layout.
+  const [wizardActive, setWizardActive] = useState<boolean>(
     () => { try { return localStorage.getItem('tq-ui-mode') !== 'legacy'; } catch { return true; } },
   );
+  useEffect(() => {
+    const sync = () => {
+      try { setWizardActive(localStorage.getItem('tq-ui-mode') !== 'legacy'); } catch { /* ignore */ }
+    };
+    window.addEventListener('storage', sync);
+    window.addEventListener('tq-ui-mode-changed', sync);
+    return () => {
+      window.removeEventListener('storage', sync);
+      window.removeEventListener('tq-ui-mode-changed', sync);
+    };
+  }, []);
   const tripleMode = !wizardActive;
   // ─── Режимы работы с окнами (отдельные пункты меню):
   //  'restrictions' — Установка ограничений (клик по ЛЮБОЙ карте ставит зону);
@@ -2197,11 +2214,29 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // пересчитывается. Ждём оба валидных измерения — для режима 3 окон логика не
     // меняется: MiniMapPanel имеет собственный рендер и этот эффект не использует.
     if (!map || !mapLoaded || canvasSize.width <= 0 || canvasSize.height <= 0) return;
-    const boundsKey = map.bounds ? `${map.bounds.north},${map.bounds.south}` : 'nobounds';
+    const boundsKey = map.bounds ? `${map.bounds.north},${map.bounds.south},${map.bounds.west},${map.bounds.east}` : 'nobounds';
     const fitKey = `${map.dataUrl ? 'img' : 'tiles'}|${boundsKey}`;
-    if (lastInitialFitRef.current === fitKey) return; // только ОДИН раз на карту — ресайз вид не трогает
-    lastInitialFitRef.current = fitKey;
-    if (!map.bounds) return;
+    // ФИКС «1 окно: битый вид зафиксирован навсегда» (этап 3): раньше ключ
+    // ставился ДО проверки сохранённого вида — при невалидном/чужом savedView
+    // эффект выходил с помеченным ключом, повторный fit блокировался и карта
+    // оставалась на stale-виде от другой карты («карта также не работает»).
+    // Флаги после ключа: '|pending' — промежуточный замер (fit пересчитается
+    // на следующем изменении размеров), '|saved' — восстановлен savedView
+    // (пересчёт при следующем resize — безопасный фолбэк). Штатно выполненный fit
+    // хранит ключ без флага — ранний выход: ресайз/смена режима вид НЕ
+    // трогают (прежнее поведение; режим трёх окон этим кодом не управляет).
+    // ФИКС (этап 3, v2): сравнение по ПРЕФИКСУ ключа. Раньше проверялось
+    // точное равенство «ключ === fitKey», но флаги '|pending'/'|saved'
+    // дописываются ПОСЛЕ fitKey ⇒ строки никогда не совпадали, ветка сброса
+    // была мертва, а штатно выполненный fit ('fitKey' без флага) при любом
+    // повторном проходе эффекта перезапускал подгонку и затирал ручной
+    // зум/пан пользователя (remount-гипотеза «карта также не работает»).
+    const prevFit = lastInitialFitRef.current ?? '';
+    if (prevFit === fitKey) return; // fit выполнен штатно — ресайз/смена режима вид НЕ трогают
+    if (prevFit.startsWith(fitKey + '|')) {
+      lastInitialFitRef.current = null; // был pending/saved — пересчитаем ниже на валидных размерах
+    }
+    if (!map.bounds) { lastInitialFitRef.current = `${fitKey}|pending`; return; }
     // ── ФИКС «ВИСНЕТ НАМЕРТВО ПРИ ЗАГРУЗКЕ КАРТ» + «Фиксация над СПб» ───────
     // Стартовая фиксация вида выполняется ровно ОДИН раз для конкретной карты:
     // если в localStorage-зеркале уже есть валидный сохранённый вид именно для
@@ -2227,6 +2262,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
             setViewState({ ...v });
           }
         }
+        lastInitialFitRef.current = `${fitKey}|saved`; // флаг: пересчёт возможен при resize
         return;
       }
     }
@@ -2355,6 +2391,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // немедленно уходит в localStorage-зеркало 'tq-view' СИНХРОННО. Без этого
     // remount до ближайшего кадра/жеста читал бы зеркало со stale-видом или
     // без ключа карты → повторная подгонка → гонка стора и зеркала.
+    lastInitialFitRef.current = fitKey; // штатный fit выполнен — защита от повтора (см. v2 выше)
     writeMirrorNow();
   }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled, mapLoaded, canvasSize.width, canvasSize.height]);
 
