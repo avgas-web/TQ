@@ -1874,7 +1874,15 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     const cs = canvasSizeRef.current;
     if (!(cs.width > 0 && cs.height > 0) || !Number.isFinite(cs.width) || !Number.isFinite(cs.height)) {
       mapImageRef.current = null;
-      publishMapLoaded(false);
+      // ФИКС «СИНИЙ ЭКРАН»: раньше выход был терминальным — эффект не имел
+      // canvasSize в deps и никогда не перезапускался после появления реальных
+      // размеров → mapLoaded зависал на false, стартовый fit (гейт !mapLoaded)
+      // не выполнялся, камера оставалась вне подложки. Теперь при нулевом
+      // замере флаг готовности публикуем сразу для ТАЙЛОВОЙ карты (подложка
+      // существует независимо от растрового снимка — см. loadActiveTileMap),
+      // а появление ненулевого размера (0→N) перестроит этот эффект через
+      // новый boolean-dep ниже (ResizeObserver → setCanvasSize → re-render).
+      if (tilesActive) publishMapLoaded(true);
       return;
     }
 
@@ -1912,7 +1920,12 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       window.clearTimeout(guardTimer);
       abortTileImage(img);
     };
-  }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled]);
+  }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled,
+      // перезапуск при первом появлении валидного размера (0→N) — снятие
+      // терминального publishMapLoaded(false) в ветке гейта размеров.
+      // Boolean-dep: значение меняется только на границе 0↔N, лишних
+      // пересозданий Image при resize нет.
+      canvasSize.width > 0 && canvasSize.height > 0]);
 
   // Resize observer: при изменении размера окна МАСШТАБ НЕ СБИВАЕТСЯ —
   // смещаем offsetX/offsetY так, чтобы географическая точка в центре экрана осталась в центре.
