@@ -2270,6 +2270,17 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       // растра, если bounds шире окна). Никакой зависимости от размеров окна,
       // никакого «полёта в космоса»: строгая привязка к координатам при любом
       // масштабе и панораме.
+      // ── ФИКС «В РЕЖИМЕ ОДНОГО ОКНА НЕВЕРНЫЙ МАСШТАБ/СМЕЩЕНИЕ» ─────────────
+      // loadActiveTileMap фиксирует bounds как окно обзора под ЭТАЛОН 800×600
+      // css px на зуме z. В режиме трёх окон контейнеры близки к эталону —
+      // баг маскировался; в редакторе-«одном окне» flex-колонка даёт другой
+      // размер ⇒ fit-to-bounds (zb) открывал карту на масштабе, отличном от
+      // запрошенного z, со смещением центра. Исправление: для тайловой карты
+      // стартовый зум берётся НАПРЯМУЮ из геометрии виртуального растра
+      // (rasterWorldPx ≈ 256·2^z — ровно z загрузки), а не из размера окна;
+      // fit-to-bounds остаётся только фолбэком (неполный растр / bounds шире
+      // экрана). Формула инвариантна к размеру контейнера: worldPx = vh·2^zoom,
+      // центр bounds всегда в центре экрана.
       const b = map.bounds;
       const topM = latToMerc(b.north);
       const botM = latToMerc(b.south);
@@ -2293,10 +2304,15 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       const rasterWorldPx = (map.width / spanFx + map.height / spanFy) / 2; // ≈ 256·2^z
       const rasterFitsScreen = map.width <= canvasSize.width && map.height <= canvasSize.height;
       let zoom: number;
-      if (rasterFitsScreen && rasterWorldPx >= 256 * Math.pow(2, zb)) {
+      if (rasterFitsScreen && Number.isFinite(rasterWorldPx) && rasterWorldPx >= 256 * Math.pow(2, MIN_ZOOM)) {
+        // Тайловая карта loadActiveTileMap: bounds — окно обзора под эталон
+        // 800×600, а не фактический контейнер. Стартовый зум = ровно z загрузки
+        // (инвариант worldPx = 256·2^z), НЕ fit-to-bounds от размера окна:
+        // иначе в «одном окне» при контейнере ≠ 800×600 масштаб и центр
+        // уезжают (в трёх окнах баг маскировался близостью к эталону).
         zoom = Math.log2(rasterWorldPx / 256); // ровно z загрузки
       } else {
-        zoom = zb; // подогнать область bounds под экран
+        zoom = zb; // фолбэк: подогнать область bounds под экран
       }
       zoom = clampZoom(zoom);
       const zFix = ZOOM_REF; // ЭТАЛОН для инварианта worldPx = canvasHeight·2^(zFix+log2 scale)
