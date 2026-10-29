@@ -1,7 +1,8 @@
 // Unit-тесты «готовности карты» — ядро запрета на постановку точек в пустом
 // поле без карты (режим Мастера). Чистая функция computeMapReadiness.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, beforeEach } from 'vitest';
 import { computeMapReadiness } from '../src/components/wizard/mapReadiness';
+import { useApiKeysStore } from '../src/store/useApiKeysStore';
 
 const readyProject = {
   settings: { tilesEnabled: true },
@@ -10,6 +11,11 @@ const readyProject = {
 };
 
 describe('computeMapReadiness', () => {
+  beforeEach(() => {
+    // ЭТАП 1.2: ключи живут только в сессионном сторе — сбрасываем между тестами.
+    useApiKeysStore.getState().clearAllKeys();
+  });
+
   it('карта НЕ готова, когда тайловая подложка выключена (пустое поле)', () => {
     const r = computeMapReadiness({ ...readyProject, settings: { tilesEnabled: false } }, true);
     expect(r.ready).toBe(false);
@@ -66,11 +72,14 @@ describe('computeMapReadiness', () => {
     expect(blocked.ready).toBe(false);
     expect(blocked.reason).toMatch(/API-ключ Яндекс/);
 
+    // ЭТАП 1.2: «с включённым ключом» = ключ введён в сессионный стор
+    useApiKeysStore.getState().setManualKey('yandex', 'k');
     const allowed = computeMapReadiness(
       {
         ...readyProject,
         openStreetMap: { tileServer: 'yandex' },
-        yandexMaps: { apiKey: 'k', enabled: true },
+        // ЭТАП 1.2: в persist-проекте остаётся только enabled; сам ключ — в сессионном сторе
+        yandexMaps: { enabled: true },
       } as never,
       true,
     );

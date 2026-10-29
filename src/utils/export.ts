@@ -131,8 +131,10 @@ export function exportProject(project: Project): string {
   // экспорт передаётся другим людям, а ключ в .tqproj = утечка платного квотного доступа.
   const redacted: Project = {
     ...project,
-    googleMaps: project.googleMaps ? { ...project.googleMaps, apiKey: '' } : project.googleMaps,
-    yandexMaps: project.yandexMaps ? { ...project.yandexMaps, apiKey: '' } : project.yandexMaps,
+    // ЭТАП 1.2: поле apiKey полностью удалено из модели — экспорт не содержит
+    // секретов ни при каких условиях (раньше писался пустой apiKey-заглушка).
+    googleMaps: project.googleMaps ? { enabled: project.googleMaps.enabled } : project.googleMaps,
+    yandexMaps: project.yandexMaps ? { enabled: project.yandexMaps.enabled } : project.yandexMaps,
   };
   return JSON.stringify(redacted, null, 2);
 }
@@ -224,11 +226,10 @@ export function importProject(json: string): Project | null {
       tilesEnabled: data.settings?.tilesEnabled,
     },
     googleMaps: {
-      apiKey: str(data.googleMaps?.apiKey, ''),
+      // ЭТАП 1.2: apiKey из файла проекта ИГНОРИРУЕТСЯ (секреты не импортируются).
       enabled: !!(data.googleMaps && data.googleMaps.enabled),
     },
     yandexMaps: {
-      apiKey: str(data.yandexMaps?.apiKey, ''),
       enabled: !!(data.yandexMaps && data.yandexMaps.enabled),
     },
     openStreetMap: {

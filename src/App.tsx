@@ -10,6 +10,7 @@ import { useStore } from './store/useStore';
 import { initOpenStreetMap } from './utils/openStreetMap';
 import { eventBus } from './utils/eventBus';
 import { useAppInitialization } from './hooks/useAppInitialization';
+import OfflineIndicator from './components/OfflineIndicator';
 
 /** Компактная полоса загрузки карт для Мастера миссий.
  *  ФИКС #1 «полоса скрыта за строкой „Далее“»: раньше это был выпадающий
@@ -434,6 +435,9 @@ const App: React.FC = () => {
       )}
 
       {!wizardMode && <StatusBar />}
+
+      {/* ЭТАП 1.3: бейдж онлайн/офлайн + статус офлайн-кэша (PWA) */}
+      <OfflineIndicator />
 
       <StorageToast />
     </div>

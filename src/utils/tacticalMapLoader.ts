@@ -10,6 +10,8 @@
 // В node-окружении (тесты) DOM-декодеры отсутствуют — для растров возвращает
 // понятную ошибку, векторные парсеры работают полностью (см. tacticalMapParsers).
 import type { TacticalOverlayLayer, TacticalOverlayFormat, BBox4 } from '../types';
+// ЭТАП 1.1: необязательный фоновый транспорт (Web Worker) для тяжёлых форматов.
+import type { MapParsersTransport } from '../hooks/useMapParsersWorker';
 import {
   detectTacticalMapFormat,
   parseGeoTiffGeoref,
@@ -99,7 +101,12 @@ const RASTER_ENCODINGS: Record<string, 'png' | 'jpeg'> = { png: 'png', jpeg: 'jp
  * payload — в IndexedDB). Бросает Error с человекочитаемым сообщением, если
  * геопривязка не найдена — ЖЁСТКОЕ требование: слой без bounds не импортируется.
  */
-export async function loadTacticalMapFile(file: File | { name: string; arrayBuffer(): Promise<ArrayBuffer> }): Promise<LoadedTacticalOverlay> {
+export async function loadTacticalMapFile(
+  file: File | { name: string; arrayBuffer(): Promise<ArrayBuffer> },
+  // ЭТАП 1.1: если передан фоновый транспорт — GeoTIFF-растр и MBTiles-метаданные
+  // парсятся в Web Worker (main thread не блокируется на файлах >50MB).
+  runner?: MapParsersTransport,
+): Promise<LoadedTacticalOverlay> {
   const buf = await file.arrayBuffer();
   const detected = detectTacticalMapFormat(buf, file.name);
   if (detected === 'unknown') throw new Error(`Неизвестный формат файла «${file.name}»`);
@@ -110,14 +117,28 @@ export async function loadTacticalMapFile(file: File | { name: string; arrayBuff
   if (detected === 'geotiff') {
     const g = parseGeoTiffGeoref(buf);
     if (!g.ok) throw new Error(g.error);
-    const { canvas, widthPx, heightPx } = await decodeGeoTiffToCanvas(buf);
+    let widthPx = 0;
+    let heightPx = 0;
+    let payload: string;
+    if (runner) {
+      // Фоновый режим: воркер возвращает готовый PNG data URL + размеры
+      const r = await runner.parseGeotiff(buf.slice(0));
+      payload = r.imageDataUrl ?? '';
+      widthPx = r.imageWidth ?? 0;
+      heightPx = r.imageHeight ?? 0;
+    } else {
+      const { canvas, widthPx: wPx, heightPx: hPx } = await decodeGeoTiffToCanvas(buf);
+      widthPx = wPx;
+      heightPx = hPx;
+      payload = toDataUrl(canvas);
+    }
     // размер растра из тегов должен совпадать с декодированным — иначе привязка неверна
     const georef = { ...g.georef, widthPx: widthPx || g.georef.widthPx, heightPx: heightPx || g.georef.heightPx };
     const layer: TacticalOverlayLayer = {
       id, blobKey: id, name: file.name, format: 'geotiff', encoding: 'png',
       visible: true, opacity: 0.85, georef, importedAt: nowIso(), sizeBytes,
     };
-    return { layer, payload: toDataUrl(canvas), kind: 'raster' };
+    return { layer, payload, kind: 'raster' };
   }
 
   // ── PNG/JPEG с world-file комментарием (жёсткая привязка обязательна) ──
@@ -173,8 +194,25 @@ export async function loadTacticalMapFile(file: File | { name: string; arrayBuff
 
   // ── MBTiles: SQLite-хранилище тайлов — метаданные (bounds/zooms) ──
   if (detected === 'mbtiles') {
-    const p = parseMbtilesGeoref(buf);
-    if (!p.ok) throw new Error(p.error);
+    type Summary = { ok: true; bbox: BBox4; zoomRange?: { min: number; max: number }; name: string } | { ok: false; error: string; name?: string };
+    let p: Summary;
+    if (runner) {
+      // Фоновый режим: sql.js/WASM выполняется в Web Worker; результат
+      // нормализуется к тому же контракту, что и синхронный parseMbtilesGeoref.
+      const s = await runner.mbtilesSummary(buf.slice(0));
+      p = s.bounds && s.tileCount > 0
+        ? {
+            ok: true,
+            bbox: [s.bounds.west, s.bounds.south, s.bounds.east, s.bounds.north] as BBox4,
+            zoomRange: { min: s.minZoom, max: s.maxZoom },
+            name: s.name,
+          }
+        : { ok: false, error: 'MBTiles не содержит тайлов или границы (bounds) отсутствуют', name: s.name };
+    } else {
+      p = parseMbtilesGeoref(buf);
+    }
+    if (!p.ok) throw new Error(p.error ?? 'MBTiles: ошибка разбора');
+    if (!p.bbox) throw new Error('MBTiles: пустой bbox');
     const layer: TacticalOverlayLayer = {
       id, blobKey: id, name: `${file.name} (${p.name})`, format: 'mbtiles', encoding: 'png',
       visible: true, opacity: 0.85,

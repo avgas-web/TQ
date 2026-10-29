@@ -3,6 +3,8 @@ import ReactDOM from "react-dom/client";
 import "./index.css";
 import App from "./App.tsx";
 import { AppErrorBoundary } from "./components/AppErrorBoundary.tsx";
+import { scrubPersistedApiKeys } from "./utils/apiKeySanitizer.ts";
+import { registerServiceWorker } from "./utils/swRegistration.ts";
 
 // Экран с текстом ошибки вместо «белого листа» при сбое загрузки/рендера
 function showError(title: string, detail: unknown) {
@@ -28,6 +30,15 @@ window.addEventListener("unhandledrejection", (e) => {
 
 const rootEl = document.getElementById("root");
 
+// ── ЭТАП 1.2 (P0): при старте вычищаем API-ключи из уже сохранённых
+// snapshots localStorage (tq-map и legacy totalquadro-storage). Ошибка
+// санитайзера не должна блокировать запуск приложения.
+try {
+  scrubPersistedApiKeys();
+} catch (err) {
+  console.error("Не удалось очистить ключи из хранилища:", err);
+}
+
 if (!rootEl) {
   showError("Не найден элемент #root. Проверьте index.html.", "");
 } else {
@@ -45,3 +56,9 @@ if (!rootEl) {
     showError("Ошибка запуска приложения:", err);
   }
 }
+
+// ── ЭТАП 1.3: PWA Service Worker (офлайн-режим для полевых условий).
+// registerServiceWorker сам проверяет поддержку и никогда не бросает —
+// при отсутствии serviceWorker API показывает понятное сообщение в консоли
+// и статус в OfflineIndicator, а не «белый экран».
+void registerServiceWorker();

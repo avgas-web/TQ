@@ -37,6 +37,12 @@ export interface LoadOptions {
   maxFeatures?: number;
   /** Максимальный размер растра на выходе, px по стороне ( downsampling ) */
   maxRasterSide?: number;
+  /**
+   * ЭТАП 1.1: транспорт фоновой обработки (см. hooks/useMapParsersWorker).
+   * Если задан — GeoTIFF/MBTiles парсятся ВНЕ основного потока; иначе
+   * выполняется синхронный путь в текущем потоке (graceful degradation).
+   */
+  runner?: import('../hooks/useMapParsersWorker').MapParsersTransport;
 }
 
 let idCounter = 0;
@@ -744,7 +750,12 @@ export async function loadUserMapFile(file: File, opts: LoadOptions = {}): Promi
   }
 
   if (format === 'geotiff') {
-    const part = await loadGeoTiff(await file.arrayBuffer(), opts);
+    const buffer = await file.arrayBuffer();
+    // ЭТАП 1.1: при наличии транспорта — парсинг вне основного потока;
+    // сам транспорт уже гарантирует fallback на синхронный loadGeoTiff.
+    const part = opts.runner
+      ? await opts.runner.parseGeotiff(buffer, opts)
+      : await loadGeoTiff(buffer, opts);
     if (!part.bbox) throw new Error('GeoTIFF без геопривязки (нет ModelTransformation/ModelTiepoint) — выполните привязку вручную как растр');
     return base('raster', part);
   }
@@ -753,7 +764,9 @@ export async function loadUserMapFile(file: File, opts: LoadOptions = {}): Promi
     // Бинарник SQLite храним ЦЕЛИКОМ (sourceBlob): тайлы извлекаются лениво
     // через sql.js только для видимой области (requestMbtilesTiles в MapCanvas).
     const buffer = await file.arrayBuffer();
-    const summary = await readMbtilesSummary(buffer, undefined, onProgress);
+    const summary = opts.runner
+      ? await opts.runner.mbtilesSummary(buffer)
+      : await readMbtilesSummary(buffer, undefined, onProgress);
     if (!summary.tileCount) throw new Error('MBTiles не содержит тайлов');
     const bbox = summary.bounds ?? syntheticMbtilesBounds(summary.minZoom, summary.maxZoom);
     return base('raster', {

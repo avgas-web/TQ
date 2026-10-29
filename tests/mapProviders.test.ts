@@ -14,12 +14,15 @@ import {
   KEYLESS_PROVIDERS,
 } from '../src/utils/mapProviders';
 import { useMapStore } from '../src/store/useMapStore';
+import { useApiKeysStore } from '../src/store/useApiKeysStore';
 
 type ProjectSlice = Parameters<typeof getProviderStatus>[0];
 
 const noKeys: ProjectSlice = { googleMaps: undefined, yandexMaps: undefined };
+// ЭТАП 1.2: ключ больше НЕ хранится в persist-проекте — наличие ключа
+// определяется сессионным стором (см. beforeEach ниже).
 const withGoogleKey: ProjectSlice = {
-  googleMaps: { enabled: true, apiKey: 'AIza-test-key' },
+  googleMaps: { enabled: true },
   yandexMaps: undefined,
 };
 
@@ -62,6 +65,11 @@ describe('mapProviders: URL-шаблоны тайлов', () => {
 });
 
 describe('mapProviders: graceful degradation без ключей', () => {
+  beforeEach(() => {
+    // ЭТАП 1.2: наличие ключа берётся из сессионного стора — гарантируем чистоту.
+    useApiKeysStore.getState().clearAllKeys();
+  });
+
   it('Google без ключа: НЕ падает, возвращает ready:false + понятное сообщение', () => {
     const s = getProviderStatus(noKeys, 'google');
     expect(s.ready).toBe(false);
@@ -77,6 +85,8 @@ describe('mapProviders: graceful degradation без ключей', () => {
   });
 
   it('Google С валидным включённым ключом: ready:true', () => {
+    // ЭТАП 1.2: ключ задаётся только в сессионном сторе (не в persist-проекте)
+    useApiKeysStore.getState().setManualKey('google', 'AIza-test-key');
     const s = getProviderStatus(withGoogleKey, 'google');
     expect(s.ready).toBe(true);
     expect(s.message).toBeUndefined();
