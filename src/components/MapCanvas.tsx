@@ -1951,6 +1951,10 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       abortTileImage(img);
     };
   }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled,
+      // смена тайлового провайдера пересчитывает tilesActive-ветки публикации
+      // готовности (см. ФИКС «СИНИЙ ЭКРАН» в useMapStore.setOSMTileServer);
+      // boolean-dep ниже не меняется, лишних пересозданий Image нет.
+      tileServer,
       // перезапуск при первом появлении валидного размера (0→N) — снятие
       // терминального publishMapLoaded(false) в ветке гейта размеров.
       // Boolean-dep: значение меняется только на границе 0↔N, лишних
@@ -2043,6 +2047,13 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         const v: ViewState = { ...fb, offsetX: w / 2 - ((SPB_GEO_CONST.lng + 180) / 360) * Math.max(256, h * Math.pow(2, DEFAULT_TILE_MAP_ZOOM)) };
         viewRef.current = v;
         useStore.getState().setViewState({ ...v });
+        // ФИКС «СИНИЙ ЭКРАН» (копия пути режима трёх окон): MiniMapPanel при
+        // каждом применении вида синхронно переставляет свой слой подложки.
+        // Здесь раньше этого не было: transform DOM-слоя оставался от
+        // временного вида spbFallbackView(600) (эталонная высота 600 вместо
+        // фактической), слой уезжал за экран → фон канваса #1a2744 до первого
+        // пользовательского жеста. canvasSizeRef обновлён выше синхронно.
+        tileLayerPositionRef.current?.();
         writeMirrorNow();
       }
       setCanvasSize((prev) => {
@@ -2050,10 +2061,24 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         if (prev.width > 0 && prev.height > 0 && w > 0 && h > 0) {
           // инвариант вида: scale и z0 сохраняются, центр карты не «прыгает»
           const v = viewRef.current ?? NEUTRAL_VIEW;
-          useStore.getState().setViewState({
+          // ── КЛЮЧЕВОЙ ФИКС «СИНИЙ ЭКРАН» (viewRef ⇔ стор) ───────────────────
+          // Раньше здесь вызывался setViewState с ЧАСТИЧНЫМ объектом {offsetX,
+          // offsetY} без синхронной записи в viewRef. viewRef — источник истины
+          // для positionTileLayer/syncTileDom/канваса; подписка на стор
+          // догоняла его только через rAF. При переключении режимов 3 окна →
+          // 1 окно (remount) viewRef мог остаться на stale-виде от другого
+          // контейнера, а стор — на скорректированном: DOM-слой тайлов
+          // позиционировался по stale-виду (за экраном), канвас рисовал по
+          // новому — подложка не видна («синий экран»). Теперь viewRef
+          // обновляется СИНХРОННО со стором — расхождение невозможно.
+          const nextV: ViewState = {
+            ...v,
             offsetX: v.offsetX + (w - prev.width) / 2,
             offsetY: v.offsetY + (h - prev.height) / 2,
-          });
+          };
+          viewRef.current = nextV;
+          useStore.getState().setViewState({ ...nextV });
+          tileLayerPositionRef.current?.();
         }
         // ФИКС «не удалось определить размер карты»: зеркало 'tq-view' обязано
         // содержать фактические размеры канваса СРАЗУ после замера — иначе
@@ -2228,7 +2253,13 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   const lastFittedMapRef = useRef<string | null>(null);
   useEffect(() => {
     const map = project.map;
-    if (!map?.bounds || canvasSize.height <= 0) return;
+    // ФИКС «СИНИЙ ЭКРАН»: гейт ждёт ОБА измерения (width тоже) — эффект может
+    // запуститься на промежуточном layout, когда height уже разрешён CSS, а
+    // width ещё 0 (flex-колонка мастера). В этом случае viewRef оставался бы
+    // на временном spbFallbackView(600), а z0 фиксировался бы ZOOM_REF:
+    // worldPx уезжал на ~2^4 экранов от подложки. Режим трёх окон не затронут:
+    // MiniMapPanel этот эффект не использует.
+    if (!map?.bounds || canvasSize.height <= 0 || canvasSize.width <= 0) return;
     const key = `${map.name}|${map.bounds.north.toFixed(6)},${map.bounds.south.toFixed(6)}`;
     if (lastFittedMapRef.current === key && viewRef.current?.z0 != null) return;
     lastFittedMapRef.current = key;
@@ -2280,6 +2311,36 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       lastInitialFitRef.current = null; // был pending/saved — пересчитаем ниже на валидных размерах
     }
     if (!map.bounds) { lastInitialFitRef.current = `${fitKey}|pending`; return; }
+    // ── КЛЮЧЕВОЙ ФИКС «СИНИЙ ЭКРАН» (копия пути режима трёх окон) ────────────
+    // Стартовый fit выполнялся ДОСРОЧНО: viewRef мог ещё стоять на временном
+    // spbFallbackView(600) (эталонная высота 600 вместо фактической, offsetX
+    // — заглушка), а saved-ветка ниже принимала этот stale-вид за валидный и
+    // лишь публиковала его в стор. positionTileLayer/syncTileDom читают
+    // viewRef (источник истины канваса) — слой оставался позиционированным
+    // под чужой worldPx: transform уходил за экран → фон #1a2744 («синий»),
+    // при увеличении объекты расходились и проглядывали пиксели прошлого
+    // transform'а («карта появляется»). MiniMapPanel так не делает: он всегда
+    // ВЫЧИСЛЯЕТ вид из своих данных карты. Теперь перед fit принудительно
+    // пересчитываем корректный стартовый вид над центром bounds на фактических
+    // размерах контейнера (та же формула, что в блоке tilesActive ниже).
+    const bInit = map.bounds;
+    const spanFxI = Math.max(1e-12, (bInit.east + 180) / 360 - (bInit.west + 180) / 360);
+    const spanFyI = Math.max(1e-12, latToMerc(bInit.south) - latToMerc(bInit.north));
+    const zoomI = clampZoom(Math.min(
+      Math.log2(canvasSize.width / (256 * spanFxI)),
+      Math.log2(canvasSize.height / (256 * spanFyI)),
+    ));
+    const wpI = canvasSize.height * Math.pow(2, zoomI);
+    const vFix: ViewState = {
+      scale: wpI / (canvasSize.height * Math.pow(2, ZOOM_REF)),
+      offsetX: canvasSize.width / 2 - ((bInit.west + 180) / 360 + spanFxI / 2) * wpI,
+      offsetY: canvasSize.height / 2 - (latToMerc(bInit.north) + spanFyI / 2) * wpI,
+      z0: ZOOM_REF,
+    };
+    viewRef.current = vFix;
+    setViewState({ ...vFix });
+    tileLayerPositionRef.current?.();
+    syncTileDom();
     // ── ФИКС «ВИСНЕТ НАМЕРТВО ПРИ ЗАГРУЗКЕ КАРТ» + «Фиксация над СПб» ───────
     // Стартовая фиксация вида выполняется ровно ОДИН раз для конкретной карты:
     // если в localStorage-зеркале уже есть валидный сохранённый вид именно для
@@ -2436,7 +2497,12 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // без ключа карты → повторная подгонка → гонка стора и зеркала.
     lastInitialFitRef.current = fitKey; // штатный fit выполнен — защита от повтора (см. v2 выше)
     writeMirrorNow();
-  }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled, mapLoaded, canvasSize.width, canvasSize.height]);
+  }, [project.map?.dataUrl, project.map?.bounds, project.settings?.tilesEnabled, mapLoaded, canvasSize.width, canvasSize.height,
+      // syncTileDom стабилен (useCallback []), но обязан быть в deps: эффект
+      // вызывает его напрямую (пересчёт стартового вида — см. ФИКС «СИНИЙ
+      // ЭКРАН» выше); без dep eslint/exhaustive-deps и будущие правки колбэка
+      // могли бы остаться невидимыми для этого эффекта.
+      setViewState, writeMirrorNow, syncTileDom]);
 
   // Отдельный эффект: при ПЕРВОМ появлении объектов на новой карте —
   // автоматически подогнать вид под все объекты ровно один раз.

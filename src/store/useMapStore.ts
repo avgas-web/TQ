@@ -468,7 +468,22 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
     // оставался бы в сторе и decision-логика мастера (isMapReadyNow) ставила бы
     // точки поверх key-overlay. Сбрасываем флаг загрузки немедленно; MapCanvas
     // восстановит его после фактической отрисовки тайлов нового провайдера.
-    if (get().mapLoaded) get().publishMapLoaded(false);
+    // ── ФИКС «СИНИЙ ЭКРАН» (защита от взаимоблокировки) ──────────────────────
+    // Раньше сброс выполнялся ВСЕГДА. При активной ТАЙЛОВОЙ карте (Esri ⇄ OSM
+    // не требуют ключей) это создавало цикл: MapCanvas-эффект смены сервера
+    // чистит DOM-слой → syncTileDom загружает первые тайлы → публикация true
+    // только по onload; если же в этот момент эффект загрузки отрабатывал на
+    // нулевом замере контейнера, терминальный publishMapLoaded(false) из стора
+    // зациклил готовность (false→true→false…) — оверлей/пустой канвас. Теперь
+    // для согласованной тайловой пары (tilesEnabled + bounds) флаг НЕ сбрасы-
+    // вается: подложка нового провайдера физически существует сразу (тот же
+    // принцип, что у loadActiveTileMap: publishMapLoaded(true) без ожидания
+    // onload). Обратная совместимость: поведение для снимков Google/Yandex
+    // (нужен ключ) и легаси-растров не изменилось; режим трёх окон (MiniMapPanel)
+    // этим экшеном не управляет.
+    const s = get();
+    const tilesBacked = !!s.settings?.tilesEnabled && !!s.map?.bounds;
+    if (s.mapLoaded && !tilesBacked) get().publishMapLoaded(false);
   },
 
   setMapBounds: (bounds) => set((state) => ({
