@@ -19,6 +19,11 @@ import {
 import { eventBus } from "../utils/eventBus";
 import type { TileServerId } from "../utils/openStreetMap";
 import { planPathAroundZonesResult } from "../utils/routing";
+// Ф4.4 (аудит): единая валидация перед развёртыванием/экспортом.
+import {
+  validateMissionForDeployment,
+  deploymentBlockingMessage,
+} from "../utils/deploymentValidation";
 import type { Restriction } from "../types";
 
 // ─── Типы домена мастера ────────────────────────────────────────
@@ -957,24 +962,14 @@ export const useMissionWizardStore = create<MissionWizardState>()(
         log.push(`Генерация файла формата ${s.exportFormat ?? "—"}…`);
         try {
           if (!s.exportFormat) throw new Error("Формат экспорта не выбран.");
-          if (s.calculatedRoutes.length === 0)
-            throw new Error("Нет рассчитанных маршрутов для экспорта.");
-          // Ф1.3 (аудит): маршруты, которые не удалось проложить в обход NFZ,
-          // запрещены к развёртыванию даже в обход поштучной валидации этапов —
-          // тихий экспорт прямой линии сквозь зону = гарантированная потеря дрона.
-          const blocked = s.calculatedRoutes.filter((r) => r.blockedByNfz);
-          if (blocked.length > 0) {
-            throw new Error(
-              `Экспорт заблокирован: ${blocked.length} маршрут(ов) проходят через NFZ (обход не построен). Измените зоны или точки.`,
-            );
-          }
-          const unack = s.calculatedRoutes.filter(
-            (r) => r.exceedsRange && !r.acknowledged,
-          );
-          if (unack.length > 0) {
-            throw new Error(
-              `Экспорт заблокирован: ${unack.length} маршрут(ов) превышают дальность аппарата без подтверждения.`,
-            );
+          // Ф4.4 (аудит): единый источник истины для блокировок экспорта —
+          // validateMissionForDeployment (см. utils/deploymentValidation).
+          // Покрывает: отсутствие маршрутов, NFZ-блокировку (Ф1.3) и
+          // неподтверждённое превышение дальности. UI-чек-лист использует ту же
+          // функцию, поэтому «зелёный чек-лист» ⇔ «экспорт пройдёт».
+          const validation = validateMissionForDeployment(s.calculatedRoutes);
+          if (!validation.ok) {
+            throw new Error(deploymentBlockingMessage(validation));
           }
           log.push(`✓ Сгенерировано маршрутов: ${s.calculatedRoutes.length}`);
           log.push("✓ Файл готов к скачиванию.");

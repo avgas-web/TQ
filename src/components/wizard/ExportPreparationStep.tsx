@@ -8,6 +8,8 @@ import {
 // ФАЗА 3.1 (аудит): превью больше НЕ генерируется отдельной «имитацией» с
 // пиксельными координатами — это честный префикс реального файла из utils/wizardExport.
 import { buildPreview as buildFullFilePreview } from "../../utils/wizardExport";
+// Ф4.4 (аудит): чек-лист и блокировка экспорта используют ОДНУ функцию валидации.
+import { validateMissionForDeployment } from "../../utils/deploymentValidation";
 
 const FORMATS: { id: ExportFormat; label: string; desc: string }[] = [
   {
@@ -27,6 +29,11 @@ export function ExportPreparationStep() {
     s.exportFormat ?? "json",
   );
 
+  const deploymentValidation = useMemo(
+    () => validateMissionForDeployment(s.calculatedRoutes),
+    [s.calculatedRoutes],
+  );
+
   const checklist = useMemo(
     () => [
       {
@@ -43,14 +50,19 @@ export function ExportPreparationStep() {
           s.fleetGroups.reduce((a, g) => a + g.totalCraft, 0) === s.totalCraft,
         text: `Группы сформированы корректно (${s.fleetGroups.length}, суммарно ${s.fleetGroups.reduce((a, g) => a + g.totalCraft, 0)}/${s.totalCraft})`,
       },
+      // Ф4.4 (аудит): пункты NFZ/дальности берутся из единого результата
+      // validateMissionForDeployment — чек-лист не может разойтись с логикой
+      // блокировки deployMission (раньше правила были продублированы вручную).
       {
         ok:
           s.calculatedRoutes.length > 0 &&
-          !s.calculatedRoutes.some((r) => r.blockedByNfz),
+          !deploymentValidation.issues.some((i) => i.code === "NFZ_BLOCKED"),
         text: `Маршруты пересчитаны, обход зон ПВО (ADIZ) выполнен (${s.calculatedRoutes.length})`,
       },
       {
-        ok: !s.calculatedRoutes.some((r) => r.exceedsRange && !r.acknowledged),
+        ok: !deploymentValidation.issues.some(
+          (i) => i.code === "RANGE_EXCEEDED_UNACKNOWLEDGED",
+        ),
         text: "Превышения дальности подтверждены или отсутствуют",
       },
       {
@@ -65,7 +77,8 @@ export function ExportPreparationStep() {
     () => buildFullFilePreview(previewFormat, s),
     [previewFormat, s],
   );
-  const hasCriticalErrors = checklist.some((c) => !c.ok);
+  const hasCriticalErrors =
+    checklist.some((c) => !c.ok) || !deploymentValidation.ok;
 
   return (
     <div className="flex h-full flex-col gap-3 overflow-auto p-3">

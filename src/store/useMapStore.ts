@@ -4,35 +4,53 @@
 // тайлов, IndexedDB-карты, кэш активных зон, Open-Elevation настройки.
 // НЕ содержит логику маршрутов (useMissionStore) и парка (useFleetStore).
 // ═══════════════════════════════════════════════════════════════
-import { create } from 'zustand';
-import type { StateCreator } from 'zustand';
-import { persist, createJSONStorage } from 'zustand/middleware';
+import { create } from "zustand";
+import type { StateCreator } from "zustand";
+import { persist } from "zustand/middleware";
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-import { v4 as uuidv4 } from 'uuid';
+import { v4 as uuidv4 } from "uuid";
 import type {
   Project,
-  Marker, Restriction, Layer, ViewState, MapData, Point,
-  CalibrationPoint, MapBounds, Tool, TacticalOverlayLayer,
-} from '../types';
+  Marker,
+  Restriction,
+  Layer,
+  ViewState,
+  MapData,
+  Point,
+  CalibrationPoint,
+  MapBounds,
+  Tool,
+  TacticalOverlayLayer,
+} from "../types";
 
 /** Настройки карты/высот (подмножество Project['settings']). */
-export type ProjectSettings = Project['settings'];
+export type ProjectSettings = Project["settings"];
 import {
-  saveMapToIndexedDB, loadMapFromIndexedDB,
-  saveTacticalOverlayToIndexedDB, deleteTacticalOverlayFromIndexedDB, loadTacticalOverlayFromIndexedDB,
-} from '../utils/storage';
-import { loadTacticalMapFile } from '../utils/tacticalMapLoader';
+  saveMapToIndexedDB,
+  loadMapFromIndexedDB,
+  saveTacticalOverlayToIndexedDB,
+  deleteTacticalOverlayFromIndexedDB,
+  loadTacticalOverlayFromIndexedDB,
+} from "../utils/storage";
+import { loadTacticalMapFile } from "../utils/tacticalMapLoader";
 // ЭТАП 1.1: фоновый транспорт парсеров (Web Worker + sync-фолбэк)
-import { getMapParsersTransport, lastWorkerNotice } from '../hooks/useMapParsersWorker';
-import { mercatorYToLat, calculateBoundsFromCenter } from '../utils/googleMaps';
-import { sanitizeProjectData } from '../utils/projectSchema';
+import {
+  getMapParsersTransport,
+  lastWorkerNotice,
+} from "../hooks/useMapParsersWorker";
+import { mercatorYToLat, calculateBoundsFromCenter } from "../utils/googleMaps";
+import { sanitizeProjectData } from "../utils/projectSchema";
+// ФАЗА 4.2 (аудит): безопасный persist-storage (quota-spill + storage:error)
+import { createSafeStorage } from "../utils/safeStorage";
 // ЭТАП 1.2 (безопасность): API-ключи живут ТОЛЬКО в сессионном сторе
 // useApiKeysStore (память текущей вкладки). В persist-стор они НЕ пишутся:
 // тип провайдерского среза — PersistedProviderPrefs без поля apiKey.
-import type { MapsProviderId } from './useApiKeysStore';
+import type { MapsProviderId } from "./useApiKeysStore";
 
 /** Персистимые настройки провайдера карт БЕЗ секретов (ЭТАП 1.2). */
-export interface PersistedProviderPrefs { enabled: boolean }
+export interface PersistedProviderPrefs {
+  enabled: boolean;
+}
 
 /** Нормализация legacy-slice: {apiKey,enabled} → {enabled}; ключ выбрасывается. */
 function toProviderPrefs(p: unknown): PersistedProviderPrefs {
@@ -57,14 +75,22 @@ export function invalidateZoneCache(): void {
  *  (см. комментарий в types/index.ts): раньше «активная» была ровно одна, и
  *  добавление новой зоны молча снимало с расчёта все прежние. */
 function drawableZones(restrictions: Restriction[]): Restriction[] {
-  return restrictions.filter(
-    (r) => (r.type === 'circle' ? r.points.length >= 1 && !!r.radius : r.points.length >= 2),
+  return restrictions.filter((r) =>
+    r.type === "circle"
+      ? r.points.length >= 1 && !!r.radius
+      : r.points.length >= 2,
   );
 }
 
 /** Активные «проходимые внутри» зоны в нормализованном виде (сброс при изменении зон). */
-export function getActiveZonesCached(restrictions: Restriction[]): Restriction[] {
-  if (zoneCacheKey && zoneCacheKey.ver === zonesVersion && zoneCacheKey.n === restrictions.length) {
+export function getActiveZonesCached(
+  restrictions: Restriction[],
+): Restriction[] {
+  if (
+    zoneCacheKey &&
+    zoneCacheKey.ver === zonesVersion &&
+    zoneCacheKey.n === restrictions.length
+  ) {
     return zoneCacheList!;
   }
   const list = drawableZones(restrictions);
@@ -89,13 +115,24 @@ export function getActiveZonesCached(restrictions: Restriction[]): Restriction[]
 export function normalizeViewState(v: unknown): ViewState {
   const o = (v ?? {}) as Record<string, unknown>;
   const num = (x: unknown, dflt: number): number =>
-    typeof x === 'number' && Number.isFinite(x) ? x : dflt;
-  const z0 = typeof o.z0 === 'number' && Number.isFinite(o.z0) ? o.z0 : undefined;
-  const rawScale = typeof o.scale === 'number' ? o.scale : NaN;
-  if (!Number.isFinite(rawScale) || !(rawScale > 0) || rawScale < 1e-6 || rawScale > 1e6) {
+    typeof x === "number" && Number.isFinite(x) ? x : dflt;
+  const z0 =
+    typeof o.z0 === "number" && Number.isFinite(o.z0) ? o.z0 : undefined;
+  const rawScale = typeof o.scale === "number" ? o.scale : NaN;
+  if (
+    !Number.isFinite(rawScale) ||
+    !(rawScale > 0) ||
+    rawScale < 1e-6 ||
+    rawScale > 1e6
+  ) {
     return { offsetX: NaN, offsetY: NaN, scale: NaN, z0 };
   }
-  return { offsetX: num(o.offsetX, 0), offsetY: num(o.offsetY, 0), scale: rawScale, z0 };
+  return {
+    offsetX: num(o.offsetX, 0),
+    offsetY: num(o.offsetY, 0),
+    scale: rawScale,
+    z0,
+  };
 }
 
 // ─── Типы стора ────────────────────────────────────────────────
@@ -185,14 +222,22 @@ export interface MapActions {
   loadMap: (mapData: MapData) => void;
   loadMapWithStorage: (mapData: MapData) => Promise<void>;
   /** Активная тайловая карта без снимка: центр (lat/lng) + зум 6..19 */
-  loadActiveTileMap: (center: { lat: number; lng: number }, zoom: number) => void;
+  loadActiveTileMap: (
+    center: { lat: number; lng: number },
+    zoom: number,
+  ) => void;
   restoreMapFromStorage: () => Promise<void>;
   resetMapUi: () => void;
   // ─── ЗАГРУЗ ПОЛЬЗОВАТЕЛЬСКИХ ТАКТИЧЕСКИХ КАРТ (Задача 2) ──────────────
   /** Импорт файла: парсинг геопривязки -> метаданные в стор, payload в IDB.
    *  Возвращает id созданного слоя; бросает Error при отсутствии bounds. */
-  importTacticalOverlay: (file: File | { name: string; arrayBuffer(): Promise<ArrayBuffer> }) => Promise<string>;
-  updateTacticalOverlay: (id: string, patch: Partial<Pick<TacticalOverlayLayer, 'visible' | 'opacity' | 'name'>>) => void;
+  importTacticalOverlay: (
+    file: File | { name: string; arrayBuffer(): Promise<ArrayBuffer> },
+  ) => Promise<string>;
+  updateTacticalOverlay: (
+    id: string,
+    patch: Partial<Pick<TacticalOverlayLayer, "visible" | "opacity" | "name">>,
+  ) => void;
   removeTacticalOverlay: (id: string) => Promise<void>;
   /** Гидрация payload-ов из IndexedDB (после старта/импорта метаданных). */
   hydrateTacticalOverlays: () => Promise<void>;
@@ -206,9 +251,9 @@ export const defaultMapSettings: ProjectSettings = {
   showGrid: true,
   gridSize: 0,
   showCoordinates: true,
-  theme: 'dark',
+  theme: "dark",
   tilesEnabled: true,
-  tileStyle: 'scheme',
+  tileStyle: "scheme",
   elevationAuto: true,
   altitudeClearanceM: 50,
 };
@@ -224,13 +269,13 @@ const initialMapState: MapState = {
   tacticalOverlays: [],
   markers: [],
   restrictions: [],
-  layers: [{ id: 'default', name: 'Основной', visible: true, locked: false }],
+  layers: [{ id: "default", name: "Основной", visible: true, locked: false }],
   calibration: { enabled: false, points: [] },
   googleMaps: { enabled: false },
   yandexMaps: { enabled: false },
-  openStreetMap: { enabled: false, tileServer: 'osm' },
+  openStreetMap: { enabled: false, tileServer: "osm" },
   settings: { ...defaultMapSettings },
-  currentTool: 'pan',
+  currentTool: "pan",
   viewState: { offsetX: 0, offsetY: 0, scale: 1 },
   viewTick: 0,
   // Флаг готовности тайловой подложки публикуется MapCanvas СИНХРОННО при
@@ -243,8 +288,8 @@ const initialMapState: MapState = {
   drawingPoints: [],
   redoDrawingStack: [],
   measurementPoints: [],
-  searchQuery: '',
-  filterType: '',
+  searchQuery: "",
+  filterType: "",
   selectedMarkerId: null,
   selectedRestrictionId: null,
   activeRestrictionId: null,
@@ -252,16 +297,21 @@ const initialMapState: MapState = {
 
 // ─── Реализация экшенов ────────────────────────────────────────
 
-const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) => ({
-  setTool: (tool) => set({ currentTool: tool, isDrawing: false, drawingPoints: [] }),
+const createMapActions: StateCreator<MapStore, [], [], MapActions> = (
+  set,
+  get,
+) => ({
+  setTool: (tool) =>
+    set({ currentTool: tool, isDrawing: false, drawingPoints: [] }),
 
-  setViewState: (viewState) => set((state) => ({
-    viewState: { ...state.viewState, ...viewState },
-    // счётчик вида: селекторы компонентов (selectViewForRender) пересчитываются
-    // при каждом изменении вида; без него re-render мог видеть устаревший/не
-    // гидрированный viewState (краш «viewState is not defined» на проде)
-    viewTick: state.viewTick + 1,
-  })),
+  setViewState: (viewState) =>
+    set((state) => ({
+      viewState: { ...state.viewState, ...viewState },
+      // счётчик вида: селекторы компонентов (selectViewForRender) пересчитываются
+      // при каждом изменении вида; без него re-render мог видеть устаревший/не
+      // гидрированный viewState (краш «viewState is not defined» на проде)
+      viewTick: state.viewTick + 1,
+    })),
 
   publishMapLoaded: (loaded) => {
     // Синхронная публикация флага готовности в стор. Используется MapCanvas
@@ -275,91 +325,106 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
   setCursorPosition: (pos) => set({ cursorPosition: pos }),
   setDrawing: (isDrawing) => set({ isDrawing }),
 
-  addDrawingPoint: (point) => set((state) => ({
-    drawingPoints: [...state.drawingPoints, point],
-    redoDrawingStack: [], // новое действие очищает redo-стек
-  })),
+  addDrawingPoint: (point) =>
+    set((state) => ({
+      drawingPoints: [...state.drawingPoints, point],
+      redoDrawingStack: [], // новое действие очищает redo-стек
+    })),
 
-  undoDrawingPoint: () => set((state) => {
-    if (state.drawingPoints.length === 0) return {};
-    const removed = state.drawingPoints[state.drawingPoints.length - 1];
-    const pts = state.drawingPoints.slice(0, -1);
-    return {
-      drawingPoints: pts,
-      isDrawing: pts.length > 0 && state.isDrawing,
-      redoDrawingStack: [...state.redoDrawingStack, removed],
-    };
-  }),
+  undoDrawingPoint: () =>
+    set((state) => {
+      if (state.drawingPoints.length === 0) return {};
+      const removed = state.drawingPoints[state.drawingPoints.length - 1];
+      const pts = state.drawingPoints.slice(0, -1);
+      return {
+        drawingPoints: pts,
+        isDrawing: pts.length > 0 && state.isDrawing,
+        redoDrawingStack: [...state.redoDrawingStack, removed],
+      };
+    }),
 
-  redoDrawingPoint: () => set((state) => {
-    const stack = state.redoDrawingStack;
-    if (stack.length === 0) return {};
-    const last = stack[stack.length - 1];
-    return {
-      drawingPoints: [...state.drawingPoints, last],
-      isDrawing: true,
-      redoDrawingStack: stack.slice(0, -1),
-    };
-  }),
+  redoDrawingPoint: () =>
+    set((state) => {
+      const stack = state.redoDrawingStack;
+      if (stack.length === 0) return {};
+      const last = stack[stack.length - 1];
+      return {
+        drawingPoints: [...state.drawingPoints, last],
+        isDrawing: true,
+        redoDrawingStack: stack.slice(0, -1),
+      };
+    }),
 
-  clearDrawingPoints: () => set({ drawingPoints: [], isDrawing: false, redoDrawingStack: [] }),
+  clearDrawingPoints: () =>
+    set({ drawingPoints: [], isDrawing: false, redoDrawingStack: [] }),
   setMeasurementPoints: (points) => set({ measurementPoints: points }),
   setSearchQuery: (query) => set({ searchQuery: query }),
   setFilterType: (type) => set({ filterType: type }),
-  selectMarker: (id) => set({ selectedMarkerId: id, selectedRestrictionId: null }),
-  selectRestriction: (id) => set({ selectedRestrictionId: id, selectedMarkerId: null }),
+  selectMarker: (id) =>
+    set({ selectedMarkerId: id, selectedRestrictionId: null }),
+  selectRestriction: (id) =>
+    set({ selectedRestrictionId: id, selectedMarkerId: null }),
 
   setActiveRestriction: (id) => {
     invalidateZoneCache();
     set((state) => ({
       activeRestrictionId: id,
-      restrictions: state.restrictions.map((r) => ({ ...r, active: r.id === id })),
+      restrictions: state.restrictions.map((r) => ({
+        ...r,
+        active: r.id === id,
+      })),
     }));
     // Перестройку маршрутов выполняет ЕДИНСТВЕННЫЙ троттлинговый подписчик
     // на изменения restrictions (useAppInitialization). Синхронный вызов
     // создавал двойной запуск пакетной перестройки.
   },
 
-  addMarker: (markerData) => set((state) => {
-    const id = uuidv4();
-    const markerCount = state.markers.length + 1;
-    const marker: Marker = {
-      id,
-      name: markerData.name || `Точка ${markerCount}`,
-      x: markerData.x || 0,
-      y: markerData.y || 0,
-      lat: markerData.lat || null,
-      lon: markerData.lon || null,
-      type: markerData.type || 'default',
-      color: markerData.color || '#00ff00',
-      comment: markerData.comment || '',
-      layer: markerData.layer || 'default',
-      createdAt: new Date().toISOString(),
-      terrainM: markerData.terrainM ?? null,
-    };
-    return { markers: [...state.markers, marker], selectedMarkerId: id };
-  }),
+  addMarker: (markerData) =>
+    set((state) => {
+      const id = uuidv4();
+      const markerCount = state.markers.length + 1;
+      const marker: Marker = {
+        id,
+        name: markerData.name || `Точка ${markerCount}`,
+        x: markerData.x || 0,
+        y: markerData.y || 0,
+        lat: markerData.lat || null,
+        lon: markerData.lon || null,
+        type: markerData.type || "default",
+        color: markerData.color || "#00ff00",
+        comment: markerData.comment || "",
+        layer: markerData.layer || "default",
+        createdAt: new Date().toISOString(),
+        terrainM: markerData.terrainM ?? null,
+      };
+      return { markers: [...state.markers, marker], selectedMarkerId: id };
+    }),
 
-  updateMarker: (id, updates) => set((state) => ({
-    markers: state.markers.map((m) => (m.id === id ? { ...m, ...updates } : m)),
-  })),
+  updateMarker: (id, updates) =>
+    set((state) => ({
+      markers: state.markers.map((m) =>
+        m.id === id ? { ...m, ...updates } : m,
+      ),
+    })),
 
   deleteMarker: (id) => {
     // Тип точки нужен ДО удаления — по нему решаем, каскадировать ли маршруты.
     const kind = (() => {
       const mk = get().markers.find((m) => m.id === id);
-      return mk?.type === 'start' || mk?.type === 'goal' ? mk.type : null;
+      return mk?.type === "start" || mk?.type === "goal" ? mk.type : null;
     })();
     set((state) => ({
       markers: state.markers.filter((m) => m.id !== id),
-      selectedMarkerId: state.selectedMarkerId === id ? null : state.selectedMarkerId,
+      selectedMarkerId:
+        state.selectedMarkerId === id ? null : state.selectedMarkerId,
     }));
     // Каскад старта/цели: при удалении точки start/goal удаляем привязанные
     // маршруты и чистим назначения дронов (иначе остаются «висячие» ссылки —
     // точки на нижней карте исчезают, а маршрут/назначение продолжает жить).
     // Маршруты живут в mission-сторе, назначения — во fleet-сторе: обращение
     // через динамический import разрывает потенциальный цикл map↔mission↔fleet.
-    if (kind) void cascadeRemoveStartGoal(id, kind === 'start' ? 'start' : 'goal');
+    if (kind)
+      void cascadeRemoveStartGoal(id, kind === "start" ? "start" : "goal");
   },
 
   addRestriction: (restrictionData) => {
@@ -368,12 +433,15 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
       const id = uuidv4();
       const restriction: Restriction = {
         id,
-        type: restrictionData.type || 'polygon',
+        type: restrictionData.type || "polygon",
         points: restrictionData.points || [],
         radius: restrictionData.radius,
-        color: restrictionData.color || '#ff000080',
-        name: restrictionData.name || `Ограничение ${state.restrictions.length + 1}`,
-        active: restrictionData.active !== undefined ? restrictionData.active : true,
+        color: restrictionData.color || "#ff000080",
+        name:
+          restrictionData.name ||
+          `Ограничение ${state.restrictions.length + 1}`,
+        active:
+          restrictionData.active !== undefined ? restrictionData.active : true,
         minHeightAGL: restrictionData.minHeightAGL ?? null,
         maxHeightAGL: restrictionData.maxHeightAGL ?? null,
       };
@@ -390,7 +458,9 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
   updateRestriction: (id, updates) => {
     invalidateZoneCache(); // геометрия/лимиты зоны изменились — кэш недействителен
     set((state) => ({
-      restrictions: state.restrictions.map((r) => (r.id === id ? { ...r, ...updates } : r)),
+      restrictions: state.restrictions.map((r) =>
+        r.id === id ? { ...r, ...updates } : r,
+      ),
     }));
     // Перестройку выполняет единственный троттлинговый подписчик.
   },
@@ -399,35 +469,51 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
     invalidateZoneCache();
     set((state) => ({
       restrictions: state.restrictions.filter((r) => r.id !== id),
-      activeRestrictionId: state.activeRestrictionId === id ? null : state.activeRestrictionId,
-      selectedRestrictionId: state.selectedRestrictionId === id ? null : state.selectedRestrictionId,
+      activeRestrictionId:
+        state.activeRestrictionId === id ? null : state.activeRestrictionId,
+      selectedRestrictionId:
+        state.selectedRestrictionId === id ? null : state.selectedRestrictionId,
     }));
   },
 
-  addLayer: (name) => set((state) => {
-    const id = uuidv4();
-    return { layers: [...state.layers, { id, name, visible: true, locked: false }] };
-  }),
+  addLayer: (name) =>
+    set((state) => {
+      const id = uuidv4();
+      return {
+        layers: [...state.layers, { id, name, visible: true, locked: false }],
+      };
+    }),
 
-  updateLayer: (id, updates) => set((state) => ({
-    layers: state.layers.map((l) => (l.id === id ? { ...l, ...updates } : l)),
-  })),
+  updateLayer: (id, updates) =>
+    set((state) => ({
+      layers: state.layers.map((l) => (l.id === id ? { ...l, ...updates } : l)),
+    })),
 
-  deleteLayer: (id) => set((state) => ({
-    layers: state.layers.filter((l) => l.id !== id),
-  })),
+  deleteLayer: (id) =>
+    set((state) => ({
+      layers: state.layers.filter((l) => l.id !== id),
+    })),
 
-  addCalibrationPoint: (point) => set((state) => ({
-    calibration: { ...state.calibration, points: [...state.calibration.points, point] },
-  })),
+  addCalibrationPoint: (point) =>
+    set((state) => ({
+      calibration: {
+        ...state.calibration,
+        points: [...state.calibration.points, point],
+      },
+    })),
 
-  removeCalibrationPoint: (index) => set((state) => ({
-    calibration: { ...state.calibration, points: state.calibration.points.filter((_, i) => i !== index) },
-  })),
+  removeCalibrationPoint: (index) =>
+    set((state) => ({
+      calibration: {
+        ...state.calibration,
+        points: state.calibration.points.filter((_, i) => i !== index),
+      },
+    })),
 
-  toggleCalibration: (enabled) => set((state) => ({
-    calibration: { ...state.calibration, enabled },
-  })),
+  toggleCalibration: (enabled) =>
+    set((state) => ({
+      calibration: { ...state.calibration, enabled },
+    })),
 
   updateSettings: (settings) => {
     const prevElevationAuto = get().settings.elevationAuto;
@@ -439,9 +525,11 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
     // изменения геометрии («не работает запрос рельефа»). Динамический
     // import сохраняет направление зависимостей map → mission.
     if (settings.elevationAuto === true && prevElevationAuto !== true) {
-      void import('./useMissionStore')
+      void import("./useMissionStore")
         .then((m) => m.useMissionStore.getState().updateRouteAltitudes())
-        .catch(() => { /* миссия ещё не загружена — следующий прогон посчитает */ });
+        .catch(() => {
+          /* миссия ещё не загружена — следующий прогон посчитает */
+        });
     }
   },
 
@@ -450,18 +538,31 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
   // остаётся только enabled. Динамический import сохраняет направление
   // зависимостей (store → store) и не создаёт цикла на этапе инициализации.
   setGoogleMapsApiKey: (apiKey) => {
-    void import('./useApiKeysStore').then((m) => m.useApiKeysStore.getState().setManualKey('google' as MapsProviderId, apiKey));
+    void import("./useApiKeysStore").then((m) =>
+      m.useApiKeysStore
+        .getState()
+        .setManualKey("google" as MapsProviderId, apiKey),
+    );
     set((state) => ({ googleMaps: { ...state.googleMaps } }));
   },
-  toggleGoogleMaps: (enabled) => set((state) => ({ googleMaps: { ...state.googleMaps, enabled } })),
+  toggleGoogleMaps: (enabled) =>
+    set((state) => ({ googleMaps: { ...state.googleMaps, enabled } })),
   setYandexMapsApiKey: (apiKey) => {
-    void import('./useApiKeysStore').then((m) => m.useApiKeysStore.getState().setManualKey('yandex' as MapsProviderId, apiKey));
+    void import("./useApiKeysStore").then((m) =>
+      m.useApiKeysStore
+        .getState()
+        .setManualKey("yandex" as MapsProviderId, apiKey),
+    );
     set((state) => ({ yandexMaps: { ...state.yandexMaps } }));
   },
-  toggleYandexMaps: (enabled) => set((state) => ({ yandexMaps: { ...state.yandexMaps, enabled } })),
-  toggleOpenStreetMap: (enabled) => set((state) => ({ openStreetMap: { ...state.openStreetMap, enabled } })),
+  toggleYandexMaps: (enabled) =>
+    set((state) => ({ yandexMaps: { ...state.yandexMaps, enabled } })),
+  toggleOpenStreetMap: (enabled) =>
+    set((state) => ({ openStreetMap: { ...state.openStreetMap, enabled } })),
   setOSMTileServer: (server) => {
-    set((state) => ({ openStreetMap: { ...state.openStreetMap, tileServer: server } }));
+    set((state) => ({
+      openStreetMap: { ...state.openStreetMap, tileServer: server },
+    }));
     // КОРНЕВОЙ ФИКС «вечного оверлея» при смене провайдера: MapCanvas публикует
     // mapLoaded в момент готовности подложки; при переключении на провайдера без
     // API-ключа (Google/Яндекс) он НЕ перепубликует false — старый флаг true
@@ -486,9 +587,10 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
     if (s.mapLoaded && !tilesBacked) get().publishMapLoaded(false);
   },
 
-  setMapBounds: (bounds) => set((state) => ({
-    map: state.map ? { ...state.map, bounds } : null,
-  })),
+  setMapBounds: (bounds) =>
+    set((state) => ({
+      map: state.map ? { ...state.map, bounds } : null,
+    })),
 
   loadMap: (mapData) => set({ map: mapData }),
 
@@ -501,7 +603,9 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
     set({ map: { ...mapData, mapId }, _currentMapId: mapId });
     // Маршруты строго привязаны к географии: пересчёт пикселей под новые границы
     // выполняет mission-стор (динамический import — циклической зависимости нет).
-    void import('./useMissionStore').then((m) => m.useMissionStore.getState().refreshAllRoutesAfterMapChange());
+    void import("./useMissionStore").then((m) =>
+      m.useMissionStore.getState().refreshAllRoutesAfterMapChange(),
+    );
   },
 
   /**
@@ -528,9 +632,9 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
       name: `Активная карта: ${center.lat.toFixed(5)}, ${center.lng.toFixed(5)} (z${z})`,
       width: worldPx,
       height: worldPx,
-      dataUrl: '', // без фотографии — подложка грузится тайлами динамически
+      dataUrl: "", // без фотографии — подложка грузится тайлами динамически
       bounds: viewBounds,
-      source: 'osm',
+      source: "osm",
     };
     set((state) => ({
       map: mapData,
@@ -544,7 +648,9 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
     // тайла с CDN, а при медленной сети оверлей «Карта ещё не загружена»
     // висел бесконечно — «в мастерской карте ничего не видно».
     get().publishMapLoaded(true);
-    void import('./useMissionStore').then((m) => m.useMissionStore.getState().refreshAllRoutesAfterMapChange());
+    void import("./useMissionStore").then((m) =>
+      m.useMissionStore.getState().refreshAllRoutesAfterMapChange(),
+    );
   },
 
   restoreMapFromStorage: async () => {
@@ -559,21 +665,24 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
       set((cur) => ({ map: cur.map ? { ...cur.map, dataUrl } : cur.map }));
       // Пиксели маршрутов были рассчитаны по старому/пустому растру — после
       // восстановления изображения mission-стор пересчитывает их из lat/lng.
-      void import('./useMissionStore').then((m) => m.useMissionStore.getState().refreshAllRoutesAfterMapChange());
+      void import("./useMissionStore").then((m) =>
+        m.useMissionStore.getState().refreshAllRoutesAfterMapChange(),
+      );
     }
   },
 
-  resetMapUi: () => set({
-    currentTool: 'pan',
-    activeRestrictionId: null,
-    selectedMarkerId: null,
-    selectedRestrictionId: null,
-    cursorPosition: null,
-    isDrawing: false,
-    drawingPoints: [],
-    redoDrawingStack: [],
-    measurementPoints: [],
-  }),
+  resetMapUi: () =>
+    set({
+      currentTool: "pan",
+      activeRestrictionId: null,
+      selectedMarkerId: null,
+      selectedRestrictionId: null,
+      cursorPosition: null,
+      isDrawing: false,
+      drawingPoints: [],
+      redoDrawingStack: [],
+      measurementPoints: [],
+    }),
 
   // ─── ЗАГРУЗ ПОЛЬЗОВАТЕЛЬСКИХ ТАКТИЧЕСКИХ КАРТ (Задача 2) ──────────────
   // Импорт: парсинг геопривязки (tacticalMapLoader) -> метаданные в стор,
@@ -586,7 +695,10 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
     // а причину видит UI (баннер TacticalLayersPanel / console.warn).
     const runner = getMapParsersTransport();
     if (!runner.workerAvailable) {
-      console.warn('[maps] Фоновый обработчик недоступен:', lastWorkerNotice() ?? 'Web Workers не поддерживаются');
+      console.warn(
+        "[maps] Фоновый обработчик недоступен:",
+        lastWorkerNotice() ?? "Web Workers не поддерживаются",
+      );
     }
     // Загрузчик возвращает готовый слой (метаданные) + payload для хранилища.
     const loaded = await loadTacticalMapFile(file, runner);
@@ -607,7 +719,10 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
         sizeBytes: layer.sizeBytes,
         savedAt: Date.now(),
       });
-      if (!saved) console.warn('[tactical] IndexedDB save failed (layer stays in-memory)');
+      if (!saved)
+        console.warn(
+          "[tactical] IndexedDB save failed (layer stays in-memory)",
+        );
     }
     set((s) => ({
       tacticalOverlays: [...(s.tacticalOverlays ?? []), layer],
@@ -650,118 +765,131 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (set, get) 
     }
   },
 
-  getTacticalOverlayPayload: (layerId) => tacticalPayloadCache.get(layerId) ?? null,
+  getTacticalOverlayPayload: (layerId) =>
+    tacticalPayloadCache.get(layerId) ?? null,
 });
 
 // ─── Стор + persist (миграция из legacy totalquadro-storage) ────────────────
 
 export const useMapStore = create<MapStore>()(
-  persist(
-    (...a) => ({ ...initialMapState, ...createMapActions(...a) }),
-    {
-      name: 'tq-map',
-      version: 3,
-      // Явная JSON-гидрация из localStorage. Важно: при default storage persist
-      // записывает восстановленные поля через Object.assign (in-place мутация до
-      // первого notify) — компонент мог отрендериться с частично гидрированным
-      // viewState («viewState is not defined»). viewTick форсирует notify.
-      storage: createJSONStorage(() => localStorage),
-      // Сохраняемые поля = MapState минус транзиентные UI-флаги.
-      // mapLoaded НЕ гидрируется из localStorage: флаг публикуется MapCanvas
-      // только когда тайлы реально отрисованы (иначе после перезагрузки
-      // Мастер ложно считал бы карту готовой до первой загрузки).
-      partialize: (s): Omit<MapState, 'mapLoaded'> => ({
-        // Не сохраняем map.dataUrl в localStorage — он слишком большой
-        map: s.map ? { ...s.map, dataUrl: '' } : null,
-        // Метаданные тактических слоёв (payload-ы — в IndexedDB/кэше)
-        tacticalOverlays: s.tacticalOverlays ?? [],
-        markers: s.markers,
-        restrictions: s.restrictions,
-        layers: s.layers,
-        calibration: s.calibration,
-        // ЭТАП 1.2: НИКОГДА не пишем apiKey — только флаг enabled (см. тип среза)
-        googleMaps: { enabled: s.googleMaps.enabled },
-        yandexMaps: { enabled: s.yandexMaps.enabled },
-        openStreetMap: s.openStreetMap,
-        settings: s.settings,
-        _currentMapId: s._currentMapId,
-        currentTool: s.currentTool,
-        viewState: s.viewState,
-        viewTick: s.viewTick,
-        cursorPosition: null,
-        isDrawing: false,
-        drawingPoints: [],
-        redoDrawingStack: [],
-        measurementPoints: [],
-        searchQuery: s.searchQuery,
-        filterType: s.filterType,
-        selectedMarkerId: null,
-        selectedRestrictionId: null,
-        activeRestrictionId: s.activeRestrictionId,
-      }),
-      migrate: (persistedState: unknown, version: number) => {
-        const p = persistedState as Record<string, unknown>;
-        // Миграция из legacy 'totalquadro-storage' v2: project → гео-поля
-        const proj = (p.project ?? p) as Partial<{
-          map: MapData | null; markers: Marker[]; restrictions: Restriction[];
-          layers: Layer[]; calibration: MapState['calibration'];
-          googleMaps: { enabled?: boolean }; yandexMaps: { enabled?: boolean };
-          openStreetMap: MapState['openStreetMap']; settings: ProjectSettings;
-          currentTool: Tool; viewState: ViewState;
-        }>;
-        if (proj.map !== undefined) p.map = proj.map ?? null;
-        if (proj.markers) p.markers = proj.markers;
-        if (proj.restrictions) p.restrictions = proj.restrictions;
-        if (proj.layers?.length) p.layers = proj.layers;
-        if (proj.calibration) p.calibration = proj.calibration;
-        else if (!p.calibration) p.calibration = { enabled: false, points: [] };
-        // ЭТАП 1.2: даже если в СТАРОМ снапшоте лежит apiKey — он вырезается
-        // (toProviderPrefs берёт только enabled). Секреты не переживают миграцию.
-        p.googleMaps = toProviderPrefs(proj.googleMaps);
-        p.yandexMaps = toProviderPrefs(proj.yandexMaps);
-        if (proj.openStreetMap) p.openStreetMap = proj.openStreetMap;
-        else if (!p.openStreetMap) p.openStreetMap = { enabled: false, tileServer: 'osm' };
-        const st = (p.settings ?? {}) as Partial<ProjectSettings>;
-        p.settings = {
-          ...defaultMapSettings,
-          ...st,
-          // Режимы «спутник/гибрид» и внешние Overpass-слои удалены из приложения:
-          tileStyle: 'scheme',
-        };
-        if (version < 3) delete p.project;
-        // Нормализация viewState: старые версии могли записать вид без z0 или
-        // с «грязным» значением null/строка/NaN.
-        if (p.viewState !== undefined) p.viewState = normalizeViewState(p.viewState);
-        // Zod-санитайзер внешних данных: конечные числа, диапазоны lat/lon,
-        // bounds north>south/east>west, канонизация legacy rectangle→polygon,
-        // дефолты для дефектных секций. Ошибку не кидаем — persist-миграция
-        // должна вернуть состояние любой ценой; битые секции чинятся дефолтами.
-        try {
-          Object.assign(p, sanitizeProjectData(p));
-        } catch (e) {
-          console.warn('[tq-map migrate] schema sanitize skipped:', e);
-        }
-        return p as unknown as MapState;
-      },
-      onRehydrateStorage: () => (state, error) => {
-        if (error) console.warn('[tq-map persist] rehydration failed:', error);
-        // Принудительный set() после гидрации: гарантирует новый ссылочный ярлык
-        // viewTick и уведомление всех подписчиков — компоненты перерисуются уже
-        // с полностью восстановленным состоянием.
-        try {
-          useMapStore.setState((s) => ({
-            viewTick: s.viewTick + 1,
-            // ЭТАП 1.2 (двойная страховка): если zustand успел in-place
-            // смёржить legacy-объект с apiKey — вырезаем секрет немедленно,
-            // до любого подписчика/следующей записи.
-            googleMaps: toProviderPrefs(s.googleMaps),
-            yandexMaps: toProviderPrefs(s.yandexMaps),
-          }));
-        } catch { /* стор ещё не создан (первичная синхронная гидрация) — не страшно */ }
-        invalidateZoneCache();
-      },
+  persist((...a) => ({ ...initialMapState, ...createMapActions(...a) }), {
+    name: "tq-map",
+    version: 3,
+    // ФАЗА 4.2 (аудит): вместо прямого createJSONStorage — безопасное
+    // хранилище: запись через safeSetItem (quota → spill в IndexedDB,
+    // ошибки → 'storage:error' → toast), чтение битого JSON не роняет
+    // гидрацию, removeItem чистит и spill-запись. Валидация снапшота —
+    // мягкой Zod-санацией (sanitizeProjectData) на границе чтения.
+    storage: createSafeStorage<
+      Omit<MapState, "mapLoaded"> & { partialize?: never }
+    >("tq-map", {
+      sanitize: (raw) => sanitizeProjectData(raw) as never,
+    }),
+    // Сохраняемые поля = MapState минус транзиентные UI-флаги.
+    // mapLoaded НЕ гидрируется из localStorage: флаг публикуется MapCanvas
+    // только когда тайлы реально отрисованы (иначе после перезагрузки
+    // Мастер ложно считал бы карту готовой до первой загрузки).
+    partialize: (s): Omit<MapState, "mapLoaded"> => ({
+      // Не сохраняем map.dataUrl в localStorage — он слишком большой
+      map: s.map ? { ...s.map, dataUrl: "" } : null,
+      // Метаданные тактических слоёв (payload-ы — в IndexedDB/кэше)
+      tacticalOverlays: s.tacticalOverlays ?? [],
+      markers: s.markers,
+      restrictions: s.restrictions,
+      layers: s.layers,
+      calibration: s.calibration,
+      // ЭТАП 1.2: НИКОГДА не пишем apiKey — только флаг enabled (см. тип среза)
+      googleMaps: { enabled: s.googleMaps.enabled },
+      yandexMaps: { enabled: s.yandexMaps.enabled },
+      openStreetMap: s.openStreetMap,
+      settings: s.settings,
+      _currentMapId: s._currentMapId,
+      currentTool: s.currentTool,
+      viewState: s.viewState,
+      viewTick: s.viewTick,
+      cursorPosition: null,
+      isDrawing: false,
+      drawingPoints: [],
+      redoDrawingStack: [],
+      measurementPoints: [],
+      searchQuery: s.searchQuery,
+      filterType: s.filterType,
+      selectedMarkerId: null,
+      selectedRestrictionId: null,
+      activeRestrictionId: s.activeRestrictionId,
+    }),
+    migrate: (persistedState: unknown, version: number) => {
+      const p = persistedState as Record<string, unknown>;
+      // Миграция из legacy 'totalquadro-storage' v2: project → гео-поля
+      const proj = (p.project ?? p) as Partial<{
+        map: MapData | null;
+        markers: Marker[];
+        restrictions: Restriction[];
+        layers: Layer[];
+        calibration: MapState["calibration"];
+        googleMaps: { enabled?: boolean };
+        yandexMaps: { enabled?: boolean };
+        openStreetMap: MapState["openStreetMap"];
+        settings: ProjectSettings;
+        currentTool: Tool;
+        viewState: ViewState;
+      }>;
+      if (proj.map !== undefined) p.map = proj.map ?? null;
+      if (proj.markers) p.markers = proj.markers;
+      if (proj.restrictions) p.restrictions = proj.restrictions;
+      if (proj.layers?.length) p.layers = proj.layers;
+      if (proj.calibration) p.calibration = proj.calibration;
+      else if (!p.calibration) p.calibration = { enabled: false, points: [] };
+      // ЭТАП 1.2: даже если в СТАРОМ снапшоте лежит apiKey — он вырезается
+      // (toProviderPrefs берёт только enabled). Секреты не переживают миграцию.
+      p.googleMaps = toProviderPrefs(proj.googleMaps);
+      p.yandexMaps = toProviderPrefs(proj.yandexMaps);
+      if (proj.openStreetMap) p.openStreetMap = proj.openStreetMap;
+      else if (!p.openStreetMap)
+        p.openStreetMap = { enabled: false, tileServer: "osm" };
+      const st = (p.settings ?? {}) as Partial<ProjectSettings>;
+      p.settings = {
+        ...defaultMapSettings,
+        ...st,
+        // Режимы «спутник/гибрид» и внешние Overpass-слои удалены из приложения:
+        tileStyle: "scheme",
+      };
+      if (version < 3) delete p.project;
+      // Нормализация viewState: старые версии могли записать вид без z0 или
+      // с «грязным» значением null/строка/NaN.
+      if (p.viewState !== undefined)
+        p.viewState = normalizeViewState(p.viewState);
+      // Zod-санитайзер внешних данных: конечные числа, диапазоны lat/lon,
+      // bounds north>south/east>west, канонизация legacy rectangle→polygon,
+      // дефолты для дефектных секций. Ошибку не кидаем — persist-миграция
+      // должна вернуть состояние любой ценой; битые секции чинятся дефолтами.
+      try {
+        Object.assign(p, sanitizeProjectData(p));
+      } catch (e) {
+        console.warn("[tq-map migrate] schema sanitize skipped:", e);
+      }
+      return p as unknown as MapState;
     },
-  ),
+    onRehydrateStorage: () => (state, error) => {
+      if (error) console.warn("[tq-map persist] rehydration failed:", error);
+      // Принудительный set() после гидрации: гарантирует новый ссылочный ярлык
+      // viewTick и уведомление всех подписчиков — компоненты перерисуются уже
+      // с полностью восстановленным состоянием.
+      try {
+        useMapStore.setState((s) => ({
+          viewTick: s.viewTick + 1,
+          // ЭТАП 1.2 (двойная страховка): если zustand успел in-place
+          // смёржить legacy-объект с apiKey — вырезаем секрет немедленно,
+          // до любого подписчика/следующей записи.
+          googleMaps: toProviderPrefs(s.googleMaps),
+          yandexMaps: toProviderPrefs(s.yandexMaps),
+        }));
+      } catch {
+        /* стор ещё не создан (первичная синхронная гидрация) — не страшно */
+      }
+      invalidateZoneCache();
+    },
+  }),
 );
 
 /**
@@ -776,24 +904,31 @@ export const useMapStore = create<MapStore>()(
  */
 export async function cascadeRemoveStartGoal(
   markerId: string,
-  kind: 'start' | 'goal',
+  kind: "start" | "goal",
 ): Promise<void> {
   const [{ useMissionStore }, { useFleetStore }] = await Promise.all([
-    import('./useMissionStore'),
-    import('./useFleetStore'),
+    import("./useMissionStore"),
+    import("./useFleetStore"),
   ]);
   const mission = useMissionStore.getState();
 
   // 1) общие точки старта/цели (store-first зеркала в importLists)
-  if (kind === 'start' && mission.sharedStartId === markerId) {
+  if (kind === "start" && mission.sharedStartId === markerId) {
     useMissionStore.setState({ sharedStartId: null });
-  } else if (kind === 'goal' && mission.sharedGoalId === markerId) {
+  } else if (kind === "goal" && mission.sharedGoalId === markerId) {
     useMissionStore.setState({ sharedGoalId: null });
   }
 
   // 2) маршруты, узлы которых привязаны к удалённой точке
   const deadRouteIds = mission.routes
-    .filter((r) => r.points.some((p) => p.binding && p.binding.kind === kind && p.binding.pointId === markerId))
+    .filter((r) =>
+      r.points.some(
+        (p) =>
+          p.binding &&
+          p.binding.kind === kind &&
+          p.binding.pointId === markerId,
+      ),
+    )
     .map((r) => r.id);
   for (const rid of deadRouteIds) mission.deleteRoute(rid);
 
@@ -802,9 +937,18 @@ export async function cascadeRemoveStartGoal(
   for (const a of fleet.droneAssignments) {
     let changed = false;
     const patch: Partial<typeof a> = {};
-    if (kind === 'start' && a.startId === markerId) { patch.startId = null; changed = true; }
-    if (kind === 'goal' && a.goalId === markerId) { patch.goalId = null; changed = true; }
-    if (a.routeId && deadRouteIds.includes(a.routeId)) { patch.routeId = null; changed = true; }
+    if (kind === "start" && a.startId === markerId) {
+      patch.startId = null;
+      changed = true;
+    }
+    if (kind === "goal" && a.goalId === markerId) {
+      patch.goalId = null;
+      changed = true;
+    }
+    if (a.routeId && deadRouteIds.includes(a.routeId)) {
+      patch.routeId = null;
+      changed = true;
+    }
     if (changed) fleet.setDroneAssignment(a.droneId, patch);
   }
 }
@@ -820,7 +964,12 @@ export function selectViewForRender(s: MapStore): ViewState {
   const t = s.viewTick;
   const last = lastViewSel;
   if (last && last.t === t && last.v === v) return last.out;
-  const out: ViewState = { scale: v.scale, offsetX: v.offsetX, offsetY: v.offsetY, z0: v.z0 };
+  const out: ViewState = {
+    scale: v.scale,
+    offsetX: v.offsetX,
+    offsetY: v.offsetY,
+    z0: v.z0,
+  };
   lastViewSel = { t, v, out };
   return out;
 }

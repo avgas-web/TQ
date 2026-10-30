@@ -6,18 +6,25 @@
 // Симуляция/телеметрия дронов (DroneSim/FleetManager) подключаются сюда
 // через контроллеры (Map вне state) — сейчас здесь чистые данные.
 // ═══════════════════════════════════════════════════════════════
-import { create } from 'zustand';
-import type { StateCreator } from 'zustand';
-import { persist, createJSONStorage } from 'zustand/middleware';
-import type { DroneAssignment, DroneVideoState, Route } from '../types';
-import { MAX_FLEET_SIZE } from '../types';
-import { routeLengthM } from '../utils/routing';
-import { ValidationError } from '../utils/mission';
+import { create } from "zustand";
+import type { StateCreator } from "zustand";
+import { persist } from "zustand/middleware";
+// ФАЗА 4.2 (аудит): безопасный persist-storage + мягкая санация снапшота
+import { createSafeStorage } from "../utils/safeStorage";
+import { sanitizeFleetPersistData } from "../utils/projectSchema";
+import type { DroneAssignment, DroneVideoState, Route } from "../types";
+import { MAX_FLEET_SIZE } from "../types";
+import { routeLengthM } from "../utils/routing";
+import { ValidationError } from "../utils/mission";
 import {
-  DRONE_PROFILES, getProfile, modeFromCapabilities, videoLinkStatus,
+  DRONE_PROFILES,
+  getProfile,
+  modeFromCapabilities,
+  videoLinkStatus,
   validateRouteForMode,
-  type DroneMode, type DroneClass,
-} from '../utils/droneProfiles';
+  type DroneMode,
+  type DroneClass,
+} from "../utils/droneProfiles";
 
 /** Реестр маршрутов вне стора (без цикла модулей fleet↔mission):
  *  useMissionStore регистрирует в нём актуальный массив routes после каждого set. */
@@ -54,11 +61,19 @@ export interface FleetState {
 }
 
 export interface FleetActions {
-  setDroneAssignment: (droneId: string, patch: Partial<Omit<DroneAssignment, 'droneId'>>) => void;
+  setDroneAssignment: (
+    droneId: string,
+    patch: Partial<Omit<DroneAssignment, "droneId">>,
+  ) => void;
   removeDroneAssignment: (droneId: string) => void;
   resetFleet: () => void;
   /** Регистрация дрона; режим берётся из capabilities ('mode:long_range') или параметра. */
-  registerDrone: (droneId: string, connectionString: string, capabilities: string[], opts?: { mode?: DroneMode; droneClass?: DroneClass }) => void;
+  registerDrone: (
+    droneId: string,
+    connectionString: string,
+    capabilities: string[],
+    opts?: { mode?: DroneMode; droneClass?: DroneClass },
+  ) => void;
   unregisterDrone: (droneId: string) => void;
   setDroneMode: (droneId: string, mode: DroneMode) => void;
   setDroneClass: (droneId: string, cls: DroneClass) => void;
@@ -68,9 +83,15 @@ export interface FleetActions {
   /** Актуальный статус видеоканала дрона на заданной дистанции от GCS. */
   videoStatusFor: (droneId: string, distanceM: number) => DroneVideoState;
   /** Установка индивидуальной точки старта i-го дрона (null = сброс). */
-  setDroneStartAt: (index: number, geo: { lat: number; lng: number } | null) => void;
+  setDroneStartAt: (
+    index: number,
+    geo: { lat: number; lng: number } | null,
+  ) => void;
   /** Установка индивидуальной точки цели i-го дрона. */
-  setDroneGoalAt: (index: number, geo: { lat: number; lng: number } | null) => void;
+  setDroneGoalAt: (
+    index: number,
+    geo: { lat: number; lng: number } | null,
+  ) => void;
 }
 
 export type FleetStore = FleetState & FleetActions;
@@ -90,7 +111,11 @@ function clampIndex(i: number): number | null {
 }
 
 /** Иммутабельная установка значения в разреженном массиве гео-точек. */
-function setAt(arr: Array<{ lat: number; lng: number } | null>, i: number, v: { lat: number; lng: number } | null): Array<{ lat: number; lng: number } | null> {
+function setAt(
+  arr: Array<{ lat: number; lng: number } | null>,
+  i: number,
+  v: { lat: number; lng: number } | null,
+): Array<{ lat: number; lng: number } | null> {
   const next = [...arr];
   while (next.length < i) next.push(null);
   next[i] = v;
@@ -100,30 +125,65 @@ function setAt(arr: Array<{ lat: number; lng: number } | null>, i: number, v: { 
   return next.slice(0, end);
 }
 
-const createFleetActions: StateCreator<FleetStore, [], [], FleetActions> = (set, get) => ({
+const createFleetActions: StateCreator<FleetStore, [], [], FleetActions> = (
+  set,
+  get,
+) => ({
   setDroneAssignment: (droneId, patch) =>
     set((state) => {
-      const idx = state.droneAssignments.findIndex((d) => d.droneId === droneId);
+      const idx = state.droneAssignments.findIndex(
+        (d) => d.droneId === droneId,
+      );
       const next = [...state.droneAssignments];
       if (idx >= 0) next[idx] = { ...next[idx], ...patch };
-      else next.push({ droneId, startId: null, goalId: null, routeId: null, ...patch });
+      else
+        next.push({
+          droneId,
+          startId: null,
+          goalId: null,
+          routeId: null,
+          ...patch,
+        });
       return { droneAssignments: next };
     }),
 
   removeDroneAssignment: (droneId) =>
-    set((state) => ({ droneAssignments: state.droneAssignments.filter((d) => d.droneId !== droneId) })),
+    set((state) => ({
+      droneAssignments: state.droneAssignments.filter(
+        (d) => d.droneId !== droneId,
+      ),
+    })),
 
-  resetFleet: () => set({ droneAssignments: [], drones: [], selectedDroneId: null, droneStarts: [], droneGoals: [] }),
+  resetFleet: () =>
+    set({
+      droneAssignments: [],
+      drones: [],
+      selectedDroneId: null,
+      droneStarts: [],
+      droneGoals: [],
+    }),
 
   registerDrone: (droneId, connectionString, capabilities, opts) => {
     const id = droneId.trim();
     if (!id) return;
-    const mode: DroneMode = opts?.mode ?? modeFromCapabilities(capabilities) ?? 'short_range';
-    const droneClass: DroneClass = opts?.droneClass ?? (capabilities.some((c) => /^agri$/i.test(c.trim())) ? 'agri' : 'standard');
+    const mode: DroneMode =
+      opts?.mode ?? modeFromCapabilities(capabilities) ?? "short_range";
+    const droneClass: DroneClass =
+      opts?.droneClass ??
+      (capabilities.some((c) => /^agri$/i.test(c.trim()))
+        ? "agri"
+        : "standard");
     set((state) => ({
       drones: [
         ...state.drones.filter((d) => d.droneId !== id),
-        { droneId: id, connectionString: connectionString.trim(), capabilities: [...capabilities], mode, droneClass, videoRequested: false },
+        {
+          droneId: id,
+          connectionString: connectionString.trim(),
+          capabilities: [...capabilities],
+          mode,
+          droneClass,
+          videoRequested: false,
+        },
       ],
     }));
   },
@@ -131,8 +191,11 @@ const createFleetActions: StateCreator<FleetStore, [], [], FleetActions> = (set,
   unregisterDrone: (droneId) =>
     set((state) => ({
       drones: state.drones.filter((d) => d.droneId !== droneId),
-      droneAssignments: state.droneAssignments.filter((a) => a.droneId !== droneId),
-      selectedDroneId: state.selectedDroneId === droneId ? null : state.selectedDroneId,
+      droneAssignments: state.droneAssignments.filter(
+        (a) => a.droneId !== droneId,
+      ),
+      selectedDroneId:
+        state.selectedDroneId === droneId ? null : state.selectedDroneId,
     })),
 
   setDroneMode: (droneId, mode) => {
@@ -141,45 +204,80 @@ const createFleetActions: StateCreator<FleetStore, [], [], FleetActions> = (set,
     if (!rec) return;
     // ЖЁСТКАЯ блокировка: если назначенному дрону маршруту не хватает дальности/
     // высотной полосы нового профиля — режим НЕ меняется (hard ValidationError).
-    const assignment = get().droneAssignments.find((a) => a.droneId === droneId);
+    const assignment = get().droneAssignments.find(
+      (a) => a.droneId === droneId,
+    );
     if (assignment?.routeId) {
-      const route = routeRegistry.current.find((r) => r.id === assignment.routeId);
+      const route = routeRegistry.current.find(
+        (r) => r.id === assignment.routeId,
+      );
       if (route && route.points.length >= 2) {
         try {
-          const lenM = routeLengthM(route.points.map((p) => ({ lat: p.lat, lng: p.lng })));
+          const lenM = routeLengthM(
+            route.points.map((p) => ({ lat: p.lat, lng: p.lng })),
+          );
           const maxAgl = route.points.reduce<number | null>(
-            (acc, p) => (typeof p.altitudeAGL === 'number' ? Math.max(acc ?? 0, p.altitudeAGL) : acc), null);
+            (acc, p) =>
+              typeof p.altitudeAGL === "number"
+                ? Math.max(acc ?? 0, p.altitudeAGL)
+                : acc,
+            null,
+          );
           validateRouteForMode(lenM, maxAgl, mode);
         } catch (err) {
           if (err instanceof ValidationError) {
-            console.warn(`[fleet] смена режима «${mode}» для ${droneId} заблокирована:`, err.message);
+            console.warn(
+              `[fleet] смена режима «${mode}» для ${droneId} заблокирована:`,
+              err.message,
+            );
             return; // жёсткая ошибка — режим НЕ применяется
           }
           throw new Error(`fleet mode validation failed: ${String(err)}`);
         }
       }
     }
-    set((state) => ({ drones: state.drones.map((d) => (d.droneId === droneId ? { ...d, mode } : d)) }));
+    set((state) => ({
+      drones: state.drones.map((d) =>
+        d.droneId === droneId ? { ...d, mode } : d,
+      ),
+    }));
   },
 
   setDroneClass: (droneId, cls) =>
-    set((state) => ({ drones: state.drones.map((d) => (d.droneId === droneId ? { ...d, droneClass: cls } : d)) })),
+    set((state) => ({
+      drones: state.drones.map((d) =>
+        d.droneId === droneId ? { ...d, droneClass: cls } : d,
+      ),
+    })),
 
   selectDrone: (id) => set({ selectedDroneId: id }),
 
   requestVideo: (droneId, on) =>
-    set((state) => ({ drones: state.drones.map((d) => (d.droneId === droneId ? { ...d, videoRequested: on } : d)) })),
+    set((state) => ({
+      drones: state.drones.map((d) =>
+        d.droneId === droneId ? { ...d, videoRequested: on } : d,
+      ),
+    })),
 
   videoStatusFor: (droneId, distanceM) => {
     const rec = get().drones.find((d) => d.droneId === droneId);
-    if (!rec) return { streaming: false, requested: false, ok: false, note: 'Дрон не зарегистрирован' };
-    const link = videoLinkStatus(Math.max(0, Number.isFinite(distanceM) ? distanceM : 0), rec.mode);
+    if (!rec)
+      return {
+        streaming: false,
+        requested: false,
+        ok: false,
+        note: "Дрон не зарегистрирован",
+      };
+    const link = videoLinkStatus(
+      Math.max(0, Number.isFinite(distanceM) ? distanceM : 0),
+      rec.mode,
+    );
     const profile = getProfile(rec.mode);
     const streaming = rec.videoRequested && link.ok;
     const note = !rec.videoRequested
       ? `Видео выключено (${profile.label})`
       : link.ok
-        ? `${link.note}${rec.droneClass === 'agri' ? ' • агрокамера мультиспектр' : ''}`
+        ? `${link.note}${rec.droneClass === "agri" ? " • агрокамера мультиспектр" : ""}`
         : `Нет потока: ${link.note}`;
     return { streaming, requested: rec.videoRequested, ok: link.ok, note };
   },
@@ -188,64 +286,81 @@ const createFleetActions: StateCreator<FleetStore, [], [], FleetActions> = (set,
     const i = clampIndex(index);
     if (i === null) return;
     // Валидация координат: [-90..90] / [-180..180], только конечные числа
-    if (geo !== null && (!Number.isFinite(geo.lat) || !Number.isFinite(geo.lng))) return;
-    if (geo !== null && (geo.lat < -90 || geo.lat > 90 || geo.lng < -180 || geo.lng > 180)) return;
+    if (
+      geo !== null &&
+      (!Number.isFinite(geo.lat) || !Number.isFinite(geo.lng))
+    )
+      return;
+    if (
+      geo !== null &&
+      (geo.lat < -90 || geo.lat > 90 || geo.lng < -180 || geo.lng > 180)
+    )
+      return;
     set((state) => ({ droneStarts: setAt(state.droneStarts, i, geo) }));
   },
 
   setDroneGoalAt: (index, geo) => {
     const i = clampIndex(index);
     if (i === null) return;
-    if (geo !== null && (!Number.isFinite(geo.lat) || !Number.isFinite(geo.lng))) return;
-    if (geo !== null && (geo.lat < -90 || geo.lat > 90 || geo.lng < -180 || geo.lng > 180)) return;
+    if (
+      geo !== null &&
+      (!Number.isFinite(geo.lat) || !Number.isFinite(geo.lng))
+    )
+      return;
+    if (
+      geo !== null &&
+      (geo.lat < -90 || geo.lat > 90 || geo.lng < -180 || geo.lng > 180)
+    )
+      return;
     set((state) => ({ droneGoals: setAt(state.droneGoals, i, geo) }));
   },
 });
 
 export const useFleetStore = create<FleetStore>()(
-  persist(
-    (...a) => ({ ...initialFleetState, ...createFleetActions(...a) }),
-    {
-      name: 'tq-fleet',
-      version: 3,
-      storage: createJSONStorage(() => localStorage),
-      partialize: (s): FleetState => ({
-        droneAssignments: s.droneAssignments,
-        drones: s.drones,
-        selectedDroneId: s.selectedDroneId,
-        droneStarts: s.droneStarts,
-        droneGoals: s.droneGoals,
-      }),
-      migrate: (persistedState: unknown, version: number) => {
-        const p = persistedState as Partial<FleetState>;
-        if (!Array.isArray(p.droneAssignments)) p.droneAssignments = [];
-        if (!Array.isArray(p.drones)) p.drones = [];
-        if (version < 2) {
-          // v1: дронов не было — добавляем пустой список (режим по умолчанию short_range)
-          p.drones = [];
-          p.selectedDroneId = null;
-        }
-        if (version < 3) {
-          // v2: индивидуальных стартов/целей по индексам не было
-          if (!Array.isArray(p.droneStarts)) p.droneStarts = [];
-          if (!Array.isArray(p.droneGoals)) p.droneGoals = [];
-        }
-        return p as FleetState;
-      },
+  persist((...a) => ({ ...initialFleetState, ...createFleetActions(...a) }), {
+    name: "tq-fleet",
+    version: 3,
+    // ФАЗА 4.2 (аудит): безопасное хранилище (quota-spill в IndexedDB,
+    // 'storage:error' вместо молчаливой потери, мягкая санация на чтении).
+    storage: createSafeStorage<FleetState>("tq-fleet", {
+      sanitize: (raw) => sanitizeFleetPersistData(raw) as unknown as FleetState,
+    }),
+    partialize: (s): FleetState => ({
+      droneAssignments: s.droneAssignments,
+      drones: s.drones,
+      selectedDroneId: s.selectedDroneId,
+      droneStarts: s.droneStarts,
+      droneGoals: s.droneGoals,
+    }),
+    migrate: (persistedState: unknown, version: number) => {
+      const p = persistedState as Partial<FleetState>;
+      if (!Array.isArray(p.droneAssignments)) p.droneAssignments = [];
+      if (!Array.isArray(p.drones)) p.drones = [];
+      if (version < 2) {
+        // v1: дронов не было — добавляем пустой список (режим по умолчанию short_range)
+        p.drones = [];
+        p.selectedDroneId = null;
+      }
+      if (version < 3) {
+        // v2: индивидуальных стартов/целей по индексам не было
+        if (!Array.isArray(p.droneStarts)) p.droneStarts = [];
+        if (!Array.isArray(p.droneGoals)) p.droneGoals = [];
+      }
+      return p as FleetState;
     },
-  ),
+  }),
 );
 
 // ─── Кастомные хуки-селекторы (точечные подписки, без лишних ререндеров) ────
 
 /** Все дальнобойные дроны парка. */
 export const useLongRangeDrones = (): FleetDroneRecord[] =>
-  useFleetStore((s) => s.drones.filter((d) => d.mode === 'long_range'));
+  useFleetStore((s) => s.drones.filter((d) => d.mode === "long_range"));
 
 /** Все короткодистанционные дроны (в т.ч. агродроны). */
 export const useShortRangeDrones = (): FleetDroneRecord[] =>
-  useFleetStore((s) => s.drones.filter((d) => d.mode === 'short_range'));
+  useFleetStore((s) => s.drones.filter((d) => d.mode === "short_range"));
 
 /** Агродроны отдельной выборкой. */
 export const useAgriDrones = (): FleetDroneRecord[] =>
-  useFleetStore((s) => s.drones.filter((d) => d.droneClass === 'agri'));
+  useFleetStore((s) => s.drones.filter((d) => d.droneClass === "agri"));

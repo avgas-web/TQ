@@ -6,6 +6,8 @@ import { useMissionWizardStore } from "../../store/useMissionWizardStore";
 // превью на 3–10 точек. ФАЗА 3.2: .tqproj пишется в едином конверте v2.
 import { buildFullExport } from "../../utils/wizardExport";
 import { serializeMissionFile } from "../../utils/projectFile";
+// ФАЗА 4.2 (аудит): сохранение миссии — через safeSetItem (quota-spill + toast)
+import { safeSetItem } from "../../utils/storage";
 import { ConfirmDialog } from "./shared";
 
 export function MissionDeploymentStep() {
@@ -51,11 +53,16 @@ export function MissionDeploymentStep() {
     // ФАЗА 3.2 (аудит): раньше сериализовался весь стор (`{ wizard: s }`) —
     // JSON.stringify молча вырезал функции, формат не имел версии. Теперь —
     // только данные через единый конверт v2 (kind='mission', utils/projectFile).
+    // ФАЗА 4.2 (аудит): запись через safeSetItem — при переполнении квоты
+    // значение вытесняется в IndexedDB, а реальная ошибка публикуется в канал
+    // 'storage:error' (toast пользователю) вместо молчаливой потери миссии.
     const data = serializeMissionFile(true);
-    localStorage.setItem("tq-mission-saved", data);
-    useMissionWizardStore.setState((st2) => ({
-      deploymentLog: [...st2.deploymentLog, "✓ Миссия сохранена локально."],
-    }));
+    void safeSetItem("tq-mission-saved", data).then((ok) => {
+      if (!ok) return; // детали ошибки — уже в toast (storage:error)
+      useMissionWizardStore.setState((st2) => ({
+        deploymentLog: [...st2.deploymentLog, "✓ Миссия сохранена локально."],
+      }));
+    });
   };
 
   const exportTqproj = () => {
