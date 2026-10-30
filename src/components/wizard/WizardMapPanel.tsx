@@ -13,55 +13,75 @@
 //  • панорама и непрерывный зум работают из коробки (drag/колесо в MapCanvas);
 //  • строгая гео-привязка: вид публикуется в localStorage-зеркало 'tq-view',
 //    клики этапов конвертируются utils/mapGeoPick по той же Mercator-формуле.
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import MapCanvas from '../MapCanvas';
-import { useStore } from '../../store/useStore';
-import { useMapStore } from '../../store/useMapStore';
-import { syncShimSnapshot } from '../../store/useStoreShim';
-import { useMissionWizardStore } from '../../store/useMissionWizardStore';
-import { getProviderStatus } from '../../utils/mapProviders';
-import { TILE_SERVER_ORDER, normalizeTileServer, type TileServerId } from '../../utils/openStreetMap';
-import { ensureDefaultTileMap } from '../../hooks/useAppInitialization';
-import { wizardClickToGeo } from '../../utils/mapGeoPick';
-import { findBuildingAt, type BuildingInfo, type BuildingResult } from '../../utils/buildingLookup';
-import BuildingPopupCard from './BuildingPopupCard';
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import MapCanvas from "../MapCanvas";
+import { useStore } from "../../store/useStore";
+import { useMapStore } from "../../store/useMapStore";
+import { syncShimSnapshot } from "../../store/useStoreShim";
+import { useMissionWizardStore } from "../../store/useMissionWizardStore";
+import { getProviderStatus } from "../../utils/mapProviders";
+import {
+  TILE_SERVER_ORDER,
+  normalizeTileServer,
+  type TileServerId,
+} from "../../utils/openStreetMap";
+import { ensureDefaultTileMap } from "../../hooks/useAppInitialization";
+import { wizardClickToGeo } from "../../utils/mapGeoPick";
+import {
+  findBuildingAt,
+  type BuildingInfo,
+  type BuildingResult,
+} from "../../utils/buildingLookup";
+import BuildingPopupCard from "./BuildingPopupCard";
 
 /**
  * Подложка режима мастера — ТОЧНО как в эталонном Leaflet-коде
  * («Анализ рельефа и высоты зданий»): единственный слой OpenTopoMap,
  * maxZoom 17, та же атрибуция.
  */
-export const WIZARD_TILE_URL = 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png';
+export const WIZARD_TILE_URL =
+  "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png";
 export const WIZARD_TILE_MAX_ZOOM = 17;
 export const WIZARD_TILE_ATTRIBUTION =
-  'Map data: © OpenStreetMap contributors, SRTM | Map style: © OpenTopoMap (CC-BY-SA)';
+  "Map data: © OpenStreetMap contributors, SRTM | Map style: © OpenTopoMap (CC-BY-SA)";
 
 /** Короткие подписи переключателя: берятся из реестра рабочих провайдеров. */
 const SERVER_SHORT_LABELS: Record<TileServerId, string> = {
-  esri: '🛰 Esri',
-  'esri-sat': '🌍 Спутник',
-  osmfr: '🌐 OSM FR',
-  hot: '❤️ HOT',
-  osmde: '🇩🇪 OSM DE',
-  opentopomap: '⛰ Topo',
-  cyclosm: '🚴 Cyclo',
+  esri: "🛰 Esri",
+  "esri-sat": "🌍 Спутник",
+  osmfr: "🌐 OSM FR",
+  hot: "❤️ HOT",
+  osmde: "🇩🇪 OSM DE",
+  opentopomap: "⛰ Topo",
+  cyclosm: "🚴 Cyclo",
 };
 
 /** Панель переключения бесплатных XYZ-подложек + статус ключевых провайдеров.
  *  Список = рабочие серверы аудита (TILE_SERVER_ORDER); 2ГИС удалён полностью. */
 const ProviderSwitcher: React.FC = () => {
-  const tileServer = normalizeTileServer(useStore((s) => s.project.openStreetMap?.tileServer ?? 'osm'));
+  const tileServer = normalizeTileServer(
+    useStore((s) => s.project.openStreetMap?.tileServer ?? "osm"),
+  );
 
   const google = useStore((s) => s.project.googleMaps);
   const yandex = useStore((s) => s.project.yandexMaps);
 
   // Graceful degradation: Google/Яндекс показаны, но помечены как требующие
   // ключа — при отсутствии ключа система НЕ падает, а подсказывает рабочие XYZ.
-  const gStatus = getProviderStatus({ googleMaps: google, yandexMaps: yandex }, 'google');
-  const yStatus = getProviderStatus({ googleMaps: google, yandexMaps: yandex }, 'yandex');
+  const gStatus = getProviderStatus(
+    { googleMaps: google, yandexMaps: yandex },
+    "google",
+  );
+  const yStatus = getProviderStatus(
+    { googleMaps: google, yandexMaps: yandex },
+    "yandex",
+  );
 
   return (
-    <div className="flex items-center gap-1 border-b border-slate-800 bg-slate-950 px-2 py-1" data-testid="wizard-map-providers">
+    <div
+      className="flex items-center gap-1 border-b border-slate-800 bg-slate-950 px-2 py-1"
+      data-testid="wizard-map-providers"
+    >
       {TILE_SERVER_ORDER.map((id) => (
         <button
           key={id}
@@ -75,10 +95,10 @@ const ProviderSwitcher: React.FC = () => {
             syncShimSnapshot();
           }}
           className={
-            'rounded px-2 py-0.5 text-[11px] transition ' +
+            "rounded px-2 py-0.5 text-[11px] transition " +
             (tileServer === id
-              ? 'bg-cyan-600 font-bold text-white'
-              : 'bg-slate-800 text-slate-300 hover:bg-slate-700')
+              ? "bg-cyan-600 font-bold text-white"
+              : "bg-slate-800 text-slate-300 hover:bg-slate-700")
           }
           title="Публичные HTTPS-тайлы без API-ключа"
         >
@@ -86,16 +106,22 @@ const ProviderSwitcher: React.FC = () => {
         </button>
       ))}
       <span className="ml-auto flex gap-2 text-[10px]">
-        <span className={gStatus.ready ? 'text-green-400' : 'text-amber-400'} title={gStatus.message}>
-          🌍 Google {gStatus.ready ? '✓' : '🔑'}
+        <span
+          className={gStatus.ready ? "text-green-400" : "text-amber-400"}
+          title={gStatus.message}
+        >
+          🌍 Google {gStatus.ready ? "✓" : "🔑"}
         </span>
-        <span className={yStatus.ready ? 'text-green-400' : 'text-amber-400'} title={yStatus.message}>
-          🗺️ Яндекс {yStatus.ready ? '✓' : '🔑'}
+        <span
+          className={yStatus.ready ? "text-green-400" : "text-amber-400"}
+          title={yStatus.message}
+        >
+          🗺️ Яндекс {yStatus.ready ? "✓" : "🔑"}
         </span>
       </span>
     </div>
   );
-}
+};
 
 export interface WizardMapPanelProps {
   /** Подпись над картой (название этапа/инструмента). */
@@ -110,15 +136,41 @@ export interface WizardMapPanelProps {
  * остаётся для совместимости с тестами/редактором, но в мастере он
  * форсирует opentopomap при монтировании панели.
  */
-const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) => void }> = ({ hint, onMapLoaded }) => {
+const MapPanelBody: React.FC<{
+  hint?: string;
+  onMapLoaded?: (loaded: boolean) => void;
+}> = ({ hint, onMapLoaded }) => {
   const project = useStore((s) => s.project);
 
   // ── Клик по карте = «умный поиск здания» (Overpass), как в эталоне ────────
-  const [statusMsg, setStatusMsg] = useState<string>('Готов. Кликните по карте, чтобы узнать высоту здания.');
+  const [statusMsg, setStatusMsg] = useState<string>(
+    "Готов. Кликните по карте, чтобы узнать высоту здания.",
+  );
   // ФАЗА 2 (XSS): вместо строки html храним типизированный BuildingInfo —
   // рендер через React-компонент BuildingPopupCard (автоэкранирование).
-  const [popup, setPopup] = useState<{ x: number; y: number; building: BuildingInfo } | null>(null);
+  const [popup, setPopup] = useState<{
+    x: number;
+    y: number;
+    building: BuildingInfo;
+  } | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  // ФАЗА 4.3 (аудит): гонка Overpass-запросов. Каждому клику соответствует
+  // монотонный requestId + AbortController предыдущего запроса:
+  //  • новый клик ОТМЕНЯЕТ незавершённый предыдущий поиск (нет лишних
+  //    «зависших» fetch и устаревших попапов),
+  //  • результат применяется только если это всё ещё самый новый запрос
+  //    (поздний ответ старого клика не перезапишет данные нового).
+  const buildingReqSeq = useRef(0);
+  const buildingAbortRef = useRef<AbortController | null>(null);
+  useEffect(
+    () => () => {
+      // Размонтирование панели — отменяем активный сетевой запрос.
+      buildingReqSeq.current++;
+      buildingAbortRef.current?.abort();
+      buildingAbortRef.current = null;
+    },
+    [],
+  );
 
   // Этап 1 мастера: подложка = основная карта, выбранная пользователем.
   // При монтировании панели синхронизируем картографический стор с выбором
@@ -131,7 +183,9 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
     // legacy-значение 'osm' в project.tileServer нормализуется в 'esri', и старая
     // проверка «project.tileServer !== primary» при primary='esri' не совпадала бы
     // никогда → панель мастера так и осталась бы на дефолтной Esri вместо osmfr.
-    const current = normalizeTileServer(useMapStore.getState().openStreetMap.tileServer);
+    const current = normalizeTileServer(
+      useMapStore.getState().openStreetMap.tileServer,
+    );
     if (current !== primary) {
       // Пишем ПРЯМО в доменный стор: legacy-фасад useStore.setOSMTileServer
       // обновляет только снапшот project.openStreetMap и НЕ трогает
@@ -156,7 +210,9 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
   const wizardPrimaryMap = useMissionWizardStore((s) => s.primaryMap);
   useEffect(() => {
     if (!wizardPrimaryMap) return;
-    const current = normalizeTileServer(useMapStore.getState().openStreetMap.tileServer);
+    const current = normalizeTileServer(
+      useMapStore.getState().openStreetMap.tileServer,
+    );
     if (current !== wizardPrimaryMap) {
       // Пишем прямо в доменный стор (источник истины рендера), синхронизируем фасад.
       useMapStore.getState().setOSMTileServer(wizardPrimaryMap);
@@ -170,47 +226,77 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
    * Mercator-формулой, что использует вся система гео-привязки мастера
    * (utils/mapGeoPick.screenToGeo + зеркало вида 'tq-view').
    */
-  const handleMapClick = useCallback(async (e: React.MouseEvent<HTMLDivElement>) => {
-    const el = containerRef.current;
-    if (!el) return;
-    // Эталон: клик по интерактивному объекту маршрута не запускает поиск.
-    const target = e.target as HTMLElement | null;
-    if (target && typeof target.className === 'string' && target.className.includes('leaflet-interactive')) return;
-    // Не перехватываем клики по попапу/статусной строке/попаданию в UI поверх карты.
-    if (target && target.closest('[data-wizard-map-ui]')) return;
+  const handleMapClick = useCallback(
+    async (e: React.MouseEvent<HTMLDivElement>) => {
+      const el = containerRef.current;
+      if (!el) return;
+      // Эталон: клик по интерактивному объекту маршрута не запускает поиск.
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        typeof target.className === "string" &&
+        target.className.includes("leaflet-interactive")
+      )
+        return;
+      // Не перехватываем клики по попапу/статусной строке/попаданию в UI поверх карты.
+      if (target && target.closest("[data-wizard-map-ui]")) return;
 
-    const r = el.getBoundingClientRect();
-    const geo = wizardClickToGeo(e.clientX - r.left, e.clientY - r.top, r.height);
-    if (!geo) return;
-    const { lat, lng } = geo;
-    const lon = lng; // legacy-алиас для последующего кода этапа (стандарт — lng, аудит 1.2)
+      const r = el.getBoundingClientRect();
+      const geo = wizardClickToGeo(
+        e.clientX - r.left,
+        e.clientY - r.top,
+        r.height,
+      );
+      if (!geo) return;
+      const { lat, lng } = geo;
+      const lon = lng; // legacy-алиас для последующего кода этапа (стандарт — lng, аудит 1.2)
 
-    setStatusMsg('🔍 Поиск здания в этой точке...');
-    setPopup(null);
+      setStatusMsg("🔍 Поиск здания в этой точке...");
+      setPopup(null);
 
-    const res: BuildingResult = await findBuildingAt(lat, lon);
-    if (res.kind === 'found') {
-      setPopup({
-        x: e.clientX - r.left,
-        y: e.clientY - r.top,
-        building: res.building,
+      // ФАЗА 4.3: отменяем предыдущий незавершённый поиск и фиксируем номер
+      // текущего — только он имеет право обновить попап/статус по приходу ответа.
+      buildingAbortRef.current?.abort();
+      const controller = new AbortController();
+      buildingAbortRef.current = controller;
+      const reqId = ++buildingReqSeq.current;
+
+      const res = await findBuildingAt(lat, lon, undefined, {
+        signal: controller.signal,
       });
-      setStatusMsg(`🏢 Здание найдено: высота ${res.building.heightStr}`);
-    } else if (res.kind === 'not-found') {
-      setStatusMsg('❌ Здание в этой точке не найдено. Попробуйте кликнуть ближе к центру строения.');
-    } else {
-      setStatusMsg('⚠️ Не удалось связаться с сервером OSM. Попробуйте позже.');
-    }
-  }, []);
+      // Устаревший/отменённый ответ — молча игнорируем (не трогаем UI нового запроса).
+      if (res.kind === "aborted" || reqId !== buildingReqSeq.current) return;
+
+      if (res.kind === "found") {
+        setPopup({
+          x: e.clientX - r.left,
+          y: e.clientY - r.top,
+          building: res.building,
+        });
+        setStatusMsg(`🏢 Здание найдено: высота ${res.building.heightStr}`);
+      } else if (res.kind === "not-found") {
+        setStatusMsg(
+          "❌ Здание в этой точке не найдено. Попробуйте кликнуть ближе к центру строения.",
+        );
+      } else {
+        setStatusMsg(
+          "⚠️ Не удалось связаться с сервером OSM. Попробуйте позже.",
+        );
+      }
+    },
+    [],
+  );
   // Все серверы из TILE_SERVER_ORDER — публичные XYZ без ключей; getProviderStatus
   // принимает legacy-идентификаторы ('osm' и т.п.), поэтому нормализованное
   // значение прокидывается как 'osm' (готовность = ready всегда для keyless).
-  const status = getProviderStatus(project, 'osm');
+  const status = getProviderStatus(project, "osm");
   return (
     <>
       <ProviderSwitcher />
       {hint && (
-        <div className="border-b border-slate-800 bg-slate-900 px-2 py-1 text-[11px] text-slate-300">{hint}</div>
+        <div className="border-b border-slate-800 bg-slate-900 px-2 py-1 text-[11px] text-slate-300">
+          {hint}
+        </div>
       )}
       {/* ФИКС «Не удалось определить размер карты» (КОРЕНЬ): раньше здесь был
           style={{ height: '100%' }} / класс h-full — в flex-колонке мастера
@@ -227,7 +313,7 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
           схлопывалась до содержимого. */}
       <div
         className="relative w-full min-h-[280px] flex-1 basis-auto overflow-hidden"
-        style={{ height: 'calc(100vh - 320px)' }}
+        style={{ height: "calc(100vh - 320px)" }}
         data-testid="wizard-map-container"
         onClickCapture={handleMapClick}
       >
@@ -240,7 +326,10 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
             data-wizard-map-ui
             data-testid="wizard-building-popup"
             className="building-popup absolute z-30 rounded-md border border-slate-300 bg-white px-3 py-2 shadow-lg"
-            style={{ left: Math.min(popup.x + 8, 9999), top: Math.max(popup.y - 12, 4) }}
+            style={{
+              left: Math.min(popup.x + 8, 9999),
+              top: Math.max(popup.y - 12, 4),
+            }}
           >
             <BuildingPopupCard building={popup.building} />
           </div>
@@ -251,7 +340,9 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
             className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/85 p-4 text-center"
             data-testid="wizard-map-key-overlay"
           >
-            <p className="max-w-sm text-sm text-amber-300">⚠️ {status.message}</p>
+            <p className="max-w-sm text-sm text-amber-300">
+              ⚠️ {status.message}
+            </p>
           </div>
         )}
       </div>
@@ -281,7 +372,9 @@ function useEnsureTileMap(): void {
     // (тот же класс краша #127, что лечился в MapCanvas). Таймер чистится в
     // cleanup — при быстром размонтировании (переключение шагов) колбэк не
     // выполнится на «мёртвом» дереве.
-    const t = window.setTimeout(() => { ensureDefaultTileMap(); }, 0);
+    const t = window.setTimeout(() => {
+      ensureDefaultTileMap();
+    }, 0);
     return () => window.clearTimeout(t);
   }, []);
 }
@@ -300,7 +393,7 @@ export function WizardMapPanel({ hint, onMapLoaded }: WizardMapPanelProps) {
   return (
     <div
       className="relative flex min-h-[340px] w-full flex-1 basis-auto flex-col overflow-hidden rounded-lg border border-cyan-700/60 bg-slate-950 shadow-lg"
-      style={{ height: 'calc(100vh - 300px)' }}
+      style={{ height: "calc(100vh - 300px)" }}
       data-testid="wizard-map-panel"
     >
       <MapPanelBody hint={hint} onMapLoaded={onMapLoaded} />

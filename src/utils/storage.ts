@@ -1,11 +1,12 @@
 // Утилиты для работы с хранилищем данных
+import { eventBus } from "./eventBus";
 
 /** Ключ persist-стора. ЭТАП 3 (боевая терминология) переименовал доменные поля,
  *  но сам ключ остаётся стабильным: менять его нельзя — это разрыв совместимости
  *  с уже сохранёнными проектами. Переименованные поля читаются из старых записей
  *  через migratePersistedState (старые имена читаются, новые пишутся).
  */
-const STORAGE_KEY = 'totalquadro-storage';
+const STORAGE_KEY = "totalquadro-storage";
 
 /**
  * ФАЗА 2 (безопасность данных): собственный allow-list ключей приложения.
@@ -16,22 +17,27 @@ const STORAGE_KEY = 'totalquadro-storage';
  */
 export const APP_OWN_STORAGE_KEYS: readonly string[] = Object.freeze([
   STORAGE_KEY,
-  'tq-map',
-  'tq-mission',
-  'tq-fleet',
-  'tq-mission-wizard',
-  'tq-mission-saved',
-  'tq-ui-mode',
-  'tq-wizard-maps-open',
-  'tq-view',
+  "tq-map",
+  "tq-mission",
+  "tq-fleet",
+  "tq-mission-wizard",
+  "tq-mission-saved",
+  "tq-ui-mode",
+  "tq-wizard-maps-open",
+  "tq-view",
 ]);
 
 /** Префиксы ключей, принадлежащих приложению (резервные копии сторов). */
-const APP_OWN_KEY_PREFIXES: readonly string[] = Object.freeze(['totalquadro-backup']);
+const APP_OWN_KEY_PREFIXES: readonly string[] = Object.freeze([
+  "totalquadro-backup",
+]);
 
 /** Принадлежит ли ключ приложению (см. APP_OWN_STORAGE_KEYS). */
 export function isAppOwnStorageKey(key: string): boolean {
-  return APP_OWN_STORAGE_KEYS.includes(key) || APP_OWN_KEY_PREFIXES.some((p) => key.startsWith(p));
+  return (
+    APP_OWN_STORAGE_KEYS.includes(key) ||
+    APP_OWN_KEY_PREFIXES.some((p) => key.startsWith(p))
+  );
 }
 
 /**
@@ -41,7 +47,7 @@ export function isAppOwnStorageKey(key: string): boolean {
 const EPHEMERAL_KEY_RE = /^(mission-launch|tq-launch)(-\d{10,})?$/;
 
 /** Spill-маркеры heavy-значений (см. safeSetItem): `spill:<key>`. */
-const SPILL_PREFIX = 'spill:';
+const SPILL_PREFIX = "spill:";
 const SPILL_MARKER = '{"__tqSpill":';
 
 /** Является ли ключ временной служебной записью приложения (удаляется безусловно). */
@@ -54,37 +60,44 @@ function isEphemeralAppKey(key: string): boolean {
  * oldKey -> newKey в теле сохранённого состояния (persist payload).
  * Читаем старое имя, пишем новое, старое удаляем после успешного переноса.
  */
-export const LEGACY_STATE_KEYS: Readonly<Record<string, string>> = Object.freeze({
-  droneAssignments: 'combatAssetAssignments',
-  droneCount: 'assetCount',
-  droneGoals: 'strikeObjectives',
-  droneStarts: 'combatAssetStarts',
-  nfzList: 'adizList',
-  routeDraft: 'tacticalProjection',
-  draftRoute: 'tacticalProjection',
-  waypoints: 'tacticalNodes',
-  waypointParams: 'tacticalNodeParams',
-  gameLoop: 'combatCycle',
-});
+export const LEGACY_STATE_KEYS: Readonly<Record<string, string>> =
+  Object.freeze({
+    droneAssignments: "combatAssetAssignments",
+    droneCount: "assetCount",
+    droneGoals: "strikeObjectives",
+    droneStarts: "combatAssetStarts",
+    nfzList: "adizList",
+    routeDraft: "tacticalProjection",
+    draftRoute: "tacticalProjection",
+    waypoints: "tacticalNodes",
+    waypointParams: "tacticalNodeParams",
+    gameLoop: "combatCycle",
+  });
 
 /**
  * Миграция вложенных полей маршрутов (project.routes[]): старые имена параметров
  * узлов боевого курса читаются, новые пишутся, старые удаляются. Идемпотентно.
  */
-const LEGACY_ROUTE_FIELD_KEYS: Readonly<Record<string, string>> = Object.freeze({
-  waypointParams: 'tacticalNodeParams',
-});
+const LEGACY_ROUTE_FIELD_KEYS: Readonly<Record<string, string>> = Object.freeze(
+  {
+    waypointParams: "tacticalNodeParams",
+  },
+);
 
 function migrateRouteShapes(state: Record<string, any>): void {
   const routes = state?.project?.routes;
   if (!Array.isArray(routes)) return;
   for (const r of routes) {
-    if (!r || typeof r !== 'object') continue;
+    if (!r || typeof r !== "object") continue;
     for (const [legacyKey, newKey] of Object.entries(LEGACY_ROUTE_FIELD_KEYS)) {
       if (!(legacyKey in r)) continue;
       const legacyValue = r[legacyKey];
-      const hasNew = newKey in r && r[newKey] !== undefined && r[newKey] !== null;
-      const newIsEmpty = hasNew && typeof r[newKey] === 'object' && Object.keys(r[newKey]).length === 0;
+      const hasNew =
+        newKey in r && r[newKey] !== undefined && r[newKey] !== null;
+      const newIsEmpty =
+        hasNew &&
+        typeof r[newKey] === "object" &&
+        Object.keys(r[newKey]).length === 0;
       if (!hasNew || newIsEmpty) r[newKey] = legacyValue;
       delete r[legacyKey];
     }
@@ -96,13 +109,17 @@ function migrateRouteShapes(state: Record<string, any>): void {
  * ничего не меняет. Если новое поле уже присутствует и не пустое — старое
  * просто удаляется (новое приоритетнее: оно записано текущей версией стора).
  */
-export function migratePersistedState<T extends Record<string, any>>(state: T | null | undefined): T {
+export function migratePersistedState<T extends Record<string, any>>(
+  state: T | null | undefined,
+): T {
   const out: Record<string, any> = { ...(state ?? {}) };
   for (const [legacyKey, newKey] of Object.entries(LEGACY_STATE_KEYS)) {
     if (!(legacyKey in out)) continue;
     const legacyValue = out[legacyKey];
-    const hasNew = newKey in out && out[newKey] !== undefined && out[newKey] !== null;
-    const newIsEmpty = hasNew && Array.isArray(out[newKey]) && out[newKey].length === 0;
+    const hasNew =
+      newKey in out && out[newKey] !== undefined && out[newKey] !== null;
+    const newIsEmpty =
+      hasNew && Array.isArray(out[newKey]) && out[newKey].length === 0;
     if (!hasNew || newIsEmpty) {
       out[newKey] = legacyValue;
     }
@@ -111,12 +128,12 @@ export function migratePersistedState<T extends Record<string, any>>(state: T | 
   migrateRouteShapes(out);
   return out as T;
 }
-const MAP_DB_NAME = 'totalquadro-maps';
-const MAP_STORE_NAME = 'maps';
+const MAP_DB_NAME = "totalquadro-maps";
+const MAP_STORE_NAME = "maps";
 /** Версия БД: 3 — добавлен store «tactical-overlays» (бинарные данные тактических слоёв из main) */
 const MAP_DB_VERSION = 3;
-const USER_LAYER_STORE_NAME = 'userlayers';
-const TACTICAL_STORE_NAME = 'tactical-overlays';
+const USER_LAYER_STORE_NAME = "userlayers";
+const TACTICAL_STORE_NAME = "tactical-overlays";
 
 /** Максимальный размер слоя, при котором он ещё допускается к загрузке (150 МБ).
  *  IndexedDB физически вмещает больше, но такие файлы почти всегда ошибочны. */
@@ -125,30 +142,34 @@ export const MAX_USER_LAYER_BYTES = 150 * 1024 * 1024;
 /**
  * Проверка доступного места в localStorage
  */
-export function checkLocalStorageQuota(): { used: number; available: number; percentage: number } {
+export function checkLocalStorageQuota(): {
+  used: number;
+  available: number;
+  percentage: number;
+} {
   let used = 0;
-  
+
   // Реальный Storage перечисляет ключи как свойства объекта, но не является их
   // владельцем (Object.getPrototypeOf(localStorage) === Storage.prototype),
   // поэтому hasOwnProperty в старом коде всегда давал false и объём считался как 0.
   // Корректный итератор: Object.keys + length/key(i).
   const ownKeys = Object.keys(localStorage);
   for (const key of ownKeys) {
-    used += key.length + String(localStorage.getItem(key) ?? '').length;
+    used += key.length + String(localStorage.getItem(key) ?? "").length;
   }
   const count = Number(localStorage.length) || 0;
   for (let i = 0; i < count; i++) {
     const key = localStorage.key(i);
     if (key && !ownKeys.includes(key)) {
-      used += key.length + String(localStorage.getItem(key) ?? '').length;
+      used += key.length + String(localStorage.getItem(key) ?? "").length;
     }
   }
-  
+
   // Примерный лимит localStorage (5 МБ)
   const limit = 5 * 1024 * 1024;
   const available = Math.max(0, limit - used);
   const percentage = (used / limit) * 100;
-  
+
   return { used, available, percentage };
 }
 
@@ -173,28 +194,39 @@ export interface CleanupResult {
 }
 
 export function cleanupLocalStorage(): CleanupResult {
-  const result: CleanupResult = { removedKeys: [], freedBytes: 0, percentage: 0 };
+  const result: CleanupResult = {
+    removedKeys: [],
+    freedBytes: 0,
+    percentage: 0,
+  };
   try {
     const quota = checkLocalStorageQuota();
     result.percentage = quota.percentage;
 
     for (const key of Object.keys(localStorage)) {
       // Никогда не удаляем чужие ключи (вне allow-list) и активные сторы.
-      if (!isEphemeralAppKey(key) && !key.startsWith('totalquadro-backup')) continue;
+      if (!isEphemeralAppKey(key) && !key.startsWith("totalquadro-backup"))
+        continue;
       if (APP_OWN_STORAGE_KEYS.includes(key)) continue;
-      const size = key.length + String(localStorage.getItem(key) ?? '').length;
+      const size = key.length + String(localStorage.getItem(key) ?? "").length;
       try {
         localStorage.removeItem(key);
         result.removedKeys.push(key);
         result.freedBytes += size;
-      } catch { /* недоступно — пропускаем */ }
+      } catch {
+        /* недоступно — пропускаем */
+      }
     }
 
     if (quota.percentage > 80) {
-      console.warn('localStorage заполнен на', quota.percentage.toFixed(1), '%');
+      console.warn(
+        "localStorage заполнен на",
+        quota.percentage.toFixed(1),
+        "%",
+      );
     }
   } catch (error) {
-    console.error('Ошибка очистки localStorage:', error);
+    console.error("Ошибка очистки localStorage:", error);
   }
   return result;
 }
@@ -202,15 +234,60 @@ export function cleanupLocalStorage(): CleanupResult {
 /**
  * Пользовательское уведомление об ошибке сохранения (UX-слой).
  * console.error сам по себе невидим пользователю — при переполнении хранилища
- * данные терялись молча. Dispatch собственного события; компоненты могут
- * подписаться на него для показа тоста. detail содержит только текст (строку).
+ * данные терялись молча.
+ *
+ * ФАЗА 4.1 (аудит): раньше здесь был ТОЛЬКО legacy-канал `window`
+ * ('tq:storage-error'), а типобезопасный eventBus ('storage:error'), на который
+ * подписан StorageToast в App.tsx, эмитировался лишь отдельными вызывающими
+ * (validatedStorage / мастер). Ошибки safeSetItem/spill доходили до консоли и
+ * глобального слушателя, но toast пользователю НЕ показывался — «тихая» потеря
+ * данных. Теперь единая точка: notifyStorageError публикует сообщение в оба
+ * канала (eventBus — основной канал UI, window CustomEvent — обратная
+ * совместимость со сторонними слушателями/тестами).
+ *
+ * eventBus не импортирует хранилище — цикла модулей нет; прямые вызовы
+ * notifyStorageError из других модулей доставляют сообщение синхронно.
  */
 export function notifyStorageError(message: string): void {
+  // Основной канал UI (StorageToast подписан именно сюда).
+  eventBus.emit("storage:error", { message });
   try {
-    window.dispatchEvent(new CustomEvent('tq:storage-error', { detail: message }));
+    window.dispatchEvent(
+      new CustomEvent("tq:storage-error", { detail: message }),
+    );
   } catch {
-    /* окружение без DOM — тихо пропускаем */
+    /* окружение без DOM — событие в eventBus уже доставлено */
   }
+}
+
+/**
+ * ФАЗА 4.1: мост «внешние/легаси источники → eventBus».
+ * Любой код (в т.ч. сторонний, worker-фолбэки, тесты), dispatching-щий legacy
+ * событие 'tq:storage-error' на window, попадает в единый канал приложения.
+ * Дедупликация по последнему сообщению: сообщения от самого notifyStorageError
+ * не эхом возвращаются в шину вторично.
+ * @returns функция отписки.
+ */
+let lastBridgedMessage: string | null = null;
+export function bridgeLegacyStorageErrors(): () => void {
+  if (typeof window === "undefined") return () => undefined;
+  const handler = (e: Event): void => {
+    const detail = (e as CustomEvent).detail;
+    const msg = typeof detail === "string" ? detail : String(detail ?? "");
+    if (!msg || msg === lastBridgedMessage) return; // эхо собственного emit
+    lastBridgedMessage = msg;
+    eventBus.emit("storage:error", { message: msg });
+  };
+  window.addEventListener("tq:storage-error", handler);
+  return () => window.removeEventListener("tq:storage-error", handler);
+}
+
+// Саморегистрация моста при загрузке модуля хранилища (app bootstrap импортирует
+// его транзитивно через сторы). В средах без DOM — noop.
+try {
+  void bridgeLegacyStorageErrors();
+} catch {
+  /* SSR/worker — мост не нужен */
 }
 
 /**
@@ -243,21 +320,30 @@ async function freeLocalStorageSpace(protectedKeys: string[]): Promise<number> {
     // Одноразовые ключи вида `mission-launch-<ts>` чистим первыми: они самые
     // большие по объёму и не участвуют в восстановлении состояния.
     const tsOf = (k: string) => Number(/-(\d{10,})$/.exec(k)?.[1] ?? Infinity);
-    const ephemeral = keys.filter((k) => isEphemeralAppKey(k)).sort((a, b) => tsOf(a) - tsOf(b));
-    const backups = keys.filter((k) => k.startsWith('totalquadro-backup'));
+    const ephemeral = keys
+      .filter((k) => isEphemeralAppKey(k))
+      .sort((a, b) => tsOf(a) - tsOf(b));
+    const backups = keys.filter((k) => k.startsWith("totalquadro-backup"));
     // Сторовые ключи — только из allow-list и только не защищённые; вытесняем в IDB.
     const storeKeys = keys.filter(
-      (k) => !isEphemeralAppKey(k) && !k.startsWith('totalquadro-backup')
-        && isAppOwnStorageKey(k) && !protectedKeys.includes(k),
+      (k) =>
+        !isEphemeralAppKey(k) &&
+        !k.startsWith("totalquadro-backup") &&
+        isAppOwnStorageKey(k) &&
+        !protectedKeys.includes(k),
     );
     for (const key of [...ephemeral, ...backups, ...storeKeys]) {
       if (removed >= 64) break;
       try {
         await safeRemoveItem(key);
         removed += 1;
-      } catch { /* пропускаем */ }
+      } catch {
+        /* пропускаем */
+      }
     }
-  } catch { /* доступ к хранилищу запрещён — освобождать нечего */ }
+  } catch {
+    /* доступ к хранилищу запрещён — освобождать нечего */
+  }
   return removed;
 }
 
@@ -275,8 +361,8 @@ export async function safeGetItem(key: string): Promise<string | null> {
     if (!marker.__tqSpill) return null;
     const record = await loadUserLayerFromIndexedDB(marker.__tqSpill);
     if (!record) return null;
-    if (typeof record.sourceText === 'string') return record.sourceText;
-    if (typeof record.imageDataUrl === 'string') return record.imageDataUrl;
+    if (typeof record.sourceText === "string") return record.sourceText;
+    if (typeof record.imageDataUrl === "string") return record.imageDataUrl;
     if (record.sourceBlob) return await new Blob([record.sourceBlob]).text();
     return null;
   } catch {
@@ -287,28 +373,44 @@ export async function safeGetItem(key: string): Promise<string | null> {
 /** Удалить значение вместе с возможным spill-файлом в IndexedDB */
 export async function safeRemoveItem(key: string): Promise<void> {
   let raw: string | null = null;
-  try { raw = localStorage.getItem(key); } catch { /* недоступно */ }
+  try {
+    raw = localStorage.getItem(key);
+  } catch {
+    /* недоступно */
+  }
   if (raw && raw.startsWith(SPILL_MARKER)) {
     try {
       const marker = JSON.parse(raw) as { __tqSpill?: string };
-      if (marker.__tqSpill) await deleteUserLayerFromIndexedDB(marker.__tqSpill);
-    } catch { /* уже удалено */ }
+      if (marker.__tqSpill)
+        await deleteUserLayerFromIndexedDB(marker.__tqSpill);
+    } catch {
+      /* уже удалено */
+    }
   }
-  try { localStorage.removeItem(key); } catch { /* недоступно */ }
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    /* недоступно */
+  }
 }
 
 /**
  * Безопасное сохранение в localStorage с обработкой ошибок и spill-переполнения
  */
-export async function safeSetItem(key: string, value: string): Promise<boolean> {
+export async function safeSetItem(
+  key: string,
+  value: string,
+): Promise<boolean> {
   try {
     localStorage.setItem(key, value);
     return true;
   } catch (error) {
-    const quotaHit = error instanceof DOMException
-      && (error.name === 'QuotaExceededError' || error.name === 'NS_ERROR_DOM_QUOTA_REACHED');
+    const quotaHit =
+      error instanceof DOMException &&
+      (error.name === "QuotaExceededError" ||
+        error.name === "NS_ERROR_DOM_QUOTA_REACHED");
     if (quotaHit) {
-      console.warn('localStorage quota exceeded for key:', key);
+      console.warn("localStorage quota exceeded for key:", key);
 
       // Пытаемся очистить место и пробуем снова
       await freeLocalStorageSpace([STORAGE_KEY, key]);
@@ -333,24 +435,41 @@ export async function safeSetItem(key: string, value: string): Promise<boolean> 
         // saveUserLayerToIndexedDB перехватывает собственные ошибки и возвращает
         // false — без проверки факта записи «неудавшийся» spill считался успехом.
         if (!spilled || !(await loadUserLayerFromIndexedDB(spillId))) {
-          try { await deleteUserLayerFromIndexedDB(spillId); } catch { /* записи нет */ }
-          notifyStorageError('Хранилище браузера переполнено — последние изменения НЕ сохранены. Очистите старые карты или экспортируйте проект в файл.');
+          try {
+            await deleteUserLayerFromIndexedDB(spillId);
+          } catch {
+            /* записи нет */
+          }
+          notifyStorageError(
+            "Хранилище браузера переполнено — последние изменения НЕ сохранены. Очистите старые карты или экспортируйте проект в файл.",
+          );
           return false;
         }
         try {
           localStorage.setItem(key, JSON.stringify({ __tqSpill: spillId }));
           return true;
         } catch (markerError) {
-          console.error('Не удалось записать spill-маркер в localStorage:', markerError);
-          try { await deleteUserLayerFromIndexedDB(spillId); } catch { /* записи нет */ }
-          notifyStorageError('Хранилище браузера переполнено — последние изменения НЕ сохранены. Очистите старые карты или экспортируйте проект в файл.');
+          console.error(
+            "Не удалось записать spill-маркер в localStorage:",
+            markerError,
+          );
+          try {
+            await deleteUserLayerFromIndexedDB(spillId);
+          } catch {
+            /* записи нет */
+          }
+          notifyStorageError(
+            "Хранилище браузера переполнено — последние изменения НЕ сохранены. Очистите старые карты или экспортируйте проект в файл.",
+          );
           return false;
         }
       }
     }
 
-    console.error('Ошибка сохранения в localStorage:', error);
-    notifyStorageError('Не удалось сохранить данные в локальное хранилище браузера.');
+    console.error("Ошибка сохранения в localStorage:", error);
+    notifyStorageError(
+      "Не удалось сохранить данные в локальное хранилище браузера.",
+    );
     return false;
   }
 }
@@ -368,7 +487,7 @@ export class StorageUnavailableError extends Error {
   readonly cause?: unknown;
   constructor(message: string, cause?: unknown) {
     super(message);
-    this.name = 'StorageUnavailableError';
+    this.name = "StorageUnavailableError";
     this.cause = cause;
   }
 }
@@ -376,7 +495,7 @@ export class StorageUnavailableError extends Error {
 /** Доступно ли IndexedDB в текущем окружении (без бросания исключений) */
 export function isIndexedDbAvailable(): boolean {
   try {
-    return typeof indexedDB !== 'undefined' && indexedDB !== null;
+    return typeof indexedDB !== "undefined" && indexedDB !== null;
   } catch {
     // Safari private mode может бросать на самом обращении к global-свойству
     return false;
@@ -387,9 +506,11 @@ export function isIndexedDbAvailable(): boolean {
 export function initMapDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     if (!isIndexedDbAvailable()) {
-      reject(new StorageUnavailableError(
-        'Приватное хранилище недоступно: браузер блокирует IndexedDB (режим инкогнито или ограничение сайта)'
-      ));
+      reject(
+        new StorageUnavailableError(
+          "Приватное хранилище недоступно: браузер блокирует IndexedDB (режим инкогнито или ограничение сайта)",
+        ),
+      );
       return;
     }
     let request: IDBOpenDBRequest;
@@ -397,26 +518,40 @@ export function initMapDatabase(): Promise<IDBDatabase> {
       request = indexedDB.open(MAP_DB_NAME, MAP_DB_VERSION);
     } catch (error) {
       // синхронный SecurityError/TypeError (приватный режим Safari, file:// в Firefox)
-      reject(new StorageUnavailableError(
-        'Приватное хранилище недоступно: браузер отказал в доступе к IndexedDB', error));
+      reject(
+        new StorageUnavailableError(
+          "Приватное хранилище недоступно: браузер отказал в доступе к IndexedDB",
+          error,
+        ),
+      );
       return;
     }
 
     request.onerror = () => {
       const err = request.error;
-      if (err && err.name === 'SecurityError') {
-        reject(new StorageUnavailableError(
-          'Приватное хранилище недоступно: браузер отказал в доступе к IndexedDB', err));
+      if (err && err.name === "SecurityError") {
+        reject(
+          new StorageUnavailableError(
+            "Приватное хранилище недоступно: браузер отказал в доступе к IndexedDB",
+            err,
+          ),
+        );
         return;
       }
-      reject(new Error(`Не удалось открыть IndexedDB${err ? ` (${err.name})` : ''}`));
+      reject(
+        new Error(`Не удалось открыть IndexedDB${err ? ` (${err.name})` : ""}`),
+      );
     };
 
     // onblocked: другая вкладка держит старую версию БД —
     // событие отличается от onerror (отказ хранилища). Раньше не
     // обрабатывалось, и Promise висел вечно; теперь — явная ошибка.
     request.onblocked = () => {
-      reject(new Error('IndexedDB заблокирована другой открытой вкладкой — закройте её и повторите'));
+      reject(
+        new Error(
+          "IndexedDB заблокирована другой открытой вкладкой — закройте её и повторите",
+        ),
+      );
     };
 
     request.onsuccess = () => {
@@ -427,15 +562,15 @@ export function initMapDatabase(): Promise<IDBDatabase> {
       const db = request.result;
 
       if (!db.objectStoreNames.contains(MAP_STORE_NAME)) {
-        db.createObjectStore(MAP_STORE_NAME, { keyPath: 'id' });
+        db.createObjectStore(MAP_STORE_NAME, { keyPath: "id" });
       }
       // v2: пользовательские тактические карты (данные отделены от снимков подложки)
       if (!db.objectStoreNames.contains(USER_LAYER_STORE_NAME)) {
-        db.createObjectStore(USER_LAYER_STORE_NAME, { keyPath: 'id' });
+        db.createObjectStore(USER_LAYER_STORE_NAME, { keyPath: "id" });
       }
       // v3: бинарные данные тактических слоёв (API main: save/load/deleteTacticalOverlay…)
       if (!db.objectStoreNames.contains(TACTICAL_STORE_NAME)) {
-        db.createObjectStore(TACTICAL_STORE_NAME, { keyPath: 'layerId' });
+        db.createObjectStore(TACTICAL_STORE_NAME, { keyPath: "layerId" });
       }
       void event;
     };
@@ -445,31 +580,34 @@ export function initMapDatabase(): Promise<IDBDatabase> {
 /**
  * Сохранение карты в IndexedDB
  */
-export async function saveMapToIndexedDB(mapId: string, dataUrl: string): Promise<boolean> {
+export async function saveMapToIndexedDB(
+  mapId: string,
+  dataUrl: string,
+): Promise<boolean> {
   try {
     const db = await initMapDatabase();
-    
+
     return new Promise((resolve) => {
-      const transaction = db.transaction([MAP_STORE_NAME], 'readwrite');
+      const transaction = db.transaction([MAP_STORE_NAME], "readwrite");
       const store = transaction.objectStore(MAP_STORE_NAME);
-      
+
       const request = store.put({
         id: mapId,
         dataUrl: dataUrl,
         timestamp: Date.now(),
       });
-      
+
       request.onsuccess = () => {
         resolve(true);
       };
-      
+
       request.onerror = () => {
-        console.error('Ошибка сохранения карты в IndexedDB');
+        console.error("Ошибка сохранения карты в IndexedDB");
         resolve(false);
       };
     });
   } catch (error) {
-    console.error('Ошибка сохранения карты:', error);
+    console.error("Ошибка сохранения карты:", error);
     return false;
   }
 }
@@ -477,16 +615,18 @@ export async function saveMapToIndexedDB(mapId: string, dataUrl: string): Promis
 /**
  * Загрузка карты из IndexedDB
  */
-export async function loadMapFromIndexedDB(mapId: string): Promise<string | null> {
+export async function loadMapFromIndexedDB(
+  mapId: string,
+): Promise<string | null> {
   try {
     const db = await initMapDatabase();
-    
+
     return new Promise((resolve) => {
-      const transaction = db.transaction([MAP_STORE_NAME], 'readonly');
+      const transaction = db.transaction([MAP_STORE_NAME], "readonly");
       const store = transaction.objectStore(MAP_STORE_NAME);
-      
+
       const request = store.get(mapId);
-      
+
       request.onsuccess = () => {
         if (request.result) {
           resolve(request.result.dataUrl);
@@ -494,14 +634,14 @@ export async function loadMapFromIndexedDB(mapId: string): Promise<string | null
           resolve(null);
         }
       };
-      
+
       request.onerror = () => {
-        console.error('Ошибка загрузки карты из IndexedDB');
+        console.error("Ошибка загрузки карты из IndexedDB");
         resolve(null);
       };
     });
   } catch (error) {
-    console.error('Ошибка загрузки карты:', error);
+    console.error("Ошибка загрузки карты:", error);
     return null;
   }
 }
@@ -512,24 +652,24 @@ export async function loadMapFromIndexedDB(mapId: string): Promise<string | null
 export async function deleteMapFromIndexedDB(mapId: string): Promise<boolean> {
   try {
     const db = await initMapDatabase();
-    
+
     return new Promise((resolve) => {
-      const transaction = db.transaction([MAP_STORE_NAME], 'readwrite');
+      const transaction = db.transaction([MAP_STORE_NAME], "readwrite");
       const store = transaction.objectStore(MAP_STORE_NAME);
-      
+
       const request = store.delete(mapId);
-      
+
       request.onsuccess = () => {
         resolve(true);
       };
-      
+
       request.onerror = () => {
-        console.error('Ошибка удаления карты из IndexedDB');
+        console.error("Ошибка удаления карты из IndexedDB");
         resolve(false);
       };
     });
   } catch (error) {
-    console.error('Ошибка удаления карты:', error);
+    console.error("Ошибка удаления карты:", error);
     return false;
   }
 }
@@ -540,50 +680,62 @@ export interface TacticalOverlayBlob {
   layerId: string;
   /** base64 data URL растра (PNG/JPEG/WebP) или текст KML/GeoJSON */
   payload: string;
-  kind: 'raster' | 'vector';
+  kind: "raster" | "vector";
   format: string;
   sizeBytes: number;
   savedAt: number;
 }
 
 /** Сохранить бинарник/текст импортированного слоя (метаданные живут в сторе Zustand) */
-export async function saveTacticalOverlayToIndexedDB(rec: TacticalOverlayBlob): Promise<boolean> {
+export async function saveTacticalOverlayToIndexedDB(
+  rec: TacticalOverlayBlob,
+): Promise<boolean> {
   try {
     const db = await initMapDatabase();
     return await new Promise((resolve) => {
-      const transaction = db.transaction([TACTICAL_STORE_NAME], 'readwrite');
+      const transaction = db.transaction([TACTICAL_STORE_NAME], "readwrite");
       const store = transaction.objectStore(TACTICAL_STORE_NAME);
       store.put({ ...rec, savedAt: Date.now() });
       transaction.oncomplete = () => resolve(true);
-      transaction.onerror = () => { console.error('Ошибка сохранения тактического слоя'); resolve(false); };
+      transaction.onerror = () => {
+        console.error("Ошибка сохранения тактического слоя");
+        resolve(false);
+      };
     });
   } catch (error) {
-    console.error('Ошибка сохранения тактического слоя:', error);
+    console.error("Ошибка сохранения тактического слоя:", error);
     return false;
   }
 }
 
-export async function loadTacticalOverlayFromIndexedDB(layerId: string): Promise<TacticalOverlayBlob | null> {
+export async function loadTacticalOverlayFromIndexedDB(
+  layerId: string,
+): Promise<TacticalOverlayBlob | null> {
   try {
     const db = await initMapDatabase();
     return await new Promise((resolve) => {
-      const transaction = db.transaction([TACTICAL_STORE_NAME], 'readonly');
+      const transaction = db.transaction([TACTICAL_STORE_NAME], "readonly");
       const store = transaction.objectStore(TACTICAL_STORE_NAME);
       const request = store.get(layerId);
       request.onsuccess = () => resolve(request.result ?? null);
-      request.onerror = () => { console.error('Ошибка загрузки тактического слоя'); resolve(null); };
+      request.onerror = () => {
+        console.error("Ошибка загрузки тактического слоя");
+        resolve(null);
+      };
     });
   } catch (error) {
-    console.error('Ошибка загрузки тактического слоя:', error);
+    console.error("Ошибка загрузки тактического слоя:", error);
     return null;
   }
 }
 
-export async function deleteTacticalOverlayFromIndexedDB(layerId: string): Promise<boolean> {
+export async function deleteTacticalOverlayFromIndexedDB(
+  layerId: string,
+): Promise<boolean> {
   try {
     const db = await initMapDatabase();
     return await new Promise((resolve) => {
-      const transaction = db.transaction([TACTICAL_STORE_NAME], 'readwrite');
+      const transaction = db.transaction([TACTICAL_STORE_NAME], "readwrite");
       transaction.objectStore(TACTICAL_STORE_NAME).delete(layerId);
       transaction.oncomplete = () => resolve(true);
       transaction.onerror = () => resolve(false);
@@ -604,24 +756,24 @@ export async function clearAllStoredMaps(): Promise<boolean> {
 export async function clearAllMapsFromIndexedDB(): Promise<boolean> {
   try {
     const db = await initMapDatabase();
-    
+
     return new Promise((resolve) => {
-      const transaction = db.transaction([MAP_STORE_NAME], 'readwrite');
+      const transaction = db.transaction([MAP_STORE_NAME], "readwrite");
       const store = transaction.objectStore(MAP_STORE_NAME);
-      
+
       const request = store.clear();
-      
+
       request.onsuccess = () => {
         resolve(true);
       };
-      
+
       request.onerror = () => {
-        console.error('Ошибка очистки IndexedDB');
+        console.error("Ошибка очистки IndexedDB");
         resolve(false);
       };
     });
   } catch (error) {
-    console.error('Ошибка очистки IndexedDB:', error);
+    console.error("Ошибка очистки IndexedDB:", error);
     return false;
   }
 }
@@ -632,13 +784,13 @@ export async function clearAllMapsFromIndexedDB(): Promise<boolean> {
 export async function getIndexedDBSize(): Promise<number> {
   try {
     const db = await initMapDatabase();
-    
+
     return new Promise((resolve) => {
-      const transaction = db.transaction([MAP_STORE_NAME], 'readonly');
+      const transaction = db.transaction([MAP_STORE_NAME], "readonly");
       const store = transaction.objectStore(MAP_STORE_NAME);
-      
+
       const request = store.getAll();
-      
+
       request.onsuccess = () => {
         const maps = request.result || [];
         const totalSize = maps.reduce((sum, map) => {
@@ -646,7 +798,7 @@ export async function getIndexedDBSize(): Promise<number> {
         }, 0);
         resolve(totalSize);
       };
-      
+
       request.onerror = () => {
         resolve(0);
       };
@@ -660,13 +812,13 @@ export async function getIndexedDBSize(): Promise<number> {
  * Форматирование размера файла
  */
 export function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 Б';
-  
+  if (bytes === 0) return "0 Б";
+
   const k = 1024;
-  const sizes = ['Б', 'КБ', 'МБ', 'ГБ'];
+  const sizes = ["Б", "КБ", "МБ", "ГБ"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
-  
-  return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+
+  return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + " " + sizes[i];
 }
 
 // ─── Пользовательские тактические карты (IndexedDB) ──────────────────────────
@@ -697,7 +849,10 @@ export const USER_LAYER_LIMITS = {
 };
 
 /** Проверка допустимости файла слоя по размеру; возвращает текст ошибки или null */
-export function validateUserLayerSize(bytes: number, fileName = ''): string | null {
+export function validateUserLayerSize(
+  bytes: number,
+  fileName = "",
+): string | null {
   if (!Number.isFinite(bytes) || bytes <= 0) {
     return `Файл «${fileName}» пуст или повреждён`;
   }
@@ -710,34 +865,62 @@ export function validateUserLayerSize(bytes: number, fileName = ''): string | nu
 }
 
 async function withStore<T>(
-  storeName: string, mode: IDBTransactionMode, fn: (store: IDBObjectStore) => IDBRequest<T>
+  storeName: string,
+  mode: IDBTransactionMode,
+  fn: (store: IDBObjectStore) => IDBRequest<T>,
 ): Promise<T> {
   const db = await initMapDatabase();
   return new Promise<T>((resolve, reject) => {
     let settled = false;
-    const finish = (fn2: () => void) => { if (!settled) { settled = true; fn2(); } };
+    const finish = (fn2: () => void) => {
+      if (!settled) {
+        settled = true;
+        fn2();
+      }
+    };
     const transaction = db.transaction([storeName], mode);
     const store = transaction.objectStore(storeName);
     const request = fn(store);
     request.onsuccess = () => finish(() => resolve(request.result));
-    request.onerror = () => finish(() => reject(request.error ?? new Error('Ошибка IndexedDB')));
+    request.onerror = () =>
+      finish(() => reject(request.error ?? new Error("Ошибка IndexedDB")));
     // abort/error транзакции (например QuotaExceededError при put) тоже должен
     // завершать промис — иначе загрузка «висит» без ответа
-    transaction.onabort = () => finish(() => reject(transaction.error ?? new Error('Транзакция IndexedDB прервана')));
-    transaction.onerror = () => finish(() => reject(transaction.error ?? new Error('Ошибка транзакции IndexedDB')));
+    transaction.onabort = () =>
+      finish(() =>
+        reject(transaction.error ?? new Error("Транзакция IndexedDB прервана")),
+      );
+    transaction.onerror = () =>
+      finish(() =>
+        reject(transaction.error ?? new Error("Ошибка транзакции IndexedDB")),
+      );
   });
 }
 
 /** Сохранение данных пользовательского слоя (растр/источник/тайлы) */
-export async function saveUserLayerToIndexedDB(record: UserLayerBlobRecord): Promise<boolean> {
+export async function saveUserLayerToIndexedDB(
+  record: UserLayerBlobRecord,
+): Promise<boolean> {
   try {
-    await withStore(USER_LAYER_STORE_NAME, 'readwrite', (store) =>
-      store.put({ ...record, timestamp: Date.now() }) as IDBRequest<IDBValidKey>);
+    await withStore(
+      USER_LAYER_STORE_NAME,
+      "readwrite",
+      (store) =>
+        store.put({
+          ...record,
+          timestamp: Date.now(),
+        }) as IDBRequest<IDBValidKey>,
+    );
     return true;
   } catch (error) {
-    console.error('Ошибка сохранения тактической карты:', error);
-    if (error instanceof DOMException && (error.name === 'QuotaExceededError' || error.code === 22)) {
-      notifyStorageError('Хранилище браузера переполнено — тактическая карта не сохранена. Удалите старые слои.');
+    console.error("Ошибка сохранения тактической карты:", error);
+    if (
+      error instanceof DOMException &&
+      (error.name === "QuotaExceededError" || error.code === 22)
+    ) {
+      notifyStorageError(
+        "Хранилище браузера переполнено — тактическая карта не сохранена. Удалите старые слои.",
+      );
     } else if (error instanceof StorageUnavailableError) {
       notifyStorageError(error.message);
     }
@@ -746,25 +929,37 @@ export async function saveUserLayerToIndexedDB(record: UserLayerBlobRecord): Pro
 }
 
 /** Чтение записи слоя (или null, если данных нет) */
-export async function loadUserLayerFromIndexedDB(id: string): Promise<UserLayerBlobRecord | null> {
+export async function loadUserLayerFromIndexedDB(
+  id: string,
+): Promise<UserLayerBlobRecord | null> {
   try {
-    const res = await withStore<UserLayerBlobRecord | undefined>(USER_LAYER_STORE_NAME, 'readonly', (store) =>
-      store.get(id) as IDBRequest<UserLayerBlobRecord | undefined>);
+    const res = await withStore<UserLayerBlobRecord | undefined>(
+      USER_LAYER_STORE_NAME,
+      "readonly",
+      (store) => store.get(id) as IDBRequest<UserLayerBlobRecord | undefined>,
+    );
     return res ?? null;
   } catch (error) {
-    if (error instanceof StorageUnavailableError) notifyStorageError(error.message);
-    console.error('Ошибка загрузки тактической карты:', error);
+    if (error instanceof StorageUnavailableError)
+      notifyStorageError(error.message);
+    console.error("Ошибка загрузки тактической карты:", error);
     return null;
   }
 }
 
 /** Удаление данных слоя */
-export async function deleteUserLayerFromIndexedDB(id: string): Promise<boolean> {
+export async function deleteUserLayerFromIndexedDB(
+  id: string,
+): Promise<boolean> {
   try {
-    await withStore(USER_LAYER_STORE_NAME, 'readwrite', (store) => store.delete(id) as IDBRequest<undefined>);
+    await withStore(
+      USER_LAYER_STORE_NAME,
+      "readwrite",
+      (store) => store.delete(id) as IDBRequest<undefined>,
+    );
     return true;
   } catch (error) {
-    console.error('Ошибка удаления тактической карты:', error);
+    console.error("Ошибка удаления тактической карты:", error);
     return false;
   }
 }
@@ -772,8 +967,11 @@ export async function deleteUserLayerFromIndexedDB(id: string): Promise<boolean>
 /** Все id сохранённых слоёв (для сверки с метаданными проекта / сборки мусора) */
 export async function listUserLayerIds(): Promise<string[]> {
   try {
-    const keys = await withStore<IDBValidKey[]>(USER_LAYER_STORE_NAME, 'readonly', (store) =>
-      store.getAllKeys() as IDBRequest<IDBValidKey[]>);
+    const keys = await withStore<IDBValidKey[]>(
+      USER_LAYER_STORE_NAME,
+      "readonly",
+      (store) => store.getAllKeys() as IDBRequest<IDBValidKey[]>,
+    );
     return keys.map(String);
   } catch {
     return [];
@@ -783,8 +981,11 @@ export async function listUserLayerIds(): Promise<string[]> {
 /** Суммарный объём данных пользовательских слоёв, байт */
 export async function getUserLayersTotalBytes(): Promise<number> {
   try {
-    const all = await withStore<UserLayerBlobRecord[]>(USER_LAYER_STORE_NAME, 'readonly', (store) =>
-      store.getAll() as IDBRequest<UserLayerBlobRecord[]>);
+    const all = await withStore<UserLayerBlobRecord[]>(
+      USER_LAYER_STORE_NAME,
+      "readonly",
+      (store) => store.getAll() as IDBRequest<UserLayerBlobRecord[]>,
+    );
     return (all || []).reduce((sum, r) => sum + (r.bytes || 0), 0);
   } catch {
     return 0;
