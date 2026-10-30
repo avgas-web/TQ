@@ -11,6 +11,8 @@ import { persist, createJSONStorage } from 'zustand/middleware';
 import { v4 as uuidv4 } from 'uuid';
 import { useMapStore } from './useMapStore';
 import type { TileServerId } from '../utils/openStreetMap';
+import { planPathAroundZonesResult } from '../utils/routing';
+import type { Restriction } from '../types';
 
 // ─── Типы домена мастера ────────────────────────────────────────
 export type WizardStep =
@@ -122,7 +124,11 @@ export const pyToLat = (y: number): number => 90 - (y / MAP_H_PX) * 180;
 export const lonToPx = (lon: number): number => ((lon + 180) / 360) * MAP_W_PX;
 export const latToPy = (lat: number): number => ((90 - lat) / 180) * MAP_H_PX;
 
-/** Расстояние по большой окружности (косинусное приближение), метры. */
+/** Расстояние по большой окружности (формула гаверсинуса), метры.
+ *  Единственный источник истины для всех лимитов мастер-мара (дубликаты,
+ *  близость цели к старту, дальность). Пиксельные метрики мини-карты в
+ *  расчёт расстояний НЕ входят (см. аудит Ф1.1: Math.min(geo, pxDist)
+ *  недооценивал дистанции и пропускал дубликаты точек). */
 export function geoDistanceM(aLat: number, aLon: number, bLat: number, bLon: number): number {
   const R = 6371000;
   const dLat = ((bLat - aLat) * Math.PI) / 180;
@@ -248,22 +254,13 @@ export const useMissionWizardStore = create<MissionWizardState>()(
       const pushIssue = (issue: WizardValidationIssue) =>
         set((s) => ({ issues: [...s.issues.filter((i) => i.message !== issue.message), issue] }));
 
-      /** Расстояние между точками: основной критерий — гео (WGS84), но если
-       *  обе точки согласованы с проекцией мини-карты (реальный клик/поиск),
-       *  берём минимум гео и пиксельного расстояния в метриках карты. Это
-       *  гарантирует работу лимитов 10 м / 50 м независимо от того, заданы ли
-       *  x/y демо-числами или вынесены из координат. */
-      const distBetween = (a: GeoPointData, b: GeoPointData): number => {
-        const geo = geoDistanceM(a.lat, a.lon, b.lat, b.lon);
-        const bothProjected =
-          Math.abs(lonToPx(a.lon) - a.x) <= 2 && Math.abs(latToPy(a.lat) - a.y) <= 2 &&
-          Math.abs(lonToPx(b.lon) - b.x) <= 2 && Math.abs(latToPy(b.lat) - b.y) <= 2;
-        if (!bothProjected) return geo;
-        // пиксели → метры через широтный масштаб equirectangular-проекты карты мастера
-        const mPerPx = (geoDistanceM(a.lat, 0, a.lat, 360) || 40_075_000) / MAP_W_PX;
-        const pxDist = Math.hypot(a.x - b.x, a.y - b.y) * mPerPx;
-        return Math.min(geo, pxDist);
-      };
+      /** Ф1.1 (аудит): расстояние — ТОЛЬКО гео по WGS-84 (гаверсинус).
+       *  Прежний `Math.min(geo, pxDist)` недооценивал дистанцию при расхождении
+       *  x/y с проекцией координат: два разных объекта могли «слипаться» до
+       *  нулевой дистанции (ложные дубликаты), а реальные дубликаты — проходить
+       *  лимиты 10/50 м. Пиксельная мини-карта — только средство визуализации. */
+      const distBetween = (a: GeoPointData, b: GeoPointData): number =>
+        geoDistanceM(a.lat, a.lon, b.lat, b.lon);
 
       /** Дубликат (<minM метров) — предупреждаем и НЕ добавляем точку. */
       const checkDuplicates = (p: GeoPointData, list: GeoPointData[], minM: number, msg: string): boolean => {
@@ -471,79 +468,8 @@ export const useMissionWizardStore = create<MissionWizardState>()(
         }
         return inside;
       };
-      const segIntersectsPolyEdge = (ax: number, ay: number, bx: number, by: number, cx: number, cy: number, dx: number, dy: number): boolean => {
-        const den = (bx - ax) * (dy - cy) - (by - ay) * (dx - cx);
-        if (Math.abs(den) < 1e-12) return false;
-        const t = ((cx - ax) * (dy - cy) - (cy - ay) * (dx - cx)) / den;
-        const u = ((cx - ax) * (by - ay) - (cy - ay) * (bx - ax)) / den;
-        return t >= 0 && t <= 1 && u >= 0 && u <= 1;
-      };
-      const segmentCrossesPolygon = (a: { x: number; y: number }, b: { x: number; y: number }, poly: { x: number; y: number }[]): boolean => {
-        if (pointInPolygon(a.x, a.y, poly) || pointInPolygon(b.x, b.y, poly)) return true;
-        for (let i = 0; i < poly.length; i++) {
-          const p = poly[i];
-          const q = poly[(i + 1) % poly.length];
-          if (segIntersectsPolyEdge(a.x, a.y, b.x, b.y, p.x, p.y, q.x, q.y)) return true;
-        }
-        return false;
-      };
-
-      /** Дедовский simple-waypoints detour: поднимаем средние точки вдоль луча
-       *  над зоной, пока сегменты не станут чистыми. Возвращает null, если
-       *  обойти невозможно (зона полностью блокирует путь). */
-      const detourAround = (from: { x: number; y: number }, to: { x: number; y: number }, zones: NoFlyZone[]): { x: number; y: number }[] | null => {
-        const blocking = zones.filter((z) => segmentCrossesPolygon(from, to, z.polygon));
-        if (blocking.length === 0) return [from, to];
-        // candidate waypoints: вершины зон с «выносом» наружу (чтобы отрезки к ним
-        // не ложились на рёбра полигона и не считались пересечением), плюс середины рёбер
-        const candidates: { x: number; y: number }[] = [];
-        const DETOUR_OFFSET = 0.5; // вынос за вершину/ребро на 0.5px — вне зоны и вне линий рёбер
-        for (const z of blocking) {
-          const cx = z.polygon.reduce((acc, p) => acc + p.x, 0) / z.polygon.length;
-          const cy = z.polygon.reduce((acc, p) => acc + p.y, 0) / z.polygon.length;
-          for (const v of z.polygon) {
-            const dx = v.x - cx;
-            const dy = v.y - cy;
-            const len = Math.hypot(dx, dy) || 1;
-            candidates.push({ x: v.x + (dx / len) * DETOUR_OFFSET, y: v.y + (dy / len) * DETOUR_OFFSET });
-          }
-          for (let i = 0; i < z.polygon.length; i++) {
-            const a = z.polygon[i];
-            const b = z.polygon[(i + 1) % z.polygon.length];
-            const mx = (a.x + b.x) / 2;
-            const my = (a.y + b.y) / 2;
-            const ex = mx - cx;
-            const ey = my - cy;
-            const elen = Math.hypot(ex, ey) || 1;
-            candidates.push({ x: mx + (ex / elen) * DETOUR_OFFSET, y: my + (ey / elen) * DETOUR_OFFSET });
-          }
-        }
-        const clean = (p: { x: number; y: number }) =>
-          zones.every((z) => !pointInPolygon(p.x, p.y, z.polygon));
-        // ЦИКЛ-ГАРД (шаг П3 ТЗ): перебор пар кандидатов строго ограничен —
-        // детерминированный выход даже при вырожденных полигонах NFZ.
-        const MAX_DETOUR_CANDIDATES = 12;
-        const scored = candidates
-          .filter(clean)
-          .map((c) => ({ c, cost: Math.hypot(c.x - from.x, c.y - from.y) + Math.hypot(to.x - c.x, to.y - c.y) }))
-          .sort((a, b) => a.cost - b.cost);
-        for (const { c } of scored.slice(0, MAX_DETOUR_CANDIDATES)) {
-          const leg1 = zones.every((z) => !segmentCrossesPolygon(from, c, z.polygon));
-          const leg2 = zones.every((z) => !segmentCrossesPolygon(c, to, z.polygon));
-          if (leg1 && leg2) return [from, c, to];
-          // два промежуточных
-          for (const { c: c2 } of scored.slice(0, MAX_DETOUR_CANDIDATES)) {
-            if (
-              zones.every((z) => !segmentCrossesPolygon(from, c, z.polygon)) &&
-              zones.every((z) => !segmentCrossesPolygon(c, c2, z.polygon)) &&
-              zones.every((z) => !segmentCrossesPolygon(c2, to, z.polygon))
-            ) {
-              return [from, c, c2, to];
-            }
-          }
-        }
-        return null; // зона блокирует все пути
-      };
+      // Мёртвый код удалён (аудит Ф1.3): segIntersectsPolyEdge использовался только
+      // локальным detourAround, заменённым на planPathAroundZonesResult из utils/routing.
 
       const pixelLen = (pts: { x: number; y: number }[]) => {
         let l = 0;
@@ -614,16 +540,27 @@ export const useMissionWizardStore = create<MissionWizardState>()(
             });
             continue;
           }
-          const detour = detourAround({ x: sp.x, y: sp.y }, { x: tp.x, y: tp.y }, s.noFlyZones);
-          if (!detour) {
+          // Ф1.3 (аудит): единый планнер обхода NFZ из utils/routing с точной
+          // геометрией (segment×зона, без сэмплинга) и ЯВНЫМ контрактом blocked.
+          // Локальный «дедовский» detourAround удалён: он перебирал лишь 12
+          // кандидатов и при неудаче молча возвращал null → вызывающий код
+          // рисовал прямую сквозь зону как «валидный» маршрут.
+          const restrictions: Restriction[] = s.noFlyZones.map((z) => ({
+            id: z.id, type: 'polygon', points: z.polygon, color: '#ef4444', name: z.name, active: true,
+          }));
+          const planned = planPathAroundZonesResult(
+            { x: sp.x, y: sp.y }, { x: tp.x, y: tp.y }, restrictions, MAP_W_PX, MAP_H_PX,
+          );
+          if (planned.blocked) {
             routes.push({
               id: uuidv4(), groupId: leg.groupId, startPointId: sp.id, targetPointId: tp.id,
-              points: [{ x: sp.x, y: sp.y }, { x: tp.x, y: tp.y }],
+              points: planned.points, // только визуальная подсказка — экспорт заблокирован валидацией
               lengthMeters: geoDistanceM(sp.lat, sp.lon, tp.lat, tp.lon),
               crossesNfz: true, blockedByNfz: true, exceedsRange: false, acknowledged: false,
             });
             continue;
           }
+          const detour = planned.points;
           const lengthMeters = routeLengthM(sp, tp, detour);
           routes.push({
             id: uuidv4(), groupId: leg.groupId, startPointId: sp.id, targetPointId: tp.id,
@@ -660,9 +597,15 @@ export const useMissionWizardStore = create<MissionWizardState>()(
           pushIssue({ step: 'altitude-profiles', level: 'error', message: 'Позиция на маршруте должна быть в диапазоне 0–100%.' });
           return;
         }
-        const below = p.terrainM !== null && p.altitudeAgl < p.terrainM + SAFETY_MARGIN_M;
+        // Ф1.2 (аудит): AGL — высота НАД землёй, поэтому сравнивается с рельефом
+        // ТОЛЬКО как запас clearance: `altitudeAgl < SAFETY_MARGIN_M` означает
+        // «дрон ниже безопасного зазора над поверхностью». Прежняя проверка
+        // `altitudeAgl < terrainM + margin` смешивала AGL и абсолютные высоты
+        // (MSL): на рельефе 300 м валидные 100 м AGL ложно помечались опасными,
+        // а на равнине наоборот — пропускали реальные нарушения.
+        const below = p.terrainM !== null && p.altitudeAgl < SAFETY_MARGIN_M;
         if (below) {
-          pushIssue({ step: 'altitude-profiles', level: 'warning', message: `Высота ${p.altitudeAgl} м ниже рельефа + safety margin ${SAFETY_MARGIN_M} м. Увеличьте высоту.` });
+          pushIssue({ step: 'altitude-profiles', level: 'warning', message: `Высота AGL ${p.altitudeAgl} м меньше безопасного запаса ${SAFETY_MARGIN_M} м над рельефом. Увеличьте высоту.` });
         }
         set((s) => {
           const profiles = [...s.altitudeProfiles];
@@ -685,15 +628,19 @@ export const useMissionWizardStore = create<MissionWizardState>()(
             .filter((pr) => pr.points.length > 0),
         }));
 
+      // Ф1.2 (аудит): автокоррекция НЕ должна прибавлять высоту рельефа к AGL.
+      // было: altitudeAgl = terrainM + margin  →  на рельефе 300 м точка становилась
+      // «650 м AGL», т.е. ~950 м над уровнем моря — гарантированная потеря дрона
+      // по лимиту высоты / энергетике. стало: поднимаем AGL ровно до безопасного
+      // зазора над поверхностью (margin), абсолютная высота = terrainM + margin.
       const autoAdjustAltitudes = () =>
         set((s) => ({
           altitudeProfiles: s.altitudeProfiles.map((pr) => ({
             ...pr,
             points: pr.points.map((p) => {
               if (p.terrainM === null) return p;
-              const need = p.terrainM + SAFETY_MARGIN_M;
-              return p.altitudeAgl < need
-                ? { ...p, altitudeAgl: Math.ceil(need), belowTerrainWarning: false }
+              return p.altitudeAgl < SAFETY_MARGIN_M
+                ? { ...p, altitudeAgl: SAFETY_MARGIN_M, belowTerrainWarning: false }
                 : { ...p, belowTerrainWarning: false };
             }),
           })),
@@ -709,6 +656,17 @@ export const useMissionWizardStore = create<MissionWizardState>()(
         try {
           if (!s.exportFormat) throw new Error('Формат экспорта не выбран.');
           if (s.calculatedRoutes.length === 0) throw new Error('Нет рассчитанных маршрутов для экспорта.');
+          // Ф1.3 (аудит): маршруты, которые не удалось проложить в обход NFZ,
+          // запрещены к развёртыванию даже в обход поштучной валидации этапов —
+          // тихий экспорт прямой линии сквозь зону = гарантированная потеря дрона.
+          const blocked = s.calculatedRoutes.filter((r) => r.blockedByNfz);
+          if (blocked.length > 0) {
+            throw new Error(`Экспорт заблокирован: ${blocked.length} маршрут(ов) проходят через NFZ (обход не построен). Измените зоны или точки.`);
+          }
+          const unack = s.calculatedRoutes.filter((r) => r.exceedsRange && !r.acknowledged);
+          if (unack.length > 0) {
+            throw new Error(`Экспорт заблокирован: ${unack.length} маршрут(ов) превышают дальность аппарата без подтверждения.`);
+          }
           log.push(`✓ Сгенерировано маршрутов: ${s.calculatedRoutes.length}`);
           log.push('✓ Файл готов к скачиванию.');
           set({ deploymentLog: log });

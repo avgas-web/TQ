@@ -45,7 +45,20 @@ export function AltitudeProfilesStep() {
     return () => { cancelled = true; ac.abort(); };
   }, [routeId, ratioPct, route, s.startPoints, s.targetPoints]);
 
-  const maxAlt = Math.max(200, ...(profile?.points.map((p) => p.altitudeAgl) ?? []), alt);
+  // Ф1.2 (аудит): единая шкала графика — абсолютные высоты (MSL).
+  // AGL-точки отображаются как terrainM + altitudeAgl (там, где дрон будет
+  // физически), рельеф — как terrainM. Прежний рендер сравнивал AGL с MSL
+  // в одной координате: точка «100 м AGL» на рельефе 300 м рисовалась НИЖЕ
+  // линии земли, хотя реально находилась на 400 м — оператор видел ложную
+  // картину запаса высоты.
+  const absOf = (agl: number, terrain: number | null) => (terrain ?? 0) + agl;
+  const chartMax = Math.max(
+    200,
+    (terrainM ?? 0) + alt,
+    ...(profile?.points.map((p) => absOf(p.altitudeAgl, p.terrainM)) ?? []),
+    ...(profile?.points.map((p) => p.terrainM ?? 0) ?? []),
+  );
+  const yOf = (v: number) => 170 - (v / chartMax) * 160;
 
   return (
     <div className="flex h-full flex-col gap-3 overflow-auto p-3">
@@ -100,18 +113,19 @@ export function AltitudeProfilesStep() {
         }}>
         <line x1={0} y1={170} x2={600} y2={170} stroke="#334155" />
         {terrainM !== null && (
-          <line x1={0} y1={170 - (terrainM / maxAlt) * 160} x2={600} y2={170 - (terrainM / maxAlt) * 160}
+          <line x1={0} y1={yOf(terrainM)} x2={600} y2={yOf(terrainM)}
             stroke="#84cc16" strokeDasharray="4 4" />
         )}
         {(profile?.points ?? []).map((p) => {
           const x = p.positionRatio * 600;
-          const y = 170 - (p.altitudeAgl / maxAlt) * 160;
+          const absAlt = absOf(p.altitudeAgl, p.terrainM);
+          const y = yOf(absAlt);
           return (
             <g key={p.id}>
               <circle cx={x} cy={y} r={6} fill={p.belowTerrainWarning ? '#ef4444' : '#34d399'}>
-                <title>{`${(p.positionRatio * 100).toFixed(0)}% · ${p.altitudeAgl} м${p.belowTerrainWarning ? ' · СЛИШКОМ НИЗКО' : ''}`}</title>
+                <title>{`${(p.positionRatio * 100).toFixed(0)}% · ${p.altitudeAgl} м AGL (${absAlt.toFixed(0)} м MSL)${p.belowTerrainWarning ? ' · СЛИШКОМ НИЗКО' : ''}`}</title>
               </circle>
-              <text x={x} y={y - 10} fontSize={10} fill="#cbd5e1" textAnchor="middle">{p.altitudeAgl}м</text>
+              <text x={x} y={y - 10} fontSize={10} fill="#cbd5e1" textAnchor="middle">{p.altitudeAgl}м AGL</text>
             </g>
           );
         })}
@@ -127,7 +141,7 @@ export function AltitudeProfilesStep() {
               <td>{p.altitudeAgl} м</td>
               <td>{p.terrainM === null ? '—' : `${p.terrainM.toFixed(0)} м`}</td>
               <td className={p.belowTerrainWarning ? 'text-red-400' : 'text-green-400'}>
-                {p.belowTerrainWarning ? '✗ ниже рельефа+50м' : '✓'}
+                {p.belowTerrainWarning ? '✗ AGL < запаса 50м' : '✓'}
               </td>
               <td><button type="button" aria-label="Удалить точку высоты" className="text-red-400"
                 onClick={() => s.removeAltitudePoint(p.routeId, p.id)}>✛</button></td>
