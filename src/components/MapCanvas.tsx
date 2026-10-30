@@ -1864,6 +1864,25 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       return;
     }
 
+    // ── ФИКС «СИНИЙ ЭКРАН (#1a2744), ПРОПАДАЮЩИЙ ПРИ УВЕЛИЧЕНИИ» (корень) ────
+    // Карта loadMapWithStorage без bounds (растр из Google Static/локального
+    // файла с неполным MapBounds) при tilesEnabled=true формально считалась
+    // «тайловой активной»: mapLoaded публиковался сразу, но syncTileDom
+    // выходил по !mapBounds и НЕ вызывал positionTileLayer → DOM-слой тайлов
+    // оставался display:none (последняя позиция — с прошлой карты или вовсе
+    // отсутствовала). Canvas же при этом заливал фон #1a2744 (ветка
+    // tilesActiveNow=true в render-эффекте) и рисовал объекты по stale-виду:
+    // экран — синий, при увеличении объекты расходятся так, что проглядывают
+    // пиксели прошлого transform'а слоя («карта появляется»). Теперь: если
+    // bounds нет — тайловая подложка физически невозможна, режим легаси-растра
+    // (Image грузится штатно, mapLoaded публикуется по onload, слой тайлов
+    // принудительно скрывается). Обратная совместимость: карты loadActiveTileMap
+    // и снимки с полными bounds (Google/Yandex) имеют bounds ⇒ поведение не
+    // меняется; режим трёх окон (MiniMapPanel/pannelli) этим кодом не управляет.
+    if (!project.map?.bounds) {
+      const tl = tileLayerRef.current;
+      if (tl) tl.style.display = 'none';
+    }
     // ГЕЙТ РАЗМЕРА (P0 «нулевые размеры»): загрузка растровой подложки стартует
     // ТОЛЬКО когда контейнер реально измерен. При width/height === 0 (сломанный
     // layout, display:none у родителя) Image не создаётся вообще — иначе тесты
@@ -2511,6 +2530,24 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
+    // ── ФИКС «СИНИЙ ЭКРАН, ПРОПАДАЮЩИЙ ПРИ УВЕЛИЧЕНИИ» (защита от гонки) ─────
+    // tilesActiveNow обязан соответствовать ФАКТИЧЕСКИ загруженному виду:
+    // если bounds нет (или растр ещё не загружен), тайловой подложки на экране
+    // нет — canvas НЕ должен заливать фон #1a2744 поверх DOM-слоя и обязан
+    // рисовать растр. Без этой проверки при быстрой смене карты render-эффект
+    // мог отработать с новым project.map (bounds уже есть), тогда как Image
+    // ещё не загружен и syncTileDom ещё не позиционировал слой → экран синий,
+    // «проявляется» только при увеличении (пиксели прошлого transform'а).
+    let tilesActiveNow = !!project.settings?.tilesEnabled && !!project.map?.bounds;
+    if (tilesActiveNow && !mapImageRef.current && !project.map?.dataUrl) {
+      // виртуальный тайловый растр loadActiveTileMap: согласованность вида ⇔
+      // подложки гарантирована только после syncTileDom; до первого прохода
+      // слоя не показываем («синий экран» вместо серой пустоты = прозрачный
+      // canvas над непозиционированным display:none слоем).
+      const tl0 = tileLayerRef.current;
+      if (tl0 && (tl0.style.display === 'none' || !tl0.style.transform)) tilesActiveNow = false;
+    }
+
     // HiDPI: физический размер канваса больше логического в dpr раз
     const physW = Math.max(1, Math.round(canvasSize.width * dpr));
     const physH = Math.max(1, Math.round(canvasSize.height * dpr));
@@ -2530,7 +2567,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // Clear: при активной подложке OSM canvas ПРОЗРАЧЕН — сквозь него виден
     // DOM-слой тайлов (подложка как на openstreetmap.org), а объекты рисуются
     // поверх. Без подложки — классический непрозрачный фон + растр fallback.
-    const tilesActiveNow = !!project.settings?.tilesEnabled && !!project.map?.bounds;
+    // (tilesActiveNow — единый вычислитель на весь эффект, см. защиту от гонки выше.)
     if (tilesActiveNow) {
       ctx.clearRect(0, 0, canvasSize.width, canvasSize.height);
     } else {
