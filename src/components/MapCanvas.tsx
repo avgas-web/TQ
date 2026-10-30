@@ -2133,14 +2133,24 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         // карты»: после ~1 с непрерывных нулевых замеров выводим во временную
         // консоль причины (display:none / схлопнутый flex-родитель / отсутствие
         // пиксельного базиса высоты у предков #map-container).
-        if (zeroStreak === 4) {
+        if (zeroStreak === 4 || zeroStreak === 20) {
           const c = containerRef.current;
           const parentHidden = !!(c && (getComputedStyle(c).display === 'none'
             || (c.parentElement && getComputedStyle(c.parentElement).display === 'none')));
-          console.warn('[MapCanvas] контейнер карты имеет нулевой размер ≥1 с.',
+          // Диагностика для отчётов пользователя: причина оверлея «Не удалось
+          // определить размер контейнера карты» видна сразу — hidden vs layout.
+          let chain: string[] = [];
+          try {
+            let n: HTMLElement | null = c;
+            for (let i = 0; n && i < 6; i++, n = n.parentElement) {
+              const csN = getComputedStyle(n);
+              chain.push(`${n.tagName.toLowerCase()}${n.id ? '#' + n.id : ''} d=${csN.display} h=${n.getBoundingClientRect().height.toFixed(0)} pos=${csN.position}`);
+            }
+          } catch { /* jsdom */ }
+          console.warn('[MapCanvas] контейнер карты имеет нулевой размер ≥' + (zeroStreak === 4 ? '1' : '5') + ' с.',
             'Возможные причины: display:none у родителя; схлопнутый flex-элемент;',
             'у предков нет пиксельного базиса высоты (h-full без height у root).',
-            { displayNone: parentHidden, rect: c?.getBoundingClientRect().toJSON?.() ?? null });
+            { displayNone: parentHidden, rect: c?.getBoundingClientRect().toJSON?.() ?? null, ancestors: chain });
         }
         if (cur.width > 0 || cur.height > 0) {
           applySizes(0, 0);
@@ -2160,8 +2170,22 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       roRaf = requestAnimationFrame(() => {
         roRaf = 0;
         if (!mounted) return;
-        for (const entry of entries) {
-          applySizes(entry.contentRect.width, entry.contentRect.height);
+        // ── ФИКС «НЕ УДАЛОСЬ ОПРЕДЕЛИТЬ РАЗМЕР» (КОРЕНЬ #2): RO-колбэк раньше
+        // использовал ТОЛЬКО contentRect и молча выходил при пустых entries
+        // (jsdom/happy-dom, браузеры со старым движком, нулевой content-box при
+        // border/padding у родителя). canvasSize оставался {0,0} → circuit
+        // breaker размеров висел навечно. Теперь событие RO — лишь сигнал
+        // «layout изменился»: размер всегда берётся из фактического замера
+        // контейнера (тот же путь, что в режиме трёх окон: MiniMapPanel меряет
+        // свой DOM-узел напрямую, а не через contentRect). Нулевой замер с
+        // ненулевым contentRect игнорируется штатной валидацией applySizes.
+        const m = measureContainer();
+        if (m.w > 0 && m.h > 0) {
+          applySizes(m.w, m.h);
+        } else {
+          for (const entry of entries) {
+            applySizes(entry.contentRect.width, entry.contentRect.height);
+          }
         }
       });
     });
@@ -2604,6 +2628,25 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    // ── ФИКС «НЕ УДАЛОСЬ ОПРЕДЕЛИТЬ РАЗМЕР» (КОРЕНЬ #3, самовосстановление) ──
+    // Раньше канвас получал width/height только при canvasSize > 0 — при нулевом
+    // замере элемент оставался 0×0 физически, и в средах с урезанным
+    // ResizeObserver (jsdom/happy-dom, старые движки webview, отключённый RO)
+    // карта не могла стартовать НИКОГДА: ни RO, ни интервал-страховка не
+    // вызывались. Теперь каждый рендер-проход (а их гарантированно много:
+    // сторы, renderTick, тики загрузки тайлов) делает синхронный фактический
+    // замер контейнера — как это делает режим трёх окон (MiniMapPanel меряет
+    // свой DOM напрямую на каждом кадре). Отрицательные/нулевые значения
+    // игнорируются штатной валидацией applySizes.
+    if (!(canvasSize.width > 0 && canvasSize.height > 0)) {
+      const c = containerRef.current;
+      if (c) {
+        const r = c.getBoundingClientRect();
+        const w = r.width > 0 ? r.width : c.clientWidth;
+        const h = r.height > 0 ? r.height : c.clientHeight;
+        if (w > 0 && h > 0) setCanvasSize({ width: w, height: h });
+      }
+    }
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
