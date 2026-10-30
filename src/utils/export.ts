@@ -2,6 +2,11 @@
 import type { Marker, Project, Route, Restriction } from "../types";
 import { pixelToGeoFromBounds } from "./googleMaps";
 import { toCsv, parseCsv, FORMULA_INJECTION_PREFIXES } from "./csv";
+import {
+  serializeWorkspaceFile,
+  readProjectFile,
+  validateWorkspacePayload,
+} from "./projectFile";
 
 /**
  * Получение координат маркера с учётом привязки к Google Maps
@@ -148,7 +153,10 @@ ${placemarks}
 }
 
 /**
- * Экспорт всего проекта в JSON
+ * Экспорт всего проекта в JSON (содержимое .tqproj, kind='workspace').
+ * ФАЗА 3.2 (аудит): сериализация — через единый конверт utils/projectFile v2
+ * ({format, schemaVersion, kind, payload}); раньше писался «голый» Project с
+ * числовой/строковой version, несовместимый с миссийным файлом мастера.
  */
 export function exportProject(project: Project): string {
   // Секьюрити: API-ключи не должны покидать устройство вместе с файлом проекта —
@@ -164,134 +172,27 @@ export function exportProject(project: Project): string {
       ? { enabled: project.yandexMaps.enabled }
       : project.yandexMaps,
   };
-  return JSON.stringify(redacted, null, 2);
+  return serializeWorkspaceFile(redacted);
 }
 
 /**
- * Импорт проекта из JSON.
- * Валидация структуры: файл может быть повреждён или содержать объекты
- * без обязательных полей (points, числовые координаты и т.п.), что иначе
- * приводит к крахам в planPathAroundZones / fitViewToData / делению на ноль.
- * Некорректные элементы отбрасываются, недостающие секции дополняются
- * значениями по умолчанию. Возвращает null только если это явно не проект.
+ * Импорт проекта из JSON. Принимает как новый конверт v2 (kind='workspace'),
+ * так и legacy-файлы без конверта; payload проходит Zod-валидацию
+ * (utils/projectSchema) ДО возврата. Возвращает null только если файл явно
+ * не является проектом рабочего стола (битый JSON / чужой формат).
  */
 export function importProject(json: string): Project | null {
-  let data: any;
-  try {
-    data = JSON.parse(json);
-  } catch {
+  const parsed = readProjectFile(json);
+  if (!parsed.ok || parsed.kind !== "workspace") return null;
+  const validated = validateWorkspacePayload(parsed.payload);
+  if (!validated.ok) {
+    console.warn(
+      "[importProject] файл прошёл распознавание, но не валидацию:",
+      validated.errors,
+    );
     return null;
   }
-  if (!data || typeof data !== "object") return null;
-  if (typeof data.version !== "string" && typeof data.projectName !== "string")
-    return null;
-
-  const num = (v: unknown, d: number) =>
-    typeof v === "number" && Number.isFinite(v) ? v : d;
-  const str = (v: unknown, d: string) => (typeof v === "string" ? v : d);
-  const arr = <T>(v: unknown): T[] => (Array.isArray(v) ? v : []);
-
-  // Карта: принимаем только с валидными размерами и dataUrl, иначе — null
-  let map: Project["map"] = null;
-  if (
-    data.map &&
-    typeof data.map === "object" &&
-    typeof data.map.dataUrl === "string" &&
-    num(data.map.width, 0) > 0 &&
-    num(data.map.height, 0) > 0
-  ) {
-    map = data.map;
-  }
-
-  const markers: Marker[] = arr<any>(data.markers)
-    .filter((m) => m && typeof m === "object")
-    .map((m, i) => ({
-      ...m,
-      id: str(m.id, `m-${Date.now()}-${i}`),
-      name: str(m.name, `Точка ${i + 1}`),
-      x: num(m.x, 0),
-      y: num(m.y, 0),
-    }));
-
-  const routes: Route[] = arr<any>(data.routes)
-    .filter((r) => r && typeof r === "object" && Array.isArray(r.points))
-    .map((r, i) => ({
-      ...r,
-      id: str(r.id, `r-${Date.now()}-${i}`),
-      points: r.points.filter(
-        (p: any) =>
-          p &&
-          typeof p === "object" &&
-          Number.isFinite(p.lat) &&
-          Number.isFinite(p.lng),
-      ),
-    }))
-    .filter((r) => r.points.length >= 2);
-
-  const restrictions: Restriction[] = arr<any>(data.restrictions)
-    .filter((z) => z && typeof z === "object" && Array.isArray(z.points))
-    .map((z, i) => ({
-      ...z,
-      id: str(z.id, `z-${Date.now()}-${i}`),
-      points: z.points.filter(
-        (p: any) =>
-          p &&
-          typeof p === "object" &&
-          Number.isFinite(p.x) &&
-          Number.isFinite(p.y),
-      ),
-    }))
-    .filter((z) => z.points.length >= 1);
-
-  return {
-    version: str(data.version, "1.0"),
-    projectName: str(data.projectName, "Импортированный проект"),
-    createdAt: str(data.createdAt, new Date().toISOString()),
-    updatedAt: str(data.updatedAt, new Date().toISOString()),
-    map,
-    calibration: {
-      enabled: !!(data.calibration && data.calibration.enabled === true),
-      points: arr(data.calibration?.points),
-    },
-    restrictions,
-    markers,
-    routes,
-    importLists:
-      data.importLists && typeof data.importLists === "object"
-        ? data.importLists
-        : undefined,
-    layers: arr(data.layers),
-    settings: {
-      showGrid: !!(data.settings && data.settings.showGrid),
-      gridSize: num(data.settings?.gridSize, 100),
-      showCoordinates: !!data.settings?.showCoordinates,
-      theme: data.settings?.theme === "light" ? "light" : "dark",
-      // Стиль подложки из импортируемого проекта; внешние Overpass-слои удалены —
-      // нормализуем к схеме, спутник/гибрид сохраняем.
-      tileStyle:
-        data.settings?.tileStyle === "satellite" ||
-        data.settings?.tileStyle === "hybrid"
-          ? (data.settings.tileStyle as "satellite" | "hybrid")
-          : ("scheme" as const),
-      tilesEnabled: data.settings?.tilesEnabled,
-    },
-    googleMaps: {
-      // ЭТАП 1.2: apiKey из файла проекта ИГНОРИРУЕТСЯ (секреты не импортируются).
-      enabled: !!(data.googleMaps && data.googleMaps.enabled),
-    },
-    yandexMaps: {
-      enabled: !!(data.yandexMaps && data.yandexMaps.enabled),
-    },
-    openStreetMap: {
-      enabled: !!(data.openStreetMap && data.openStreetMap.enabled),
-      // legacy-значения ('osm', 'carto') и новые ('esri', 'esri-sat') — все валидны
-      tileServer: ["osm", "opentopomap", "carto", "esri", "esri-sat"].includes(
-        data.openStreetMap?.tileServer,
-      )
-        ? data.openStreetMap.tileServer
-        : "osm",
-    },
-  };
+  return validated.project;
 }
 
 /**

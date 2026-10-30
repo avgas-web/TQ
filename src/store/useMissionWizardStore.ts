@@ -6,41 +6,55 @@
 // Автосохранение через zustand persist (localStorage) после каждого
 // изменения — перезагрузка страницы восстанавливает прогресс.
 // ═══════════════════════════════════════════════════════════════
-import { create } from 'zustand';
-import { persist, createJSONStorage } from 'zustand/middleware';
-import { v4 as uuidv4 } from 'uuid';
-import { useMapStore } from './useMapStore';
-import type { TileServerId } from '../utils/openStreetMap';
-import { planPathAroundZonesResult } from '../utils/routing';
-import type { Restriction } from '../types';
+import { create } from "zustand";
+import { persist } from "zustand/middleware";
+import { v4 as uuidv4 } from "uuid";
+import { useMapStore } from "./useMapStore";
+import { createValidatedJSONStorage } from "../utils/validatedStorage";
+import {
+  sanitizeWizardData,
+  WizardPersistSchema,
+  type WizardPersistData,
+} from "../utils/wizardSchema";
+import { eventBus } from "../utils/eventBus";
+import type { TileServerId } from "../utils/openStreetMap";
+import { planPathAroundZonesResult } from "../utils/routing";
+import type { Restriction } from "../types";
 
 // ─── Типы домена мастера ────────────────────────────────────────
 export type WizardStep =
-  | 'map-selection'
-  | 'craft-selection'
-  | 'start-points'
-  | 'target-points'
-  | 'fleet-formation'
-  | 'nfz-and-routes'
-  | 'altitude-profiles'
-  | 'export-preparation'
-  | 'mission-deployment';
+  | "map-selection"
+  | "craft-selection"
+  | "start-points"
+  | "target-points"
+  | "fleet-formation"
+  | "nfz-and-routes"
+  | "altitude-profiles"
+  | "export-preparation"
+  | "mission-deployment";
 
 export const WIZARD_STEPS: WizardStep[] = [
-  'map-selection', 'craft-selection', 'start-points', 'target-points', 'fleet-formation',
-  'nfz-and-routes', 'altitude-profiles', 'export-preparation', 'mission-deployment',
+  "map-selection",
+  "craft-selection",
+  "start-points",
+  "target-points",
+  "fleet-formation",
+  "nfz-and-routes",
+  "altitude-profiles",
+  "export-preparation",
+  "mission-deployment",
 ];
 
 export const STEP_LABELS_RU: Record<WizardStep, string> = {
-  'map-selection': 'Выбор карт',
-  'craft-selection': 'Выбор типа аппарата',
-  'start-points': 'Точки старта',
-  'target-points': 'Точки целей',
-  'fleet-formation': 'Группировка флота',
-  'nfz-and-routes': 'Бесполётные зоны и маршруты',
-  'altitude-profiles': 'Профили высот',
-  'export-preparation': 'Подготовка экспорта',
-  'mission-deployment': 'Передача заданий',
+  "map-selection": "Выбор карт",
+  "craft-selection": "Выбор типа аппарата",
+  "start-points": "Точки старта",
+  "target-points": "Точки целей",
+  "fleet-formation": "Группировка флота",
+  "nfz-and-routes": "Бесполётные зоны и маршруты",
+  "altitude-profiles": "Профили высот",
+  "export-preparation": "Подготовка экспорта",
+  "mission-deployment": "Передача заданий",
 };
 
 export interface GeoPointData {
@@ -82,9 +96,9 @@ export interface CalculatedRoute {
   points: { x: number; y: number }[];
   lengthMeters: number;
   crossesNfz: boolean;
-  blockedByNfz: boolean;      // маршрут вообще не удалось построить в обход
-  exceedsRange: boolean;      // длина > дальности аппарата
-  acknowledged: boolean;      // пользователь подтвердил игнорирование warning
+  blockedByNfz: boolean; // маршрут вообще не удалось построить в обход
+  exceedsRange: boolean; // длина > дальности аппарата
+  acknowledged: boolean; // пользователь подтвердил игнорирование warning
 }
 
 export interface AltitudeChangePoint {
@@ -92,9 +106,9 @@ export interface AltitudeChangePoint {
   routeId: string;
   /** позиция на маршруте, доля 0..1 от начала */
   positionRatio: number;
-  altitudeAgl: number;        // м AGL, > 0
-  climbRate?: number;         // м/с, опционально
-  terrainM: number | null;    // высота рельефа (null — API недоступно)
+  altitudeAgl: number; // м AGL, > 0
+  climbRate?: number; // м/с, опционально
+  terrainM: number | null; // высота рельефа (null — API недоступно)
   belowTerrainWarning: boolean;
 }
 export interface AltitudeProfile {
@@ -102,16 +116,16 @@ export interface AltitudeProfile {
   points: AltitudeChangePoint[];
 }
 
-export type ExportFormat = 'mavlink' | 'json' | 'csv' | 'gpx' | 'kml';
+export type ExportFormat = "mavlink" | "json" | "csv" | "gpx" | "kml";
 
 export interface WizardValidationIssue {
   step: WizardStep;
-  level: 'error' | 'warning';
+  level: "error" | "warning";
   message: string;
 }
 
 const SAFETY_MARGIN_M = 50;
-const MIN_POINT_DISTANCE_M = 10;   // дубликаты точек старта/целей
+const MIN_POINT_DISTANCE_M = 10; // дубликаты точек старта/целей
 const MIN_START_TARGET_DIST_M = 50; // цель слишком близко к старту
 export const MAX_START_POINTS = 100;
 export const MAX_TARGET_POINTS = 1000;
@@ -129,22 +143,43 @@ export const latToPy = (lat: number): number => ((90 - lat) / 180) * MAP_H_PX;
  *  близость цели к старту, дальность). Пиксельные метрики мини-карты в
  *  расчёт расстояний НЕ входят (см. аудит Ф1.1: Math.min(geo, pxDist)
  *  недооценивал дистанции и пропускал дубликаты точек). */
-export function geoDistanceM(aLat: number, aLon: number, bLat: number, bLon: number): number {
+export function geoDistanceM(
+  aLat: number,
+  aLon: number,
+  bLat: number,
+  bLon: number,
+): number {
   const R = 6371000;
   const dLat = ((bLat - aLat) * Math.PI) / 180;
   const dLon = ((bLon - aLon) * Math.PI) / 180;
   const la1 = (aLat * Math.PI) / 180;
   const la2 = (bLat * Math.PI) / 180;
-  const h = Math.sin(dLat / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) ** 2;
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) ** 2;
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
 export function isValidLatLon(lat: number, lon: number): boolean {
-  return Number.isFinite(lat) && Number.isFinite(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
+  return (
+    Number.isFinite(lat) &&
+    Number.isFinite(lon) &&
+    lat >= -90 &&
+    lat <= 90 &&
+    lon >= -180 &&
+    lon <= 180
+  );
 }
 
+/** Ключ persist-хранилища мастера (единственный — используется resetWizard и storage). */
+export const WIZARD_PERSIST_KEY = "tq-mission-wizard";
+/** Версия схемы персистимых данных мастера (ФАЗА 3.3). */
+export const WIZARD_PERSIST_VERSION = 2;
+
 /** Парсер поиска Этапов 2/3: «lat, lon» или текстовый запрос (геокодер подменяется в тестах). */
-export function parseCoordinateQuery(q: string): { lat: number; lon: number } | null {
+export function parseCoordinateQuery(
+  q: string,
+): { lat: number; lon: number } | null {
   const m = q.trim().match(/^(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)$/);
   if (!m) return null;
   const lat = Number(m[1]);
@@ -155,14 +190,46 @@ export function parseCoordinateQuery(q: string): { lat: number; lon: number } | 
 // ─── Контракт стора ─────────────────────────────────────────────
 /** Доступные для выбора карты (стили подложки) — ТЗ: пользователь выбирает из
  *  всех вариантов, кроме 2ГИС; 2ГИС УДАЛЁН ПОЛНОСТЬЮ (пункт C аудита). */
-export const MAP_CHOICES: ReadonlyArray<{ id: TileServerId; label: string; desc: string }> = [
-  { id: 'esri',        label: 'Esri — улицы',           desc: 'Стабильная уличная подложка (стиль по умолчанию)' },
-  { id: 'esri-sat',    label: 'Esri — спутник',          desc: 'Спутниковые снимки высокого разрешения' },
-  { id: 'osmfr',       label: 'OSM France (стандарт)',   desc: 'Классическая схема OpenStreetMap (зеркало FR)' },
-  { id: 'hot',         label: 'OSM France (гуманитарный)', desc: 'HOT-стиль: детали для ЧС и картографирования' },
-  { id: 'osmde',       label: 'OSM Germany',             desc: 'Зеркало немецкого сообщества OSM' },
-  { id: 'opentopomap', label: 'OpenTopoMap',             desc: 'Топографический стиль с рельефом' },
-  { id: 'cyclosm',     label: 'CyclOSM',                 desc: 'Велосипедные маршруты и инфраструктура' },
+export const MAP_CHOICES: ReadonlyArray<{
+  id: TileServerId;
+  label: string;
+  desc: string;
+}> = [
+  {
+    id: "esri",
+    label: "Esri — улицы",
+    desc: "Стабильная уличная подложка (стиль по умолчанию)",
+  },
+  {
+    id: "esri-sat",
+    label: "Esri — спутник",
+    desc: "Спутниковые снимки высокого разрешения",
+  },
+  {
+    id: "osmfr",
+    label: "OSM France (стандарт)",
+    desc: "Классическая схема OpenStreetMap (зеркало FR)",
+  },
+  {
+    id: "hot",
+    label: "OSM France (гуманитарный)",
+    desc: "HOT-стиль: детали для ЧС и картографирования",
+  },
+  {
+    id: "osmde",
+    label: "OSM Germany",
+    desc: "Зеркало немецкого сообщества OSM",
+  },
+  {
+    id: "opentopomap",
+    label: "OpenTopoMap",
+    desc: "Топографический стиль с рельефом",
+  },
+  {
+    id: "cyclosm",
+    label: "CyclOSM",
+    desc: "Велосипедные маршруты и инфраструктура",
+  },
 ];
 
 export interface MissionWizardState {
@@ -174,7 +241,7 @@ export interface MissionWizardState {
   /** Основная карта — активный стиль подложки (должна быть в selectedMaps). */
   primaryMap: TileServerId | null;
 
-  craftType: 'drone' | 'uav' | null;
+  craftType: "drone" | "uav" | null;
   startPoints: StartPoint[];
   targetPoints: TargetPoint[];
   fleetGroups: FleetGroup[];
@@ -191,25 +258,27 @@ export interface MissionWizardState {
   toggleMapChoice: (id: TileServerId) => void;
   /** Назначить основную (активную) карту; автоматически добавляет в selectedMaps. */
   setPrimaryMap: (id: TileServerId) => void;
-  setCraftType: (type: 'drone' | 'uav') => void;
-  addStartPoint: (point: Omit<StartPoint, 'id'>) => void;
+  setCraftType: (type: "drone" | "uav") => void;
+  addStartPoint: (point: Omit<StartPoint, "id">) => void;
   updateStartPoint: (id: string, patch: Partial<StartPoint>) => void;
   removeStartPoint: (id: string) => void;
-  addTargetPoint: (point: Omit<TargetPoint, 'id'>) => void;
+  addTargetPoint: (point: Omit<TargetPoint, "id">) => void;
   updateTargetPoint: (id: string, patch: Partial<TargetPoint>) => void;
   removeTargetPoint: (id: string) => void;
   setTotalCraft: (n: number) => void;
-  createFleetGroup: (group: Omit<FleetGroup, 'id'>) => void;
+  createFleetGroup: (group: Omit<FleetGroup, "id">) => void;
   updateFleetGroup: (id: string, patch: Partial<FleetGroup>) => void;
   removeFleetGroup: (id: string) => void;
   autoFormGroups: () => void;
-  addNoFlyZone: (zone: Omit<NoFlyZone, 'id'>) => void;
+  addNoFlyZone: (zone: Omit<NoFlyZone, "id">) => void;
   updateNoFlyZone: (id: string, patch: Partial<NoFlyZone>) => void;
   removeNoFlyZone: (id: string) => void;
   calculateRoutes: (maxRangeMeters?: number) => Promise<void>;
   acknowledgeRouteIssues: () => void;
   setAltitudeProfile: (profile: AltitudeProfile) => void;
-  addAltitudePoint: (p: Omit<AltitudeChangePoint, 'id' | 'belowTerrainWarning'>) => void;
+  addAltitudePoint: (
+    p: Omit<AltitudeChangePoint, "id" | "belowTerrainWarning">,
+  ) => void;
   autoAdjustAltitudes: () => void;
   removeAltitudePoint: (routeId: string, pointId: string) => void;
   setExportFormat: (format: ExportFormat) => void;
@@ -217,7 +286,7 @@ export interface MissionWizardState {
   resetWizard: () => void;
   /** Полный сброс данных мастера при смене типа аппарата (с подтверждением в UI).
    *  newType — сразу фиксирует новый выбранный тип, чтобы не требовать повторного диалога. */
-  resetCraftChoice: (newType?: 'drone' | 'uav') => void;
+  resetCraftChoice: (newType?: "drone" | "uav") => void;
 
   validateCurrentStep: () => WizardValidationIssue[];
   runValidationAndPublish: () => WizardValidationIssue[];
@@ -228,13 +297,13 @@ export interface MissionWizardState {
 }
 
 const initialData = {
-  currentStep: 'map-selection' as WizardStep,
+  currentStep: "map-selection" as WizardStep,
   completedSteps: [] as WizardStep[],
   // Этап 1 (ТЗ): карты не выбраны — валидация этапа потребует хотя бы одну;
   // основная по умолчанию Esri Streets (стиль по умолчанию аудита).
   selectedMaps: [] as TileServerId[],
-  primaryMap: 'esri' as TileServerId | null,
-  craftType: null as 'drone' | 'uav' | null,
+  primaryMap: "esri" as TileServerId | null,
+  craftType: null as "drone" | "uav" | null,
   startPoints: [] as StartPoint[],
   targetPoints: [] as TargetPoint[],
   fleetGroups: [] as FleetGroup[],
@@ -252,7 +321,12 @@ export const useMissionWizardStore = create<MissionWizardState>()(
     (set, get) => {
       // ── helpers ────────────────────────────────────────────────
       const pushIssue = (issue: WizardValidationIssue) =>
-        set((s) => ({ issues: [...s.issues.filter((i) => i.message !== issue.message), issue] }));
+        set((s) => ({
+          issues: [
+            ...s.issues.filter((i) => i.message !== issue.message),
+            issue,
+          ],
+        }));
 
       /** Ф1.1 (аудит): расстояние — ТОЛЬКО гео по WGS-84 (гаверсинус).
        *  Прежний `Math.min(geo, pxDist)` недооценивал дистанцию при расхождении
@@ -263,19 +337,41 @@ export const useMissionWizardStore = create<MissionWizardState>()(
         geoDistanceM(a.lat, a.lon, b.lat, b.lon);
 
       /** Дубликат (<minM метров) — предупреждаем и НЕ добавляем точку. */
-      const checkDuplicates = (p: GeoPointData, list: GeoPointData[], minM: number, msg: string): boolean => {
+      const checkDuplicates = (
+        p: GeoPointData,
+        list: GeoPointData[],
+        minM: number,
+        msg: string,
+      ): boolean => {
         // сравнение с уже сохранёнными точками; id ещё не назначен → исключаем по координатам
-        if (list.some((q) => !(q.id === p.id && q.x === p.x && q.y === p.y) && distBetween(p, q) < minM)) {
-          pushIssue({ step: get().currentStep, level: 'warning', message: msg });
+        if (
+          list.some(
+            (q) =>
+              !(q.id === p.id && q.x === p.x && q.y === p.y) &&
+              distBetween(p, q) < minM,
+          )
+        ) {
+          pushIssue({
+            step: get().currentStep,
+            level: "warning",
+            message: msg,
+          });
           return true;
         }
         return false;
       };
 
       /** Близость цели к старту (<50 м) — только warning, точка добавляется. */
-      const nearStartNotice = (p: GeoPointData, starts: GeoPointData[]): boolean => {
+      const nearStartNotice = (
+        p: GeoPointData,
+        starts: GeoPointData[],
+      ): boolean => {
         if (starts.some((sp) => distBetween(p, sp) < MIN_START_TARGET_DIST_M)) {
-          pushIssue({ step: 'target-points', level: 'warning', message: 'Цель слишком близко к точке старта (минимум 50 метров).' });
+          pushIssue({
+            step: "target-points",
+            level: "warning",
+            message: "Цель слишком близко к точке старта (минимум 50 метров).",
+          });
           return true;
         }
         return false;
@@ -299,9 +395,15 @@ export const useMissionWizardStore = create<MissionWizardState>()(
       const toggleMapChoice = (id: TileServerId) => {
         set((s) => {
           const has = s.selectedMaps.includes(id);
-          const nextSelected = has ? s.selectedMaps.filter((m) => m !== id) : [...s.selectedMaps, id];
+          const nextSelected = has
+            ? s.selectedMaps.filter((m) => m !== id)
+            : [...s.selectedMaps, id];
           // снимаем основную карту, если её убрали из выбора (держим инвариант)
-          const nextPrimary = !has ? id : s.primaryMap === id ? (nextSelected[0] ?? null) : s.primaryMap;
+          const nextPrimary = !has
+            ? id
+            : s.primaryMap === id
+              ? (nextSelected[0] ?? null)
+              : s.primaryMap;
           return { selectedMaps: nextSelected, primaryMap: nextPrimary };
         });
         syncMapStoreFromChoice();
@@ -310,78 +412,135 @@ export const useMissionWizardStore = create<MissionWizardState>()(
       const setPrimaryMap = (id: TileServerId) => {
         set((s) => ({
           primaryMap: id,
-          selectedMaps: s.selectedMaps.includes(id) ? s.selectedMaps : [...s.selectedMaps, id],
+          selectedMaps: s.selectedMaps.includes(id)
+            ? s.selectedMaps
+            : [...s.selectedMaps, id],
         }));
         syncMapStoreFromChoice();
       };
 
       // ── Этап 2 ─────────────────────────────────────────────────
-      const setCraftType = (type: 'drone' | 'uav') => {
+      const setCraftType = (type: "drone" | "uav") => {
         set({ craftType: type });
       };
-      const resetCraftChoice = (newType?: 'drone' | 'uav') => {
+      const resetCraftChoice = (newType?: "drone" | "uav") => {
         // полный сброс мастер-данных при смене типа (edge-case из ТЗ);
         // остаёмся на этапе выбора типа; если пользователь уже подтвердил
         // новый тип — фиксируем его сразу, чтобы не терять двойной диалог.
         // Карты Этапа 1 НЕ сбрасываются: выбор подложек — свойство проекта,
         // а не аппарата (иначе после смены типа возвращались бы к этапу 1).
-        set({ ...initialData, currentStep: 'craft-selection', craftType: newType ?? null,
-              selectedMaps: get().selectedMaps, primaryMap: get().primaryMap });
+        set({
+          ...initialData,
+          currentStep: "craft-selection",
+          craftType: newType ?? null,
+          selectedMaps: get().selectedMaps,
+          primaryMap: get().primaryMap,
+        });
       };
 
       // ── Этапы 2/3: точки ───────────────────────────────────────
-      const addStartPoint = (point: Omit<StartPoint, 'id'>) => {
+      const addStartPoint = (point: Omit<StartPoint, "id">) => {
         const s = get();
         if (!isValidLatLon(point.lat, point.lon)) {
-          pushIssue({ step: 'start-points', level: 'error', message: 'Невалидные координаты. Пример правильного формата: «55.7558, 37.6173» (lat ∈ [-90; 90], lon ∈ [-180; 180]).' });
+          pushIssue({
+            step: "start-points",
+            level: "error",
+            message:
+              "Невалидные координаты. Пример правильного формата: «55.7558, 37.6173» (lat ∈ [-90; 90], lon ∈ [-180; 180]).",
+          });
           return;
         }
         if (!point.name.trim()) {
-          pushIssue({ step: 'start-points', level: 'error', message: 'Название точки не может быть пустым.' });
+          pushIssue({
+            step: "start-points",
+            level: "error",
+            message: "Название точки не может быть пустым.",
+          });
           return;
         }
         if (s.startPoints.length >= MAX_START_POINTS) {
-          pushIssue({ step: 'start-points', level: 'error', message: `Достигнут лимит ${MAX_START_POINTS} точек старта.` });
+          pushIssue({
+            step: "start-points",
+            level: "error",
+            message: `Достигнут лимит ${MAX_START_POINTS} точек старта.`,
+          });
           return;
         }
         const full: StartPoint = { ...point, id: uuidv4() };
-        if (checkDuplicates(full, s.startPoints, MIN_POINT_DISTANCE_M, 'Точки слишком близко друг к другу (минимум 10 метров).')) return;
+        if (
+          checkDuplicates(
+            full,
+            s.startPoints,
+            MIN_POINT_DISTANCE_M,
+            "Точки слишком близко друг к другу (минимум 10 метров).",
+          )
+        )
+          return;
         set({ startPoints: [...s.startPoints, full] });
       };
 
       const updateStartPoint = (id: string, patch: Partial<StartPoint>) => {
         set((s) => ({
-          startPoints: s.startPoints.map((p) => (p.id === id ? { ...p, ...patch } : p)),
+          startPoints: s.startPoints.map((p) =>
+            p.id === id ? { ...p, ...patch } : p,
+          ),
         }));
         // ВАЖНО: никаких изменений viewState — автофиксации карты нет.
       };
       const removeStartPoint = (id: string) =>
         set((s) => ({
           startPoints: s.startPoints.filter((p) => p.id !== id),
-          fleetGroups: s.fleetGroups.map((g) => ({ ...g, assignments: g.assignments.filter((a) => a.startPointId !== id) })),
+          fleetGroups: s.fleetGroups.map((g) => ({
+            ...g,
+            assignments: g.assignments.filter((a) => a.startPointId !== id),
+          })),
         }));
 
-      const addTargetPoint = (point: Omit<TargetPoint, 'id'>) => {
+      const addTargetPoint = (point: Omit<TargetPoint, "id">) => {
         const s = get();
         if (!isValidLatLon(point.lat, point.lon)) {
-          pushIssue({ step: 'target-points', level: 'error', message: 'Невалидные координаты цели. Формат: «55.7558, 37.6173».' });
+          pushIssue({
+            step: "target-points",
+            level: "error",
+            message: "Невалидные координаты цели. Формат: «55.7558, 37.6173».",
+          });
           return;
         }
         if (!point.name.trim()) {
-          pushIssue({ step: 'target-points', level: 'error', message: 'Название цели не может быть пустым.' });
+          pushIssue({
+            step: "target-points",
+            level: "error",
+            message: "Название цели не может быть пустым.",
+          });
           return;
         }
         if (s.targetPoints.length >= MAX_TARGET_POINTS) {
-          pushIssue({ step: 'target-points', level: 'error', message: `Достигнут лимит ${MAX_TARGET_POINTS} точек целей.` });
+          pushIssue({
+            step: "target-points",
+            level: "error",
+            message: `Достигнут лимит ${MAX_TARGET_POINTS} точек целей.`,
+          });
           return;
         }
         const full: TargetPoint = { ...point, id: uuidv4() };
-        if (checkDuplicates(full, s.targetPoints, MIN_POINT_DISTANCE_M, 'Цели слишком близко друг к другу (минимум 10 метров).')) return;
+        if (
+          checkDuplicates(
+            full,
+            s.targetPoints,
+            MIN_POINT_DISTANCE_M,
+            "Цели слишком близко друг к другу (минимум 10 метров).",
+          )
+        )
+          return;
         full.nearStartWarning = nearStartNotice(full, s.startPoints);
         set({ targetPoints: [...s.targetPoints, full] });
       };
       const updateTargetPoint = (id: string, patch: Partial<TargetPoint>) =>
-        set((s) => ({ targetPoints: s.targetPoints.map((p) => (p.id === id ? { ...p, ...patch } : p)) }));
+        set((s) => ({
+          targetPoints: s.targetPoints.map((p) =>
+            p.id === id ? { ...p, ...patch } : p,
+          ),
+        }));
       const removeTargetPoint = (id: string) =>
         set((s) => ({
           targetPoints: s.targetPoints.filter((p) => p.id !== id),
@@ -389,29 +548,47 @@ export const useMissionWizardStore = create<MissionWizardState>()(
         }));
 
       // ── Этап 4: группы флота ───────────────────────────────────
-      const setTotalCraft = (n: number) => set({ totalCraft: Math.max(0, Math.floor(n) || 0) });
+      const setTotalCraft = (n: number) =>
+        set({ totalCraft: Math.max(0, Math.floor(n) || 0) });
 
-      const groupSum = (g: { assignments: CraftAssignment[] }) => g.assignments.reduce((acc, a) => acc + a.craftCount, 0);
+      const groupSum = (g: { assignments: CraftAssignment[] }) =>
+        g.assignments.reduce((acc, a) => acc + a.craftCount, 0);
 
-      const createFleetGroup = (group: Omit<FleetGroup, 'id'>) => {
+      const createFleetGroup = (group: Omit<FleetGroup, "id">) => {
         const s = get();
         if (!s.targetPoints.some((t) => t.id === group.targetPointId)) {
-          pushIssue({ step: 'fleet-formation', level: 'error', message: 'Группа должна быть назначена на существующую цель.' });
+          pushIssue({
+            step: "fleet-formation",
+            level: "error",
+            message: "Группа должна быть назначена на существующую цель.",
+          });
           return;
         }
         if (group.totalCraft <= 0) {
-          pushIssue({ step: 'fleet-formation', level: 'error', message: 'В группе должно быть хотя бы 1 аппарат.' });
+          pushIssue({
+            step: "fleet-formation",
+            level: "error",
+            message: "В группе должно быть хотя бы 1 аппарат.",
+          });
           return;
         }
         if (groupSum(group) !== group.totalCraft) {
-          pushIssue({ step: 'fleet-formation', level: 'error', message: `Распределение по стартам (${groupSum(group)}) не совпадает с размером группы (${group.totalCraft}).` });
+          pushIssue({
+            step: "fleet-formation",
+            level: "error",
+            message: `Распределение по стартам (${groupSum(group)}) не совпадает с размером группы (${group.totalCraft}).`,
+          });
           return;
         }
         set({ fleetGroups: [...s.fleetGroups, { ...group, id: uuidv4() }] });
       };
 
       const updateFleetGroup = (id: string, patch: Partial<FleetGroup>) =>
-        set((s) => ({ fleetGroups: s.fleetGroups.map((g) => (g.id === id ? { ...g, ...patch } : g)) }));
+        set((s) => ({
+          fleetGroups: s.fleetGroups.map((g) =>
+            g.id === id ? { ...g, ...patch } : g,
+          ),
+        }));
       const removeFleetGroup = (id: string) =>
         set((s) => ({ fleetGroups: s.fleetGroups.filter((g) => g.id !== id) }));
 
@@ -419,16 +596,27 @@ export const useMissionWizardStore = create<MissionWizardState>()(
        *  аппаратов по целям (round-robin остатков), старт каждой группы — ближайшая точка старта. */
       const autoFormGroups = () => {
         const s = get();
-        if (s.totalCraft <= 0 || s.targetPoints.length === 0 || s.startPoints.length === 0) {
-          pushIssue({ step: 'fleet-formation', level: 'error', message: 'Для автоформирования нужны: общее число аппаратов > 0, хотя бы одна цель и один старт.' });
+        if (
+          s.totalCraft <= 0 ||
+          s.targetPoints.length === 0 ||
+          s.startPoints.length === 0
+        ) {
+          pushIssue({
+            step: "fleet-formation",
+            level: "error",
+            message:
+              "Для автоформирования нужны: общее число аппаратов > 0, хотя бы одна цель и один старт.",
+          });
           return;
         }
         const n = s.targetPoints.length;
         const base = Math.floor(s.totalCraft / n);
         let rem = s.totalCraft % n;
         const groups: FleetGroup[] = s.targetPoints.map((t) => {
-          const cnt = base + (rem > 0 ? (rem-- , 1) : 0);
-          const nearest = [...s.startPoints].sort((a, b) => distBetween(a, t) - distBetween(b, t))[0];
+          const cnt = base + (rem > 0 ? (rem--, 1) : 0);
+          const nearest = [...s.startPoints].sort(
+            (a, b) => distBetween(a, t) - distBetween(b, t),
+          )[0];
           return {
             id: uuidv4(),
             targetPointId: t.id,
@@ -440,17 +628,28 @@ export const useMissionWizardStore = create<MissionWizardState>()(
       };
 
       // ── Этап 5: NFZ + маршруты ─────────────────────────────────
-      const addNoFlyZone = (zone: Omit<NoFlyZone, 'id'>) => {
+      const addNoFlyZone = (zone: Omit<NoFlyZone, "id">) => {
         if (zone.polygon.length < 3) {
-          pushIssue({ step: 'nfz-and-routes', level: 'error', message: 'Полигон бесполётной зоны должен содержать минимум 3 вершины.' });
+          pushIssue({
+            step: "nfz-and-routes",
+            level: "error",
+            message:
+              "Полигон бесполётной зоны должен содержать минимум 3 вершины.",
+          });
           return;
         }
-        set((s) => ({ noFlyZones: [...s.noFlyZones, { ...zone, id: uuidv4() }] }));
+        set((s) => ({
+          noFlyZones: [...s.noFlyZones, { ...zone, id: uuidv4() }],
+        }));
         // обязательный автоматический пересчёт маршрутов в обход новой зоны
         void get().calculateRoutes();
       };
       const updateNoFlyZone = (id: string, patch: Partial<NoFlyZone>) => {
-        set((s) => ({ noFlyZones: s.noFlyZones.map((z) => (z.id === id ? { ...z, ...patch } : z)) }));
+        set((s) => ({
+          noFlyZones: s.noFlyZones.map((z) =>
+            z.id === id ? { ...z, ...patch } : z,
+          ),
+        }));
         void get().calculateRoutes();
       };
       const removeNoFlyZone = (id: string) => {
@@ -459,11 +658,20 @@ export const useMissionWizardStore = create<MissionWizardState>()(
       };
 
       // ray-casting in-polygon test (метрический пиксельный контур полигона)
-      const pointInPolygon = (px: number, py: number, poly: { x: number; y: number }[]): boolean => {
+      const pointInPolygon = (
+        px: number,
+        py: number,
+        poly: { x: number; y: number }[],
+      ): boolean => {
         let inside = false;
         for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-          const xi = poly[i].x, yi = poly[i].y, xj = poly[j].x, yj = poly[j].y;
-          const intersect = ((yi > py) !== (yj > py)) && (px < ((xj - xi) * (py - yi)) / (yj - yi) + xi);
+          const xi = poly[i].x,
+            yi = poly[i].y,
+            xj = poly[j].x,
+            yj = poly[j].y;
+          const intersect =
+            yi > py !== yj > py &&
+            px < ((xj - xi) * (py - yi)) / (yj - yi) + xi;
           if (intersect) inside = !inside;
         }
         return inside;
@@ -473,7 +681,8 @@ export const useMissionWizardStore = create<MissionWizardState>()(
 
       const pixelLen = (pts: { x: number; y: number }[]) => {
         let l = 0;
-        for (let i = 1; i < pts.length; i++) l += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+        for (let i = 1; i < pts.length; i++)
+          l += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
         return l;
       };
 
@@ -483,14 +692,18 @@ export const useMissionWizardStore = create<MissionWizardState>()(
        *  заданы демо-числами вне проекции карты (тесты/демо) — длина считается
        *  по сегментам полилинии через equirectangular-проекцию карты мастера. */
       const routeLengthM = (
-        sp: GeoPointData, tp: GeoPointData, pts: { x: number; y: number }[],
+        sp: GeoPointData,
+        tp: GeoPointData,
+        pts: { x: number; y: number }[],
       ): number => {
         const pxDirect = Math.hypot(tp.x - sp.x, tp.y - sp.y);
         const geo = geoDistanceM(sp.lat, sp.lon, tp.lat, tp.lon);
         // endpoints согласованы с проекцией карты? (клик по карте / поиск координат)
         const consistentWithProjection =
-          Math.abs(lonToPx(sp.lon) - sp.x) <= 2 && Math.abs(latToPy(sp.lat) - sp.y) <= 2 &&
-          Math.abs(lonToPx(tp.lon) - tp.x) <= 2 && Math.abs(latToPy(tp.lat) - tp.y) <= 2;
+          Math.abs(lonToPx(sp.lon) - sp.x) <= 2 &&
+          Math.abs(latToPy(sp.lat) - sp.y) <= 2 &&
+          Math.abs(lonToPx(tp.lon) - tp.x) <= 2 &&
+          Math.abs(latToPy(tp.lat) - tp.y) <= 2;
         if (consistentWithProjection && pxDirect > 0) {
           const factor = pixelLen(pts) / pxDirect;
           return Number.isFinite(factor) ? geo * Math.max(1, factor) : geo;
@@ -499,8 +712,10 @@ export const useMissionWizardStore = create<MissionWizardState>()(
         let total = 0;
         for (let i = 1; i < pts.length; i++) {
           total += geoDistanceM(
-            pyToLat(pts[i - 1].y), pxToLon(pts[i - 1].x),
-            pyToLat(pts[i].y), pxToLon(pts[i].x),
+            pyToLat(pts[i - 1].y),
+            pxToLon(pts[i - 1].x),
+            pyToLat(pts[i].y),
+            pxToLon(pts[i].x),
           );
         }
         return total;
@@ -509,11 +724,25 @@ export const useMissionWizardStore = create<MissionWizardState>()(
       const calculateRoutes = async (maxRangeMeters = Infinity) => {
         const s = get();
         // маршруты строим для групп (если сформированы), иначе напрямую старт→цель
-        type Leg = { groupId: string; startPointId: string; targetPointId: string };
-        const legs: Leg[] = s.fleetGroups.length > 0
-          ? s.fleetGroups.flatMap((g) =>
-              g.assignments.map((a) => ({ groupId: g.id, startPointId: a.startPointId, targetPointId: g.targetPointId })))
-          : s.targetPoints.map((t) => ({ groupId: '', startPointId: s.startPoints[0]?.id ?? '', targetPointId: t.id }));
+        type Leg = {
+          groupId: string;
+          startPointId: string;
+          targetPointId: string;
+        };
+        const legs: Leg[] =
+          s.fleetGroups.length > 0
+            ? s.fleetGroups.flatMap((g) =>
+                g.assignments.map((a) => ({
+                  groupId: g.id,
+                  startPointId: a.startPointId,
+                  targetPointId: g.targetPointId,
+                })),
+              )
+            : s.targetPoints.map((t) => ({
+                groupId: "",
+                startPointId: s.startPoints[0]?.id ?? "",
+                targetPointId: t.id,
+              }));
 
         const routes: CalculatedRoute[] = [];
         // ЦИКЛ-ГАРД (шаг П3 ТЗ): жёсткий лимит числа обрабатываемых рёбер.
@@ -521,7 +750,11 @@ export const useMissionWizardStore = create<MissionWizardState>()(
         // завершается за конечное число итераций с warning'ом, а не вешает поток.
         const MAX_ROUTE_LEGS = 10_000;
         if (legs.length > MAX_ROUTE_LEGS) {
-          pushIssue({ step: 'nfz-and-routes', level: 'warning', message: `Слишком много сегментов маршрутов (${legs.length}). Рассчитаны первые ${MAX_ROUTE_LEGS}.` });
+          pushIssue({
+            step: "nfz-and-routes",
+            level: "warning",
+            message: `Слишком много сегментов маршрутов (${legs.length}). Рассчитаны первые ${MAX_ROUTE_LEGS}.`,
+          });
         }
         for (const leg of legs.slice(0, MAX_ROUTE_LEGS)) {
           const sp = s.startPoints.find((p) => p.id === leg.startPointId);
@@ -529,14 +762,25 @@ export const useMissionWizardStore = create<MissionWizardState>()(
           if (!sp || !tp) continue;
           // hard-check: точка старта или цели внутри NFZ — обход невозможен в принципе
           const insideZone = s.noFlyZones.some(
-            (z) => pointInPolygon(sp.x, sp.y, z.polygon) || pointInPolygon(tp.x, tp.y, z.polygon),
+            (z) =>
+              pointInPolygon(sp.x, sp.y, z.polygon) ||
+              pointInPolygon(tp.x, tp.y, z.polygon),
           );
           if (insideZone) {
             routes.push({
-              id: uuidv4(), groupId: leg.groupId, startPointId: sp.id, targetPointId: tp.id,
-              points: [{ x: sp.x, y: sp.y }, { x: tp.x, y: tp.y }],
+              id: uuidv4(),
+              groupId: leg.groupId,
+              startPointId: sp.id,
+              targetPointId: tp.id,
+              points: [
+                { x: sp.x, y: sp.y },
+                { x: tp.x, y: tp.y },
+              ],
               lengthMeters: geoDistanceM(sp.lat, sp.lon, tp.lat, tp.lon),
-              crossesNfz: true, blockedByNfz: true, exceedsRange: false, acknowledged: false,
+              crossesNfz: true,
+              blockedByNfz: true,
+              exceedsRange: false,
+              acknowledged: false,
             });
             continue;
           }
@@ -546,28 +790,48 @@ export const useMissionWizardStore = create<MissionWizardState>()(
           // кандидатов и при неудаче молча возвращал null → вызывающий код
           // рисовал прямую сквозь зону как «валидный» маршрут.
           const restrictions: Restriction[] = s.noFlyZones.map((z) => ({
-            id: z.id, type: 'polygon', points: z.polygon, color: '#ef4444', name: z.name, active: true,
+            id: z.id,
+            type: "polygon",
+            points: z.polygon,
+            color: "#ef4444",
+            name: z.name,
+            active: true,
           }));
           const planned = planPathAroundZonesResult(
-            { x: sp.x, y: sp.y }, { x: tp.x, y: tp.y }, restrictions, MAP_W_PX, MAP_H_PX,
+            { x: sp.x, y: sp.y },
+            { x: tp.x, y: tp.y },
+            restrictions,
+            MAP_W_PX,
+            MAP_H_PX,
           );
           if (planned.blocked) {
             routes.push({
-              id: uuidv4(), groupId: leg.groupId, startPointId: sp.id, targetPointId: tp.id,
+              id: uuidv4(),
+              groupId: leg.groupId,
+              startPointId: sp.id,
+              targetPointId: tp.id,
               points: planned.points, // только визуальная подсказка — экспорт заблокирован валидацией
               lengthMeters: geoDistanceM(sp.lat, sp.lon, tp.lat, tp.lon),
-              crossesNfz: true, blockedByNfz: true, exceedsRange: false, acknowledged: false,
+              crossesNfz: true,
+              blockedByNfz: true,
+              exceedsRange: false,
+              acknowledged: false,
             });
             continue;
           }
           const detour = planned.points;
           const lengthMeters = routeLengthM(sp, tp, detour);
           routes.push({
-            id: uuidv4(), groupId: leg.groupId, startPointId: sp.id, targetPointId: tp.id,
+            id: uuidv4(),
+            groupId: leg.groupId,
+            startPointId: sp.id,
+            targetPointId: tp.id,
             points: detour,
             lengthMeters,
-            crossesNfz: false, blockedByNfz: false,
-            exceedsRange: lengthMeters > maxRangeMeters, acknowledged: false,
+            crossesNfz: false,
+            blockedByNfz: false,
+            exceedsRange: lengthMeters > maxRangeMeters,
+            acknowledged: false,
           });
         }
         set({ calculatedRoutes: routes });
@@ -578,23 +842,42 @@ export const useMissionWizardStore = create<MissionWizardState>()(
       };
 
       const acknowledgeRouteIssues = () => {
-        set((s) => ({ calculatedRoutes: s.calculatedRoutes.map((r) => (r.exceedsRange && !r.blockedByNfz ? { ...r, acknowledged: true } : r)) }));
+        set((s) => ({
+          calculatedRoutes: s.calculatedRoutes.map((r) =>
+            r.exceedsRange && !r.blockedByNfz
+              ? { ...r, acknowledged: true }
+              : r,
+          ),
+        }));
         get().runValidationAndPublish();
       };
 
       // ── Этап 6: профили высот (опциональный) ──────────────────
       const setAltitudeProfile = (profile: AltitudeProfile) =>
         set((s) => ({
-          altitudeProfiles: [...s.altitudeProfiles.filter((p) => p.routeId !== profile.routeId), profile],
+          altitudeProfiles: [
+            ...s.altitudeProfiles.filter((p) => p.routeId !== profile.routeId),
+            profile,
+          ],
         }));
 
-      const addAltitudePoint = (p: Omit<AltitudeChangePoint, 'id' | 'belowTerrainWarning'>) => {
+      const addAltitudePoint = (
+        p: Omit<AltitudeChangePoint, "id" | "belowTerrainWarning">,
+      ) => {
         if (!Number.isFinite(p.altitudeAgl) || p.altitudeAgl <= 0) {
-          pushIssue({ step: 'altitude-profiles', level: 'error', message: 'Высота должна быть больше 0 м.' });
+          pushIssue({
+            step: "altitude-profiles",
+            level: "error",
+            message: "Высота должна быть больше 0 м.",
+          });
           return;
         }
         if (p.positionRatio < 0 || p.positionRatio > 1) {
-          pushIssue({ step: 'altitude-profiles', level: 'error', message: 'Позиция на маршруте должна быть в диапазоне 0–100%.' });
+          pushIssue({
+            step: "altitude-profiles",
+            level: "error",
+            message: "Позиция на маршруте должна быть в диапазоне 0–100%.",
+          });
           return;
         }
         // Ф1.2 (аудит): AGL — высота НАД землёй, поэтому сравнивается с рельефом
@@ -605,14 +888,24 @@ export const useMissionWizardStore = create<MissionWizardState>()(
         // а на равнине наоборот — пропускали реальные нарушения.
         const below = p.terrainM !== null && p.altitudeAgl < SAFETY_MARGIN_M;
         if (below) {
-          pushIssue({ step: 'altitude-profiles', level: 'warning', message: `Высота AGL ${p.altitudeAgl} м меньше безопасного запаса ${SAFETY_MARGIN_M} м над рельефом. Увеличьте высоту.` });
+          pushIssue({
+            step: "altitude-profiles",
+            level: "warning",
+            message: `Высота AGL ${p.altitudeAgl} м меньше безопасного запаса ${SAFETY_MARGIN_M} м над рельефом. Увеличьте высоту.`,
+          });
         }
         set((s) => {
           const profiles = [...s.altitudeProfiles];
           const idx = profiles.findIndex((pr) => pr.routeId === p.routeId);
-          const np: AltitudeChangePoint = { ...p, id: uuidv4(), belowTerrainWarning: below };
+          const np: AltitudeChangePoint = {
+            ...p,
+            id: uuidv4(),
+            belowTerrainWarning: below,
+          };
           if (idx >= 0) {
-            const pts = [...profiles[idx].points, np].sort((a, b) => a.positionRatio - b.positionRatio);
+            const pts = [...profiles[idx].points, np].sort(
+              (a, b) => a.positionRatio - b.positionRatio,
+            );
             profiles[idx] = { routeId: profiles[idx].routeId, points: pts };
           } else {
             profiles.push({ routeId: p.routeId, points: [np] });
@@ -624,7 +917,11 @@ export const useMissionWizardStore = create<MissionWizardState>()(
       const removeAltitudePoint = (routeId: string, pointId: string) =>
         set((s) => ({
           altitudeProfiles: s.altitudeProfiles
-            .map((pr) => (pr.routeId === routeId ? { ...pr, points: pr.points.filter((p) => p.id !== pointId) } : pr))
+            .map((pr) =>
+              pr.routeId === routeId
+                ? { ...pr, points: pr.points.filter((p) => p.id !== pointId) }
+                : pr,
+            )
             .filter((pr) => pr.points.length > 0),
         }));
 
@@ -640,38 +937,52 @@ export const useMissionWizardStore = create<MissionWizardState>()(
             points: pr.points.map((p) => {
               if (p.terrainM === null) return p;
               return p.altitudeAgl < SAFETY_MARGIN_M
-                ? { ...p, altitudeAgl: SAFETY_MARGIN_M, belowTerrainWarning: false }
+                ? {
+                    ...p,
+                    altitudeAgl: SAFETY_MARGIN_M,
+                    belowTerrainWarning: false,
+                  }
                 : { ...p, belowTerrainWarning: false };
             }),
           })),
         }));
 
       // ── Этапы 7/8: экспорт и развёртывание ─────────────────────
-      const setExportFormat = (format: ExportFormat) => set({ exportFormat: format });
+      const setExportFormat = (format: ExportFormat) =>
+        set({ exportFormat: format });
 
       const deployMission = async () => {
         const s = get();
         const log: string[] = [...s.deploymentLog];
-        log.push(`Генерация файла формата ${s.exportFormat ?? '—'}…`);
+        log.push(`Генерация файла формата ${s.exportFormat ?? "—"}…`);
         try {
-          if (!s.exportFormat) throw new Error('Формат экспорта не выбран.');
-          if (s.calculatedRoutes.length === 0) throw new Error('Нет рассчитанных маршрутов для экспорта.');
+          if (!s.exportFormat) throw new Error("Формат экспорта не выбран.");
+          if (s.calculatedRoutes.length === 0)
+            throw new Error("Нет рассчитанных маршрутов для экспорта.");
           // Ф1.3 (аудит): маршруты, которые не удалось проложить в обход NFZ,
           // запрещены к развёртыванию даже в обход поштучной валидации этапов —
           // тихий экспорт прямой линии сквозь зону = гарантированная потеря дрона.
           const blocked = s.calculatedRoutes.filter((r) => r.blockedByNfz);
           if (blocked.length > 0) {
-            throw new Error(`Экспорт заблокирован: ${blocked.length} маршрут(ов) проходят через NFZ (обход не построен). Измените зоны или точки.`);
+            throw new Error(
+              `Экспорт заблокирован: ${blocked.length} маршрут(ов) проходят через NFZ (обход не построен). Измените зоны или точки.`,
+            );
           }
-          const unack = s.calculatedRoutes.filter((r) => r.exceedsRange && !r.acknowledged);
+          const unack = s.calculatedRoutes.filter(
+            (r) => r.exceedsRange && !r.acknowledged,
+          );
           if (unack.length > 0) {
-            throw new Error(`Экспорт заблокирован: ${unack.length} маршрут(ов) превышают дальность аппарата без подтверждения.`);
+            throw new Error(
+              `Экспорт заблокирован: ${unack.length} маршрут(ов) превышают дальность аппарата без подтверждения.`,
+            );
           }
           log.push(`✓ Сгенерировано маршрутов: ${s.calculatedRoutes.length}`);
-          log.push('✓ Файл готов к скачиванию.');
+          log.push("✓ Файл готов к скачиванию.");
           set({ deploymentLog: log });
         } catch (e) {
-          log.push(`✗ Ошибка генерации: ${e instanceof Error ? e.message : String(e)}`);
+          log.push(
+            `✗ Ошибка генерации: ${e instanceof Error ? e.message : String(e)}`,
+          );
           set({ deploymentLog: log });
           throw e;
         }
@@ -687,9 +998,28 @@ export const useMissionWizardStore = create<MissionWizardState>()(
       // тестах (beforeEach → resetWizard + localStorage.clear()).
       const resetWizard = () => {
         set({ ...initialData });
+        // Ф3.1: persist-очистка — только собственный ключ мастера, через
+        // safeRemoveItem (удаляет и spill-запись IndexedDB). Прежний прямой
+        // localStorage.removeItem не чистил spill → после reset в стор могла
+        // гидратироваться «мусорная» тяжёлая запись.
+        void safeRemovePersistSnapshot();
+      };
+
+      /** Асинхронное удаление собственного persist-снапшота (+spill).
+       *  Ошибки хранилища не роняют reset — они уходят в eventBus внутри storage. */
+      const safeRemovePersistSnapshot = () => {
         try {
-          localStorage.removeItem('tq-mission-wizard');
-        } catch { /* localStorage может быть недоступен (приватный режим Safari ITP) */ }
+          const raw = useMissionWizardStore.persist;
+          void Promise.resolve(raw.clearStorage()).catch(() => {
+            try {
+              localStorage.removeItem(WIZARD_PERSIST_KEY);
+            } catch {
+              /* noop */
+            }
+          });
+        } catch {
+          /* persist без getStorage (тестовые окружения) — noop */
+        }
       };
 
       /** Валидация этапа. При вызове с `publish: true` результаты также
@@ -697,69 +1027,156 @@ export const useMissionWizardStore = create<MissionWizardState>()(
        *  read-only режим: подписчики (useEffect в UI) не должны провоцировать
        *  повторные рендеры через persist-set, а тесты/навигация не зависят от
        *  того, «успел ли UI опубликовать» ошибки. */
-      const validateCurrentStep = (publish = false): WizardValidationIssue[] => {
+      const validateCurrentStep = (
+        publish = false,
+      ): WizardValidationIssue[] => {
         const s = get();
         const errs: WizardValidationIssue[] = [];
         const step = s.currentStep;
         switch (step) {
-          case 'map-selection':
+          case "map-selection":
             // ТЗ: первым этапом — выбор карт для загрузки. Без выбора дальше
             // идти нельзя (иначе мастер «молча» грузит подложку по умолчанию).
-            if (s.selectedMaps.length === 0) errs.push({ step, level: 'error', message: 'Выберите хотя бы одну карту для загрузки.' });
-            else if (!s.primaryMap || !s.selectedMaps.includes(s.primaryMap)) errs.push({ step, level: 'error', message: 'Назначьте основную карту из выбранных.' });
+            if (s.selectedMaps.length === 0)
+              errs.push({
+                step,
+                level: "error",
+                message: "Выберите хотя бы одну карту для загрузки.",
+              });
+            else if (!s.primaryMap || !s.selectedMaps.includes(s.primaryMap))
+              errs.push({
+                step,
+                level: "error",
+                message: "Назначьте основную карту из выбранных.",
+              });
             break;
-          case 'craft-selection':
-            if (!s.craftType) errs.push({ step, level: 'error', message: 'Выберите тип аппарата.' });
+          case "craft-selection":
+            if (!s.craftType)
+              errs.push({
+                step,
+                level: "error",
+                message: "Выберите тип аппарата.",
+              });
             break;
-          case 'start-points':
-            if (s.startPoints.length === 0) errs.push({ step, level: 'error', message: 'Добавьте хотя бы одну точку старта.' });
+          case "start-points":
+            if (s.startPoints.length === 0)
+              errs.push({
+                step,
+                level: "error",
+                message: "Добавьте хотя бы одну точку старта.",
+              });
             break;
-          case 'target-points':
-            if (s.targetPoints.length === 0) errs.push({ step, level: 'error', message: 'Добавьте хотя бы одну точку цели.' });
+          case "target-points":
+            if (s.targetPoints.length === 0)
+              errs.push({
+                step,
+                level: "error",
+                message: "Добавьте хотя бы одну точку цели.",
+              });
             break;
-          case 'fleet-formation': {
-            if (s.totalCraft <= 0) errs.push({ step, level: 'error', message: 'Укажите общее количество аппаратов (> 0).' });
+          case "fleet-formation": {
+            if (s.totalCraft <= 0)
+              errs.push({
+                step,
+                level: "error",
+                message: "Укажите общее количество аппаратов (> 0).",
+              });
             const covered = new Set(s.fleetGroups.map((g) => g.targetPointId));
             for (const t of s.targetPoints) {
-              if (!covered.has(t.id)) errs.push({ step, level: 'warning', message: `Цель «${t.name}» без назначенных аппаратов.` });
+              if (!covered.has(t.id))
+                errs.push({
+                  step,
+                  level: "warning",
+                  message: `Цель «${t.name}» без назначенных аппаратов.`,
+                });
             }
             const sum = s.fleetGroups.reduce((acc, g) => acc + g.totalCraft, 0);
-            if (sum !== s.totalCraft) errs.push({ step, level: 'error', message: `Сумма аппаратов в группах (${sum}) ≠ общее количество (${s.totalCraft}). Расхождение: ${s.totalCraft - sum}.` });
+            if (sum !== s.totalCraft)
+              errs.push({
+                step,
+                level: "error",
+                message: `Сумма аппаратов в группах (${sum}) ≠ общее количество (${s.totalCraft}). Расхождение: ${s.totalCraft - sum}.`,
+              });
             for (const g of s.fleetGroups) {
-              if (groupSum(g) !== g.totalCraft) errs.push({ step, level: 'error', message: `В группе ${g.id}: сумма по стартам (${groupSum(g)}) ≠ размеру группы (${g.totalCraft}).` });
+              if (groupSum(g) !== g.totalCraft)
+                errs.push({
+                  step,
+                  level: "error",
+                  message: `В группе ${g.id}: сумма по стартам (${groupSum(g)}) ≠ размеру группы (${g.totalCraft}).`,
+                });
             }
             break;
           }
-          case 'nfz-and-routes': {
-            if (s.calculatedRoutes.length === 0) errs.push({ step, level: 'error', message: 'Маршруты не рассчитаны — нажмите «Рассчитать маршруты».' });
+          case "nfz-and-routes": {
+            if (s.calculatedRoutes.length === 0)
+              errs.push({
+                step,
+                level: "error",
+                message:
+                  "Маршруты не рассчитаны — нажмите «Рассчитать маршруты».",
+              });
             const blocked = s.calculatedRoutes.filter((r) => r.blockedByNfz);
-            if (blocked.length > 0) errs.push({ step, level: 'error', message: `Невозможно построить маршрут в обход зоны (${blocked.length} шт.). Удалите или переместите зону.` });
-            const unack = s.calculatedRoutes.filter((r) => r.exceedsRange && !r.acknowledged);
+            if (blocked.length > 0)
+              errs.push({
+                step,
+                level: "error",
+                message: `Невозможно построить маршрут в обход зоны (${blocked.length} шт.). Удалите или переместите зону.`,
+              });
+            const unack = s.calculatedRoutes.filter(
+              (r) => r.exceedsRange && !r.acknowledged,
+            );
             // превышение дальности дрона — КРИТИЧЕСКАЯ ошибка безопасности полёта
             // (для БПЛА с запасом дальности это остаётся предупреждением ниже)
-            if (unack.length > 0 && s.craftType === 'drone') {
-              errs.push({ step, level: 'error', message: `${unack.length} маршрут(ов) превышают дальность аппарата — подтвердите игнорирование или измените план.` });
+            if (unack.length > 0 && s.craftType === "drone") {
+              errs.push({
+                step,
+                level: "error",
+                message: `${unack.length} маршрут(ов) превышают дальность аппарата — подтвердите игнорирование или измените план.`,
+              });
             } else if (unack.length > 0) {
-              errs.push({ step, level: 'warning', message: `${unack.length} маршрут(ов) превышают дальность аппарата. Подтвердите игнорирование или измените план.` });
+              errs.push({
+                step,
+                level: "warning",
+                message: `${unack.length} маршрут(ов) превышают дальность аппарата. Подтвердите игнорирование или измените план.`,
+              });
             }
             break;
           }
-          case 'altitude-profiles':
+          case "altitude-profiles":
             // этап опциональный: ошибок нет всегда
             break;
-          case 'export-preparation': {
-            if (!s.exportFormat) errs.push({ step, level: 'error', message: 'Выберите формат экспорта.' });
-            const critical = s.calculatedRoutes.filter((r) => r.blockedByNfz || (r.exceedsRange && !r.acknowledged));
-            if (critical.length > 0) errs.push({ step, level: 'error', message: 'Есть критические проблемы маршрутов — вернитесь на этап 5.' });
+          case "export-preparation": {
+            if (!s.exportFormat)
+              errs.push({
+                step,
+                level: "error",
+                message: "Выберите формат экспорта.",
+              });
+            const critical = s.calculatedRoutes.filter(
+              (r) => r.blockedByNfz || (r.exceedsRange && !r.acknowledged),
+            );
+            if (critical.length > 0)
+              errs.push({
+                step,
+                level: "error",
+                message:
+                  "Есть критические проблемы маршрутов — вернитесь на этап 5.",
+              });
             break;
           }
-          case 'mission-deployment':
+          case "mission-deployment":
             break;
         }
         if (publish) {
           const prev = get().issues;
           // set только при реальном изменении — защита от бесконечных циклов рендера
-          if (prev.length !== errs.length || prev.some((p, i) => p.message !== errs[i]?.message || p.level !== errs[i]?.level)) {
+          if (
+            prev.length !== errs.length ||
+            prev.some(
+              (p, i) =>
+                p.message !== errs[i]?.message || p.level !== errs[i]?.level,
+            )
+          ) {
             set({ issues: errs });
           }
         }
@@ -767,10 +1184,11 @@ export const useMissionWizardStore = create<MissionWizardState>()(
       };
 
       /** Валидация с публикацией результатов в `issues` (для отображения в UI). */
-      const runValidationAndPublish = (): WizardValidationIssue[] => validateCurrentStep(true);
+      const runValidationAndPublish = (): WizardValidationIssue[] =>
+        validateCurrentStep(true);
 
       const canProceedToNextStep = (): boolean =>
-        validateCurrentStep().every((i) => i.level !== 'error');
+        validateCurrentStep().every((i) => i.level !== "error");
 
       const goToNextStep = () => {
         const s = get();
@@ -780,7 +1198,9 @@ export const useMissionWizardStore = create<MissionWizardState>()(
         const next = WIZARD_STEPS[idx + 1];
         set({
           currentStep: next,
-          completedSteps: s.completedSteps.includes(s.currentStep) ? s.completedSteps : [...s.completedSteps, s.currentStep],
+          completedSteps: s.completedSteps.includes(s.currentStep)
+            ? s.completedSteps
+            : [...s.completedSteps, s.currentStep],
         });
       };
 
@@ -795,33 +1215,89 @@ export const useMissionWizardStore = create<MissionWizardState>()(
         const s = get();
         // переход назад — свободный; вперёд — только на завершённый или сразу следующий после последнего завершённого
         const targetIdx = WIZARD_STEPS.indexOf(step);
-        const doneIdx = Math.max(...s.completedSteps.map((c) => WIZARD_STEPS.indexOf(c)), -1);
+        const doneIdx = Math.max(
+          ...s.completedSteps.map((c) => WIZARD_STEPS.indexOf(c)),
+          -1,
+        );
         if (targetIdx <= doneIdx + 1) set({ currentStep: step });
-        else pushIssue({ step: s.currentStep, level: 'error', message: 'Этот этап ещё недоступен — сначала завершите предыдущие.' });
+        else
+          pushIssue({
+            step: s.currentStep,
+            level: "error",
+            message: "Этот этап ещё недоступен — сначала завершите предыдущие.",
+          });
       };
 
       return {
         ...initialData,
-        toggleMapChoice, setPrimaryMap,
-        setCraftType, resetCraftChoice,
-        addStartPoint, updateStartPoint, removeStartPoint,
-        addTargetPoint, updateTargetPoint, removeTargetPoint,
-        setTotalCraft, createFleetGroup, updateFleetGroup, removeFleetGroup, autoFormGroups,
-        addNoFlyZone, updateNoFlyZone, removeNoFlyZone,
-        calculateRoutes, acknowledgeRouteIssues,
-        setAltitudeProfile, addAltitudePoint, autoAdjustAltitudes, removeAltitudePoint,
-        setExportFormat, deployMission, resetWizard,
-        validateCurrentStep, runValidationAndPublish, canProceedToNextStep, goToNextStep, goToPreviousStep, goToStep,
+        toggleMapChoice,
+        setPrimaryMap,
+        setCraftType,
+        resetCraftChoice,
+        addStartPoint,
+        updateStartPoint,
+        removeStartPoint,
+        addTargetPoint,
+        updateTargetPoint,
+        removeTargetPoint,
+        setTotalCraft,
+        createFleetGroup,
+        updateFleetGroup,
+        removeFleetGroup,
+        autoFormGroups,
+        addNoFlyZone,
+        updateNoFlyZone,
+        removeNoFlyZone,
+        calculateRoutes,
+        acknowledgeRouteIssues,
+        setAltitudeProfile,
+        addAltitudePoint,
+        autoAdjustAltitudes,
+        removeAltitudePoint,
+        setExportFormat,
+        deployMission,
+        resetWizard,
+        validateCurrentStep,
+        runValidationAndPublish,
+        canProceedToNextStep,
+        goToNextStep,
+        goToPreviousStep,
+        goToStep,
       };
     },
     {
-      name: 'tq-mission-wizard',
-      storage: createJSONStorage(() => localStorage),
+      name: WIZARD_PERSIST_KEY,
+      // ФАЗА 3.3 (аудит): граница приложения — любой снапшот из localStorage/
+      // IndexedDB проходит Zod-схему ДО попадания в стор; запись идёт через
+      // safeSetItem (quota → spill в IndexedDB, ошибки → eventBus 'storage:error').
+      storage: createValidatedJSONStorage<WizardPersistData>(
+        WIZARD_PERSIST_KEY,
+        WizardPersistSchema,
+      ),
+      // Версия схемы персистимых данных. bump при изменении формы; migrate
+      // вызывается zustand перед гидратацией старых снапшотов.
+      version: WIZARD_PERSIST_VERSION,
+      migrate: (persistedState, version) => {
+        const { data, warnings } = sanitizeWizardData(persistedState);
+        if (version < WIZARD_PERSIST_VERSION) {
+          warnings.push(
+            `Миграция сохранений v${version} → v${WIZARD_PERSIST_VERSION} выполнена.`,
+          );
+        }
+        if (warnings.length > 0) {
+          eventBus.emit("storage:error", {
+            message: `Мастер миссий: ${warnings.join(" ")} Часть данных восстановлена автоматически.`,
+          });
+        }
+        return data;
+      },
       // Миграция старых сохранений (до Этапа 1 «Выбор карт»): zustand persist
       // делает shallow-merge persisted-объекта поверх дефолтов состояния,
       // поэтому достаточно включить новые поля в partialize — у старых снапшотов
       // их просто нет и останутся дефолты (primaryMap='esri', selectedMaps=[]).
-      partialize: (s) => ({
+      // Тип — WizardPersistData (z.infer схемы): partialize описывает ТОЛЬКО
+      // персистимые данные, методы стора сюда не попадают.
+      partialize: (s): WizardPersistData => ({
         currentStep: s.currentStep,
         completedSteps: s.completedSteps,
         selectedMaps: s.selectedMaps,
