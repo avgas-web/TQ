@@ -125,13 +125,18 @@ export const ExportFormatSchema = z.enum([
 
 /** Схема персистимых/файловых данных мастера (совпадает с partialize стора).
  *  enum-поля защищены z.preprocess: неизвестное значение → дефолт, а не ошибка. */
+/** Санация enum-секций: `undefined` (или неизвестное значение) в zod v4 НЕ
+ *  активирует `.default()` — default срабатывает только на отсутствующий ключ
+ *  объекта. Поэтому preprocess обязан вернуть сам дефолт, а не undefined/null. */
+const enumOrDefault =
+  <T extends string>(def: T, options: readonly string[]) =>
+  (v: unknown): string =>
+    options.includes(v as string) ? (v as string) : def;
+
 export const WizardPersistSchema = z.object({
   currentStep: z
     .preprocess(
-      (v) =>
-        (WizardStepIdSchema.options as readonly string[]).includes(v as string)
-          ? v
-          : undefined,
+      enumOrDefault("map-selection", WizardStepIdSchema.options),
       WizardStepIdSchema,
     )
     .default("map-selection"),
