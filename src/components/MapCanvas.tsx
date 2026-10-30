@@ -633,7 +633,17 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   // тайлов синхронизировался по другому, очередь уходила в бесконечную
   // перезагрузку — страница «виснет намертво». Теперь приоритет источников
   // жёсткий: зеркало → стор → дефолт, и всё сводится к одному состоянию.
-  const fitKeyInit = mapFitKey(useMapStore.getState().map);
+  // ФИКС «СИНИЙ ЭКРАН ПРИ ЗАГРУЗКЕ» (копия математики вида из MiniMapPanel):
+  // fitKeyInit обязан пересчитываться при СМЕНЕ КАРТЫ. Раньше mapFitKey читался
+  // ОДИН РАЗ на маунт: remount'а при загрузке новой карты нет, поэтому зеркало
+  // 'tq-view' с ключом СТАРОЙ карты отвергалось sanitizeSavedView как stale →
+  // включался СПб-фолбэк (z10), который затем затирался stale-видом persist-стора
+  // ('tq-map', гидрируется асинхронно ПОСЛЕ mount) — камера уходила за пределы
+  // подложки новой карты: экран синий, при увеличении тайлы догоняют viewport.
+  // В режиме трёх окон этот путь не используется: MiniMapPanel сам вычисляет
+  // viewRef из своих данных и глобальный viewState не читает (см. pannelli.ts).
+  const fitKeyNow = mapFitKey(project.map ?? useMapStore.getState().map);
+  const lastFitKeyInitRef = useRef<string | null>(null);
   const viewRef = useRef<ViewState | null>(null);
   // Флаг «зеркало tq-view уже опознано на этом маунте»: пока он не снят,
   // hydrating persist 'tq-map' НЕ имеет права затирать восстановленный вид
@@ -642,12 +652,12 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   // Флаг «вид не восстановлен ни из зеркала, ни из стора» — при первом
   // реальном замере контейнера вид фиксируется над СПб (см. applySizes).
   const pendingSpbFallbackRef = useRef(false);
-  if (viewRef.current === null) {
+  if (viewRef.current === null || (fitKeyNow && lastFitKeyInitRef.current !== null && lastFitKeyInitRef.current !== fitKeyNow)) {
     const savedRaw = readSavedView();
     const savedKeyRaw = (() => {
       try { return localStorage.getItem(`${VIEW_STORAGE_KEY}-map`); } catch { return null; }
     })();
-    const restored = sanitizeSavedView(savedRaw, fitKeyInit, savedKeyRaw);
+    const restored = sanitizeSavedView(savedRaw, fitKeyNow, savedKeyRaw);
     // Зеркало распознано (валидно либо осознанно отвергнуто по ключу карты) —
     // с этого момента стор больше не является источником истины для viewRef.
     mirrorResolvedRef.current = true;
@@ -665,6 +675,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       pendingSpbFallbackRef.current = true;
       viewRef.current = spbFallbackView(600); // временный корректный вид (offsetX добирается при замере)
     }
+    lastFitKeyInitRef.current = fitKeyNow;
   }
   // Синхронизация стора с восстановленным зеркалом — ровно один раз на маунт
   // (см. комментарий выше; setViewState с теми же значениями безопасен).
