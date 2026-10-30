@@ -4,6 +4,7 @@ import {
   WizardPersistSchema,
   sanitizeWizardData,
   validateMissionPayload,
+  validateWizardInput,
 } from "../src/utils/wizardSchema";
 
 const validPoint = {
@@ -41,11 +42,22 @@ describe("wizardSchema — граница валидации Zustand (регре
     expect(r.warnings.join(" ")).toMatch(/startPoints/i);
   });
 
-  it("координаты вне диапазона (999°) не проходят схему", () => {
-    const res = WizardPersistSchema.safeParse({
+  it("координаты вне диапазона (999°) не проходят СТРОГУЮ границу validateWizardInput", () => {
+    // REGRESSION: раньше такие точки молча проходили sanitize-преprocess.
+    const res = validateWizardInput({
       startPoints: [{ id: "p1", name: "N", lat: 999, lon: 200, x: 0, y: 0 }],
     });
     expect(res.success).toBe(false);
+    expect(res.error?.issues[0]?.message).toMatch(/startPoints/);
+    // мягкий режим (persist-автовосстановление) — отбрасывает битый элемент
+    const soft = sanitizeWizardData({
+      startPoints: [
+        validPoint,
+        { id: "p2", name: "N", lat: 999, lon: 200, x: 0, y: 0 },
+      ],
+    });
+    expect(soft.data.startPoints).toHaveLength(1);
+    expect(soft.warnings.join(" ")).toMatch(/startPoints/i);
   });
 
   it("неизвестный currentStep/exportFormat/craftType → дефолт, а не падение parse", () => {

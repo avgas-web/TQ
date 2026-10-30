@@ -27,7 +27,22 @@ describe("validatedStorage — целостность на границе Zustan
     const store = createValidatedStorage<Shape>("tq-test-broken", Schema);
     await expect(store.getItem("tq-test-broken")).resolves.toBeNull();
     expect(spy).toHaveBeenCalled();
+    // восстанавливаем prototype для остальных тестов
+    delete (Storage.prototype as unknown as { getItem?: unknown }).getItem;
     eventBus.off("storage:error", spy);
+  });
+
+  it("REGRESSION: недоступный localStorage (SecurityError) → null без throw", async () => {
+    const original = Storage.prototype.getItem;
+    Storage.prototype.getItem = () => {
+      throw new DOMException("access denied", "SecurityError");
+    };
+    try {
+      const store = createValidatedStorage<Shape>("tq-test-denied", Schema);
+      await expect(store.getItem("tq-test-denied")).resolves.toBeNull();
+    } finally {
+      Storage.prototype.getItem = original;
+    }
   });
 
   it("валидный envelope проходит насквозь без предупреждений", async () => {

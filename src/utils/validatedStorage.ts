@@ -50,7 +50,10 @@ export function createValidatedStorage<S>(
 
   return {
     async getItem(key): Promise<StorageValue<S> | null> {
-      let raw: string | null = null;
+      // Читаем через safeGetItem: он разворачивает spill-записи (quota →
+      // IndexedDB) и возвращает null при недоступном хранилище. Битый JSON —
+      // отдельная ветка: storage:error + чистый старт, без throw.
+      let raw: string | null;
       try {
         raw = await safeGetItem(key);
       } catch {
