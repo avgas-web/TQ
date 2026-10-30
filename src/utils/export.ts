@@ -1,19 +1,27 @@
 // Утилиты экспорта/импорта
-import type { Marker, Project, Route, Restriction } from '../types';
-import { pixelToGeoFromBounds } from './googleMaps';
-import { toCsv, parseCsv } from './csv';
+import type { Marker, Project, Route, Restriction } from "../types";
+import { pixelToGeoFromBounds } from "./googleMaps";
+import { toCsv, parseCsv, FORMULA_INJECTION_PREFIXES } from "./csv";
 
 /**
  * Получение координат маркера с учётом привязки к Google Maps
  */
-function getMarkerGeoCoords(marker: Marker, project?: Project): { lat: number | null; lon: number | null } {
+function getMarkerGeoCoords(
+  marker: Marker,
+  project?: Project,
+): { lat: number | null; lon: number | null } {
   // Если есть привязка к онлайн-картам, вычисляем координаты автоматически
-  if (project?.map?.bounds && (project.map.source === 'google' || project.map.source === 'yandex' || project.map.source === 'osm')) {
+  if (
+    project?.map?.bounds &&
+    (project.map.source === "google" ||
+      project.map.source === "yandex" ||
+      project.map.source === "osm")
+  ) {
     const geo = pixelToGeoFromBounds(
       { x: marker.x, y: marker.y },
       project.map.bounds,
       project.map.width,
-      project.map.height
+      project.map.height,
     );
     return { lat: geo.lat, lon: geo.lng };
   }
@@ -27,12 +35,21 @@ function getMarkerGeoCoords(marker: Marker, project?: Project): { lat: number | 
  * кавычование по RFC 4180 и защита от Formula Injection (=, +, -, @, Tab, CR).
  */
 export function exportToCSV(markers: Marker[], project?: Project): string {
-  const header = ['id', 'name', 'x', 'y', 'lat', 'lon', 'type', 'comment'];
-  const rows = markers.map(m => {
+  const header = ["id", "name", "x", "y", "lat", "lon", "type", "comment"];
+  const rows = markers.map((m) => {
     const geo = getMarkerGeoCoords(m, project);
-    return [m.id, m.name, m.x, m.y, geo.lat ?? '', geo.lon ?? '', m.type, m.comment];
+    return [
+      m.id,
+      m.name,
+      m.x,
+      m.y,
+      geo.lat ?? "",
+      geo.lon ?? "",
+      m.type,
+      m.comment,
+    ];
   });
-  return toCsv([header, ...rows], { delimiter: ';' });
+  return toCsv([header, ...rows], { delimiter: ";" });
 }
 
 /**
@@ -47,13 +64,13 @@ export function exportToJSON(markers: Marker[]): string {
  */
 export function exportToGeoJSON(markers: Marker[], project?: Project): string {
   const features = markers
-    .map(m => {
+    .map((m) => {
       const geo = getMarkerGeoCoords(m, project);
       if (geo.lat === null || geo.lon === null) return null;
       return {
-        type: 'Feature',
+        type: "Feature",
         geometry: {
-          type: 'Point',
+          type: "Point",
           coordinates: [geo.lon, geo.lat],
         },
         properties: {
@@ -67,12 +84,16 @@ export function exportToGeoJSON(markers: Marker[], project?: Project): string {
         },
       };
     })
-    .filter(f => f !== null);
+    .filter((f) => f !== null);
 
-  return JSON.stringify({
-    type: 'FeatureCollection',
-    features,
-  }, null, 2);
+  return JSON.stringify(
+    {
+      type: "FeatureCollection",
+      features,
+    },
+    null,
+    2,
+  );
 }
 
 /**
@@ -80,7 +101,7 @@ export function exportToGeoJSON(markers: Marker[], project?: Project): string {
  */
 export function exportToGPX(markers: Marker[], project?: Project): string {
   const tacticalNodes = markers
-    .map(m => {
+    .map((m) => {
       const geo = getMarkerGeoCoords(m, project);
       if (geo.lat === null || geo.lon === null) return null;
       return `  <wpt lat="${geo.lat}" lon="${geo.lon}">
@@ -89,8 +110,8 @@ export function exportToGPX(markers: Marker[], project?: Project): string {
     <type>${escapeXml(m.type)}</type>
   </wpt>`;
     })
-    .filter(w => w !== null)
-    .join('\n');
+    .filter((w) => w !== null)
+    .join("\n");
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" creator="TotalQuadro Coordinate Marker">
@@ -103,7 +124,7 @@ ${tacticalNodes}
  */
 export function exportToKML(markers: Marker[], project?: Project): string {
   const placemarks = markers
-    .map(m => {
+    .map((m) => {
       const geo = getMarkerGeoCoords(m, project);
       if (geo.lat === null || geo.lon === null) return null;
       return `    <Placemark>
@@ -114,8 +135,8 @@ export function exportToKML(markers: Marker[], project?: Project): string {
       </Point>
     </Placemark>`;
     })
-    .filter(p => p !== null)
-    .join('\n');
+    .filter((p) => p !== null)
+    .join("\n");
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
@@ -136,8 +157,12 @@ export function exportProject(project: Project): string {
     ...project,
     // ЭТАП 1.2: поле apiKey полностью удалено из модели — экспорт не содержит
     // секретов ни при каких условиях (раньше писался пустой apiKey-заглушка).
-    googleMaps: project.googleMaps ? { enabled: project.googleMaps.enabled } : project.googleMaps,
-    yandexMaps: project.yandexMaps ? { enabled: project.yandexMaps.enabled } : project.yandexMaps,
+    googleMaps: project.googleMaps
+      ? { enabled: project.googleMaps.enabled }
+      : project.googleMaps,
+    yandexMaps: project.yandexMaps
+      ? { enabled: project.yandexMaps.enabled }
+      : project.yandexMaps,
   };
   return JSON.stringify(redacted, null, 2);
 }
@@ -157,22 +182,29 @@ export function importProject(json: string): Project | null {
   } catch {
     return null;
   }
-  if (!data || typeof data !== 'object') return null;
-  if (typeof data.version !== 'string' && typeof data.projectName !== 'string') return null;
+  if (!data || typeof data !== "object") return null;
+  if (typeof data.version !== "string" && typeof data.projectName !== "string")
+    return null;
 
-  const num = (v: unknown, d: number) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
-  const str = (v: unknown, d: string) => (typeof v === 'string' ? v : d);
+  const num = (v: unknown, d: number) =>
+    typeof v === "number" && Number.isFinite(v) ? v : d;
+  const str = (v: unknown, d: string) => (typeof v === "string" ? v : d);
   const arr = <T>(v: unknown): T[] => (Array.isArray(v) ? v : []);
 
   // Карта: принимаем только с валидными размерами и dataUrl, иначе — null
-  let map: Project['map'] = null;
-  if (data.map && typeof data.map === 'object' && typeof data.map.dataUrl === 'string' &&
-      num(data.map.width, 0) > 0 && num(data.map.height, 0) > 0) {
+  let map: Project["map"] = null;
+  if (
+    data.map &&
+    typeof data.map === "object" &&
+    typeof data.map.dataUrl === "string" &&
+    num(data.map.width, 0) > 0 &&
+    num(data.map.height, 0) > 0
+  ) {
     map = data.map;
   }
 
   const markers: Marker[] = arr<any>(data.markers)
-    .filter((m) => m && typeof m === 'object')
+    .filter((m) => m && typeof m === "object")
     .map((m, i) => ({
       ...m,
       id: str(m.id, `m-${Date.now()}-${i}`),
@@ -182,28 +214,38 @@ export function importProject(json: string): Project | null {
     }));
 
   const routes: Route[] = arr<any>(data.routes)
-    .filter((r) => r && typeof r === 'object' && Array.isArray(r.points))
+    .filter((r) => r && typeof r === "object" && Array.isArray(r.points))
     .map((r, i) => ({
       ...r,
       id: str(r.id, `r-${Date.now()}-${i}`),
-      points: r.points.filter((p: any) => p && typeof p === 'object' &&
-        Number.isFinite(p.lat) && Number.isFinite(p.lng)),
+      points: r.points.filter(
+        (p: any) =>
+          p &&
+          typeof p === "object" &&
+          Number.isFinite(p.lat) &&
+          Number.isFinite(p.lng),
+      ),
     }))
     .filter((r) => r.points.length >= 2);
 
   const restrictions: Restriction[] = arr<any>(data.restrictions)
-    .filter((z) => z && typeof z === 'object' && Array.isArray(z.points))
+    .filter((z) => z && typeof z === "object" && Array.isArray(z.points))
     .map((z, i) => ({
       ...z,
       id: str(z.id, `z-${Date.now()}-${i}`),
-      points: z.points.filter((p: any) => p && typeof p === 'object' &&
-        Number.isFinite(p.x) && Number.isFinite(p.y)),
+      points: z.points.filter(
+        (p: any) =>
+          p &&
+          typeof p === "object" &&
+          Number.isFinite(p.x) &&
+          Number.isFinite(p.y),
+      ),
     }))
     .filter((z) => z.points.length >= 1);
 
   return {
-    version: str(data.version, '1.0'),
-    projectName: str(data.projectName, 'Импортированный проект'),
+    version: str(data.version, "1.0"),
+    projectName: str(data.projectName, "Импортированный проект"),
     createdAt: str(data.createdAt, new Date().toISOString()),
     updatedAt: str(data.updatedAt, new Date().toISOString()),
     map,
@@ -214,18 +256,23 @@ export function importProject(json: string): Project | null {
     restrictions,
     markers,
     routes,
-    importLists: data.importLists && typeof data.importLists === 'object' ? data.importLists : undefined,
+    importLists:
+      data.importLists && typeof data.importLists === "object"
+        ? data.importLists
+        : undefined,
     layers: arr(data.layers),
     settings: {
       showGrid: !!(data.settings && data.settings.showGrid),
       gridSize: num(data.settings?.gridSize, 100),
-      showCoordinates: !!(data.settings?.showCoordinates),
-      theme: data.settings?.theme === 'light' ? 'light' : 'dark',
+      showCoordinates: !!data.settings?.showCoordinates,
+      theme: data.settings?.theme === "light" ? "light" : "dark",
       // Стиль подложки из импортируемого проекта; внешние Overpass-слои удалены —
       // нормализуем к схеме, спутник/гибрид сохраняем.
-      tileStyle: (data.settings?.tileStyle === 'satellite' || data.settings?.tileStyle === 'hybrid')
-        ? (data.settings.tileStyle as 'satellite' | 'hybrid')
-        : ('scheme' as const),
+      tileStyle:
+        data.settings?.tileStyle === "satellite" ||
+        data.settings?.tileStyle === "hybrid"
+          ? (data.settings.tileStyle as "satellite" | "hybrid")
+          : ("scheme" as const),
       tilesEnabled: data.settings?.tilesEnabled,
     },
     googleMaps: {
@@ -238,8 +285,11 @@ export function importProject(json: string): Project | null {
     openStreetMap: {
       enabled: !!(data.openStreetMap && data.openStreetMap.enabled),
       // legacy-значения ('osm', 'carto') и новые ('esri', 'esri-sat') — все валидны
-      tileServer: ['osm', 'opentopomap', 'carto', 'esri', 'esri-sat'].includes(data.openStreetMap?.tileServer)
-        ? data.openStreetMap.tileServer : 'osm',
+      tileServer: ["osm", "opentopomap", "carto", "esri", "esri-sat"].includes(
+        data.openStreetMap?.tileServer,
+      )
+        ? data.openStreetMap.tileServer
+        : "osm",
     },
   };
 }
@@ -251,41 +301,65 @@ export function importProject(json: string): Project | null {
  * Formula Injection (`'=...`) выполняется при разборе текстовых колонок.
  */
 export function importFromCSV(csv: string): Partial<Marker>[] {
-  const rows = parseCsv(csv, { delimiter: ';' });
+  const rows = parseCsv(csv, { delimiter: ";" });
   if (rows.length < 2) return [];
 
   // Число с проверкой: нечисловые значения -> null (ранее parseFloat давал NaN,
   // который молча попадал в данные маркеров).
   const numOrNull = (v: string | undefined): number | null => {
-    if (v === undefined || v.trim() === '') return null;
+    if (v === undefined || v.trim() === "") return null;
     const n = Number(v);
     return Number.isFinite(n) ? n : null;
   };
 
   // Снятие защитного префикса formula injection при импорте нашего же экспорта.
+  // Формат сериализатора (csv.ts): опасное значение -> `'"<payload>"` (префикс ПЕРЕД кавычками).
   const unescapeCell = (v: string | undefined): string => {
-    if (v === undefined) return '';
-    return v.startsWith("'=") || v.startsWith("'+") || v.startsWith("'-") || v.startsWith("'@")
-      ? v.slice(1)
-      : v;
+    if (v === undefined) return "";
+    if (v.length > 3 && v.startsWith("'\"") && v.endsWith('"')) {
+      const inner = v.slice(2, -1).replace(/""/g, '"');
+      if (FORMULA_INJECTION_PREFIXES.some((p) => inner.startsWith(p)))
+        return inner;
+    }
+    return v;
   };
 
   const markers: Partial<Marker>[] = [];
+  // Индекс колонок по заголовку (устойчивый импорт: не зависим от порядка/полноты колонок).
+  const header = rows[0].map((h) => h.trim().toLowerCase());
+  const col = (...names: string[]): number => {
+    for (const n of names) {
+      const idx = header.indexOf(n);
+      if (idx !== -1) return idx;
+    }
+    return -1;
+  };
+  const cName = col("name", "название", "имя");
+  const cX = col("x");
+  const cY = col("y");
+  const cLat = col("lat", "latitude", "широта");
+  const cLon = col("lon", "lng", "long", "longitude", "долгота");
+  const cType = col("type", "тип");
+  const cComment = col("comment", "описание", "комментарий");
+
   for (let i = 1; i < rows.length; i++) {
     const parts = rows[i];
-    if (parts.length >= 4) {
-      const x = numOrNull(parts[2]);
-      const y = numOrNull(parts[3]);
-      markers.push({
-        name: unescapeCell(parts[1]) || `Точка ${i}`,
-        x: x ?? 0,
-        y: y ?? 0,
-        lat: numOrNull(parts[4]),
-        lon: numOrNull(parts[5]),
-        type: unescapeCell(parts[6]) || 'default',
-        comment: unescapeCell(parts[7]),
-      });
-    }
+    if (parts.every((p) => p === "")) continue; // пропуск фантомных пустых строк
+    const at = (idx: number): string | undefined =>
+      idx >= 0 ? parts[idx] : undefined;
+    const x = numOrNull(at(cX));
+    const y = numOrNull(at(cY));
+    // Строки без валидных координат отбрасываем явно (ранее молча создавался маркер 0,0).
+    if (x === null && y === null && at(cLat) === undefined) continue;
+    markers.push({
+      name: unescapeCell(at(cName)) || `Точка ${i}`,
+      x: x ?? 0,
+      y: y ?? 0,
+      lat: numOrNull(at(cLat)),
+      lon: numOrNull(at(cLon)),
+      type: unescapeCell(at(cType)) || "default",
+      comment: unescapeCell(at(cComment)),
+    });
   }
   return markers;
 }
@@ -296,17 +370,17 @@ export function importFromCSV(csv: string): Partial<Marker>[] {
 export function importFromGeoJSON(json: string): Partial<Marker>[] {
   try {
     const data = JSON.parse(json);
-    if (data.type !== 'FeatureCollection') return [];
+    if (data.type !== "FeatureCollection") return [];
 
     return data.features
-      .filter((f: any) => f.geometry?.type === 'Point')
+      .filter((f: any) => f.geometry?.type === "Point")
       .map((f: any, i: number) => ({
         name: f.properties?.name || `Точка ${i + 1}`,
         lat: f.geometry.coordinates[1],
         lon: f.geometry.coordinates[0],
-        type: f.properties?.type || 'default',
-        comment: f.properties?.comment || '',
-        color: f.properties?.color || '#00ff00',
+        type: f.properties?.type || "default",
+        comment: f.properties?.comment || "",
+        color: f.properties?.color || "#00ff00",
       }));
   } catch {
     return [];
@@ -318,20 +392,24 @@ export function importFromGeoJSON(json: string): Partial<Marker>[] {
  */
 function escapeXml(str: string): string {
   return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 /**
  * Скачивание файла
  */
-export function downloadFile(content: string, filename: string, mimeType: string): void {
+export function downloadFile(
+  content: string,
+  filename: string,
+  mimeType: string,
+): void {
   const blob = new Blob([content], { type: mimeType });
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
+  const a = document.createElement("a");
   a.href = url;
   a.download = filename;
   document.body.appendChild(a);

@@ -5,7 +5,7 @@
 //   поля в кавычках, удвоенные кавычки внутри значений, любой односимвольный разделитель.
 
 /** Опасные префиксы ячеек: табличные процессоры (Excel/Sheets) интерпретируют их как формулы. */
-const FORMULA_INJECTION_PREFIXES = ['=', '+', '-', '@', '\t', '\r'];
+export const FORMULA_INJECTION_PREFIXES = ["=", "+", "-", "@", "\t", "\r"];
 
 export interface CsvSerializeOptions {
   /** Разделитель полей. По умолчанию ';' (исторический формат TotalQuadro). */
@@ -23,8 +23,8 @@ function needsQuoting(field: string, delimiter: string): boolean {
   return (
     field.includes(delimiter) ||
     field.includes('"') ||
-    field.includes('\n') ||
-    field.includes('\r')
+    field.includes("\n") ||
+    field.includes("\r")
   );
 }
 
@@ -37,9 +37,14 @@ function quoteField(field: string, delimiter: string): string {
  * Защита от CSV Formula Injection: если значение начинается с опасного символа,
  * принудительно кавычуем и добавляем префикс `'`, чтобы Excel/Sheets не вычисляли формулу.
  */
-function sanitizeCell(value: string, delimiter: string, escapeInjection: boolean): string {
+function sanitizeCell(
+  value: string,
+  delimiter: string,
+  escapeInjection: boolean,
+): string {
   const dangerous =
-    escapeInjection && FORMULA_INJECTION_PREFIXES.some((p) => value.startsWith(p));
+    escapeInjection &&
+    FORMULA_INJECTION_PREFIXES.some((p) => value.startsWith(p));
   if (dangerous || needsQuoting(value, delimiter)) {
     const quoted = quoteField(value, delimiter);
     return dangerous ? "'" + quoted : quoted;
@@ -51,14 +56,25 @@ function sanitizeCell(value: string, delimiter: string, escapeInjection: boolean
  * Сериализация строк таблицы в CSV-текст (RFC 4180 + защита от инъекций).
  * undefined/null значения превращаются в пустую строку.
  */
-export function toCsv(rows: ReadonlyArray<ReadonlyArray<string | number | null | undefined>>, options: CsvSerializeOptions = {}): string {
-  const delimiter = options.delimiter ?? ';';
+export function toCsv(
+  rows: ReadonlyArray<ReadonlyArray<string | number | null | undefined>>,
+  options: CsvSerializeOptions = {},
+): string {
+  const delimiter = options.delimiter ?? ";";
   const escapeInjection = options.escapeFormulaInjection ?? true;
   return rows
     .map((row) =>
-      row.map((cell) => sanitizeCell(cell == null ? '' : String(cell), delimiter, escapeInjection)).join(delimiter)
+      row
+        .map((cell) =>
+          sanitizeCell(
+            cell == null ? "" : String(cell),
+            delimiter,
+            escapeInjection,
+          ),
+        )
+        .join(delimiter),
     )
-    .join('\r\n');
+    .join("\r\n");
 }
 
 const enum ParseState {
@@ -66,7 +82,6 @@ const enum ParseState {
   InUnquoted,
   InQuoted,
   QuoteInQuoted,
-
 }
 
 /**
@@ -75,10 +90,13 @@ const enum ParseState {
  * многострочные поля. Пустые строки-разделители пропускаются только если они
  * реально пустые (не содержат полей из одного пустого значения при заданном delimiter).
  */
-export function parseCsv(text: string, options: CsvParseOptions = {}): string[][] {
-  const delimiter = options.delimiter ?? ';';
+export function parseCsv(
+  text: string,
+  options: CsvParseOptions = {},
+): string[][] {
+  const delimiter = options.delimiter ?? ";";
   if (delimiter.length !== 1) {
-    throw new Error('CsvParseOptions.delimiter must be a single character');
+    throw new Error("CsvParseOptions.delimiter must be a single character");
   }
 
   // Убираем UTF-8 BOM
@@ -86,13 +104,13 @@ export function parseCsv(text: string, options: CsvParseOptions = {}): string[][
 
   const rows: string[][] = [];
   let row: string[] = [];
-  let field = '';
+  let field = "";
   let state: ParseState = ParseState.StartOfField;
   let rowHasContent = false; // различать "пустая строка" и 'строка из одной пустой ячейки'
 
   const pushField = () => {
     row.push(field);
-    field = '';
+    field = "";
     rowHasContent = true;
   };
 
@@ -112,11 +130,11 @@ export function parseCsv(text: string, options: CsvParseOptions = {}): string[][
           rowHasContent = true;
         } else if (ch === delimiter) {
           pushField();
-        } else if (ch === '\r') {
-          if (src[i + 1] === '\n') i++;
-          if (rowHasContent || field !== '') pushRow();
-        } else if (ch === '\n') {
-          if (rowHasContent || field !== '') pushRow();
+        } else if (ch === "\r") {
+          if (src[i + 1] === "\n") i++;
+          if (rowHasContent || field !== "") pushRow();
+        } else if (ch === "\n") {
+          if (rowHasContent || field !== "") pushRow();
         } else {
           field += ch;
           state = ParseState.InUnquoted;
@@ -127,11 +145,11 @@ export function parseCsv(text: string, options: CsvParseOptions = {}): string[][
         if (ch === delimiter) {
           pushField();
           state = ParseState.StartOfField;
-        } else if (ch === '\r') {
-          if (src[i + 1] === '\n') i++;
+        } else if (ch === "\r") {
+          if (src[i + 1] === "\n") i++;
           pushRow();
           state = ParseState.StartOfField;
-        } else if (ch === '\n') {
+        } else if (ch === "\n") {
           pushRow();
           state = ParseState.StartOfField;
         } else {
@@ -154,11 +172,11 @@ export function parseCsv(text: string, options: CsvParseOptions = {}): string[][
         } else if (ch === delimiter) {
           pushField();
           state = ParseState.StartOfField;
-        } else if (ch === '\r') {
-          if (src[i + 1] === '\n') i++;
+        } else if (ch === "\r") {
+          if (src[i + 1] === "\n") i++;
           pushRow();
           state = ParseState.StartOfField;
-        } else if (ch === '\n') {
+        } else if (ch === "\n") {
           pushRow();
           state = ParseState.StartOfField;
         } else {
@@ -167,13 +185,11 @@ export function parseCsv(text: string, options: CsvParseOptions = {}): string[][
           state = ParseState.InUnquoted;
         }
         break;
-
-
     }
   }
 
   // Финальное поле/строка
-  if (state !== ParseState.StartOfField || field !== '' || rowHasContent) {
+  if (state !== ParseState.StartOfField || field !== "" || rowHasContent) {
     pushRow();
   }
 
