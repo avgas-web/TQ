@@ -34,8 +34,11 @@ export function isAppOwnStorageKey(key: string): boolean {
   return APP_OWN_STORAGE_KEYS.includes(key) || APP_OWN_KEY_PREFIXES.some((p) => key.startsWith(p));
 }
 
-/** Одноразовые служебные записи вида `<name>-<unix-ms>` (передача миссии на запуск). */
-const EPHEMERAL_KEY_RE = /^(mission-launch|tq-launch)-(\d{10,})$/;
+/**
+ * Одноразовые служебные записи вида `<prefix>-<unix-ms>` (передача миссии на запуск)
+ * и их старые варианты без суффикса (`mission-launch`).
+ */
+const EPHEMERAL_KEY_RE = /^(mission-launch|tq-launch)(-\d{10,})?$/;
 
 /** Spill-маркеры heavy-значений (см. safeSetItem): `spill:<key>`. */
 const SPILL_PREFIX = 'spill:';

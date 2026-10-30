@@ -1,6 +1,7 @@
 // Утилиты экспорта/импорта
 import type { Marker, Project, Route, Restriction } from '../types';
 import { pixelToGeoFromBounds } from './googleMaps';
+import { toCsv, parseCsv } from './csv';
 
 /**
  * Получение координат маркера с учётом привязки к Google Maps
@@ -22,14 +23,16 @@ function getMarkerGeoCoords(marker: Marker, project?: Project): { lat: number | 
 
 /**
  * Экспорт маркеров в CSV
+ * Безопасная сериализация (ФАЗА 2, п.3): все поля проходят через toCsv —
+ * кавычование по RFC 4180 и защита от Formula Injection (=, +, -, @, Tab, CR).
  */
 export function exportToCSV(markers: Marker[], project?: Project): string {
-  const header = 'id;name;x;y;lat;lon;type;comment';
+  const header = ['id', 'name', 'x', 'y', 'lat', 'lon', 'type', 'comment'];
   const rows = markers.map(m => {
     const geo = getMarkerGeoCoords(m, project);
-    return `${m.id};${m.name};${m.x};${m.y};${geo.lat ?? ''};${geo.lon ?? ''};${m.type};${m.comment}`;
+    return [m.id, m.name, m.x, m.y, geo.lat ?? '', geo.lon ?? '', m.type, m.comment];
   });
-  return [header, ...rows].join('\n');
+  return toCsv([header, ...rows], { delimiter: ';' });
 }
 
 /**
@@ -243,31 +246,13 @@ export function importProject(json: string): Project | null {
 
 /**
  * Импорт маркеров из CSV
+ * Парсинг конечным автоматом (src/utils/csv.ts, RFC 4180): поддержка CRLF/LF, BOM,
+ * многострочных полей в кавычках и удвоенных кавычек. Обратное снятие префикса
+ * Formula Injection (`'=...`) выполняется при разборе текстовых колонок.
  */
 export function importFromCSV(csv: string): Partial<Marker>[] {
-  const lines = csv.split('\n').filter(l => l.trim());
-  if (lines.length < 2) return [];
-
-  // RFC-совместимый разбор разделителя ';' с кавычками: имена/комментарии,
-  // содержащие ';' или кавычки, раньше ломали колонки (сдвиг полей).
-  const parseLine = (line: string): string[] => {
-    const out: string[] = [];
-    let cur = '';
-    let inQ = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (inQ) {
-        if (ch === '"') {
-          if (line[i + 1] === '"') { cur += '"'; i++; }
-          else inQ = false;
-        } else cur += ch;
-      } else if (ch === '"') inQ = true;
-      else if (ch === ';') { out.push(cur); cur = ''; }
-      else cur += ch;
-    }
-    out.push(cur);
-    return out;
-  };
+  const rows = parseCsv(csv, { delimiter: ';' });
+  if (rows.length < 2) return [];
 
   // Число с проверкой: нечисловые значения -> null (ранее parseFloat давал NaN,
   // который молча попадал в данные маркеров).
@@ -277,20 +262,28 @@ export function importFromCSV(csv: string): Partial<Marker>[] {
     return Number.isFinite(n) ? n : null;
   };
 
+  // Снятие защитного префикса formula injection при импорте нашего же экспорта.
+  const unescapeCell = (v: string | undefined): string => {
+    if (v === undefined) return '';
+    return v.startsWith("'=") || v.startsWith("'+") || v.startsWith("'-") || v.startsWith("'@")
+      ? v.slice(1)
+      : v;
+  };
+
   const markers: Partial<Marker>[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const parts = parseLine(lines[i]);
+  for (let i = 1; i < rows.length; i++) {
+    const parts = rows[i];
     if (parts.length >= 4) {
       const x = numOrNull(parts[2]);
       const y = numOrNull(parts[3]);
       markers.push({
-        name: parts[1] || `Точка ${i}`,
+        name: unescapeCell(parts[1]) || `Точка ${i}`,
         x: x ?? 0,
         y: y ?? 0,
         lat: numOrNull(parts[4]),
         lon: numOrNull(parts[5]),
-        type: parts[6] || 'default',
-        comment: parts[7] || '',
+        type: unescapeCell(parts[6]) || 'default',
+        comment: unescapeCell(parts[7]),
       });
     }
   }

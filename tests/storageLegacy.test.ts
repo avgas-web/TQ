@@ -235,7 +235,7 @@ describe('localStorage: quota и безопасная запись', () => {
     expect(await safeGetItem('missing')).toBeNull();
   });
 
-  it('safeSetItem при переполнении spill-ит в IndexedDB и освобождает мусорные ключи', async () => {
+  it('safeSetItem при переполнении освобождает место, НЕ трогая чужие ключи', async () => {
     const events: string[] = [];
     const handler = (e: Event) => events.push((e as CustomEvent).detail as string);
     window.addEventListener('tq:storage-error', handler);
@@ -244,30 +244,40 @@ describe('localStorage: quota и безопасная запись', () => {
       // freeLocalStorageSpace обязан вычистить `mission-launch-<ts>` и освободить место.
       const ls = storageMock(10_000);
       ls.setItem('mission-launch-1700000000000', 'A'.repeat(9_000));
+      // Чужой большой ключ: старая реализация удаляла «всё кроме основного» —
+      // регрессия Фазы 2: он обязан выжить даже при освобождении места.
+      ls.setItem('other-app-cache', 'X'.repeat(400));
       expect(await safeSetItem('fresh', 'C'.repeat(2_000))).toBe(true);
       expect(localStorage.getItem('fresh')).toBe('C'.repeat(2_000));
       expect(localStorage.getItem('mission-launch-1700000000000')).toBeNull();
+      expect(localStorage.getItem('other-app-cache')).toBe('X'.repeat(400));
       expect(events.length).toBe(0);
     } finally {
       window.removeEventListener('tq:storage-error', handler);
     }
   });
 
-  it('cleanupLocalStorage выше порога удаляет мусорные ключи', () => {
+  it('cleanupLocalStorage выше порога удаляет только собственные временные записи (allow-list)', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     //лимит мока заведомо больше объёма данных, поэтому setItem не бросает:
-    //проверяем, что cleanup удаляет всё, кроме основного ключа (порог — 80% от 5 МБ)
+    //проверяем результат CleanupResult и сохранность чужих/активных ключей
+    //(ФАЗА 2: старое поведение «удалить всё, кроме основного» признано деструктивным)
     const ls = storageMock(8 * 1024 * 1024);
     ls.setItem('totalquadro-storage', 'keep');
-    ls.setItem('junk1', 'A'.repeat(4.2 * 1024 * 1024));
-    ls.setItem('junk2', 'B'.repeat(300));
-    cleanupLocalStorage();
+    ls.setItem('mission-launch-1700000000000', 'A'.repeat(1000));
+    ls.setItem('totalquadro-backup-old', 'B'.repeat(300));
+    ls.setItem('other-app-data', 'C'.repeat(4.2 * 1024 * 1024));
+    ls.setItem('junk2', 'D'.repeat(300));
+    const res = cleanupLocalStorage();
     expect(warn).toHaveBeenCalledWith('localStorage заполнен на', expect.any(String), '%');
-    expect(log).toHaveBeenCalledWith('Очищено', 2, 'ключей из localStorage');
-    expect(ls.getItem('junk1')).toBeNull();
-    expect(ls.getItem('junk2')).toBeNull();
+    expect(res.removedKeys.sort()).toEqual(['mission-launch-1700000000000', 'totalquadro-backup-old']);
+    expect(res.freedBytes).toBeGreaterThan(1000);
+    expect(ls.getItem('mission-launch-1700000000000')).toBeNull();
+    expect(ls.getItem('totalquadro-backup-old')).toBeNull();
     expect(ls.getItem('totalquadro-storage')).toBe('keep');
+    // Чужие ключи origin-а не удаляются НИКОГДА — даже при переполнении.
+    expect(ls.getItem('other-app-data')).not.toBeNull();
+    expect(ls.getItem('junk2')).toBe('D'.repeat(300));
   });
 
   it('safeSetItem возвращает false и уведомляет, если spill тоже невозможен', async () => {
