@@ -309,19 +309,32 @@ function blockedPoint(p: Point, obstacles: Obstacle[]): boolean {
   return false;
 }
 
-/** True, если отрезок задевает запретную область (зону или её буфер) любой из зон */
-function segmentTouchesZones(a: Point, b: Point, obstacles: Obstacle[]): boolean {
-  if (obstacles.length === 0) return false;
-  if (blockedPoint(a, obstacles) || blockedPoint(b, obstacles)) return true;
-  const len = Math.hypot(b.x - a.x, b.y - a.y);
-  const steps = Math.min(256, Math.max(8, Math.ceil(len / 8)));
-  for (let i = 1; i < steps; i++) {
-    const t = i / steps;
-    if (blockedPoint({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }, obstacles)) return true;
-  }
-  return false;
+/** Ф1.3 (аудит): прежний сэмплирующий вариант (шаг 8px) удалён — он пропускал
+ *  «тонкие» проходы сквозь углы зон. Все проверки сегментов переведены на
+ *  аналитический segmentBlocked (пересечения circle/rect/polygon + полоса margin). */
+
+
+
+/** Минимальное расстояние между двумя отрезками (аналитика, без дискретизации). */
+function segmentSegmentDist(p1: Point, p2: Point, p3: Point, p4: Point): number {
+  const d1x = p2.x - p1.x, d1y = p2.y - p1.y;
+  const d2x = p4.x - p3.x, d2y = p4.y - p3.y;
+  const l1 = d1x * d1x + d1y * d1y;
+  const l2 = d2x * d2x + d2y * d2y;
+  if (l1 < 1e-12 && l2 < 1e-12) return Math.hypot(p1.x - p3.x, p1.y - p3.y);
+  if (l1 < 1e-12) return pointToSegmentDist(p1, p3, p4);
+  if (l2 < 1e-12) return pointToSegmentDist(p3, p1, p2);
+  // если отрезки пересекаются — расстояние 0
+  if (segmentsIntersect(p1, p2, p3, p4)) return 0;
+  return Math.min(
+    pointToSegmentDist(p1, p3, p4),
+    pointToSegmentDist(p2, p3, p4),
+    pointToSegmentDist(p3, p1, p2),
+    pointToSegmentDist(p4, p1, p2),
+  );
 }
 
+/** True, если точка лежит внутри самой зоны (без буфера) — для диагностики blocked */
 function isInsideAnyZone(p: Point, obstacles: Obstacle[]): boolean {
   for (const o of obstacles) {
     if (!o.r) continue;
@@ -331,9 +344,11 @@ function isInsideAnyZone(p: Point, obstacles: Obstacle[]): boolean {
 }
 
 /** Отрезок запрещён, если хоть где-то попадает в запретную область зоны или её буфер.
- *  Быстрая аналитика (circle/rectangle) + сэмплинг только как резерв для полигонов:
- *  раньше каждый вызов был O(256 точек × зон), из-за чего пакетная перестройка
- *  маршрутов выполнялась секундами и блокировала поток UI. */
+ *  Полностью аналитическая проверка (аудит Ф1.3): circle — пересечение с диском,
+ *  rectangle — пересечение с расширенным боксом, polygon — пересечение с рёбрами
+ *  ИЛИ расстояние до ребра ≤ margin (через точное расстояние «отрезок-отрезок»).
+ *  Равномерный сэмплинг (шаг 8px) удалён: он пропускал «тонкие» проходы сквозь
+ *  углы полигонов и давал ложные рёбра графа видимости, а также был O(N·len/8). */
 function segmentBlocked(a: Point, b: Point, obstacles: Obstacle[]): boolean {
   if (obstacles.length === 0) return false;
   if (blockedPoint(a, obstacles) || blockedPoint(b, obstacles)) return true;
@@ -342,10 +357,9 @@ function segmentBlocked(a: Point, b: Point, obstacles: Obstacle[]): boolean {
     // bbox-отсечение отрезка от расширенного бокса зоны
     if ((a.x < o.box.minX && b.x < o.box.minX) || (a.x > o.box.maxX && b.x > o.box.maxX) ||
         (a.y < o.box.minY && b.y < o.box.minY) || (a.y > o.box.maxY && b.y > o.box.maxY)) continue;
-    const rad = (o.type === 'circle' && o.r.radius) ? o.r.radius + o.margin : 0;
-    if (o.type === 'circle' && o.r.points.length >= 1 && rad > 0) {
-      const c = o.r.points[0];
-      if (segmentCircleIntersect(a, b, c, rad)) return true;
+    if (o.type === 'circle' && o.r.points.length >= 1) {
+      const rad = (o.r.radius || 0) + o.margin;
+      if (rad > 0 && segmentCircleIntersect(a, b, o.r.points[0], rad)) return true;
       continue;
     }
     if (o.type === 'rectangle') {
@@ -358,14 +372,12 @@ function segmentBlocked(a: Point, b: Point, obstacles: Obstacle[]): boolean {
       if (edges.some(([e1, e2]) => segmentsIntersect(a, b, e1, e2))) return true;
       continue;
     }
-    // polygon: рёбра + margin полоса — через сэмплинг (зоны-полигоны редки)
-    const len = Math.hypot(b.x - a.x, b.y - a.y);
-    const steps = Math.min(128, Math.max(8, Math.ceil(len / 8)));
-    for (let i = 1; i < steps; i++) {
-      const t = i / steps;
-      const p = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
-      if (isPointInZone(p, o.r)) return true;
-      if (pointNearPolygonEdges(p, o.r.points, o.margin)) return true;
+    // polygon: точное пересечение с рёбрами фигуры + полоса margin вдоль рёбер
+    const poly = o.r.points;
+    for (let i = 0; i < poly.length; i++) {
+      const j = (i + 1) % poly.length;
+      if (segmentsIntersect(a, b, poly[i], poly[j])) return true;
+      if (segmentSegmentDist(a, b, poly[i], poly[j]) <= o.margin) return true;
     }
   }
   return false;
@@ -577,31 +589,42 @@ function simplify(pts: Point[]): Point[] {
   return out;
 }
 
+/** Результат планирования обхода NFZ (аудит Ф1.3).
+ *  `blocked: true` означает, что безопасный обход построить НЕ удалось:
+ *  вызывающий код обязан пометить маршрут заблокированным и ЗАПРЕТИТЬ
+ *  экспорт/подтверждение. Тихий возврат прямой линии сквозь зону удалён. */
+export interface PlannedPath {
+  /** Итоговая ломаная (при blocked — прямая start→goal ТОЛЬКО как визуальная подсказка) */
+  points: Point[];
+  /** Обход невозможен (старт/цель внутри зоны или путь полностью перегорожен) */
+  blocked: boolean;
+  reason?: 'start-inside-zone' | 'goal-inside-zone' | 'no-route-around-zones';
+}
+
 /**
  * Построить путь старт→цель, обходящий активные зоны ограничений.
  * Стратегия (максимально просто и быстро):
  *  1) если прямая не пересекает зоны — возвращаем прямую (2 точки);
- *  2) граф видимости по углам зон (точный, для малых/выпуклых зон);
- *  3) A* по адаптивной сетке (для вогнутых зон), затем string-pulling.
+ *  2) граф видимости по рёбрам зон (точный, для малых/выпуклых зон);
+ *  3) A* по адаптивной сетке (для вогнутых зон), затем string-pulling;
+ *  4) ничего не найдено → blocked:true (безопасность важнее «красивой картинки»).
  */
-export function planPathAroundZones(
+export function planPathAroundZonesResult(
   start: Point, goal: Point, restrictions: Restriction[],
   mapW: number, mapH: number
-): Point[] {
+): PlannedPath {
   const margin = Math.max(6, Math.min(mapW, mapH) * 0.01);
   const obstacles = buildObstacles(restrictions, margin);
-  if (obstacles.length === 0) return [start, goal];
+  if (obstacles.length === 0) return { points: [start, goal], blocked: false };
 
   // 2) граф видимости.
-  // ВАЖНО: запретным считается только буфер ВДОЛЬ границ зон (сами зоны проходимы),
-  // поэтому прямая start→goal, пересекающая зону, формально «разрешена» и dijkstra по
-  // полному графу выбирала бы её вместо реального обхода. Чтобы маршрут гарантированно
-  // ОБОГНАЛ активные зоны, строим отдельный граф без прямого ребра start-goal (если оно
-  // заблокировано) — путь в нём обязан идти через внешние точки границ зон.
+  // Запретной считается вся зона вместе с буфером (blockedPoint), поэтому
+  // прямая start→goal, пересекающая зону, корректно помечается как blocked
+  // и планнер обязан пойти через внешние точки границ зон.
   {
     const vg = visibilityGraph(start, goal, obstacles);
     const directOk = !segmentBlocked(start, goal, obstacles);
-    if (directOk) return [start, goal]; // зона не задевается — прямой путь оптимален
+    if (directOk) return { points: [start, goal], blocked: false }; // зона не задевается — прямой путь оптимален
     const pathVg = vg ? dijkstraOnGraphNoDirect(vg.nodes, vg.adj) : null;
     if (pathVg) {
       let pulled = stringPull(pathVg, obstacles);
@@ -610,7 +633,7 @@ export function planPathAroundZones(
       if (pulled.length === 2 && segmentBlocked(start, goal, obstacles)) {
         pulled = pathVg;
       }
-      return simplify(pulled);
+      return { points: simplify(pulled), blocked: false };
     }
   }
 
@@ -624,20 +647,17 @@ export function planPathAroundZones(
     const grid = astarGrid(start, goal, obstacles, span / cells, { minX, minY, maxX, maxY }, cells * cells);
     if (grid) {
       const pulled = stringPull(grid, obstacles);
-      // финальная страховка: если после утончения путь всё же задевает зону —
-      // возвращаем сырую сетку (она строится только по проходимым клеткам)
-      // Финальная страховка без мёртвого условия: проверяем ВСЕ сегменты
-      // утончённого пути; если хоть один задевает зону — возвращаем сырую сетку.
+      // Финальная страховка: проверяем ВСЕ сегменты утончённого пути;
+      // если хоть один задевает запретную область — возвращаем сырую сетку
+      // (она строится только по проходимым клеткам).
       const pulledOk =
         pulled.length >= 2 &&
-        !pulled.some((_, i) => i + 1 < pulled.length && segmentTouchesZones(pulled[i], pulled[i + 1], obstacles));
-      return simplify(pulledOk ? pulled : grid);
-      return simplify(pulled);
+        !pulled.some((_, i) => i + 1 < pulled.length && segmentBlocked(pulled[i], pulled[i + 1], obstacles));
+      return { points: simplify(pulledOk ? pulled : grid), blocked: false };
     }
   }
   // широкая рамка: если локальный бокс перегорожен «стеной» из зон, расширяем
-  // область поиска до всей карты и окрестностей — иначе fallback-прямая
-  // проходит сквозь ограничение.
+  // область поиска до всей карты и окрестностей.
   const gMinX = Math.min(minX, -mapW * 0.05), gMaxX = Math.max(maxX, mapW * 1.05);
   const gMinY = Math.min(minY, -mapH * 0.05), gMaxY = Math.max(maxY, mapH * 1.05);
   const gSpan = Math.max(gMaxX - gMinX, gMaxY - gMinY);
@@ -646,45 +666,36 @@ export function planPathAroundZones(
     if (grid) {
       let bad = false;
       for (let i = 0; i + 1 < grid.length; i++) {
-        if (segmentTouchesZones(grid[i], grid[i + 1], obstacles)) { bad = true; break; }
+        if (segmentBlocked(grid[i], grid[i + 1], obstacles)) { bad = true; break; }
       }
       const pulled = bad ? grid : stringPull(grid, obstacles);
-      return simplify(pulled);
+      return { points: simplify(pulled), blocked: false };
     }
   }
-  // ничего не найдено — оставляем прямой путь (будет предупреждение о пересечении)
-  return [start, goal];
+  // Ф1.3 (аудит): раньше здесь молча возвращался прямой путь сквозь зону —
+  // экспорт «валидного» маршрута мог угробить дрон. Теперь — явный blocked.
+  // Причина: старт/цель внутри зоны определяем точно; иначе — путь перегорожен.
+  const reason: PlannedPath['reason'] = isInsideAnyZone(start, obstacles)
+    ? 'start-inside-zone'
+    : isInsideAnyZone(goal, obstacles)
+      ? 'goal-inside-zone'
+      : 'no-route-around-zones';
+  return { points: [start, goal], blocked: true, reason };
 }
 
-function dijkstraOnGraph(nodes: Point[], adj: Map<number, Set<number>>, s: number, t: number): Point[] | null {
-  const n = nodes.length;
-  const dist = new Float64Array(n).fill(Infinity);
-  const prev = new Int32Array(n).fill(-1);
-  const done = new Uint8Array(n);
-  dist[s] = 0;
-  for (;;) {
-    let u = -1, bd = Infinity;
-    for (let i = 0; i < n; i++) if (!done[i] && dist[i] < bd) { bd = dist[i]; u = i; }
-    if (u === -1) break;
-    if (u === t) break;
-    done[u] = 1;
-    for (const v of adj.get(u)!) {
-      const w = Math.hypot(nodes[v].x - nodes[u].x, nodes[v].y - nodes[u].y);
-      if (dist[u] + w < dist[v]) { dist[v] = dist[u] + w; prev[v] = u; }
-    }
-  }
-  if (dist[t] === Infinity) return null;
-  const path: Point[] = [];
-  let cur = t;
-  while (cur !== -1) { path.push(nodes[cur]); cur = prev[cur]; }
-  return path.reverse();
+/** Совместимость: вернуть только ломаную (см. planPathAroundZonesResult). */
+export function planPathAroundZones(
+  start: Point, goal: Point, restrictions: Restriction[],
+  mapW: number, mapH: number
+): Point[] {
+  return planPathAroundZonesResult(start, goal, restrictions, mapW, mapH).points;
 }
 
 /** Dijkstra по графу видимости start(0)→goal(1) с запрещённым прямым ребром 0-1.
- *  Используется, когда прямое соединение старт-финиш пересекает запретный буфер:
- *  без этого ограничения dijkstra выбирала бы прямое ребро (в нашем определении
- *  «запретён только буфер вдоль границ зон, сами зоны проходимы») и маршрут не
- *  огибал бы ограничения. */
+ *  Используется, когда прямое соединение старт-финиш пересекает запретную область:
+ *  без этого ограничения планнер мог выбрать прямое ребро сквозь зону вместо
+ *  реального обхода. Мёртвая универсальная версия dijkstraOnGraph(s,t) удалена
+ *  (аудит Ф1.3: недостижимый/неиспользуемый код). */
 function dijkstraOnGraphNoDirect(nodes: Point[], adj: Map<number, Set<number>>): Point[] | null {
   const n = nodes.length;
   const dist = new Float64Array(n).fill(Infinity);

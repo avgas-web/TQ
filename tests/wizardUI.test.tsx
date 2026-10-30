@@ -383,15 +383,17 @@ describe('Этап 7 UI — AltitudeProfilesStep', () => {
     vi.unstubAllGlobals();
   });
 
-  it('добавление точки высоты ниже рельефа+50 → красный статус в таблице', async () => {
+  it('добавление точки AGL ниже запаса 50м → красный статус в таблице', async () => {
     await toAlt();
     render(<MissionWizard />);
     const rid = st().calculatedRoutes[0].id;
     useMissionWizardStore.setState(() => ({}));
     st().addAltitudePoint({ routeId: rid, positionRatio: 0.5, altitudeAgl: 30, terrainM: 100 });
-    await waitFor(() => expect(screen.getByText('✗ ниже рельефа+50м')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText('✗ AGL < запаса 50м')).toBeTruthy());
     fireEvent.click(screen.getByTestId('auto-adjust'));
-    expect(st().altitudeProfiles[0].points[0].altitudeAgl).toBeGreaterThanOrEqual(150);
+    // Регрессия Ф1.2 (аудит): автокоррекция поднимает AGL ровно до запаса 50 м,
+    // НЕ прибавляя высоту рельефа (было: terrainM + 50 = 150 «AGL» ≈ 250 м MSL).
+    expect(st().altitudeProfiles[0].points[0].altitudeAgl).toBe(50);
   });
 });
 

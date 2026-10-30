@@ -2,7 +2,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
   useMissionWizardStore, MAP_CHOICES, MAX_START_POINTS, MAX_TARGET_POINTS,
-  parseCoordinateQuery, geoDistanceM, isValidLatLon, lonToPx, latToPy, type StartPoint, type TargetPoint,
+  parseCoordinateQuery, geoDistanceM, isValidLatLon, lonToPx, latToPy, type StartPoint,
 } from '../src/store/useMissionWizardStore';
 
 const st = () => useMissionWizardStore.getState();
@@ -328,7 +328,13 @@ describe('Этап 6 — профили высот (опциональный э�
     expect(st().issues.some((i) => i.message.includes('больше 0'))).toBe(true);
   });
 
-  it('warning при высоте < рельеф+50м, автокоррекция поднимает высоту', async () => {
+  // Регрессия Ф1.2 (аудит): раньше проверка и автокоррекция смешивали AGL и MSL —
+  // `altitudeAgl < terrainM + 50` ложно помечала валидные 100 м AGL на рельефе 300 м,
+  // а автокоррекция записывала terrainM + margin прямо в поле AGL (650 м «над землёй»
+  // = ~950 м MSL → потеря дрона). Теперь AGL сравнивается только с запасом над
+  // поверхностью, и коррекция поднимает AGL ровно до SAFETY_MARGIN_M (50), НЕ
+  // прибавляя высоту рельефа.
+  it('AGL ниже запаса 50 м → warning; автокоррекция поднимает AGL до 50 м БЕЗ добавления рельефа', async () => {
     await toAlt();
     const rid = st().calculatedRoutes[0].id;
     st().addAltitudePoint({ routeId: rid, positionRatio: 0.5, altitudeAgl: 30, terrainM: 100 });
@@ -336,8 +342,21 @@ describe('Этап 6 — профили высот (опциональный э�
     expect(p.belowTerrainWarning).toBe(true);
     st().autoAdjustAltitudes();
     const fixed = st().altitudeProfiles[0].points[0];
-    expect(fixed.altitudeAgl).toBeGreaterThanOrEqual(150);
+    expect(fixed.altitudeAgl).toBe(50);          // ровно запас, а не terrainM + 50 = 150
     expect(fixed.belowTerrainWarning).toBe(false);
+  });
+
+  it('валидный AGL на высоком рельефе НЕ помечается опасным (регрессия AGL/MSL-микса)', async () => {
+    await toAlt();
+    const rid = st().calculatedRoutes[0].id;
+    // 100 м AGL на рельефе 300 м → физически 400 м MSL, запас над землёй 100 м ≥ 50 м — безопасно
+    st().addAltitudePoint({ routeId: rid, positionRatio: 0.5, altitudeAgl: 100, terrainM: 300 });
+    const p = st().altitudeProfiles[0].points[0];
+    expect(p.belowTerrainWarning).toBe(false);
+    expect(st().issues.some((i) => i.message.includes('меньше безопасного запаса'))).toBe(false);
+    // автокоррекция не должна «завышать» уже безопасную точку
+    st().autoAdjustAltitudes();
+    expect(st().altitudeProfiles[0].points[0].altitudeAgl).toBe(100);
   });
 
   it('точки сортируются по возрастанию позиции', async () => {
@@ -390,6 +409,131 @@ describe('Этапы 7–8 — экспорт и развёртывание', ()
     st().setExportFormat('gpx');
     await st().deployMission();
     expect(st().deploymentLog.some((l) => l.includes('✓ Файл готов'))).toBe(true);
+  });
+});
+
+// ── Регрессии Фазы 1 (аудит безопасности полёта) ──────────────────────────
+describe('Ф1.1 — геометрия: расстояние только по WGS-84 (гаверсинус)', () => {
+  it('Москва → Санкт-Петербург ≈ 634 км (допускается точность сферической модели ±2%)', () => {
+    // Кремль (55.7558, 37.6173) → Дворцовая площадь (59.9398, 30.3146)
+    const d = geoDistanceM(55.7558, 37.6173, 59.9398, 30.3146);
+    expect(d).toBeGreaterThan(620_000);
+    expect(d).toBeLessThan(648_000);
+  });
+
+  it('нулевое расстояние для идентичных координат и симметричность', () => {
+    expect(geoDistanceM(55.75, 37.62, 55.75, 37.62)).toBeCloseTo(0, 6);
+    const a = geoDistanceM(55.7558, 37.6173, 59.9398, 30.3146);
+    const b = geoDistanceM(59.9398, 30.3146, 55.7558, 37.6173);
+    expect(a).toBeCloseTo(b, 3);
+  });
+
+  it('РЕГРЕССИЯ Math.min(geo, pxDist): пиксели мини-карты НЕ занижают дистанцию', () => {
+    // Две точки ~634 км друг от друга, но с ОДИНАКОВЫМИ пиксельными координатами
+    // на мини-карте (прежний Math.min вернул бы 0 м → ложный дубликат/слипание).
+    toStart();
+    st().addStartPoint({ name: 'МСК', lat: 55.7558, lon: 37.6173, x: 100, y: 100 });
+    st().goToNextStep();
+    st().addTargetPoint({ name: 'СПб', lat: 59.9398, lon: 30.3146, x: 100, y: 100 });
+    // дубликат не объявлен (цель вообще на другом этапе), и цель НЕ признана
+    // «слишком близкой к старту» — раньше px=0 проходил как <50 м
+    const nearStart = st().issues.some((i) => i.message.includes('слишком близко'));
+    expect(nearStart).toBe(false);
+  });
+});
+
+describe('Ф1.2 — высоты: AGL проверяется только относительно рельефа', () => {
+  const mkAlt = async () => {
+    toCraft();
+    st().setCraftType('drone');
+    st().goToNextStep();
+    st().addStartPoint(mkPt(1));
+    st().goToNextStep();
+    st().addTargetPoint({ name: 'Ц1', lat: 56, lon: 38, x: 500, y: 100 });
+    st().goToNextStep(); st().setTotalCraft(2); st().autoFormGroups();
+    st().goToNextStep(); await st().calculateRoutes();
+    st().goToNextStep(); // altitude-profiles
+  };
+
+  it('РЕГРЕССИЯ смешения AGL/MSL: 100 м AGL на рельефе 300 м — ВАЛИДНО (не warning)', async () => {
+    await mkAlt();
+    const routeId = st().calculatedRoutes[0].id;
+    st().addAltitudePoint({ routeId, positionRatio: 0.5, altitudeAgl: 100, terrainM: 300 });
+    const pt = st().altitudeProfiles.find((p) => p.routeId === routeId)?.points[0];
+    expect(pt?.belowTerrainWarning).toBe(false);
+    expect(st().issues.some((i) => i.level === 'warning' && i.message.includes('меньше безопасного запаса'))).toBe(false);
+  });
+
+  it('AGL 30 м над горой (рельеф 300 м) — warning: мало зазора НАД поверхностью', async () => {
+    await mkAlt();
+    const routeId = st().calculatedRoutes[0].id;
+    st().addAltitudePoint({ routeId, positionRatio: 0.5, altitudeAgl: 30, terrainM: 300 });
+    const pt = st().altitudeProfiles.find((p) => p.routeId === routeId)?.points[0];
+    expect(pt?.belowTerrainWarning).toBe(true);
+  });
+
+  it('РЕГРЕССИЯ автокоррекции: НЕ прибавляет рельеф к AGL (30 м AGL при рельефе 300 м → ровно 50 м AGL)', async () => {
+    await mkAlt();
+    const routeId = st().calculatedRoutes[0].id;
+    st().addAltitudePoint({ routeId, positionRatio: 0.5, altitudeAgl: 30, terrainM: 300 });
+    st().autoAdjustAltitudes();
+    const pt = st().altitudeProfiles.find((p) => p.routeId === routeId)?.points[0];
+    // было: 300 + 50 = 350 м AGL (≈700 м MSL — потеря дрона). стало: ровно margin.
+    expect(pt?.altitudeAgl).toBe(50);
+    expect(pt?.belowTerrainWarning).toBe(false);
+  });
+
+  it('автокоррекция не трогает валидные точки и точки без данных рельефа', async () => {
+    await mkAlt();
+    const routeId = st().calculatedRoutes[0].id;
+    st().addAltitudePoint({ routeId, positionRatio: 0.3, altitudeAgl: 120, terrainM: 300 });
+    st().addAltitudePoint({ routeId, positionRatio: 0.7, altitudeAgl: 10, terrainM: null });
+    st().autoAdjustAltitudes();
+    const pts = st().altitudeProfiles.find((p) => p.routeId === routeId)?.points ?? [];
+    expect(pts.find((p) => p.positionRatio === 0.3)?.altitudeAgl).toBe(120);
+    expect(pts.find((p) => p.positionRatio === 0.7)?.altitudeAgl).toBe(10); // terrain неизвестен — не гадаем
+  });
+});
+
+describe('Ф1.3 — маршрутизация через NFZ: явная блокировка вместо тихого прямого пути', () => {
+  const toNfz2 = () => {
+    toCraft();
+    st().setCraftType('drone');
+    st().goToNextStep();
+    st().addStartPoint(mkPt(1));
+    st().goToNextStep();
+    st().addTargetPoint({ name: 'Ц1', lat: 56, lon: 38, x: 500, y: 100 });
+    st().goToNextStep(); st().setTotalCraft(2); st().autoFormGroups();
+    st().goToNextStep();
+  };
+
+  it('старт внутри замкнутого кольца зон → blockedByNfz:true (НЕ прямой путь сквозь зоны)', async () => {
+    toNfz2();
+    const sp = st().startPoints[0];
+    // кольцо из 4 прямоугольников со всех сторон старта (100,100)
+    const ring = [
+      [{ x: sp.x - 60, y: sp.y - 60 }, { x: sp.x + 60, y: sp.y - 60 }, { x: sp.x + 60, y: sp.y - 30 }, { x: sp.x - 60, y: sp.y - 30 }],
+      [{ x: sp.x - 60, y: sp.y + 30 }, { x: sp.x + 60, y: sp.y + 30 }, { x: sp.x + 60, y: sp.y + 60 }, { x: sp.x - 60, y: sp.y + 60 }],
+      [{ x: sp.x - 60, y: sp.y - 60 }, { x: sp.x - 30, y: sp.y - 60 }, { x: sp.x - 30, y: sp.y + 60 }, { x: sp.x - 60, y: sp.y + 60 }],
+      [{ x: sp.x + 30, y: sp.y - 60 }, { x: sp.x + 60, y: sp.y - 60 }, { x: sp.x + 60, y: sp.y + 60 }, { x: sp.x + 30, y: sp.y + 60 }],
+    ];
+    ring.forEach((polygon, i) => st().addNoFlyZone({ name: `R${i}`, polygon }));
+    await st().calculateRoutes();
+    const r = st().calculatedRoutes[0];
+    expect(r.blockedByNfz).toBe(true);
+    expect(st().canProceedToNextStep()).toBe(false);
+  });
+
+  it('deployMission бросает ошибку при blockedByNfz (защита от тихого экспорта прямой линии)', async () => {
+    toNfz2();
+    await st().calculateRoutes();
+    st().goToNextStep(); st().goToNextStep(); // export-preparation
+    st().setExportFormat('gpx');
+    st().goToNextStep(); // mission-deployment
+    useMissionWizardStore.setState((s) => ({
+      calculatedRoutes: s.calculatedRoutes.map((r) => ({ ...r, blockedByNfz: true })),
+    }));
+    await expect(st().deployMission()).rejects.toThrow('Экспорт заблокирован');
   });
 });
 
