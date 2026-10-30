@@ -23,7 +23,8 @@ import { getProviderStatus } from '../../utils/mapProviders';
 import { TILE_SERVER_ORDER, normalizeTileServer, type TileServerId } from '../../utils/openStreetMap';
 import { ensureDefaultTileMap } from '../../hooks/useAppInitialization';
 import { wizardClickToGeo } from '../../utils/mapGeoPick';
-import { findBuildingAt, buildingPopupHtml, type BuildingResult } from '../../utils/buildingLookup';
+import { findBuildingAt, type BuildingInfo, type BuildingResult } from '../../utils/buildingLookup';
+import BuildingPopupCard from './BuildingPopupCard';
 
 /**
  * Подложка режима мастера — ТОЧНО как в эталонном Leaflet-коде
@@ -114,7 +115,9 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
 
   // ── Клик по карте = «умный поиск здания» (Overpass), как в эталоне ────────
   const [statusMsg, setStatusMsg] = useState<string>('Готов. Кликните по карте, чтобы узнать высоту здания.');
-  const [popup, setPopup] = useState<{ x: number; y: number; html: string } | null>(null);
+  // ФАЗА 2 (XSS): вместо строки html храним типизированный BuildingInfo —
+  // рендер через React-компонент BuildingPopupCard (автоэкранирование).
+  const [popup, setPopup] = useState<{ x: number; y: number; building: BuildingInfo } | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   // Этап 1 мастера: подложка = основная карта, выбранная пользователем.
@@ -190,7 +193,7 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
       setPopup({
         x: e.clientX - r.left,
         y: e.clientY - r.top,
-        html: buildingPopupHtml(res.building),
+        building: res.building,
       });
       setStatusMsg(`🏢 Здание найдено: высота ${res.building.heightStr}`);
     } else if (res.kind === 'not-found') {
@@ -229,15 +232,18 @@ const MapPanelBody: React.FC<{ hint?: string; onMapLoaded?: (loaded: boolean) =>
         onClickCapture={handleMapClick}
       >
         <MapCanvas onMapLoaded={onMapLoaded} />
-        {/* Попап здания (аналог L.popup().setLatLng().openOn(map) из эталона) */}
+        {/* Попап здания (аналог L.popup().setLatLng().openOn(map) из эталона).
+            ФАЗА 2 (XSS): dangerouslySetInnerHTML убран — содержимое Overpass
+            рендерится чистым React-компонентом (автоэкранирование текста). */}
         {popup && (
           <div
             data-wizard-map-ui
             data-testid="wizard-building-popup"
-            className="absolute z-30 rounded-md border border-slate-300 bg-white px-3 py-2 shadow-lg"
+            className="building-popup absolute z-30 rounded-md border border-slate-300 bg-white px-3 py-2 shadow-lg"
             style={{ left: Math.min(popup.x + 8, 9999), top: Math.max(popup.y - 12, 4) }}
-            dangerouslySetInnerHTML={{ __html: popup.html }}
-          />
+          >
+            <BuildingPopupCard building={popup.building} />
+          </div>
         )}
         {!status.ready && (
           <div

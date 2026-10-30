@@ -26,14 +26,11 @@ export const OVERPASS_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
 ];
 
-/** HTML попапа здания — 1:1 разметка эталонного кода (класс .building-popup). */
-export function buildingPopupHtml(b: BuildingInfo): string {
-  return `<div class="building-popup">` +
-    `<div><b>Высота:</b> ${b.heightStr}</div>` +
-    `<div><b>Этажей:</b> ${b.levelsStr}</div>` +
-    `<div><b>Тип:</b> ${b.typeStr}</div>` +
-    `</div>`;
-}
+// ФАЗА 2 (XSS): buildingPopupHtml() удалён — он возвращал сырой HTML из
+// тегов OSM (props.building / height / levels могут содержать произвольные
+// строки, например `<img src=x onerror=...>`), который вставлялся в DOM через
+// dangerouslySetInnerHTML. Попап рендерится чистыми React-компонентами
+// (см. components/wizard/BuildingPopupCard.tsx) — текст экранируется автоматически.
 
 interface OverpassElement {
   tags?: Record<string, string>;

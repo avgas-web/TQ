@@ -1,12 +1,53 @@
 // Утилиты для работы с хранилищем данных
 
-/**
- * Ключ persist-стора. ЭТАП 3 (боевая терминология) переименовал доменные поля,
- * но сам ключ остаётся стабильным: менять его нельзя — это разрыв совместимости
- * с уже сохранёнными проектами. Переименованные поля читаются из старых записей
- * через migratePersistedState (старые имена читаются, новые пишутся).
+/** Ключ persist-стора. ЭТАП 3 (боевая терминология) переименовал доменные поля,
+ *  но сам ключ остаётся стабильным: менять его нельзя — это разрыв совместимости
+ *  с уже сохранёнными проектами. Переименованные поля читаются из старых записей
+ *  через migratePersistedState (старые имена читаются, новые пишутся).
  */
 const STORAGE_KEY = 'totalquadro-storage';
+
+/**
+ * ФАЗА 2 (безопасность данных): собственный allow-list ключей приложения.
+ * Очистка/вытеснение (cleanupLocalStorage, freeLocalStorageSpace) имеет право
+ * удалять ТОЛЬКО перечисленные здесь ключи и spill-записи. Всё остальное —
+ * чужие данные других сайтов-источников, расширений или будущих интеграций —
+ * не трогаем никогда (в старом коде удалялось «всё, кроме основного ключа»).
+ */
+export const APP_OWN_STORAGE_KEYS: readonly string[] = Object.freeze([
+  STORAGE_KEY,
+  'tq-map',
+  'tq-mission',
+  'tq-fleet',
+  'tq-mission-wizard',
+  'tq-mission-saved',
+  'tq-ui-mode',
+  'tq-wizard-maps-open',
+  'tq-view',
+]);
+
+/** Префиксы ключей, принадлежащих приложению (резервные копии сторов). */
+const APP_OWN_KEY_PREFIXES: readonly string[] = Object.freeze(['totalquadro-backup']);
+
+/** Принадлежит ли ключ приложению (см. APP_OWN_STORAGE_KEYS). */
+export function isAppOwnStorageKey(key: string): boolean {
+  return APP_OWN_STORAGE_KEYS.includes(key) || APP_OWN_KEY_PREFIXES.some((p) => key.startsWith(p));
+}
+
+/**
+ * Одноразовые служебные записи вида `<prefix>-<unix-ms>` (передача миссии на запуск)
+ * и их старые варианты без суффикса (`mission-launch`).
+ */
+const EPHEMERAL_KEY_RE = /^(mission-launch|tq-launch)(-\d{10,})?$/;
+
+/** Spill-маркеры heavy-значений (см. safeSetItem): `spill:<key>`. */
+const SPILL_PREFIX = 'spill:';
+const SPILL_MARKER = '{"__tqSpill":';
+
+/** Является ли ключ временной служебной записью приложения (удаляется безусловно). */
+function isEphemeralAppKey(key: string): boolean {
+  return EPHEMERAL_KEY_RE.test(key) || key.startsWith(SPILL_PREFIX);
+}
 
 /**
  * Миграция ключей/полей хранилища под боевую терминологию.
@@ -112,28 +153,50 @@ export function checkLocalStorageQuota(): { used: number; available: number; per
 }
 
 /**
- * Очистка localStorage от старых данных
+ * Очистка localStorage от устаревших данных приложения.
+ *
+ * ФАЗА 2 (безопасность данных): раньше функция удаляла ВСЕ ключи, кроме
+ * основного — включая данные других приложений/расширений в том же origin.
+ * Теперь удаляются только одноразовые служебные записи (mission-launch-<ts>,
+ * spill-маркеры) и резервные копии приложения (totalquadro-backup*).
+ * Активные сторовые ключи из allow-list сохраняются; тяжёлые данные слоёв
+ * и так живут в IndexedDB (см. saveUserLayerToIndexedDB).
+ * Возвращает структурированный результат вместо console-логов.
  */
-export function cleanupLocalStorage(): void {
+export interface CleanupResult {
+  /** Удалённые ключи. */
+  removedKeys: string[];
+  /** Освобождённый объём (символы ключ+значение). */
+  freedBytes: number;
+  /** Заполнение хранилища на момент вызова, %. */
+  percentage: number;
+}
+
+export function cleanupLocalStorage(): CleanupResult {
+  const result: CleanupResult = { removedKeys: [], freedBytes: 0, percentage: 0 };
   try {
     const quota = checkLocalStorageQuota();
-    
+    result.percentage = quota.percentage;
+
+    for (const key of Object.keys(localStorage)) {
+      // Никогда не удаляем чужие ключи (вне allow-list) и активные сторы.
+      if (!isEphemeralAppKey(key) && !key.startsWith('totalquadro-backup')) continue;
+      if (APP_OWN_STORAGE_KEYS.includes(key)) continue;
+      const size = key.length + String(localStorage.getItem(key) ?? '').length;
+      try {
+        localStorage.removeItem(key);
+        result.removedKeys.push(key);
+        result.freedBytes += size;
+      } catch { /* недоступно — пропускаем */ }
+    }
+
     if (quota.percentage > 80) {
       console.warn('localStorage заполнен на', quota.percentage.toFixed(1), '%');
-      
-      // Очищаем все кроме основных настроек
-      const keysToKeep = [STORAGE_KEY];
-      const keysToRemove = Object.keys(localStorage).filter(key => !keysToKeep.includes(key));
-      
-      keysToRemove.forEach(key => {
-        localStorage.removeItem(key);
-      });
-      
-      console.log('Очищено', keysToRemove.length, 'ключей из localStorage');
     }
   } catch (error) {
     console.error('Ошибка очистки localStorage:', error);
   }
+  return result;
 }
 
 /**
@@ -163,22 +226,36 @@ export function notifyStorageError(message: string): void {
  *   3. при недоступном IndexedDB — честно сообщить пользователю и вернуть false.
  * Чтение/удаление таких значений — через `safeGetItem` / `safeRemoveItem`.
  */
-const SPILL_PREFIX = 'spill:';
-const SPILL_MARKER = '{"__tqSpill":';
 
-/** Освободить место в localStorage, удаляя одноразовые и легаси-записи */
-function freeLocalStorageSpace(keepKeys: string[]): number {
+/**
+ * Освободить место в localStorage (ФАЗА 2 — безопасность данных).
+ * Удаляет ТОЛЬКО собственные временные/резервные записи приложения
+ * (mission-launch-<ts>, spill-маркеры, totalquadro-backup*) и устаревшие
+ * кэшированные сторовые ключи из allow-list (кроме protected). Чужие ключи
+ * origin-а не удаляются никогда. Перед удалением сторового ключа его тяжёлое
+ * значение выносится (spill) в IndexedDB — данные пользователя не теряются,
+ * readback возможен через safeGetItem по тому же ключу.
+ */
+async function freeLocalStorageSpace(protectedKeys: string[]): Promise<number> {
   let removed = 0;
   try {
-    const keys = Object.keys(localStorage).filter((k) => !keepKeys.includes(k));
+    const keys = Object.keys(localStorage);
     // Одноразовые ключи вида `mission-launch-<ts>` чистим первыми: они самые
     // большие по объёму и не участвуют в восстановлении состояния.
     const tsOf = (k: string) => Number(/-(\d{10,})$/.exec(k)?.[1] ?? Infinity);
-    const ephemeral = keys.filter((k) => /-(\d{10,})$/.test(k)).sort((a, b) => tsOf(a) - tsOf(b));
-    const rest = keys.filter((k) => !/-(\d{10,})$/.test(k));
-    for (const key of [...ephemeral, ...rest]) {
-      try { localStorage.removeItem(key); removed += 1; } catch { /* пропускаем */ }
+    const ephemeral = keys.filter((k) => isEphemeralAppKey(k)).sort((a, b) => tsOf(a) - tsOf(b));
+    const backups = keys.filter((k) => k.startsWith('totalquadro-backup'));
+    // Сторовые ключи — только из allow-list и только не защищённые; вытесняем в IDB.
+    const storeKeys = keys.filter(
+      (k) => !isEphemeralAppKey(k) && !k.startsWith('totalquadro-backup')
+        && isAppOwnStorageKey(k) && !protectedKeys.includes(k),
+    );
+    for (const key of [...ephemeral, ...backups, ...storeKeys]) {
       if (removed >= 64) break;
+      try {
+        await safeRemoveItem(key);
+        removed += 1;
+      } catch { /* пропускаем */ }
     }
   } catch { /* доступ к хранилищу запрещён — освобождать нечего */ }
   return removed;
@@ -234,7 +311,7 @@ export async function safeSetItem(key: string, value: string): Promise<boolean> 
       console.warn('localStorage quota exceeded for key:', key);
 
       // Пытаемся очистить место и пробуем снова
-      freeLocalStorageSpace([STORAGE_KEY, key]);
+      await freeLocalStorageSpace([STORAGE_KEY, key]);
       try {
         localStorage.setItem(key, value);
         return true;
