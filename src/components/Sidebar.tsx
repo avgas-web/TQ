@@ -1,23 +1,42 @@
-import React, { useState, useMemo } from 'react';
-import { useStore } from '../store/useStore';
-import { decimalToDMS } from '../utils/geometry';
-import { pixelToGeoFromBounds } from '../utils/googleMaps';
+import React, { useState, useMemo } from "react";
+import { useStore } from "../store/useStore";
+import { decimalToDMS } from "../utils/geometry";
+import { pixelToGeoFromBounds } from "../utils/googleMaps";
 import {
-  exportToCSV, exportToJSON, exportToGeoJSON, exportToGPX, exportToKML,
-  downloadFile, importFromCSV, importFromGeoJSON, exportProject, importProject,
-} from '../utils/export';
-import MapsPanel from './MapsPanel';
-import TacticalLayersPanel from './TacticalLayersPanel';
-import MissionPanel from './MissionPanel';
+  exportToCSV,
+  exportToJSON,
+  exportToGeoJSON,
+  exportToGPX,
+  exportToKML,
+  downloadFile,
+  importFromCSV,
+  importFromGeoJSON,
+  exportProject,
+} from "../utils/export";
+// ФАЗА 3.2 (аудит): единое чтение .tqproj/JSON любого поколения — распознавание
+// kind + Zod-валидация payload ДО попадания в стейт (раньше ветка «data.version»
+// грузила невалидированный JSON напрямую, а importProject отвергал миссийный файл).
+import {
+  readProjectFile,
+  migrateMissionPayload,
+  validateWorkspacePayload,
+} from "../utils/projectFile";
+import { sanitizeWizardData } from "../utils/wizardSchema";
+import { useMissionWizardStore } from "../store/useMissionWizardStore";
+import MapsPanel from "./MapsPanel";
+import TacticalLayersPanel from "./TacticalLayersPanel";
+import MissionPanel from "./MissionPanel";
 
 const Sidebar: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'points' | 'restrictions' | 'export' | 'google' | 'layers' | 'mission'>('points');
+  const [activeTab, setActiveTab] = useState<
+    "points" | "restrictions" | "export" | "google" | "layers" | "mission"
+  >("points");
   const [editingMarker, setEditingMarker] = useState<string | null>(null);
-  const [editName, setEditName] = useState('');
-  const [editX, setEditX] = useState('');
-  const [editY, setEditY] = useState('');
-  const [editComment, setEditComment] = useState('');
-  const [editType, setEditType] = useState('');
+  const [editName, setEditName] = useState("");
+  const [editX, setEditX] = useState("");
+  const [editY, setEditY] = useState("");
+  const [editComment, setEditComment] = useState("");
+  const [editType, setEditType] = useState("");
 
   const {
     project,
@@ -41,9 +60,12 @@ const Sidebar: React.FC = () => {
 
   // Filtered markers
   const filteredMarkers = useMemo(() => {
-    return project.markers.filter(m => {
-      if (searchQuery && !m.name.toLowerCase().includes(searchQuery.toLowerCase()) &&
-        !m.comment.toLowerCase().includes(searchQuery.toLowerCase())) {
+    return project.markers.filter((m) => {
+      if (
+        searchQuery &&
+        !m.name.toLowerCase().includes(searchQuery.toLowerCase()) &&
+        !m.comment.toLowerCase().includes(searchQuery.toLowerCase())
+      ) {
         return false;
       }
       if (filterType && m.type !== filterType) return false;
@@ -53,32 +75,56 @@ const Sidebar: React.FC = () => {
 
   // Unique types for filter
   const markerTypes = useMemo(() => {
-    const types = new Set(project.markers.map(m => m.type));
+    const types = new Set(project.markers.map((m) => m.type));
     return Array.from(types);
   }, [project.markers]);
 
   const handleExport = (format: string) => {
     const markers = project.markers;
-    const projectName = project.projectName || 'project';
+    const projectName = project.projectName || "project";
 
     switch (format) {
-      case 'csv':
-        downloadFile(exportToCSV(markers, project), `${projectName}_markers.csv`, 'text/csv');
+      case "csv":
+        downloadFile(
+          exportToCSV(markers, project),
+          `${projectName}_markers.csv`,
+          "text/csv",
+        );
         break;
-      case 'json':
-        downloadFile(exportToJSON(markers), `${projectName}_markers.json`, 'application/json');
+      case "json":
+        downloadFile(
+          exportToJSON(markers),
+          `${projectName}_markers.json`,
+          "application/json",
+        );
         break;
-      case 'geojson':
-        downloadFile(exportToGeoJSON(markers, project), `${projectName}_markers.geojson`, 'application/geo+json');
+      case "geojson":
+        downloadFile(
+          exportToGeoJSON(markers, project),
+          `${projectName}_markers.geojson`,
+          "application/geo+json",
+        );
         break;
-      case 'gpx':
-        downloadFile(exportToGPX(markers, project), `${projectName}_markers.gpx`, 'application/gpx+xml');
+      case "gpx":
+        downloadFile(
+          exportToGPX(markers, project),
+          `${projectName}_markers.gpx`,
+          "application/gpx+xml",
+        );
         break;
-      case 'kml':
-        downloadFile(exportToKML(markers, project), `${projectName}_markers.kml`, 'application/vnd.google-earth.kml+xml');
+      case "kml":
+        downloadFile(
+          exportToKML(markers, project),
+          `${projectName}_markers.kml`,
+          "application/vnd.google-earth.kml+xml",
+        );
         break;
-      case 'project':
-        downloadFile(exportProject(project), `${projectName}.tqproj`, 'application/json');
+      case "project":
+        downloadFile(
+          exportProject(project),
+          `${projectName}.tqproj`,
+          "application/json",
+        );
         break;
     }
   };
@@ -91,43 +137,90 @@ const Sidebar: React.FC = () => {
     reader.onload = (event) => {
       const content = event.target?.result as string;
 
-      if (file.name.endsWith('.tqproj')) {
-        const proj = importProject(content);
-        if (proj) {
-          doImportProject(proj);
-          alert('Проект успешно импортирован!');
-        } else {
-          alert('Ошибка импорта проекта');
+      if (file.name.endsWith(".tqproj")) {
+        // ФАЗА 3.2: единый ридер конверта — workspace → стейт карты, mission → мастер.
+        const parsed = readProjectFile(content);
+        if (!parsed.ok) {
+          alert(`Ошибка импорта проекта: ${parsed.errors.join(" ")}`);
+          return;
         }
-      } else if (file.name.endsWith('.csv')) {
+        if (parsed.kind === "workspace") {
+          const validated = validateWorkspacePayload(parsed.payload);
+          if (!validated.ok) {
+            alert(
+              `Файл проекта не прошёл валидацию: ${validated.errors.join("; ")}`,
+            );
+            return;
+          }
+          doImportProject(validated.project);
+          alert("Проект успешно импортирован!");
+        } else {
+          const { data, warnings } = sanitizeWizardData(
+            migrateMissionPayload(parsed.payload, parsed.schemaVersion),
+          );
+          useMissionWizardStore.setState(data);
+          alert(
+            warnings.length > 0
+              ? `Миссия импортирована с исправлениями: ${warnings.join(" ")}`
+              : "Миссия успешно импортирована!",
+          );
+        }
+      } else if (file.name.endsWith(".csv")) {
         const markers = importFromCSV(content);
-        markers.forEach(m => addMarker(m));
+        markers.forEach((m) => addMarker(m));
         alert(`Импортировано ${markers.length} точек`);
-      } else if (file.name.endsWith('.geojson') || file.name.endsWith('.json')) {
+      } else if (
+        file.name.endsWith(".geojson") ||
+        file.name.endsWith(".json")
+      ) {
         try {
           const data = JSON.parse(content);
-          if (data.type === 'FeatureCollection') {
+          if (data.type === "FeatureCollection") {
             const markers = importFromGeoJSON(content);
-            markers.forEach(m => addMarker(m));
+            markers.forEach((m) => addMarker(m));
             alert(`Импортировано ${markers.length} точек`);
-          } else if (data.version) {
-            doImportProject(data);
-            alert('Проект успешно импортирован!');
           } else if (Array.isArray(data)) {
             data.forEach((m: any) => addMarker(m));
             alert(`Импортировано ${data.length} точек`);
+          } else {
+            // ФАЗА 3.2 (аудит): раньше ветка «data.version» вызывала
+            // doImportProject(data) БЕЗ валидации — битый/чужой JSON попадал
+            // прямо в стейт. Теперь обычный .json проходит тот же путь,
+            // что и .tqproj: распознавание + Zod-валидация payload.
+            const parsed = readProjectFile(content);
+            if (parsed.ok && parsed.kind === "workspace") {
+              const validated = validateWorkspacePayload(parsed.payload);
+              if (validated.ok) {
+                doImportProject(validated.project);
+                alert("Проект успешно импортирован!");
+              } else {
+                alert(
+                  `Файл проекта не прошёл валидацию: ${validated.errors.join("; ")}`,
+                );
+              }
+            } else if (parsed.ok && parsed.kind === "mission") {
+              const { data: wd } = sanitizeWizardData(
+                migrateMissionPayload(parsed.payload, parsed.schemaVersion),
+              );
+              useMissionWizardStore.setState(wd);
+              alert("Миссия успешно импортирована!");
+            } else {
+              alert(
+                "Не удалось распознать файл: ожидается GeoJSON, список точек или проект TotalQuadro (.tqproj/.json).",
+              );
+            }
           }
         } catch {
-          alert('Ошибка парсинга файла');
+          alert("Ошибка парсинга файла");
         }
       }
     };
     reader.readAsText(file);
-    e.target.value = '';
+    e.target.value = "";
   };
 
   const startEditing = (markerId: string) => {
-    const marker = project.markers.find(m => m.id === markerId);
+    const marker = project.markers.find((m) => m.id === markerId);
     if (!marker) return;
     setEditingMarker(markerId);
     setEditName(marker.name);
@@ -149,45 +242,45 @@ const Sidebar: React.FC = () => {
     setEditingMarker(null);
   };
 
-  const selectedMarker = project.markers.find(m => m.id === selectedMarkerId);
+  const selectedMarker = project.markers.find((m) => m.id === selectedMarkerId);
 
   return (
     <div className="w-80 bg-gray-800 border-l border-gray-700 flex flex-col h-full overflow-hidden">
       {/* Tabs */}
       <div className="flex border-b border-gray-700 flex-wrap">
         <button
-          onClick={() => setActiveTab('points')}
-          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'points' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
+          onClick={() => setActiveTab("points")}
+          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === "points" ? "bg-gray-700 text-cyan-400" : "text-gray-400 hover:text-gray-200"}`}
         >
           📍 Точки ({project.markers.length})
         </button>
         <button
-          onClick={() => setActiveTab('restrictions')}
-          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'restrictions' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
+          onClick={() => setActiveTab("restrictions")}
+          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === "restrictions" ? "bg-gray-700 text-cyan-400" : "text-gray-400 hover:text-gray-200"}`}
         >
           🚧 Зоны ({project.restrictions.length})
         </button>
         <button
-          onClick={() => setActiveTab('google')}
-          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'google' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
+          onClick={() => setActiveTab("google")}
+          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === "google" ? "bg-gray-700 text-cyan-400" : "text-gray-400 hover:text-gray-200"}`}
         >
           🗺️ Карты
         </button>
         <button
-          onClick={() => setActiveTab('layers')}
-          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'layers' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
+          onClick={() => setActiveTab("layers")}
+          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === "layers" ? "bg-gray-700 text-cyan-400" : "text-gray-400 hover:text-gray-200"}`}
         >
           🗂 Слои ({(project.tacticalOverlays || []).length})
         </button>
         <button
-          onClick={() => setActiveTab('mission')}
-          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'mission' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
+          onClick={() => setActiveTab("mission")}
+          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === "mission" ? "bg-gray-700 text-cyan-400" : "text-gray-400 hover:text-gray-200"}`}
         >
           🎯 Миссия
         </button>
         <button
-          onClick={() => setActiveTab('export')}
-          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === 'export' ? 'bg-gray-700 text-cyan-400' : 'text-gray-400 hover:text-gray-200'}`}
+          onClick={() => setActiveTab("export")}
+          className={`flex-1 px-2 py-2 text-xs font-medium ${activeTab === "export" ? "bg-gray-700 text-cyan-400" : "text-gray-400 hover:text-gray-200"}`}
         >
           💾 Экспорт
         </button>
@@ -195,7 +288,7 @@ const Sidebar: React.FC = () => {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto">
-        {activeTab === 'points' && (
+        {activeTab === "points" && (
           <div className="p-2">
             {/* Search & Filter */}
             <div className="flex gap-1 mb-2">
@@ -212,22 +305,24 @@ const Sidebar: React.FC = () => {
                 className="px-2 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-white"
               >
                 <option value="">Все типы</option>
-                {markerTypes.map(t => (
-                  <option key={t} value={t}>{t}</option>
+                {markerTypes.map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
                 ))}
               </select>
             </div>
 
             {/* Markers list */}
             <div className="space-y-1">
-              {filteredMarkers.map(marker => (
+              {filteredMarkers.map((marker) => (
                 <div
                   key={marker.id}
                   onClick={() => selectMarker(marker.id)}
                   className={`p-2 rounded cursor-pointer text-sm ${
                     marker.id === selectedMarkerId
-                      ? 'bg-cyan-900 border border-cyan-500'
-                      : 'bg-gray-700 hover:bg-gray-600 border border-transparent'
+                      ? "bg-cyan-900 border border-cyan-500"
+                      : "bg-gray-700 hover:bg-gray-600 border border-transparent"
                   }`}
                 >
                   <div className="flex items-center justify-between">
@@ -240,25 +335,40 @@ const Sidebar: React.FC = () => {
                     </span>
                     <div className="flex gap-1">
                       <button
-                        onClick={(e) => { e.stopPropagation(); startEditing(marker.id); }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          startEditing(marker.id);
+                        }}
                         className="px-1 text-xs text-gray-400 hover:text-white"
-                      >✏️</button>
+                      >
+                        ✏️
+                      </button>
                       <button
-                        onClick={(e) => { e.stopPropagation(); deleteMarker(marker.id); }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          deleteMarker(marker.id);
+                        }}
                         className="px-1 text-xs text-gray-400 hover:text-red-400"
-                      >🗑️</button>
+                      >
+                        🗑️
+                      </button>
                     </div>
                   </div>
                   <div className="text-xs text-gray-400 mt-1">
                     X: {Math.round(marker.x)}, Y: {Math.round(marker.y)}
                     {(() => {
                       // Если есть привязка к онлайн-картам, вычисляем координаты автоматически
-                      if (project.map?.bounds && (project.map?.source === 'google' || project.map?.source === 'yandex' || project.map?.source === 'osm')) {
+                      if (
+                        project.map?.bounds &&
+                        (project.map?.source === "google" ||
+                          project.map?.source === "yandex" ||
+                          project.map?.source === "osm")
+                      ) {
                         const geo = pixelToGeoFromBounds(
                           { x: marker.x, y: marker.y },
                           project.map.bounds,
                           project.map.width || 0,
-                          project.map.height || 0
+                          project.map.height || 0,
                         );
                         return (
                           <span className="ml-2 text-green-400">
@@ -276,8 +386,10 @@ const Sidebar: React.FC = () => {
                       }
                       return null;
                     })()}
-                    {marker.type !== 'default' && (
-                      <span className="ml-2 text-cyan-400">[{marker.type}]</span>
+                    {marker.type !== "default" && (
+                      <span className="ml-2 text-cyan-400">
+                        [{marker.type}]
+                      </span>
                     )}
                   </div>
                 </div>
@@ -286,36 +398,46 @@ const Sidebar: React.FC = () => {
 
             {filteredMarkers.length === 0 && (
               <p className="text-gray-500 text-sm text-center mt-4">
-                {project.markers.length === 0 ? 'Нет точек. Используйте инструмент «Точка».' : 'Нет совпадений.'}
+                {project.markers.length === 0
+                  ? "Нет точек. Используйте инструмент «Точка»."
+                  : "Нет совпадений."}
               </p>
             )}
           </div>
         )}
 
-        {activeTab === 'restrictions' && (
+        {activeTab === "restrictions" && (
           <div className="p-2">
             <div className="space-y-1">
-              {project.restrictions.map(restriction => (
+              {project.restrictions.map((restriction) => (
                 <div
                   key={restriction.id}
                   className={`p-2 rounded text-sm ${
                     restriction.id === activeRestrictionId
-                      ? 'bg-red-900/30 border border-red-500'
-                      : 'bg-gray-700 border border-transparent'
+                      ? "bg-red-900/30 border border-red-500"
+                      : "bg-gray-700 border border-transparent"
                   }`}
                 >
                   <div className="flex items-center justify-between">
                     <span className="font-medium text-white">
-                      {restriction.type === 'polygon' ? '⬡' : restriction.type === 'rectangle' ? '▭' : '⭕'}
-                      {' '}{restriction.name}
+                      {restriction.type === "polygon"
+                        ? "⬡"
+                        : restriction.type === "rectangle"
+                          ? "▭"
+                          : "⭕"}{" "}
+                      {restriction.name}
                     </span>
                     <div className="flex gap-1">
                       {/* Выбор зоны = выделение для редактирования; ВСЕ зоны —
                           ограничения на пути маршрутов (флаг active устарел) */}
                       <button
-                        onClick={() => setActiveRestriction(
-                          restriction.id === activeRestrictionId ? null : restriction.id
-                        )}
+                        onClick={() =>
+                          setActiveRestriction(
+                            restriction.id === activeRestrictionId
+                              ? null
+                              : restriction.id,
+                          )
+                        }
                         className="px-1 text-xs text-gray-400 hover:text-white"
                         title="Выделить зону для редактирования"
                       >
@@ -324,39 +446,54 @@ const Sidebar: React.FC = () => {
                       <button
                         onClick={() => deleteRestriction(restriction.id)}
                         className="px-1 text-xs text-gray-400 hover:text-red-400"
-                      >🗑️</button>
+                      >
+                        🗑️
+                      </button>
                     </div>
                   </div>
                   <div className="text-xs text-gray-400 mt-1">
-                    {restriction.type === 'circle'
+                    {restriction.type === "circle"
                       ? `Центр: (${Math.round(restriction.points[0]?.x || 0)}, ${Math.round(restriction.points[0]?.y || 0)}), R: ${Math.round(restriction.radius || 0)}px`
-                      : `${restriction.points.length} вершин`
-                    }
+                      : `${restriction.points.length} вершин`}
                   </div>
                   {/* Вертикальные лимиты зоны (AGL, м): маршрут автоматически
                       поднимается над «полом» и опускается под «потолок» там,
                       где footprint зоны реально накрывает его путь */}
                   <div className="flex items-center gap-2 mt-1 text-xs text-gray-400">
-                    <span title="Минимальная разрешённая высота над землёй (AGL, м)">⬆️пол</span>
+                    <span title="Минимальная разрешённая высота над землёй (AGL, м)">
+                      ⬆️пол
+                    </span>
                     <input
                       type="number"
                       step={10}
-                      value={restriction.minHeightAGL ?? ''}
+                      value={restriction.minHeightAGL ?? ""}
                       placeholder="—"
-                      onChange={(e) => updateRestriction(restriction.id, {
-                        minHeightAGL: e.target.value === '' ? null : Number(e.target.value),
-                      })}
+                      onChange={(e) =>
+                        updateRestriction(restriction.id, {
+                          minHeightAGL:
+                            e.target.value === ""
+                              ? null
+                              : Number(e.target.value),
+                        })
+                      }
                       className="w-16 bg-gray-800 border border-gray-600 rounded px-1 py-0.5 text-white"
                     />
-                    <span title="Максимальная разрешённая высота над землёй (AGL, м)">⬇️пот.</span>
+                    <span title="Максимальная разрешённая высота над землёй (AGL, м)">
+                      ⬇️пот.
+                    </span>
                     <input
                       type="number"
                       step={10}
-                      value={restriction.maxHeightAGL ?? ''}
+                      value={restriction.maxHeightAGL ?? ""}
                       placeholder="—"
-                      onChange={(e) => updateRestriction(restriction.id, {
-                        maxHeightAGL: e.target.value === '' ? null : Number(e.target.value),
-                      })}
+                      onChange={(e) =>
+                        updateRestriction(restriction.id, {
+                          maxHeightAGL:
+                            e.target.value === ""
+                              ? null
+                              : Number(e.target.value),
+                        })
+                      }
                       className="w-16 bg-gray-800 border border-gray-600 rounded px-1 py-0.5 text-white"
                     />
                   </div>
@@ -371,7 +508,9 @@ const Sidebar: React.FC = () => {
 
             {/* Настройки автовысот (Open-Elevation) */}
             <div className="mt-3 p-2 rounded bg-gray-700/50 border border-gray-600 space-y-2">
-              <h4 className="text-xs font-medium text-gray-300">Высоты полёта (Open-Elevation)</h4>
+              <h4 className="text-xs font-medium text-gray-300">
+                Высоты полёта (Open-Elevation)
+              </h4>
               <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
                 <input
                   type="checkbox"
@@ -390,10 +529,15 @@ const Sidebar: React.FC = () => {
                   min={0}
                   step={5}
                   value={project.settings.altitudeClearanceM ?? 50}
-                  onChange={(e) => updateSettings({
-                    altitudeClearanceM: Number.isFinite(Number(e.target.value))
-                      ? Math.max(0, Number(e.target.value)) : 50,
-                  })}
+                  onChange={(e) =>
+                    updateSettings({
+                      altitudeClearanceM: Number.isFinite(
+                        Number(e.target.value),
+                      )
+                        ? Math.max(0, Number(e.target.value))
+                        : 50,
+                    })
+                  }
                   className="w-16 bg-gray-800 border border-gray-600 rounded px-1 py-0.5 text-white"
                 />
               </div>
@@ -411,38 +555,80 @@ const Sidebar: React.FC = () => {
           </div>
         )}
 
-        {activeTab === 'google' && (
-          <MapsPanel />
-        )}
+        {activeTab === "google" && <MapsPanel />}
 
-        {activeTab === 'layers' && <TacticalLayersPanel />}
+        {activeTab === "layers" && <TacticalLayersPanel />}
 
-        {activeTab === 'mission' && <MissionPanel />}
+        {activeTab === "mission" && <MissionPanel />}
 
-        {activeTab === 'export' && (
+        {activeTab === "export" && (
           <div className="p-3 space-y-3">
-            <h3 className="text-sm font-medium text-gray-300">Экспорт Точек Боевого Применения</h3>
+            <h3 className="text-sm font-medium text-gray-300">
+              Экспорт Точек Боевого Применения
+            </h3>
             <div className="grid grid-cols-2 gap-2">
-              <button onClick={() => handleExport('csv')} className="px-3 py-2 bg-green-700 hover:bg-green-600 text-white rounded text-xs">CSV</button>
-              <button onClick={() => handleExport('json')} className="px-3 py-2 bg-green-700 hover:bg-green-600 text-white rounded text-xs">JSON</button>
-              <button onClick={() => handleExport('geojson')} className="px-3 py-2 bg-green-700 hover:bg-green-600 text-white rounded text-xs">GeoJSON</button>
-              <button onClick={() => handleExport('gpx')} className="px-3 py-2 bg-green-700 hover:bg-green-600 text-white rounded text-xs">GPX</button>
-              <button onClick={() => handleExport('kml')} className="px-3 py-2 bg-green-700 hover:bg-green-600 text-white rounded text-xs">KML</button>
+              <button
+                onClick={() => handleExport("csv")}
+                className="px-3 py-2 bg-green-700 hover:bg-green-600 text-white rounded text-xs"
+              >
+                CSV
+              </button>
+              <button
+                onClick={() => handleExport("json")}
+                className="px-3 py-2 bg-green-700 hover:bg-green-600 text-white rounded text-xs"
+              >
+                JSON
+              </button>
+              <button
+                onClick={() => handleExport("geojson")}
+                className="px-3 py-2 bg-green-700 hover:bg-green-600 text-white rounded text-xs"
+              >
+                GeoJSON
+              </button>
+              <button
+                onClick={() => handleExport("gpx")}
+                className="px-3 py-2 bg-green-700 hover:bg-green-600 text-white rounded text-xs"
+              >
+                GPX
+              </button>
+              <button
+                onClick={() => handleExport("kml")}
+                className="px-3 py-2 bg-green-700 hover:bg-green-600 text-white rounded text-xs"
+              >
+                KML
+              </button>
             </div>
 
             <h3 className="text-sm font-medium text-gray-300 mt-4">Проект</h3>
             <div className="grid grid-cols-2 gap-2">
-              <button onClick={() => handleExport('project')} className="px-3 py-2 bg-purple-700 hover:bg-purple-600 text-white rounded text-xs">Сохранить .tqproj</button>
+              <button
+                onClick={() => handleExport("project")}
+                className="px-3 py-2 bg-purple-700 hover:bg-purple-600 text-white rounded text-xs"
+              >
+                Сохранить .tqproj
+              </button>
               <label className="px-3 py-2 bg-purple-700 hover:bg-purple-600 text-white rounded text-xs text-center cursor-pointer">
                 Загрузить .tqproj
-                <input type="file" accept=".tqproj,.json,.geojson,.csv" className="hidden" onChange={handleImport} />
+                <input
+                  type="file"
+                  accept=".tqproj,.json,.geojson,.csv"
+                  className="hidden"
+                  onChange={handleImport}
+                />
               </label>
             </div>
 
-            <h3 className="text-sm font-medium text-gray-300 mt-4">Импорт Точек Боевого Применения</h3>
+            <h3 className="text-sm font-medium text-gray-300 mt-4">
+              Импорт Точек Боевого Применения
+            </h3>
             <label className="block px-3 py-2 bg-blue-700 hover:bg-blue-600 text-white rounded text-xs text-center cursor-pointer">
               Импорт CSV / GeoJSON / JSON
-              <input type="file" accept=".csv,.geojson,.json" className="hidden" onChange={handleImport} />
+              <input
+                type="file"
+                accept=".csv,.geojson,.json"
+                className="hidden"
+                onChange={handleImport}
+              />
             </label>
 
             <div className="mt-4 p-2 bg-gray-700 rounded text-xs text-gray-400">
@@ -462,24 +648,48 @@ const Sidebar: React.FC = () => {
       {/* Selected marker properties */}
       {selectedMarker && (
         <div className="border-t border-gray-700 p-3 bg-gray-750">
-          <h3 className="text-sm font-medium text-cyan-400 mb-2">Свойства Точки Боевого Применения</h3>
+          <h3 className="text-sm font-medium text-cyan-400 mb-2">
+            Свойства Точки Боевого Применения
+          </h3>
           <div className="space-y-1 text-xs text-gray-300">
-            <p><span className="text-gray-500">ID:</span> {selectedMarker.id.slice(0, 8)}...</p>
-            <p><span className="text-gray-500">Имя:</span> {selectedMarker.name}</p>
-            <p><span className="text-gray-500">Пиксели:</span> X={Math.round(selectedMarker.x)}, Y={Math.round(selectedMarker.y)}</p>
+            <p>
+              <span className="text-gray-500">ID:</span>{" "}
+              {selectedMarker.id.slice(0, 8)}...
+            </p>
+            <p>
+              <span className="text-gray-500">Имя:</span> {selectedMarker.name}
+            </p>
+            <p>
+              <span className="text-gray-500">Пиксели:</span> X=
+              {Math.round(selectedMarker.x)}, Y={Math.round(selectedMarker.y)}
+            </p>
             {(() => {
               // Если есть привязка к онлайн-картам, вычисляем координаты автоматически
-              if (project.map?.bounds && (project.map?.source === 'google' || project.map?.source === 'yandex' || project.map?.source === 'osm')) {
+              if (
+                project.map?.bounds &&
+                (project.map?.source === "google" ||
+                  project.map?.source === "yandex" ||
+                  project.map?.source === "osm")
+              ) {
                 const geo = pixelToGeoFromBounds(
                   { x: selectedMarker.x, y: selectedMarker.y },
                   project.map.bounds,
                   project.map.width || 0,
-                  project.map.height || 0
+                  project.map.height || 0,
                 );
                 return (
                   <>
-                    <p><span className="text-gray-500">Координаты:</span> <span className="text-green-400">{geo.lat.toFixed(6)}, {geo.lng.toFixed(6)}</span></p>
-                    <p><span className="text-gray-500">DMS:</span> {decimalToDMS(geo.lat, true)} {decimalToDMS(geo.lng, false)}</p>
+                    <p>
+                      <span className="text-gray-500">Координаты:</span>{" "}
+                      <span className="text-green-400">
+                        {geo.lat.toFixed(6)}, {geo.lng.toFixed(6)}
+                      </span>
+                    </p>
+                    <p>
+                      <span className="text-gray-500">DMS:</span>{" "}
+                      {decimalToDMS(geo.lat, true)}{" "}
+                      {decimalToDMS(geo.lng, false)}
+                    </p>
                   </>
                 );
               }
@@ -487,17 +697,39 @@ const Sidebar: React.FC = () => {
               if (selectedMarker.lat !== null && selectedMarker.lon !== null) {
                 return (
                   <>
-                    <p><span className="text-gray-500">Координаты:</span> {selectedMarker.lat.toFixed(6)}, {selectedMarker.lon.toFixed(6)}</p>
-                    <p><span className="text-gray-500">DMS:</span> {decimalToDMS(selectedMarker.lat, true)} {decimalToDMS(selectedMarker.lon, false)}</p>
+                    <p>
+                      <span className="text-gray-500">Координаты:</span>{" "}
+                      {selectedMarker.lat.toFixed(6)},{" "}
+                      {selectedMarker.lon.toFixed(6)}
+                    </p>
+                    <p>
+                      <span className="text-gray-500">DMS:</span>{" "}
+                      {decimalToDMS(selectedMarker.lat, true)}{" "}
+                      {decimalToDMS(selectedMarker.lon, false)}
+                    </p>
                   </>
                 );
               }
               return null;
             })()}
-            <p><span className="text-gray-500">Тип:</span> {selectedMarker.type}</p>
-            <p><span className="text-gray-500">Слой:</span> {project.layers.find(l => l.id === selectedMarker.layer)?.name || '—'}</p>
-            {selectedMarker.comment && <p><span className="text-gray-500">Комментарий:</span> {selectedMarker.comment}</p>}
-            <p><span className="text-gray-500">Создана:</span> {new Date(selectedMarker.createdAt).toLocaleString('ru')}</p>
+            <p>
+              <span className="text-gray-500">Тип:</span> {selectedMarker.type}
+            </p>
+            <p>
+              <span className="text-gray-500">Слой:</span>{" "}
+              {project.layers.find((l) => l.id === selectedMarker.layer)
+                ?.name || "—"}
+            </p>
+            {selectedMarker.comment && (
+              <p>
+                <span className="text-gray-500">Комментарий:</span>{" "}
+                {selectedMarker.comment}
+              </p>
+            )}
+            <p>
+              <span className="text-gray-500">Создана:</span>{" "}
+              {new Date(selectedMarker.createdAt).toLocaleString("ru")}
+            </p>
           </div>
         </div>
       )}
@@ -506,7 +738,9 @@ const Sidebar: React.FC = () => {
       {editingMarker && (
         <div className="absolute inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-gray-800 border border-gray-600 rounded-lg p-4 w-72">
-            <h3 className="text-sm font-medium text-white mb-3">Редактировать точку</h3>
+            <h3 className="text-sm font-medium text-white mb-3">
+              Редактировать точку
+            </h3>
             <div className="space-y-2">
               <div>
                 <label className="text-xs text-gray-400">Название</label>
@@ -557,8 +791,18 @@ const Sidebar: React.FC = () => {
               </div>
             </div>
             <div className="flex gap-2 mt-3">
-              <button onClick={saveEditing} className="flex-1 px-3 py-1 bg-cyan-600 hover:bg-cyan-700 text-white rounded text-sm">Сохранить</button>
-              <button onClick={() => setEditingMarker(null)} className="flex-1 px-3 py-1 bg-gray-600 hover:bg-gray-500 text-white rounded text-sm">Отмена</button>
+              <button
+                onClick={saveEditing}
+                className="flex-1 px-3 py-1 bg-cyan-600 hover:bg-cyan-700 text-white rounded text-sm"
+              >
+                Сохранить
+              </button>
+              <button
+                onClick={() => setEditingMarker(null)}
+                className="flex-1 px-3 py-1 bg-gray-600 hover:bg-gray-500 text-white rounded text-sm"
+              >
+                Отмена
+              </button>
             </div>
           </div>
         </div>

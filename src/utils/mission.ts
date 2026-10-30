@@ -3,7 +3,7 @@
 // алгоритмы оптимизации порядка точек, генерация «змейки» для сплошного
 // сканирования полигона. Никаких новых npm-зависимостей.
 
-import type { Point } from '../types';
+import type { Point } from "../types";
 
 /** Максимальная разрешённая высота полёта (м) — общий лимит проекта. */
 export const MAX_ALTITUDE_M = 500;
@@ -12,7 +12,8 @@ export const MAX_SPEED_MS = 30;
 /** Диапазон допустимого радиуса принятия (м). */
 export const ACCEPTANCE_RADIUS_RANGE: readonly [number, number] = [0.5, 100];
 
-export type WaypointParamKey = 'hold' | 'cameraAngle' | 'speed' | 'acceptanceRadius';
+export type WaypointParamKey =
+  "hold" | "cameraAngle" | "speed" | "acceptanceRadius";
 
 /** Параметры путевой точки (задержка, угол камеры, скорость, радиус принятия). */
 export interface WaypointParams {
@@ -44,7 +45,7 @@ export interface MissionMeta {
 export class ValidationError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = 'ValidationError';
+    this.name = "ValidationError";
   }
 }
 
@@ -65,16 +66,26 @@ export class ValidationError extends Error {
  * Example:
  *   validateLatLng(55.75, 37.62, 120)
  */
-export function validateLatLng(lat: number, lon: number, alt?: number | null): void {
+export function validateLatLng(
+  lat: number,
+  lon: number,
+  alt?: number | null,
+): void {
   if (!Number.isFinite(lat) || lat < -90 || lat > 90) {
-    throw new ValidationError(`Некорректная широта: ${lat} (ожидается [-90; 90])`);
+    throw new ValidationError(
+      `Некорректная широта: ${lat} (ожидается [-90; 90])`,
+    );
   }
   if (!Number.isFinite(lon) || lon < -180 || lon > 180) {
-    throw new ValidationError(`Некорректная долгота: ${lon} (ожидается [-180; 180])`);
+    throw new ValidationError(
+      `Некорректная долгота: ${lon} (ожидается [-180; 180])`,
+    );
   }
   if (alt !== undefined && alt !== null) {
     if (!Number.isFinite(alt) || alt < 0 || alt > MAX_ALTITUDE_M) {
-      throw new ValidationError(`Некорректная высота: ${alt} (ожидается [0; ${MAX_ALTITUDE_M}])`);
+      throw new ValidationError(
+        `Некорректная высота: ${alt} (ожидается [0; ${MAX_ALTITUDE_M}])`,
+      );
     }
   }
 }
@@ -127,16 +138,28 @@ export function normalizeAngle360(angle: number): number {
  * Returns:
  *   WaypointParams: корректные параметры.
  */
-export function sanitizeWaypointParams(raw?: Partial<WaypointParams> | null): WaypointParams {
+export function sanitizeWaypointParams(
+  raw?: Partial<WaypointParams> | null,
+): WaypointParams {
   const clamp = (v: unknown, lo: number, hi: number, dflt: number): number => {
-    const n = typeof v === 'number' ? v : Number(v);
+    const n = typeof v === "number" ? v : Number(v);
     if (!Number.isFinite(n)) return dflt;
     return Math.min(hi, Math.max(lo, n));
   };
   return {
     holdSec: clamp(raw?.holdSec, 0, 3600, DEFAULT_WAYPOINT_PARAMS.holdSec),
-    cameraAngleDeg: clamp(raw?.cameraAngleDeg, -90, 90, DEFAULT_WAYPOINT_PARAMS.cameraAngleDeg),
-    speedMs: clamp(raw?.speedMs, 0, MAX_SPEED_MS, DEFAULT_WAYPOINT_PARAMS.speedMs),
+    cameraAngleDeg: clamp(
+      raw?.cameraAngleDeg,
+      -90,
+      90,
+      DEFAULT_WAYPOINT_PARAMS.cameraAngleDeg,
+    ),
+    speedMs: clamp(
+      raw?.speedMs,
+      0,
+      MAX_SPEED_MS,
+      DEFAULT_WAYPOINT_PARAMS.speedMs,
+    ),
     acceptanceRadiusM: clamp(
       raw?.acceptanceRadiusM,
       ACCEPTANCE_RADIUS_RANGE[0],
@@ -160,19 +183,27 @@ export function sanitizeWaypointParams(raw?: Partial<WaypointParams> | null): Wa
  * Raises:
  *   ValidationError: пустое название.
  */
-export function createMissionMeta(id: string, name: string, author: string): MissionMeta {
+export function createMissionMeta(
+  id: string,
+  name: string,
+  author: string,
+): MissionMeta {
   const trimmed = name.trim();
-  if (!trimmed) throw new ValidationError('Название миссии не может быть пустым');
+  if (!trimmed)
+    throw new ValidationError("Название миссии не может быть пустым");
   return {
     id,
     name: trimmed.slice(0, 120),
-    author: author.trim().slice(0, 60) || '—',
+    author: author.trim().slice(0, 60) || "—",
     createdAt: new Date().toISOString(),
   };
 }
 
 /** Расстояние между двумя точками (евклидово, в единицах входных координат). */
-function dist(a: { lat: number; lon: number }, b: { lat: number; lon: number }): number {
+function dist(
+  a: { lat: number; lon: number },
+  b: { lat: number; lon: number },
+): number {
   const dx = a.lat - b.lat;
   const dy = a.lon - b.lon;
   return Math.sqrt(dx * dx + dy * dy);
@@ -185,7 +216,8 @@ function pathLength(pts: { lat: number; lon: number }[]): number {
   return s;
 }
 
-export type OptimizeAlgorithm = 'nearest_neighbor' | 'genetic' | 'simulated_annealing';
+export type OptimizeAlgorithm =
+  "nearest_neighbor" | "genetic" | "simulated_annealing";
 
 export interface OptimizeResult<T> {
   waypoints: T[];
@@ -226,32 +258,42 @@ function mulberry32(seed: number): () => number {
  */
 export function optimizeRoute<T extends { lat: number; lon: number }>(
   waypoints: T[],
-  algorithm: OptimizeAlgorithm = 'nearest_neighbor',
+  algorithm: OptimizeAlgorithm = "nearest_neighbor",
   seed = 42,
 ): OptimizeResult<T> {
   if (waypoints.length <= 1) {
     const d = pathLength(waypoints);
-    return { waypoints, tacticalNodes: [...waypoints], distanceBefore: d, distanceAfter: d, improvementPct: 0, algorithm };
+    return {
+      waypoints,
+      tacticalNodes: [...waypoints],
+      distanceBefore: d,
+      distanceAfter: d,
+      improvementPct: 0,
+      algorithm,
+    };
   }
   const before = pathLength(waypoints);
   let order: T[];
   switch (algorithm) {
-    case 'nearest_neighbor':
+    case "nearest_neighbor":
       order = nearestNeighbor(waypoints);
       break;
-    case 'genetic':
+    case "genetic":
       order = genetic(waypoints, mulberry32(seed));
       break;
-    case 'simulated_annealing':
+    case "simulated_annealing":
       order = simulatedAnnealing(waypoints, mulberry32(seed));
       break;
     default:
-      throw new ValidationError(`Неизвестный алгоритм оптимизации: ${String(algorithm)}`);
+      throw new ValidationError(
+        `Неизвестный алгоритм оптимизации: ${String(algorithm)}`,
+      );
   }
   const after = pathLength(order);
   const improvementPct = before > 0 ? ((before - after) / before) * 100 : 0;
   return {
-    waypoints: order, tacticalNodes: order,
+    waypoints: order,
+    tacticalNodes: order,
     distanceBefore: before,
     distanceAfter: after,
     improvementPct: Math.max(0, Math.round(improvementPct * 10) / 10),
@@ -259,7 +301,9 @@ export function optimizeRoute<T extends { lat: number; lon: number }>(
   };
 }
 
-function nearestNeighbor<T extends { lat: number; lon: number }>(pts: T[]): T[] {
+function nearestNeighbor<T extends { lat: number; lon: number }>(
+  pts: T[],
+): T[] {
   const rest = pts.slice(1);
   const route: T[] = [pts[0]];
   let current = pts[0];
@@ -279,7 +323,10 @@ function nearestNeighbor<T extends { lat: number; lon: number }>(pts: T[]): T[] 
   return route;
 }
 
-function genetic<T extends { lat: number; lon: number }>(pts: T[], rnd: () => number): T[] {
+function genetic<T extends { lat: number; lon: number }>(
+  pts: T[],
+  rnd: () => number,
+): T[] {
   const head = pts[0];
   const body = pts.slice(1);
   const n = body.length;
@@ -315,7 +362,10 @@ function genetic<T extends { lat: number; lon: number }>(pts: T[], rnd: () => nu
   return [head, ...pop[0]];
 }
 
-function simulatedAnnealing<T extends { lat: number; lon: number }>(pts: T[], rnd: () => number): T[] {
+function simulatedAnnealing<T extends { lat: number; lon: number }>(
+  pts: T[],
+  rnd: () => number,
+): T[] {
   const route = [...pts];
   let currentLen = pathLength(route);
   let best = [...route];
@@ -329,9 +379,16 @@ function simulatedAnnealing<T extends { lat: number; lon: number }>(pts: T[], rn
     // 2-opt reverse segment [min..max]
     const lo = Math.min(i, j);
     const hi = Math.max(i, j);
-    const cand = [...route.slice(0, lo), ...route.slice(lo, hi + 1).reverse(), ...route.slice(hi + 1)];
+    const cand = [
+      ...route.slice(0, lo),
+      ...route.slice(lo, hi + 1).reverse(),
+      ...route.slice(hi + 1),
+    ];
     const candLen = pathLength(cand);
-    if (candLen < currentLen || rnd() < Math.exp((currentLen - candLen) / Math.max(temp, 1e-9))) {
+    if (
+      candLen < currentLen ||
+      rnd() < Math.exp((currentLen - candLen) / Math.max(temp, 1e-9))
+    ) {
       route.splice(0, route.length, ...cand);
       currentLen = candLen;
       if (candLen < bestLen) {
@@ -362,20 +419,26 @@ function simulatedAnnealing<T extends { lat: number; lon: number }>(pts: T[], rn
  * Raises:
  *   ValidationError: деградированный полигон, неверный шаг, самопересечения.
  */
-export function generateScanLawnmower(polygon: Point[], spacingPx: number, startCorner: 'nw' | 'sw' | 'ne' | 'se' = 'nw'): Point[] {
-  if (polygon.length < 3) throw new ValidationError('Полигон должен иметь минимум 3 вершины');
+export function generateScanLawnmower(
+  polygon: Point[],
+  spacingPx: number,
+  startCorner: "nw" | "sw" | "ne" | "se" = "nw",
+): Point[] {
+  if (polygon.length < 3)
+    throw new ValidationError("Полигон должен иметь минимум 3 вершины");
   if (!Number.isFinite(spacingPx) || spacingPx <= 0) {
     throw new ValidationError(`Некорректный шаг сканирования: ${spacingPx}`);
   }
-  if (segmentsIntersect(polygon)) throw new ValidationError('Полигон имеет самопересечения');
+  if (segmentsIntersect(polygon))
+    throw new ValidationError("Полигон имеет самопересечения");
   const xs = polygon.map((p) => p.x);
   const ys = polygon.map((p) => p.y);
   const minX = Math.min(...xs);
   const maxX = Math.max(...xs);
   const minY = Math.min(...ys);
   const maxY = Math.max(...ys);
-  const flipY = startCorner === 'sw' || startCorner === 'se';
-  const flipX = startCorner === 'ne' || startCorner === 'se';
+  const flipY = startCorner === "sw" || startCorner === "se";
+  const flipX = startCorner === "ne" || startCorner === "se";
   const pts: Point[] = [];
   const rows = Math.ceil((maxY - minY) / spacingPx) + 1;
   for (let r = 0; r < rows; r++) {
@@ -408,7 +471,8 @@ function scanRowAtY(polygon: Point[], y: number): Array<[number, number]> {
   }
   xsCross.sort((u, v) => u - v);
   const intervals: Array<[number, number]> = [];
-  for (let i = 0; i + 1 < xsCross.length; i += 2) intervals.push([xsCross[i], xsCross[i + 1]]);
+  for (let i = 0; i + 1 < xsCross.length; i += 2)
+    intervals.push([xsCross[i], xsCross[i + 1]]);
   return intervals;
 }
 
@@ -438,8 +502,14 @@ const ASTAR_MAX_NODES = 4000;
 
 /** Принадлежность точки 3D-препятствию (границы включительно). */
 export function insideObstacle(p: RouteNode3D, o: Obstacle3D): boolean {
-  return p.lat >= o.minLat && p.lat <= o.maxLat && p.lon >= o.minLon && p.lon <= o.maxLon
-    && p.altM >= o.minAltM && p.altM <= o.maxAltM;
+  return (
+    p.lat >= o.minLat &&
+    p.lat <= o.maxLat &&
+    p.lon >= o.minLon &&
+    p.lon <= o.maxLon &&
+    p.altM >= o.minAltM &&
+    p.altM <= o.maxAltM
+  );
 }
 
 function dist3(a: RouteNode3D, b: RouteNode3D): number {
@@ -468,11 +538,15 @@ export function calculateObstacleAvoidance(
   route: RouteNode3D[],
   obstacles: Obstacle3D[],
 ): { route: RouteNode3D[]; blocked: boolean; detourLengthM: number } {
-  if (route.length < 2) throw new ValidationError('Маршрут должен содержать минимум 2 точки');
+  if (route.length < 2)
+    throw new ValidationError("Маршрут должен содержать минимум 2 точки");
   for (const p of route) validateLatLng(p.lat, p.lon, p.altM);
   for (const o of obstacles) {
     validateGeoBox(o);
-    if (o.maxAltM < o.minAltM) throw new ValidationError(`Препятствие: maxAlt < minAlt (${o.minAltM}>${o.maxAltM})`);
+    if (o.maxAltM < o.minAltM)
+      throw new ValidationError(
+        `Препятствие: maxAlt < minAlt (${o.minAltM}>${o.maxAltM})`,
+      );
   }
   const out: RouteNode3D[] = [route[0]];
   let blocked = false;
@@ -498,20 +572,36 @@ export function calculateObstacleAvoidance(
 function validateGeoBox(o: Obstacle3D): void {
   validateLatLng(o.minLat, o.minLon, null);
   validateLatLng(o.maxLat, o.maxLon, null);
-  if (o.maxLat < o.minLat || o.maxLon < o.minLon) throw new ValidationError('Препятствие: инвертированные границы');
-  [o.minAltM, o.maxAltM].forEach((v) => assertNumFinite('alt', v));
+  if (o.maxLat < o.minLat || o.maxLon < o.minLon)
+    throw new ValidationError("Препятствие: инвертированные границы");
+  [o.minAltM, o.maxAltM].forEach((v) => assertNumFinite("alt", v));
 }
 
 function assertNumFinite(name: string, v: number): void {
-  if (!Number.isFinite(v)) throw new ValidationError(`${name}: нечисловое значение ${String(v)}`);
+  if (!Number.isFinite(v))
+    throw new ValidationError(`${name}: нечисловое значение ${String(v)}`);
 }
 
 /** Быстрая отбраковка: может ли отрезок пересекать бокс (по bounding box луча). */
-function segmentMayIntersect(a: RouteNode3D, b: RouteNode3D, o: Obstacle3D): boolean {
-  const loLat = Math.min(a.lat, b.lat), hiLat = Math.max(a.lat, b.lat);
-  const loLon = Math.min(a.lon, b.lon), hiLon = Math.max(a.lon, b.lon);
-  const loAlt = Math.min(a.altM, b.altM), hiAlt = Math.max(a.altM, b.altM);
-  return hiLat >= o.minLat && loLat <= o.maxLat && hiLon >= o.minLon && loLon <= o.maxLon && hiAlt >= o.minAltM && loAlt <= o.maxAltM;
+function segmentMayIntersect(
+  a: RouteNode3D,
+  b: RouteNode3D,
+  o: Obstacle3D,
+): boolean {
+  const loLat = Math.min(a.lat, b.lat),
+    hiLat = Math.max(a.lat, b.lat);
+  const loLon = Math.min(a.lon, b.lon),
+    hiLon = Math.max(a.lon, b.lon);
+  const loAlt = Math.min(a.altM, b.altM),
+    hiAlt = Math.max(a.altM, b.altM);
+  return (
+    hiLat >= o.minLat &&
+    loLat <= o.maxLat &&
+    hiLon >= o.minLon &&
+    loLon <= o.maxLon &&
+    hiAlt >= o.minAltM &&
+    loAlt <= o.maxAltM
+  );
 }
 
 function pathLength3(pts: RouteNode3D[]): number {
@@ -520,25 +610,52 @@ function pathLength3(pts: RouteNode3D[]): number {
   return s;
 }
 
-interface GridKey { i: number; j: number; k: number }
+interface GridKey {
+  i: number;
+  j: number;
+  k: number;
+}
 
 /** 3D A* по сетке (шаг ~50 м по горизонтали, ASTAR_ALT_STEP_M по вертикали). */
-function astar3(from: RouteNode3D, to: RouteNode3D, obstacles: Obstacle3D[]): RouteNode3D[] | null {
+function astar3(
+  from: RouteNode3D,
+  to: RouteNode3D,
+  obstacles: Obstacle3D[],
+): RouteNode3D[] | null {
   const stepDeg = 50 / 111000;
-  const latLo = Math.floor(Math.min(from.lat, to.lat) / stepDeg) * stepDeg - stepDeg * 4;
-  const latHi = Math.ceil(Math.max(from.lat, to.lat) / stepDeg) * stepDeg + stepDeg * 4;
-  const lonLo = Math.floor(Math.min(from.lon, to.lon) / stepDeg) * stepDeg - stepDeg * 4;
-  const lonHi = Math.ceil(Math.max(from.lon, to.lon) / stepDeg) * stepDeg + stepDeg * 4;
-  const altLo = Math.max(0, Math.floor(Math.min(from.altM, to.altM) / ASTAR_ALT_STEP_M) * ASTAR_ALT_STEP_M - ASTAR_ALT_STEP_M * 2);
-  const altHi = Math.min(MAX_ALTITUDE_M, Math.ceil(Math.max(from.altM, to.altM) / ASTAR_ALT_STEP_M) * ASTAR_ALT_STEP_M + ASTAR_ALT_STEP_M * 4);
+  const latLo =
+    Math.floor(Math.min(from.lat, to.lat) / stepDeg) * stepDeg - stepDeg * 4;
+  const latHi =
+    Math.ceil(Math.max(from.lat, to.lat) / stepDeg) * stepDeg + stepDeg * 4;
+  const lonLo =
+    Math.floor(Math.min(from.lon, to.lon) / stepDeg) * stepDeg - stepDeg * 4;
+  const lonHi =
+    Math.ceil(Math.max(from.lon, to.lon) / stepDeg) * stepDeg + stepDeg * 4;
+  const altLo = Math.max(
+    0,
+    Math.floor(Math.min(from.altM, to.altM) / ASTAR_ALT_STEP_M) *
+      ASTAR_ALT_STEP_M -
+      ASTAR_ALT_STEP_M * 2,
+  );
+  const altHi = Math.min(
+    MAX_ALTITUDE_M,
+    Math.ceil(Math.max(from.altM, to.altM) / ASTAR_ALT_STEP_M) *
+      ASTAR_ALT_STEP_M +
+      ASTAR_ALT_STEP_M * 4,
+  );
   const ni = Math.round((latHi - latLo) / stepDeg) + 1;
   const nj = Math.round((lonHi - lonLo) / stepDeg) + 1;
   const nk = Math.round((altHi - altLo) / ASTAR_ALT_STEP_M) + 1;
   if (ni * nj * nk > ASTAR_MAX_NODES) return null; // слишком крупная область — считаем маршрут непроходимым для сетки
   const key = (g: GridKey) => `${g.i}|${g.j}|${g.k}`;
-  const nodeAt = (g: GridKey): RouteNode3D => ({ lat: latLo + g.i * stepDeg, lon: lonLo + g.j * stepDeg, altM: altLo + g.k * ASTAR_ALT_STEP_M });
+  const nodeAt = (g: GridKey): RouteNode3D => ({
+    lat: latLo + g.i * stepDeg,
+    lon: lonLo + g.j * stepDeg,
+    altM: altLo + g.k * ASTAR_ALT_STEP_M,
+  });
   const free = (g: GridKey): boolean => {
-    if (g.i < 0 || g.j < 0 || g.k < 0 || g.i >= ni || g.j >= nj || g.k >= nk) return false;
+    if (g.i < 0 || g.j < 0 || g.k < 0 || g.i >= ni || g.j >= nj || g.k >= nk)
+      return false;
     const p = nodeAt(g);
     return !obstacles.some((o) => insideObstacle(p, o));
   };
@@ -550,10 +667,19 @@ function astar3(from: RouteNode3D, to: RouteNode3D, obstacles: Obstacle3D[]): Ro
   const start = toGrid(from);
   const goal = toGrid(to);
   if (!free(start) || !free(goal)) return null;
-  const open: Array<{ g: GridKey; f: number }> = [{ g: start, f: dist3(nodeAt(start), to) }];
+  const open: Array<{ g: GridKey; f: number }> = [
+    { g: start, f: dist3(nodeAt(start), to) },
+  ];
   const cameFrom = new Map<string, string>();
   const cost = new Map<string, number>([[key(start), 0]]);
-  const dirs = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  const dirs = [
+    [1, 0, 0],
+    [-1, 0, 0],
+    [0, 1, 0],
+    [0, -1, 0],
+    [0, 0, 1],
+    [0, 0, -1],
+  ];
   while (open.length) {
     open.sort((a, b) => a.f - b.f);
     const cur = open.shift()!;
@@ -561,7 +687,7 @@ function astar3(from: RouteNode3D, to: RouteNode3D, obstacles: Obstacle3D[]): Ro
       const path: RouteNode3D[] = [];
       let k: string | undefined = key(goal);
       while (k !== undefined) {
-        const [i, j, kk] = k.split('|').map(Number);
+        const [i, j, kk] = k.split("|").map(Number);
         path.unshift(nodeAt({ i, j, k: kk }));
         k = cameFrom.get(k);
       }
@@ -572,7 +698,8 @@ function astar3(from: RouteNode3D, to: RouteNode3D, obstacles: Obstacle3D[]): Ro
     for (const [di, dj, dk] of dirs) {
       const nb: GridKey = { i: cur.g.i + di, j: cur.g.j + dj, k: cur.g.k + dk };
       if (!free(nb)) continue;
-      const nc = (cost.get(key(cur.g)) ?? Infinity) + dist3(nodeAt(cur.g), nodeAt(nb));
+      const nc =
+        (cost.get(key(cur.g)) ?? Infinity) + dist3(nodeAt(cur.g), nodeAt(nb));
       if (nc < (cost.get(key(nb)) ?? Infinity)) {
         cost.set(key(nb), nc);
         cameFrom.set(key(nb), key(cur.g));
@@ -592,7 +719,10 @@ const RRT_LAT_BUFFER_M = 150;
 
 /** Метрика RRT: расстояние в метрах (haversine-аппроксимация + вертикаль). */
 function dist3m(a: RouteNode3D, b: RouteNode3D): number {
-  const cosLat = Math.max(0.01, Math.cos(((a.lat + b.lat) / 2 * Math.PI) / 180));
+  const cosLat = Math.max(
+    0.01,
+    Math.cos((((a.lat + b.lat) / 2) * Math.PI) / 180),
+  );
   const dxM = (a.lat - b.lat) * 111000;
   const dyM = (a.lon - b.lon) * 111000 * cosLat;
   return Math.hypot(dxM, dyM, a.altM - b.altM);
@@ -609,7 +739,12 @@ function dist3m(a: RouteNode3D, b: RouteNode3D): number {
  * Returns:
  *   RouteNode3D[] | null: цепочка узлов от from до to либо null (не найдено).
  */
-export function rrtPath(from: RouteNode3D, to: RouteNode3D, obstacles: Obstacle3D[], seed = 7): RouteNode3D[] | null {
+export function rrtPath(
+  from: RouteNode3D,
+  to: RouteNode3D,
+  obstacles: Obstacle3D[],
+  seed = 7,
+): RouteNode3D[] | null {
   const rnd = mulberry32(seed);
   validateNode(from);
   validateNode(to);
@@ -620,7 +755,10 @@ export function rrtPath(from: RouteNode3D, to: RouteNode3D, obstacles: Obstacle3
     let bd = Infinity;
     for (let i = 0; i < nodes.length; i++) {
       const d = dist3m(nodes[i], p);
-      if (d < bd) { bd = d; best = i; }
+      if (d < bd) {
+        bd = d;
+        best = i;
+      }
     }
     return best;
   };
@@ -628,34 +766,68 @@ export function rrtPath(from: RouteNode3D, to: RouteNode3D, obstacles: Obstacle3
     const d = dist3m(a, b);
     if (d <= RRT_STEP_M) return b;
     const t = RRT_STEP_M / Math.max(d, 1e-9);
-    return { lat: a.lat + (b.lat - a.lat) * t, lon: a.lon + (b.lon - a.lon) * t, altM: a.altM + (b.altM - a.altM) * t };
+    return {
+      lat: a.lat + (b.lat - a.lat) * t,
+      lon: a.lon + (b.lon - a.lon) * t,
+      altM: a.altM + (b.altM - a.altM) * t,
+    };
   };
   const clear = (a: RouteNode3D, b: RouteNode3D): boolean => {
     const steps = Math.max(2, Math.ceil(dist3m(a, b) / (RRT_STEP_M / 4)));
     for (let s = 0; s <= steps; s++) {
-      const p = { lat: a.lat + ((b.lat - a.lat) * s) / steps, lon: a.lon + ((b.lon - a.lon) * s) / steps, altM: a.altM + ((b.altM - a.altM) * s) / steps };
+      const p = {
+        lat: a.lat + ((b.lat - a.lat) * s) / steps,
+        lon: a.lon + ((b.lon - a.lon) * s) / steps,
+        altM: a.altM + ((b.altM - a.altM) * s) / steps,
+      };
       if (obstacles.some((o) => insideObstacle(p, o))) return false;
     }
     return true;
   };
-  const boundsOf = (): { lat: [number, number]; lon: [number, number]; alt: [number, number] } => {
+  const boundsOf = (): {
+    lat: [number, number];
+    lon: [number, number];
+    alt: [number, number];
+  } => {
     const degLatBuffer = RRT_LAT_BUFFER_M / 111000;
     const cosLat = Math.max(0.01, Math.cos((from.lat * Math.PI) / 180));
     const degLonBuffer = RRT_LAT_BUFFER_M / (111000 * cosLat);
-    const lats = [from.lat, to.lat, ...obstacles.flatMap((o) => [o.minLat - degLatBuffer, o.maxLat + degLatBuffer])];
-    const lons = [from.lon, to.lon, ...obstacles.flatMap((o) => [o.minLon - degLonBuffer, o.maxLon + degLonBuffer])];
-    const alts = [from.altM, to.altM, ...obstacles.flatMap((o) => [o.minAltM, o.maxAltM])];
+    const lats = [
+      from.lat,
+      to.lat,
+      ...obstacles.flatMap((o) => [
+        o.minLat - degLatBuffer,
+        o.maxLat + degLatBuffer,
+      ]),
+    ];
+    const lons = [
+      from.lon,
+      to.lon,
+      ...obstacles.flatMap((o) => [
+        o.minLon - degLonBuffer,
+        o.maxLon + degLonBuffer,
+      ]),
+    ];
+    const alts = [
+      from.altM,
+      to.altM,
+      ...obstacles.flatMap((o) => [o.minAltM, o.maxAltM]),
+    ];
     return {
       lat: [Math.min(...lats), Math.max(...lats)],
       lon: [Math.min(...lons), Math.max(...lons)],
-      alt: [Math.max(0, Math.min(...alts) - ASTAR_ALT_STEP_M), Math.min(MAX_ALTITUDE_M, Math.max(...alts) + ASTAR_ALT_STEP_M)],
+      alt: [
+        Math.max(0, Math.min(...alts) - ASTAR_ALT_STEP_M),
+        Math.min(MAX_ALTITUDE_M, Math.max(...alts) + ASTAR_ALT_STEP_M),
+      ],
     };
   };
   const bounds = boundsOf();
   // Эвристика цели: если цель уже достижима прямым сегментом — возвращаем её сразу.
   if (clear(from, to)) return [from, to];
   for (let iter = 0; iter < RRT_MAX_ITERATIONS; iter++) {
-    const useGoal = rnd() < RRT_GOAL_BIAS || dist3m(nodes[near(to)], to) < RRT_STEP_M * 2;
+    const useGoal =
+      rnd() < RRT_GOAL_BIAS || dist3m(nodes[near(to)], to) < RRT_STEP_M * 2;
     const sample: RouteNode3D = useGoal
       ? to
       : {
@@ -668,11 +840,15 @@ export function rrtPath(from: RouteNode3D, to: RouteNode3D, obstacles: Obstacle3
     if (!clear(nodes[idx], next)) continue;
     nodes.push(next);
     parents.push(idx);
-    if (dist3m(next, to) < RRT_STEP_M / 2 && clear(next, to)) {      nodes.push(to);
+    if (dist3m(next, to) < RRT_STEP_M / 2 && clear(next, to)) {
+      nodes.push(to);
       parents.push(nodes.length - 2);
       const path: RouteNode3D[] = [];
       let cur = nodes.length - 1;
-      while (cur >= 0) { path.unshift(nodes[cur]); cur = parents[cur]; }
+      while (cur >= 0) {
+        path.unshift(nodes[cur]);
+        cur = parents[cur];
+      }
       return path;
     }
   }
@@ -696,7 +872,13 @@ const CRC_EXTRA_MISSION_ITEM_INT = 154; // из MAVLink v2 message definitions
  *   string: стабильная строка без пробелов — вход для checksumMission.
  */
 export function missionChecksumContent(waypoints: RouteNode3D[]): string {
-  return JSON.stringify(waypoints.map((p) => [round7(p.lat), round7(p.lon), Math.round(p.altM * 10)]));
+  return JSON.stringify(
+    waypoints.map((p) => [
+      round7(p.lat),
+      round7(p.lon),
+      Math.round(p.altM * 10),
+    ]),
+  );
 }
 
 /** X.25/CRC-16 (полином 0x1021, init 0xFFFF) — как в MAVLink packet checksum. */
@@ -736,8 +918,11 @@ export function encodeMissionToMavlink(
   waypoints: RouteNode3D[],
   options: { systemId?: number; componentId?: number } = {},
 ): { bytes: Uint8Array; checksum: string; count: number } {
-  if (!waypoints.length) throw new ValidationError('Миссия пуста');
-  if (waypoints.length > 200) throw new ValidationError(`Слишком много точек: ${waypoints.length} (максимум 200)`);
+  if (!waypoints.length) throw new ValidationError("Миссия пуста");
+  if (waypoints.length > 200)
+    throw new ValidationError(
+      `Слишком много точек: ${waypoints.length} (максимум 200)`,
+    );
   const sysid = options.systemId ?? 1;
   const compid = options.componentId ?? 0;
   const packets: number[] = [];
@@ -747,19 +932,31 @@ export function encodeMissionToMavlink(
     const payload = new Uint8Array(25); // MISSION_ITEM_INT: 4+4+4+2+1+1+2+2+1+1+1+2 = 25 байт (wire-order)
     const dv = new DataView(payload.buffer);
     const holdMs = 0;
-    dv.setFloat32(0, 0, true);          // param1: hold time (float→uint32 wire slot)
+    dv.setFloat32(0, 0, true); // param1: hold time (float→uint32 wire slot)
     dv.setInt32(4, round7(wp.lat), true); // x: latitude int32 * 1e7
     dv.setInt32(8, round7(wp.lon), true); // y: longitude int32 * 1e7
-    dv.setFloat32(12, wp.altM, true);     // z: altitude (float32)
-    dv.setUint16(16, index, true);       // seq: номер путевой точки
+    dv.setFloat32(12, wp.altM, true); // z: altitude (float32)
+    dv.setUint16(16, index, true); // seq: номер путевой точки
     dv.setUint8(18, MAV_CMD_NAV_WAYPOINT);
     dv.setUint8(19, MAV_FRAME_GLOBAL_RELATIVE_ALT);
-    dv.setUint8(20, 1);                  // current: активная точка
-    dv.setUint8(21, 0);                  // autocontinue
-    dv.setUint16(22, holdMs, true);      // params_1-2 bitmask (в wire-order после байтов)
-    const header = [0xfd, payload.length, 0, 0, seq & 0xff, sysid, compid, 73, 0, 0];
+    dv.setUint8(20, 1); // current: активная точка
+    dv.setUint8(21, 0); // autocontinue
+    dv.setUint16(22, holdMs, true); // params_1-2 bitmask (в wire-order после байтов)
+    const header = [
+      0xfd,
+      payload.length,
+      0,
+      0,
+      seq & 0xff,
+      sysid,
+      compid,
+      73,
+      0,
+      0,
+    ];
     const body = [...header, ...payload];
-    const crc = (crc16X25(Uint8Array.from(body)) ^ CRC_EXTRA_MISSION_ITEM_INT) & 0xffff;
+    const crc =
+      (crc16X25(Uint8Array.from(body)) ^ CRC_EXTRA_MISSION_ITEM_INT) & 0xffff;
     packets.push(...body, crc & 0xff, crc >> 8);
     seq = (seq + 1) & 0xff;
   });
@@ -773,13 +970,17 @@ export function encodeMissionToMavlink(
 /** Hex-строка контрольной суммы содержимого миссии (CRC-16 X.25 по каноническому JSON). */
 export function missionChecksum(waypoints: RouteNode3D[]): string {
   const bytes = new TextEncoder().encode(missionChecksumContent(waypoints));
-  return crc16X25(bytes).toString(16).padStart(4, '0');
+  return crc16X25(bytes).toString(16).padStart(4, "0");
 }
 
 /** Результат «загрузки» миссии на контроллер (успех/ошибка связи/таймаут). */
 export type UploadResult =
   | { ok: true; checksum: string; bytes: number; count: number }
-  | { ok: false; error: 'timeout' | 'connection' | 'checksum_mismatch'; message: string };
+  | {
+      ok: false;
+      error: "timeout" | "connection" | "checksum_mismatch";
+      message: string;
+    };
 
 /**
  * Загрузка миссии в полётный контроллер с проверкой контрольной суммы.
@@ -799,16 +1000,39 @@ export async function uploadMission(
 ): Promise<UploadResult> {
   try {
     const enc = encodeMissionToMavlink(waypoints);
-    await withTimeout(Promise.resolve(send(enc.bytes)), DEFAULT_UPLOAD_TIMEOUT_MS, 'передача миссии');
-    const echo = await withTimeout(Promise.resolve(verify(enc.checksum)), DEFAULT_UPLOAD_TIMEOUT_MS, 'проверка чексуммы');
+    await withTimeout(
+      Promise.resolve(send(enc.bytes)),
+      DEFAULT_UPLOAD_TIMEOUT_MS,
+      "передача миссии",
+    );
+    const echo = await withTimeout(
+      Promise.resolve(verify(enc.checksum)),
+      DEFAULT_UPLOAD_TIMEOUT_MS,
+      "проверка чексуммы",
+    );
     if (!echo) {
-      return { ok: false, error: 'checksum_mismatch', message: `Контроллер подтвердил иную чексумму (ожидалась ${enc.checksum})` };
+      return {
+        ok: false,
+        error: "checksum_mismatch",
+        message: `Контроллер подтвердил иную чексумму (ожидалась ${enc.checksum})`,
+      };
     }
-    return { ok: true, checksum: enc.checksum, bytes: enc.bytes.byteLength, count: enc.count };
+    return {
+      ok: true,
+      checksum: enc.checksum,
+      bytes: enc.bytes.byteLength,
+      count: enc.count,
+    };
   } catch (e) {
-    if (e instanceof Error && e.name === 'TimeoutError') return { ok: false, error: 'timeout', message: e.message };
-    if (e instanceof Error && e.name === 'ConnectionError') return { ok: false, error: 'connection', message: e.message };
-    return { ok: false, error: 'connection', message: e instanceof Error ? e.message : String(e) };
+    if (e instanceof Error && e.name === "TimeoutError")
+      return { ok: false, error: "timeout", message: e.message };
+    if (e instanceof Error && e.name === "ConnectionError")
+      return { ok: false, error: "connection", message: e.message };
+    return {
+      ok: false,
+      error: "connection",
+      message: e instanceof Error ? e.message : String(e),
+    };
   }
 }
 
@@ -826,27 +1050,46 @@ export async function uploadMission(
 export async function downloadMission(
   receive: () => RouteNode3D[] | Promise<RouteNode3D[]>,
   expectedChecksum: string,
-): Promise<{ ok: true; waypoints: RouteNode3D[]; checksum: string } | { ok: false; error: 'checksum_mismatch' | 'connection'; message: string }> {
+): Promise<
+  | { ok: true; waypoints: RouteNode3D[]; checksum: string }
+  | { ok: false; error: "checksum_mismatch" | "connection"; message: string }
+> {
   try {
-    const wps = await withTimeout(Promise.resolve(receive()), DEFAULT_UPLOAD_TIMEOUT_MS, 'чтение миссии');
+    const wps = await withTimeout(
+      Promise.resolve(receive()),
+      DEFAULT_UPLOAD_TIMEOUT_MS,
+      "чтение миссии",
+    );
     const cs = missionChecksum(wps);
     if (cs !== expectedChecksum) {
-      return { ok: false, error: 'checksum_mismatch', message: `Чексумма борта ${cs} ≠ локальной ${expectedChecksum}` };
+      return {
+        ok: false,
+        error: "checksum_mismatch",
+        message: `Чексумма борта ${cs} ≠ локальной ${expectedChecksum}`,
+      };
     }
     return { ok: true, waypoints: wps, checksum: cs };
   } catch (e) {
-    return { ok: false, error: 'connection', message: e instanceof Error ? e.message : String(e) };
+    return {
+      ok: false,
+      error: "connection",
+      message: e instanceof Error ? e.message : String(e),
+    };
   }
 }
 
 const DEFAULT_UPLOAD_TIMEOUT_MS = 10000;
 
-async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+async function withTimeout<T>(
+  p: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout>;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       const err = new Error(`Таймаут (${ms} мс): ${label}`);
-      err.name = 'TimeoutError';
+      err.name = "TimeoutError";
       reject(err);
     }, ms);
   });
@@ -859,14 +1102,16 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise
 
 /** Есть ли у полигона самопересекающиеся стороны. */
 function segmentsIntersect(poly: Point[]): boolean {
-  const ccw = (a: Point, b: Point, c: Point) => (c.y - a.y) * (b.x - a.x) - (b.y - a.y) * (c.x - a.x);
+  const ccw = (a: Point, b: Point, c: Point) =>
+    (c.y - a.y) * (b.x - a.x) - (b.y - a.y) * (c.x - a.x);
   const inter = (p1: Point, p2: Point, p3: Point, p4: Point) =>
     ccw(p3, p1, p2) !== ccw(p4, p1, p2) && ccw(p1, p3, p4) !== ccw(p1, p2, p4);
   const n = poly.length;
   for (let i = 0; i < n; i++) {
     for (let j = i + 2; j < n; j++) {
       if (i === 0 && j === n - 1) continue; // соседние стороны замкнутого полигона
-      if (inter(poly[i], poly[(i + 1) % n], poly[j], poly[(j + 1) % n])) return true;
+      if (inter(poly[i], poly[(i + 1) % n], poly[j], poly[(j + 1) % n]))
+        return true;
     }
   }
   return false;
@@ -874,8 +1119,11 @@ function segmentsIntersect(poly: Point[]): boolean {
 
 // ===== Совместимость с ЭТАПАМИ 1–3 (militerminology): tactical-алиасы для waypoint-API =====
 export type TacticalNodeParamKey = WaypointParamKey;
-export interface TacticalNodeParams extends WaypointParams {}
-export const DEFAULT_TACTICAL_NODE_PARAMS: TacticalNodeParams = DEFAULT_WAYPOINT_PARAMS;
-export function sanitizeTacticalNodeParams(raw?: Partial<TacticalNodeParams> | null): TacticalNodeParams {
+export type TacticalNodeParams = WaypointParams;
+export const DEFAULT_TACTICAL_NODE_PARAMS: TacticalNodeParams =
+  DEFAULT_WAYPOINT_PARAMS;
+export function sanitizeTacticalNodeParams(
+  raw?: Partial<TacticalNodeParams> | null,
+): TacticalNodeParams {
   return sanitizeWaypointParams(raw);
 }
