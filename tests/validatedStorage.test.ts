@@ -21,15 +21,15 @@ describe("validatedStorage — целостность на границе Zustan
   it("REGRESSION: битый JSON в хранилище → null (чистый старт) + событие storage:error, НЕ throw", async () => {
     const spy = vi.fn();
     eventBus.on("storage:error", spy);
-    localStorage.setItem("tq-test-broken", JSON.stringify({ state: {} }));
-    // подменим сырое значение на невалидный JSON напрямую
-    Storage.prototype.getItem = () => "{garbage!!";
-    const store = createValidatedStorage<Shape>("tq-test-broken", Schema);
-    await expect(store.getItem("tq-test-broken")).resolves.toBeNull();
-    expect(spy).toHaveBeenCalled();
-    // восстанавливаем prototype для остальных тестов
-    delete (Storage.prototype as unknown as { getItem?: unknown }).getItem;
-    eventBus.off("storage:error", spy);
+    // Пишем невалидный JSON через прямой setItem — safeGetItem вернёт его как есть.
+    localStorage.setItem("tq-test-broken", "{garbage!!");
+    try {
+      const store = createValidatedStorage<Shape>("tq-test-broken", Schema);
+      await expect(store.getItem("tq-test-broken")).resolves.toBeNull();
+      expect(spy).toHaveBeenCalled();
+    } finally {
+      eventBus.off("storage:error", spy);
+    }
   });
 
   it("REGRESSION: недоступный localStorage (SecurityError) → null без throw", async () => {

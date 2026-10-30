@@ -21,15 +21,6 @@ const FORMATS: { id: ExportFormat; label: string; desc: string }[] = [
   { id: "kml", label: "KML", desc: "Google Earth" },
 ];
 
-/** Превью контента будущего файла (первые maxLines строк полного экспорта). */
-export function buildPreview(
-  format: ExportFormat,
-  s: ReturnType<typeof useMissionWizardStore.getState>,
-  maxLines = 20,
-): string {
-  return buildFullFilePreview(format, s, maxLines);
-}
-
 export function ExportPreparationStep() {
   const s = useMissionWizardStore();
   const [previewFormat, setPreviewFormat] = useState<ExportFormat>(
@@ -71,7 +62,7 @@ export function ExportPreparationStep() {
   );
 
   const preview = useMemo(
-    () => buildPreview(previewFormat, s),
+    () => buildFullFilePreview(previewFormat, s),
     [previewFormat, s],
   );
   const hasCriticalErrors = checklist.some((c) => !c.ok);

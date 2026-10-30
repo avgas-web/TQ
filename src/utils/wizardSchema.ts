@@ -165,17 +165,15 @@ const enumOrDefault =
  *  enum-поля защищены z.preprocess: неизвестное значение → дефолт, а не ошибка.
  *  Счётчик dropCounters заполняется во время parse/preprocess и используется
  *  санитайзером для формирования warnings об отброшенных элементах. */
-const ARRAY_SECTION_KEYS = [
-  "completedSteps",
-  "selectedMaps",
-  "startPoints",
-  "targetPoints",
-  "fleetGroups",
-  "noFlyZones",
-  "calculatedRoutes",
-  "altitudeProfiles",
-] as const;
-type ArraySectionKey = (typeof ARRAY_SECTION_KEYS)[number];
+type ArraySectionKey =
+  | "completedSteps"
+  | "selectedMaps"
+  | "startPoints"
+  | "targetPoints"
+  | "fleetGroups"
+  | "noFlyZones"
+  | "calculatedRoutes"
+  | "altitudeProfiles";
 
 export interface WizardParseOptions {
   /** Опциональный выход: сколько битых элементов отброшено по каждой секции. */
