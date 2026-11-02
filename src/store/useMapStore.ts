@@ -38,7 +38,7 @@ import {
   getMapParsersTransport,
   lastWorkerNotice,
 } from "../hooks/useMapParsersWorker";
-import { mercatorYToLat, calculateBoundsFromCenter } from "../utils/googleMaps";
+import { calculateBoundsFromCenter } from "../utils/googleMaps";
 import { sanitizeProjectData } from "../utils/projectSchema";
 // ФАЗА 4.2 (аудит): безопасный persist-storage (quota-spill + storage:error)
 import { createSafeStorage } from "../utils/safeStorage";

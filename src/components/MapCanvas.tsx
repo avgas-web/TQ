@@ -15,29 +15,22 @@ import {
   distanceBetween,
 } from "../utils/geometry";
 import { pixelToGeoFromBounds } from "../utils/googleMaps";
-import {
-  haversineDistanceM,
-  bearingDeg,
-  boundsFromPoints,
-} from "../utils/actionMode";
+import { haversineDistanceM } from "../utils/actionMode";
 import {
   pixelToGeoExact,
   geoToPixelExact,
   routeLengthM,
   zonesCrossedBy,
-  planPathAroundZones,
   smoothPolyline,
 } from "../utils/routing";
 import {
   getOSMTileUrl,
   startTileLoad,
   abortTileImage,
-  loadTileWithMirrors,
   normalizeTileServer,
   TILE_PROVIDERS,
   onTileError,
   getTileErrorCount,
-  type TileStyle,
   type TileLoadHandle,
   type TileServerId,
 } from "../utils/openStreetMap";
@@ -46,7 +39,6 @@ import { ensureDefaultTileMap } from "../hooks/useAppInitialization";
 import MiniMapPanel, {
   MiniOverlayLine,
   MiniOverlayPoint,
-  type MiniZone,
 } from "./MiniMapPanel";
 import { zoomForGroundMpp, GROUND_MPP_1CM_2KM } from "../utils/pannelli";
 import {
@@ -150,7 +142,6 @@ const SPB_GEO_CONST = { lat: 59.9398, lng: 30.3146 };
 function spbFallbackView(canvasH: number): ViewState {
   const zoom = clampZoom(DEFAULT_TILE_MAP_ZOOM);
   const worldPx = Math.max(256, canvasH * Math.pow(2, zoom));
-  const fx = (SPB_GEO_CONST.lng + 180) / 360;
   const fy = latToMerc(SPB_GEO_CONST.lat);
   return {
     scale: worldPx / (canvasH * Math.pow(2, ZOOM_REF)),
@@ -1045,7 +1036,6 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   const tilesEnabled =
     !!project.settings?.tilesEnabled && !!project.map?.bounds;
   // Только стандартная схема OSM (режимы «спутник/гибрид» удалены из приложения)
-  const tileStyle: TileStyle = "scheme";
   // ЕДИНАЯ инвариантная привязка вида (см. комментарий над worldPxOf):
   //   zoom = z0 + log2(scale),  worldPx = canvasHeight · 2^zoom.
   const effZ0 = vs.z0 ?? ZOOM_REF;
@@ -1053,9 +1043,6 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   // НЕПРЕРЫВНЫЙ зум как на openstreetmap.org: тайлы берутся с целочисленного
   // уровня round(zoom), но рисуются в масштабе 2^(zoom-level) — плавное
   // масштабирование без «прыжков» между уровнями.
-  const contZoom = clampZoom(zoomAtWorldPx(worldPx));
-
-  const boundsRef = project.map?.bounds;
 
   // ─── DOM-слой подложки OSM («как на openstreetmap.org») ────────────────────
   // Подложка — настоящие <img>-тайлы внутри абсолютно спозиционированного div
@@ -1463,7 +1450,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   const [droneCount, setDroneCount] = useState(4);
   const [sharedGoal, setSharedGoal] = useState(true);
   // Общий старт для всего роя (по умолчанию) — либо индивидуальные старты дронов
-  const [sharedStart, setSharedStart] = useState(true);
+  const [sharedStart] = useState(true);
   const [activeUav, setActiveUav] = useState(0);
   const [startGeo, setStartGeo] = useState<{ lat: number; lng: number } | null>(
     null,
@@ -1613,15 +1600,6 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       }));
   }, [tripleMode, project.routes, project.map]);
 
-  // Все гео-точки миссии (маршруты проекта + старт + цель) — для PNG-экспорта
-  const tripleAllGeoPts = React.useMemo(() => {
-    const out: { lat: number; lng: number }[] = [];
-    for (const r of tripleRoutes) out.push(...r.geo);
-    if (startGeo) out.push(startGeo);
-    if (goalGeo) out.push(goalGeo);
-    return out;
-  }, [tripleRoutes, startGeo, goalGeo]);
-
   // ─── Пошаговый мастер: старт → маршрут → цель → ЗАПУСК ──────────────────────
   // step: 0 = выбор старта (панель СТАРТ сфокусирована), 1 = редактирование
   // маршрута (панель ВЕСЬ МАРШРУТ), 2 = выбор цели (панель ЦЕЛЬ),
@@ -1681,7 +1659,6 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tripleStep, approvedSteps]);
 
-  const focusPanelIdx = tripleStep === 3 ? -1 : tripleStep;
   // Зоны ограничения, поставленные на ЛЮБОЙ из трёх карт (в т.ч. неактивной),
   // ждут утверждения — рисуем кандидатов-полигоны во всех окнах с id для удаления.
   const pendingZoneMini = pendingZones.map((pz) => ({
@@ -2215,57 +2192,6 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       ],
     });
   }, [launchState, canvasSize]);
-
-  // Перенос гео-объектов проекта (маршруты/маркеры/зоны) в виртуальный растр
-  // новой активной карты при включении режима — иначе объекты останутся в
-  // пикселях старого растра и будут вне bounds («карты пустые»).
-  const remapProjectToRaster = useCallback(() => {
-    const st = readProjectView();
-    const map = st.map;
-    if (!map?.bounds || map.width <= 0 || map.height <= 0) return;
-    const b = map.bounds;
-    const routes = (st.routes || []).map((r) => ({
-      ...r,
-      points: r.points.map((p) => ({
-        ...p,
-        ...geoToPixelExact(p.lat, p.lng, b, map.width, map.height),
-      })),
-    }));
-    const markers = st.markers.map((m) =>
-      m.lat != null && m.lon != null
-        ? { ...m, ...geoToPixelExact(m.lat, m.lon, b, map.width, map.height) }
-        : m,
-    );
-    const restrictions = st.restrictions.map((r) => {
-      if (r.points.length === 0) return r;
-      const geoPts = r.points.map((p) =>
-        pixelToGeoExact(p, b, map.width, map.height),
-      );
-      const pts = geoPts.map((g) =>
-        geoToPixelExact(g.lat, g.lng, b, map.width, map.height),
-      );
-      let radius = r.radius;
-      if (r.type === "circle" && r.radius) {
-        const cLat = geoPts[0].lat;
-        const dM =
-          r.radius *
-          metersPerPixelFromWorld(256 * Math.pow(2, ZOOM_REF + 10), cLat); // приблизительный перенос в метрах
-        const edge = { lat: cLat + dM / 111320, lng: geoPts[0].lng };
-        const pe = geoToPixelExact(
-          edge.lat,
-          edge.lng,
-          b,
-          map.width,
-          map.height,
-        );
-        radius = Math.hypot(pe.x - pts[0].x, pe.y - pts[0].y);
-      }
-      return { ...r, points: pts, radius };
-    });
-    useStore.setState((cur) => ({
-      project: { ...cur.project, routes, markers, restrictions },
-    }));
-  }, []);
 
   // Инициализация тайловой карты при старте приложения (режим трёх окон всегда включён):
   // если активной тайловой карты нет — создаём под текущий центр вида.
@@ -5245,12 +5171,6 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     if (r && r.geo.length > 0) return r.geo[r.geo.length - 1];
     return goalGeo;
   };
-  // Стартовая точка i-го дрона: общая (весь рой взлетает с одной точки) или
-  // индивидуальная (задана кликом по окну «Старт», когда общий старт выключен).
-  const startForUav = (i: number): { lat: number; lng: number } | null => {
-    if (sharedStart) return startGeo;
-    return droneStarts[i] ?? startGeo;
-  };
   // Изначальная фокусировка всех окон карты — Санкт-Петербург. Ключевой источник
   // данных окна: старт/цель — их точка (пока не задана — СПб); маршрут — точки
   // маршрута (проект + черновик; пока пусто — СПб). Только ЭТОТ источник участвует
@@ -5346,7 +5266,6 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
           .filter(Boolean) as MiniOverlayPoint[])
       : []),
   ];
-  const panelH = 260;
 
   return (
     // ФИКС «Не удалось определить размер контейнера карты» в режиме мастера:

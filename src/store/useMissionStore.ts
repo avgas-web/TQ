@@ -597,7 +597,6 @@ function rerouteAllRoutesNow(): void {
     const w = getRoutingWorker();
     if (w) {
       let pending = heavy.length;
-      let anyOk = false;
       // Пока есть незавершённые worker-обходы, троттлер не должен отменять
       // уже запланированную перестройку (см. scheduleRerouteAll).
       workerReroutePending = true;
@@ -610,7 +609,6 @@ function rerouteAllRoutesNow(): void {
           map.height,
         ).then((path) => {
           if (path && path.length >= 2) {
-            anyOk = true;
             useMissionStore.setState((cur) => ({
               routes: cur.routes.map((r) => {
                 if (r.id !== h.routeId) return r;

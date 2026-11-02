@@ -1,33 +1,55 @@
-import React, { useState, useRef } from 'react';
-import { useStore } from '../store/useStore';
-import { loadGoogleMapsApi, geocodeAddress, loadStaticMap, isGoogleMapsLoaded } from '../utils/googleMaps';
-import { loadYandexMapsApi, yandexGeocode, loadYandexStaticMap, isYandexMapsLoaded } from '../utils/yandexMaps';
-import { osmGeocode } from '../utils/openStreetMap';
-import { TILE_PROVIDERS, TILE_SERVER_ORDER, DEFAULT_TILE_SERVER, normalizeTileServer } from '../utils/openStreetMap';
-import type { TileServerId } from '../utils/openStreetMap';
-import type { MapProvider } from '../types';
+import React, { useState, useRef } from "react";
+import { useStore } from "../store/useStore";
+import {
+  loadGoogleMapsApi,
+  geocodeAddress,
+  loadStaticMap,
+  isGoogleMapsLoaded,
+} from "../utils/googleMaps";
+import {
+  loadYandexMapsApi,
+  yandexGeocode,
+  loadYandexStaticMap,
+  isYandexMapsLoaded,
+} from "../utils/yandexMaps";
+import { osmGeocode } from "../utils/openStreetMap";
+import {
+  TILE_PROVIDERS,
+  TILE_SERVER_ORDER,
+  DEFAULT_TILE_SERVER,
+  normalizeTileServer,
+} from "../utils/openStreetMap";
+import type { TileServerId } from "../utils/openStreetMap";
+import type { MapProvider } from "../types";
 // ЭТАП 1.2: защищённый masked-input + сессионный стор ключей
-import ApiKeyMaskedInput from './ApiKeyMaskedInput';
-import { useApiKeysStore, getEffectiveApiKey, type MapsProviderId } from '../store/useApiKeysStore';
+import ApiKeyMaskedInput from "./ApiKeyMaskedInput";
+import {
+  getEffectiveApiKey,
+  type MapsProviderId,
+} from "../store/useApiKeysStore";
 
 const MapsPanel: React.FC = () => {
-  const [activeProvider, setActiveProvider] = useState<MapProvider>('google');
-  const [addressInput, setAddressInput] = useState('');
-  const [zoomInput, setZoomInput] = useState('15');
-  const [googleMapType, setGoogleMapType] = useState<'roadmap' | 'satellite' | 'hybrid' | 'terrain'>('satellite');
-  const [yandexMapType, setYandexMapType] = useState<'map' | 'satellite' | 'hybrid'>('satellite');
+  const [activeProvider, setActiveProvider] = useState<MapProvider>("google");
+  const [addressInput, setAddressInput] = useState("");
+  const [zoomInput, setZoomInput] = useState("15");
+  const [googleMapType, setGoogleMapType] = useState<
+    "roadmap" | "satellite" | "hybrid" | "terrain"
+  >("satellite");
+  const [yandexMapType, setYandexMapType] = useState<
+    "map" | "satellite" | "hybrid"
+  >("satellite");
   // Стиль подложки — рабочий провайдер без API-ключей (реестр TILE_PROVIDERS,
   // аудит audit/index.fixed.html): tile.openstreetmap.org и CartoDB УДАЛЕНЫ
   // (403 по Referer для github.io / требование ключа соответственно).
-  const [osmTileServer, setOsmTileServer] = useState<TileServerId>(DEFAULT_TILE_SERVER);
-  const [widthInput, setWidthInput] = useState('2048');
-  const [heightInput, setHeightInput] = useState('2048');
+  const [osmTileServer, setOsmTileServer] =
+    useState<TileServerId>(DEFAULT_TILE_SERVER);
+  const [widthInput, setWidthInput] = useState("2048");
+  const [heightInput, setHeightInput] = useState("2048");
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [success, setSuccess] = useState('');
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
   // Счётчик фоновых снимков: результат применяется только если это всё ещё
   // последний запрос (защита от гонки при быстром двойном нажатии)
-  const loadSeqRef = useRef(0);
 
   const {
     project,
@@ -52,71 +74,89 @@ const MapsPanel: React.FC = () => {
   // Колбэк подтверждения из ApiKeyMaskedInput: ключ уже лежит в сессионном
   // сторе; здесь — загрузка SDK и включение провайдера. Секрет НИКОГДА не
   // пишется в persist-стор (setXxxMapsApiKey — deprecated-проксия, не трогаем).
-  const handleCommitGoogleKey = async (_provider: MapsProviderId, key: string): Promise<void> => {
-    setLoading(true); setError(''); setSuccess('');
+  const handleCommitGoogleKey = async (
+    _provider: MapsProviderId,
+    key: string,
+  ): Promise<void> => {
+    setLoading(true);
+    setError("");
+    setSuccess("");
     try {
       await loadGoogleMapsApi(key);
       toggleGoogleMaps(true);
-      setSuccess('Google Maps активирован (ключ — только в памяти сессии)');
+      setSuccess("Google Maps активирован (ключ — только в памяти сессии)");
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Ошибка загрузки Google Maps');
+      setError(
+        err instanceof Error ? err.message : "Ошибка загрузки Google Maps",
+      );
     } finally {
       setLoading(false);
     }
   };
 
-  const handleCommitYandexKey = async (_provider: MapsProviderId, key: string): Promise<void> => {
-    setLoading(true); setError(''); setSuccess('');
+  const handleCommitYandexKey = async (
+    _provider: MapsProviderId,
+    key: string,
+  ): Promise<void> => {
+    setLoading(true);
+    setError("");
+    setSuccess("");
     try {
       await loadYandexMapsApi(key);
       toggleYandexMaps(true);
-      setSuccess('Яндекс.Карты активированы (ключ — только в памяти сессии)');
+      setSuccess("Яндекс.Карты активированы (ключ — только в памяти сессии)");
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Ошибка загрузки Яндекс.Карт');
+      setError(
+        err instanceof Error ? err.message : "Ошибка загрузки Яндекс.Карт",
+      );
     } finally {
       setLoading(false);
     }
   };
 
-
-
   const handleGeocode = async () => {
     if (!addressInput.trim()) {
-      setError('Введите адрес');
+      setError("Введите адрес");
       return;
     }
 
     setLoading(true);
-    setError('');
-    setSuccess('');
+    setError("");
+    setSuccess("");
 
     try {
       let result: { lat: number; lng: number } | null = null;
 
-      if (activeProvider === 'google' && isGoogleMapsLoaded()) {
+      if (activeProvider === "google" && isGoogleMapsLoaded()) {
         result = await geocodeAddress(addressInput);
-      } else if (activeProvider === 'yandex' && isYandexMapsLoaded()) {
+      } else if (activeProvider === "yandex" && isYandexMapsLoaded()) {
         result = await yandexGeocode(addressInput);
-      } else if (activeProvider === 'osm') {
+      } else if (activeProvider === "osm") {
         // Тот же бесплатный геокодер (Nominatim + fallback Photon).
         const res = await osmGeocode(addressInput);
         result = res.point;
         if (!result) {
-          setError(res.kind === 'not_found' ? 'Адрес не найден' : 'Сервис геокодирования недоступен. Попробуйте ещё раз.');
+          setError(
+            res.kind === "not_found"
+              ? "Адрес не найден"
+              : "Сервис геокодирования недоступен. Попробуйте ещё раз.",
+          );
         }
       } else {
-        setError('Провайдер не инициализирован');
+        setError("Провайдер не инициализирован");
         setLoading(false);
         return;
       }
 
       if (result) {
-        setSuccess(`Координаты: ${result.lat.toFixed(6)}, ${result.lng.toFixed(6)}`);
-      } else if (activeProvider !== 'osm') {
-        setError('Адрес не найден');
+        setSuccess(
+          `Координаты: ${result.lat.toFixed(6)}, ${result.lng.toFixed(6)}`,
+        );
+      } else if (activeProvider !== "osm") {
+        setError("Адрес не найден");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Ошибка геокодирования');
+      setError(err instanceof Error ? err.message : "Ошибка геокодирования");
     } finally {
       setLoading(false);
     }
@@ -124,18 +164,19 @@ const MapsPanel: React.FC = () => {
 
   const handleLoadMap = async () => {
     if (!addressInput.trim()) {
-      setError('Введите адрес или координаты');
+      setError("Введите адрес или координаты");
       return;
     }
 
     setLoading(true);
-    setError('');
-    setSuccess('');
+    setError("");
+    setSuccess("");
 
     try {
       // Валидация размеров: без лимитов Google Static Maps вернёт ошибку размера,
       // Яндекс — 400, а OSM-конструктор соберёт тысячи тайлов (память/canvas-лимиты).
-      const clampSize = (v: number, d: number) => Math.min(4096, Math.max(256, Number.isFinite(v) ? v : d));
+      const clampSize = (v: number, d: number) =>
+        Math.min(4096, Math.max(256, Number.isFinite(v) ? v : d));
       const width = clampSize(parseInt(widthInput), 2048);
       const height = clampSize(parseInt(heightInput), 2048);
       const zoom = Math.min(21, Math.max(1, parseInt(zoomInput) || 15));
@@ -143,16 +184,16 @@ const MapsPanel: React.FC = () => {
       let geoResult: { lat: number; lng: number } | null = null;
       let mapResult: { dataUrl: string; bounds: any } | undefined;
 
-      if (activeProvider === 'google') {
+      if (activeProvider === "google") {
         if (!isGoogleMapsLoaded()) {
-          setError('Google Maps API не загружен');
+          setError("Google Maps API не загружен");
           setLoading(false);
           return;
         }
 
         geoResult = await geocodeAddress(addressInput);
         if (!geoResult) {
-          setError('Адрес не найден');
+          setError("Адрес не найден");
           setLoading(false);
           return;
         }
@@ -163,8 +204,8 @@ const MapsPanel: React.FC = () => {
           width,
           height,
           // ЭТАП 1.2: ключ — только из сессионного стора/env, никогда из persist-проекта
-          getEffectiveApiKey('google'),
-          googleMapType
+          getEffectiveApiKey("google"),
+          googleMapType,
         );
 
         await loadMapWithStorage({
@@ -173,18 +214,18 @@ const MapsPanel: React.FC = () => {
           height,
           dataUrl: mapResult.dataUrl,
           bounds: mapResult.bounds,
-          source: 'google',
+          source: "google",
         });
-      } else if (activeProvider === 'yandex') {
+      } else if (activeProvider === "yandex") {
         if (!isYandexMapsLoaded()) {
-          setError('Яндекс.Карты API не загружен');
+          setError("Яндекс.Карты API не загружен");
           setLoading(false);
           return;
         }
 
         geoResult = await yandexGeocode(addressInput);
         if (!geoResult) {
-          setError('Адрес не найден');
+          setError("Адрес не найден");
           setLoading(false);
           return;
         }
@@ -195,8 +236,8 @@ const MapsPanel: React.FC = () => {
           width,
           height,
           // ЭТАП 1.2: ключ — только из сессионного стора/env, никогда из persist-проекта
-          getEffectiveApiKey('yandex'),
-          yandexMapType
+          getEffectiveApiKey("yandex"),
+          yandexMapType,
         );
 
         await loadMapWithStorage({
@@ -205,9 +246,9 @@ const MapsPanel: React.FC = () => {
           height,
           dataUrl: mapResult.dataUrl,
           bounds: mapResult.bounds,
-          source: 'yandex',
+          source: "yandex",
         });
-      } else if (activeProvider === 'osm') {
+      } else if (activeProvider === "osm") {
         // «2ГИС» УДАЛЁН ПОЛНОСТЬЮ (ТЗ): вкладки и ветки загрузки больше нет —
         // выбор карт ограничен рабочими провайдерами (Google/Яндекс по ключу,
         // бесплатные XYZ-подложки без ключей).
@@ -219,7 +260,11 @@ const MapsPanel: React.FC = () => {
         const geoRes = await osmGeocode(addressInput);
         geoResult = geoRes.point;
         if (!geoResult) {
-          setError(geoRes.kind === 'not_found' ? 'Адрес не найден.' : 'Сервис геокодирования временно недоступен. Попробуйте ещё раз.');
+          setError(
+            geoRes.kind === "not_found"
+              ? "Адрес не найден."
+              : "Сервис геокодирования временно недоступен. Попробуйте ещё раз.",
+          );
           setLoading(false);
           return;
         }
@@ -230,7 +275,7 @@ const MapsPanel: React.FC = () => {
         // сохранений нормализует normalizeTileServer()).
         useStore.setState((cur) => ({
           project: cur.project.map
-            ? { ...cur.project, map: { ...cur.project.map, source: 'osm' } }
+            ? { ...cur.project, map: { ...cur.project.map, source: "osm" } }
             : cur.project,
         }));
 
@@ -241,7 +286,9 @@ const MapsPanel: React.FC = () => {
 
         // Привязка уже установлена loadActiveTileMap (точная Mercator); setMapBounds
         // здесь не нужен — иначе стёр бы bounds до прихода фонового снимка.
-        setSuccess('Карта открыта (как на openstreetmap.org): доступен зум и панорама, привязка к координатам строгая.');
+        setSuccess(
+          "Карта открыта (как на openstreetmap.org): доступен зум и панорама, привязка к координатам строгая.",
+        );
         return;
       }
 
@@ -250,21 +297,38 @@ const MapsPanel: React.FC = () => {
       // с non-null assertion.
       if (mapResult) {
         setMapBounds(mapResult.bounds);
-        setSuccess('Карта успешно загружена!');
+        setSuccess("Карта успешно загружена!");
       } else {
-        setError(`Провайдер «${activeProvider}» не поддерживает загрузку статической карты`);
+        setError(
+          `Провайдер «${activeProvider}» не поддерживает загрузку статической карты`,
+        );
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Ошибка загрузки карты');
+      setError(err instanceof Error ? err.message : "Ошибка загрузки карты");
     } finally {
       setLoading(false);
     }
   };
 
   const providers = [
-    { id: 'google' as MapProvider, name: 'Google', icon: '🌍', enabled: project.googleMaps?.enabled },
-    { id: 'yandex' as MapProvider, name: 'Яндекс', icon: '🗺️', enabled: project.yandexMaps?.enabled },
-    { id: 'osm' as MapProvider, name: 'OSM', icon: '🌐', enabled: project.openStreetMap?.enabled },
+    {
+      id: "google" as MapProvider,
+      name: "Google",
+      icon: "🌍",
+      enabled: project.googleMaps?.enabled,
+    },
+    {
+      id: "yandex" as MapProvider,
+      name: "Яндекс",
+      icon: "🗺️",
+      enabled: project.yandexMaps?.enabled,
+    },
+    {
+      id: "osm" as MapProvider,
+      name: "OSM",
+      icon: "🌐",
+      enabled: project.openStreetMap?.enabled,
+    },
     // «2ГИС» УДАЛЁН ПОЛНОСТЬЮ (ТЗ: выбор карт без 2ГИС) — пункт C аудита.
   ];
 
@@ -274,18 +338,18 @@ const MapsPanel: React.FC = () => {
 
       {/* Provider tabs */}
       <div className="flex gap-1">
-        {providers.map(provider => (
+        {providers.map((provider) => (
           <button
             key={provider.id}
             onClick={() => {
               setActiveProvider(provider.id);
-              setError('');
-              setSuccess('');
+              setError("");
+              setSuccess("");
             }}
             className={`flex-1 px-2 py-1.5 rounded text-xs font-medium transition-colors ${
               activeProvider === provider.id
-                ? 'bg-cyan-600 text-white'
-                : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+                ? "bg-cyan-600 text-white"
+                : "bg-gray-700 hover:bg-gray-600 text-gray-300"
             }`}
           >
             {provider.icon} {provider.name}
@@ -295,7 +359,7 @@ const MapsPanel: React.FC = () => {
       </div>
 
       {/* API Key section */}
-      {activeProvider === 'google' && (
+      {activeProvider === "google" && (
         <ApiKeyMaskedInput
           provider="google"
           label="API ключ Google Maps"
@@ -304,7 +368,7 @@ const MapsPanel: React.FC = () => {
         />
       )}
 
-      {activeProvider === 'yandex' && (
+      {activeProvider === "yandex" && (
         <ApiKeyMaskedInput
           provider="yandex"
           label="API ключ Яндекс.Карт"
@@ -313,9 +377,14 @@ const MapsPanel: React.FC = () => {
         />
       )}
 
-      {activeProvider === 'osm' && (
+      {activeProvider === "osm" && (
         <div>
-          <label className="text-xs text-gray-400 block mb-1" htmlFor="osm-tile-server">Сервер тайлов (рабочие, без ключей)</label>
+          <label
+            className="text-xs text-gray-400 block mb-1"
+            htmlFor="osm-tile-server"
+          >
+            Сервер тайлов (рабочие, без ключей)
+          </label>
           <select
             id="osm-tile-server"
             aria-label="Сервер тайлов подложки карты"
@@ -328,16 +397,23 @@ const MapsPanel: React.FC = () => {
             className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white"
           >
             {TILE_SERVER_ORDER.map((id) => (
-              <option key={id} value={id}>{TILE_PROVIDERS[id].label}</option>
+              <option key={id} value={id}>
+                {TILE_PROVIDERS[id].label}
+              </option>
             ))}
           </select>
-          <p className="text-xs text-green-400 mt-2">✓ Все стили работают по HTTPS без API-ключей; стиль по умолчанию — Esri (самый стабильный)</p>
+          <p className="text-xs text-green-400 mt-2">
+            ✓ Все стили работают по HTTPS без API-ключей; стиль по умолчанию —
+            Esri (самый стабильный)
+          </p>
         </div>
       )}
 
       {/* Address input */}
       <div>
-        <label className="text-xs text-gray-400 block mb-1">Адрес или координаты</label>
+        <label className="text-xs text-gray-400 block mb-1">
+          Адрес или координаты
+        </label>
         <div className="flex gap-1">
           <input
             type="text"
@@ -351,7 +427,7 @@ const MapsPanel: React.FC = () => {
             disabled={loading}
             className="px-3 py-1 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 text-white rounded text-xs"
           >
-            {loading ? '...' : '🔍'}
+            {loading ? "..." : "🔍"}
           </button>
         </div>
       </div>
@@ -371,7 +447,7 @@ const MapsPanel: React.FC = () => {
         </div>
         <div>
           <label className="text-xs text-gray-400 block mb-1">Тип карты</label>
-          {activeProvider === 'google' && (
+          {activeProvider === "google" && (
             <select
               value={googleMapType}
               onChange={(e) => setGoogleMapType(e.target.value as any)}
@@ -383,7 +459,7 @@ const MapsPanel: React.FC = () => {
               <option value="terrain">Рельеф</option>
             </select>
           )}
-          {activeProvider === 'yandex' && (
+          {activeProvider === "yandex" && (
             <select
               value={yandexMapType}
               onChange={(e) => setYandexMapType(e.target.value as any)}
@@ -394,7 +470,7 @@ const MapsPanel: React.FC = () => {
               <option value="hybrid">Гибрид</option>
             </select>
           )}
-          {activeProvider === 'osm' && (
+          {activeProvider === "osm" && (
             <select
               aria-label="Стиль подложки карты"
               value={osmTileServer}
@@ -406,13 +482,17 @@ const MapsPanel: React.FC = () => {
               className="w-full px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-white"
             >
               {TILE_SERVER_ORDER.map((id) => (
-                <option key={id} value={id}>{TILE_PROVIDERS[id].label}</option>
+                <option key={id} value={id}>
+                  {TILE_PROVIDERS[id].label}
+                </option>
               ))}
             </select>
           )}
         </div>
         <div>
-          <label className="text-xs text-gray-400 block mb-1">Ширина (px)</label>
+          <label className="text-xs text-gray-400 block mb-1">
+            Ширина (px)
+          </label>
           <input
             type="number"
             value={widthInput}
@@ -421,7 +501,9 @@ const MapsPanel: React.FC = () => {
           />
         </div>
         <div>
-          <label className="text-xs text-gray-400 block mb-1">Высота (px)</label>
+          <label className="text-xs text-gray-400 block mb-1">
+            Высота (px)
+          </label>
           <input
             type="number"
             value={heightInput}
@@ -434,10 +516,16 @@ const MapsPanel: React.FC = () => {
       {/* Load map button */}
       <button
         onClick={handleLoadMap}
-        disabled={loading || (activeProvider !== 'osm' && !providers.find(p => p.id === activeProvider)?.enabled)}
+        disabled={
+          loading ||
+          (activeProvider !== "osm" &&
+            !providers.find((p) => p.id === activeProvider)?.enabled)
+        }
         className="w-full px-3 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 text-white rounded text-sm font-medium"
       >
-        {loading ? 'Загрузка...' : `🗺️ Загрузить карту ${providers.find(p => p.id === activeProvider)?.name}`}
+        {loading
+          ? "Загрузка..."
+          : `🗺️ Загрузить карту ${providers.find((p) => p.id === activeProvider)?.name}`}
       </button>
 
       {/* Status messages */}
@@ -455,26 +543,54 @@ const MapsPanel: React.FC = () => {
       {/* Info */}
       <div className="p-2 bg-gray-700 rounded text-xs text-gray-400">
         <p className="font-medium text-gray-300 mb-1">ℹ️ Информация:</p>
-        {activeProvider === 'google' && (
+        {activeProvider === "google" && (
           <div className="space-y-0.5">
-            <p>• Получите ключ на <a href="https://console.cloud.google.com/" target="_blank" rel="noopener" className="text-cyan-400 hover:underline">Google Cloud</a></p>
+            <p>
+              • Получите ключ на{" "}
+              <a
+                href="https://console.cloud.google.com/"
+                target="_blank"
+                rel="noopener"
+                className="text-cyan-400 hover:underline"
+              >
+                Google Cloud
+              </a>
+            </p>
             <p>• Включите: Maps JavaScript API, Geocoding API</p>
             <p>• Ключ хранится локально</p>
           </div>
         )}
-        {activeProvider === 'yandex' && (
+        {activeProvider === "yandex" && (
           <div className="space-y-0.5">
-            <p>• Получите ключ на <a href="https://developer.tech.yandex.ru/" target="_blank" rel="noopener" className="text-cyan-400 hover:underline">Яндекс.Карты API</a></p>
+            <p>
+              • Получите ключ на{" "}
+              <a
+                href="https://developer.tech.yandex.ru/"
+                target="_blank"
+                rel="noopener"
+                className="text-cyan-400 hover:underline"
+              >
+                Яндекс.Карты API
+              </a>
+            </p>
             <p>• Бесплатный тариф: 25 000 запросов/день</p>
             <p>• Ключ хранится локально</p>
           </div>
         )}
-        {activeProvider === 'osm' && (
+        {activeProvider === "osm" && (
           <div className="space-y-0.5">
             <p>• Не требует API ключа</p>
-            <p>• Esri Street — стиль по умолчанию (самый стабильный на GitHub Pages)</p>
-            <p>• OSM France / Germany, OpenTopoMap, CyclOSM — рабочие зеркала без 403</p>
-            <p>• Геокодер: Nominatim с фоллбэком при недоступности (1 запрос/сек)</p>
+            <p>
+              • Esri Street — стиль по умолчанию (самый стабильный на GitHub
+              Pages)
+            </p>
+            <p>
+              • OSM France / Germany, OpenTopoMap, CyclOSM — рабочие зеркала без
+              403
+            </p>
+            <p>
+              • Геокодер: Nominatim с фоллбэком при недоступности (1 запрос/сек)
+            </p>
             <p>• Уважайте правила использования серверов тайлов</p>
           </div>
         )}

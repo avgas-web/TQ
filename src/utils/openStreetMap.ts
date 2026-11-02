@@ -1,5 +1,5 @@
 // Утилиты для работы с OpenStreetMap
-import { calculateBoundsFromCenter, latToMercatorY } from './googleMaps';
+import { calculateBoundsFromCenter, latToMercatorY } from "./googleMaps";
 
 /* ============================================================
    ТАЙЛОВЫЕ СЕРВЕРЫ — по аудиту audit/index.fixed.html:
@@ -13,13 +13,13 @@ import { calculateBoundsFromCenter, latToMercatorY } from './googleMaps';
    ============================================================ */
 
 export type TileServerId =
-  | 'esri'          // Esri World Street Map — самый стабильный, стиль по умолчанию
-  | 'esri-sat'      // Esri World Imagery (спутник)
-  | 'osmfr'         // OSM France (стандартная схема)
-  | 'hot'           // OSM France (гуманитарный HOT)
-  | 'osmde'         // OSM Germany
-  | 'opentopomap'   // OpenTopoMap (топографический)
-  | 'cyclosm';      // CyclOSM (велосипедный)
+  | "esri" // Esri World Street Map — самый стабильный, стиль по умолчанию
+  | "esri-sat" // Esri World Imagery (спутник)
+  | "osmfr" // OSM France (стандартная схема)
+  | "hot" // OSM France (гуманитарный HOT)
+  | "osmde" // OSM Germany
+  | "opentopomap" // OpenTopoMap (топографический)
+  | "cyclosm"; // CyclOSM (велосипедный)
 
 export interface TileProviderInfo {
   /** Человекочитаемое название стиля (для UI) */
@@ -32,24 +32,67 @@ export interface TileProviderInfo {
   attribution: string;
 }
 
-const OSM_ATTR = '© OpenStreetMap contributors';
+const OSM_ATTR = "© OpenStreetMap contributors";
 
 /** Реестр рабочих провайдеров — единственный источник истины (main). */
 export const TILE_PROVIDERS: Record<TileServerId, TileProviderInfo> = {
-  esri:        { label: 'Esri — улицы (стабильный)', maxNativeZoom: 19, maxZoom: 19, attribution: 'Tiles © Esri' },
-  'esri-sat':  { label: 'Esri — спутник',            maxNativeZoom: 19, maxZoom: 19, attribution: 'Tiles © Esri' },
-  osmfr:       { label: 'OSM France (стандарт)',     maxNativeZoom: 19, maxZoom: 19, attribution: `${OSM_ATTR} | OSM France` },
-  hot:         { label: 'OSM France (гуманитарный)', maxNativeZoom: 19, maxZoom: 19, attribution: `${OSM_ATTR} | HOT France` },
-  osmde:       { label: 'OSM Germany',               maxNativeZoom: 17, maxZoom: 18, attribution: `${OSM_ATTR} | OSM Germany` },
-  opentopomap: { label: 'OpenTopoMap',               maxNativeZoom: 17, maxZoom: 17, attribution: `${OSM_ATTR} | OpenTopoMap (CC-BY-SA)` },
-  cyclosm:     { label: 'CyclOSM',                   maxNativeZoom: 19, maxZoom: 20, attribution: `${OSM_ATTR} | CyclOSM` },
+  esri: {
+    label: "Esri — улицы (стабильный)",
+    maxNativeZoom: 19,
+    maxZoom: 19,
+    attribution: "Tiles © Esri",
+  },
+  "esri-sat": {
+    label: "Esri — спутник",
+    maxNativeZoom: 19,
+    maxZoom: 19,
+    attribution: "Tiles © Esri",
+  },
+  osmfr: {
+    label: "OSM France (стандарт)",
+    maxNativeZoom: 19,
+    maxZoom: 19,
+    attribution: `${OSM_ATTR} | OSM France`,
+  },
+  hot: {
+    label: "OSM France (гуманитарный)",
+    maxNativeZoom: 19,
+    maxZoom: 19,
+    attribution: `${OSM_ATTR} | HOT France`,
+  },
+  osmde: {
+    label: "OSM Germany",
+    maxNativeZoom: 17,
+    maxZoom: 18,
+    attribution: `${OSM_ATTR} | OSM Germany`,
+  },
+  opentopomap: {
+    label: "OpenTopoMap",
+    maxNativeZoom: 17,
+    maxZoom: 17,
+    attribution: `${OSM_ATTR} | OpenTopoMap (CC-BY-SA)`,
+  },
+  cyclosm: {
+    label: "CyclOSM",
+    maxNativeZoom: 19,
+    maxZoom: 20,
+    attribution: `${OSM_ATTR} | CyclOSM`,
+  },
 };
 
 /** Порядок стилей в выпадающих списках UI */
-export const TILE_SERVER_ORDER: TileServerId[] = ['esri', 'esri-sat', 'osmfr', 'hot', 'osmde', 'opentopomap', 'cyclosm'];
+export const TILE_SERVER_ORDER: TileServerId[] = [
+  "esri",
+  "esri-sat",
+  "osmfr",
+  "hot",
+  "osmde",
+  "opentopomap",
+  "cyclosm",
+];
 
 /** Стиль подложки по умолчанию — Esri World Street Map (пункт B аудита) */
-export const DEFAULT_TILE_SERVER: TileServerId = 'esri';
+export const DEFAULT_TILE_SERVER: TileServerId = "esri";
 
 /** Нормализация значения из стора/импорта/старых сохранений → рабочий провайдер.
  *  Legacy-значения ('osm', 'carto') маппятся на совместимые рабочие серверы:
@@ -59,54 +102,77 @@ export const DEFAULT_TILE_SERVER: TileServerId = 'esri';
  *  2ГИС закрыт (tile-b01.2gis.com не резолвится) — старые сохранения с этим
  *  значением нормализуются в Esri Streets (он и рендерился вместо него). */
 export function normalizeTileServer(v: unknown): TileServerId {
-  if (typeof v === 'string') {
+  if (typeof v === "string") {
     const s = v.trim().toLowerCase();
     if (s in TILE_PROVIDERS) return s as TileServerId;
-    if (s === 'carto') return 'osmfr';
+    if (s === "carto") return "osmfr";
     // Алиасы спутника из ЭТАПА 1 (регистронезависимо, с пробелами по краям)
-    if (s === 'satellite' || s === 'imagery' || s === 'esri-sat') return 'esri-sat';
+    if (s === "satellite" || s === "imagery" || s === "esri-sat")
+      return "esri-sat";
   }
   return DEFAULT_TILE_SERVER; // 'osm', '2gis' и всё неизвестное → Esri Streets
 }
 
 /** Зеркала-фоллбэки для Esri (при недоступности одного хоста). */
 const ESRI_MIRRORS = [
-  'https://server.arcgisonline.com',
-  'https://services.arcgisonline.com',
+  "https://server.arcgisonline.com",
+  "https://services.arcgisonline.com",
 ];
 
 /** URL тайла для любого рабочего провайдера (без нормализации зума вызывающим кодом). */
-function tileUrlFor(server: TileServerId, z: number, x: number, y: number): string {
+function tileUrlFor(
+  server: TileServerId,
+  z: number,
+  x: number,
+  y: number,
+): string {
   switch (server) {
-    case 'esri':        return esriUrl(ESRI_MIRRORS[0], 'World_Street_Map', z, x, y);
-    case 'esri-sat':    return esriUrl(ESRI_MIRRORS[0], 'World_Imagery', z, x, y);
-    case 'osmfr':       return `https://a.tile.openstreetmap.fr/osmfr/${z}/${x}/${y}.png`;
-    case 'hot':         return `https://a.tile.openstreetmap.fr/hot/${z}/${x}/${y}.png`;
-    case 'osmde':       return `https://tile.openstreetmap.de/${z}/${x}/${y}.png`;
-    case 'opentopomap': return `https://a.tile.opentopomap.org/${z}/${x}/${y}.png`;
-    case 'cyclosm':     return `https://a.tile-cyclosm.openstreetmap.fr/cyclosm/${z}/${x}/${y}.png`;
-    default:            return esriUrl(ESRI_MIRRORS[0], 'World_Street_Map', z, x, y);
+    case "esri":
+      return esriUrl(ESRI_MIRRORS[0], "World_Street_Map", z, x, y);
+    case "esri-sat":
+      return esriUrl(ESRI_MIRRORS[0], "World_Imagery", z, x, y);
+    case "osmfr":
+      return `https://a.tile.openstreetmap.fr/osmfr/${z}/${x}/${y}.png`;
+    case "hot":
+      return `https://a.tile.openstreetmap.fr/hot/${z}/${x}/${y}.png`;
+    case "osmde":
+      return `https://tile.openstreetmap.de/${z}/${x}/${y}.png`;
+    case "opentopomap":
+      return `https://a.tile.opentopomap.org/${z}/${x}/${y}.png`;
+    case "cyclosm":
+      return `https://a.tile-cyclosm.openstreetmap.fr/cyclosm/${z}/${x}/${y}.png`;
+    default:
+      return esriUrl(ESRI_MIRRORS[0], "World_Street_Map", z, x, y);
   }
 }
 
 /** Шаблон тайла Esri World Imagery (спутник) — экспорт для тестов привязки стилей. */
-export const ESRI_SAT_TEMPLATE = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+export const ESRI_SAT_TEMPLATE =
+  "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}";
 
 /** URL тайла для Esri-провайдеров с перебором зеркал */
-function esriUrl(host: string, service: string, z: number, x: number, y: number): string {
+function esriUrl(
+  host: string,
+  service: string,
+  z: number,
+  x: number,
+  y: number,
+): string {
   return `${host}/ArcGIS/rest/services/${service}/MapServer/tile/${z}/${y}/${x}`; // у Esri порядок z/y/x
 }
 
 /** Все варианты URL одного тайла (зеркала) — пустой массив, если сервер не Esri */
 export function getTileUrlVariants(
-  zoom: number, x: number, y: number,
+  zoom: number,
+  x: number,
+  y: number,
   tileServer: TileServerId = DEFAULT_TILE_SERVER,
 ): string[] {
   const z = Math.min(Math.max(Math.round(zoom), 0), 19);
-  if (tileServer === 'esri')
-    return ESRI_MIRRORS.map((h) => esriUrl(h, 'World_Street_Map', z, x, y));
-  if (tileServer === 'esri-sat')
-    return ESRI_MIRRORS.map((h) => esriUrl(h, 'World_Imagery', z, x, y));
+  if (tileServer === "esri")
+    return ESRI_MIRRORS.map((h) => esriUrl(h, "World_Street_Map", z, x, y));
+  if (tileServer === "esri-sat")
+    return ESRI_MIRRORS.map((h) => esriUrl(h, "World_Imagery", z, x, y));
   return [];
 }
 
@@ -114,13 +180,17 @@ export function getTileUrlVariants(
  *  Отдача выше maxNativeZoom («как Leaflet»: ближайший нативный уровень + растяжение)
  *  остаётся на стороне вызывающего кода. */
 export function getTileUrlVariantsFor(
-  server: TileServerId | 'osm' | 'carto',
-  zoom: number, x: number, y: number,
+  server: TileServerId | "osm" | "carto",
+  zoom: number,
+  x: number,
+  y: number,
 ): string[] {
   const s = normalizeTileServer(server);
   const z = Math.min(Math.max(Math.round(zoom), 0), 19);
-  if (s === 'esri') return ESRI_MIRRORS.map((h) => esriUrl(h, 'World_Street_Map', z, x, y));
-  if (s === 'esri-sat') return ESRI_MIRRORS.map((h) => esriUrl(h, 'World_Imagery', z, x, y));
+  if (s === "esri")
+    return ESRI_MIRRORS.map((h) => esriUrl(h, "World_Street_Map", z, x, y));
+  if (s === "esri-sat")
+    return ESRI_MIRRORS.map((h) => esriUrl(h, "World_Imagery", z, x, y));
   return [tileUrlFor(s, z, x, y)];
 }
 
@@ -163,9 +233,9 @@ export function initOpenStreetMap(): Promise<void> {
 // он идёт ПОСЛЕДНИМ: сначала независимые зеркала. Если все инстансы упали —
 // включается fallback на Photon (см. osmGeocode).
 const NOMINATIM_HOSTS = [
-  'https://nominatim.openstreetmap.fr', // independent OSM-France instance
-  'https://nominatim.othercodefor.com', // independent Code for America instance
-  'https://nominatim.openstreetmap.org', // основной — в конце (самый блокируемый)
+  "https://nominatim.openstreetmap.fr", // independent OSM-France instance
+  "https://nominatim.othercodefor.com", // independent Code for America instance
+  "https://nominatim.openstreetmap.org", // основной — в конце (самый блокируемый)
 ];
 
 // Кэш живых хостов: упавшие по сети/таймауту исключаются из ротации на 5 минут,
@@ -191,10 +261,12 @@ function reserveNominatimSlot(): Promise<void> {
   const when = Math.max(now, lastNominatimAt + 1000);
   lastNominatimAt = when;
   const wait = when - now;
-  return wait > 0 ? new Promise((res) => setTimeout(res, wait)) : Promise.resolve();
+  return wait > 0
+    ? new Promise((res) => setTimeout(res, wait))
+    : Promise.resolve();
 }
 
-export type NominatimErrorKind = 'network' | 'http';
+export type NominatimErrorKind = "network" | "http";
 
 /**
  * Запрос к Nominatim с перебором зеркал, таймаутом и одним повтором.
@@ -211,18 +283,21 @@ async function fetchNominatimJson(
   path: string,
   params: string,
   outerSignal?: AbortSignal,
-): Promise<{ data: any[] | any | null; kind: 'ok' | 'not_found' | NominatimErrorKind }> {
+): Promise<{
+  data: any[] | any | null;
+  kind: "ok" | "not_found" | NominatimErrorKind;
+}> {
   let sawHttpError = false;
   for (let round = 0; round < 2; round++) {
     for (let i = 0; i < NOMINATIM_HOSTS.length; i++) {
-      if (outerSignal?.aborted) return { data: null, kind: 'network' };
+      if (outerSignal?.aborted) return { data: null, kind: "network" };
       const host = NOMINATIM_HOSTS[i];
       if (isHostDead(host)) continue; // известное мёртвое зеркало — не ждём таймаута
       await reserveNominatimSlot();
-      if (outerSignal?.aborted) return { data: null, kind: 'network' };
+      if (outerSignal?.aborted) return { data: null, kind: "network" };
       const ctrl = new AbortController();
       const abortOuter = () => ctrl.abort();
-      outerSignal?.addEventListener('abort', abortOuter);
+      outerSignal?.addEventListener("abort", abortOuter);
       const timer = setTimeout(() => ctrl.abort(), 8000);
       try {
         const response = await fetch(`${host}${path}?format=json&${params}`, {
@@ -240,17 +315,20 @@ async function fetchNominatimJson(
         // 'not_found' немедленно, без перебора зеркал; 429/5xx по-прежнему
         // считаются сервисной ошибкой ('http') и приводят к ретраям.
         if (response.status === 404 || response.status === 400) {
-          return { data: null, kind: 'not_found' };
+          return { data: null, kind: "not_found" };
         }
-        if (!response.ok) return { data: null, kind: 'http' };
+        if (!response.ok) return { data: null, kind: "http" };
         const json = await response.json();
         hostHealth.delete(host); // хост жив — снимаем метку, если была
-        return { data: json, kind: Array.isArray(json) && json.length === 0 ? 'not_found' : 'ok' };
+        return {
+          data: json,
+          kind: Array.isArray(json) && json.length === 0 ? "not_found" : "ok",
+        };
       } catch {
         hostHealth.set(host, Date.now() + DEAD_HOST_TTL_MS); // сеть/таймаут — временно исключаем
       } finally {
         clearTimeout(timer);
-        outerSignal?.removeEventListener('abort', abortOuter);
+        outerSignal?.removeEventListener("abort", abortOuter);
       }
     }
     // после первого раунда — короткая пауза перед повтором (разрешаем retry даже
@@ -260,13 +338,13 @@ async function fetchNominatimJson(
       await new Promise((res) => setTimeout(res, 500));
     }
   }
-  return { data: null, kind: sawHttpError ? 'http' : 'network' };
+  return { data: null, kind: sawHttpError ? "http" : "network" };
 }
 
 export interface OsmGeocodeResult {
   point: { lat: number; lng: number } | null;
   /** 'ok' — успех; 'not_found' — адрес не найден; 'network'/'http' — сервисная ошибка */
-  kind: 'ok' | 'not_found' | NominatimErrorKind;
+  kind: "ok" | "not_found" | NominatimErrorKind;
 }
 
 /** Экспорт для юнит-тестов (регрессия аудита 1.4): различение 404/5xx без сети */
@@ -279,11 +357,14 @@ export const __test_fetchNominatimJson = fetchNominatimJson;
  * Возвращает первую точку GeoJSON или null. Ошибки глотаются (вызывающий код сам
  * решает, что показывать пользователю).
  */
-async function fetchPhotonPoint(query: string, outerSignal?: AbortSignal): Promise<{ lat: number; lng: number } | null> {
+async function fetchPhotonPoint(
+  query: string,
+  outerSignal?: AbortSignal,
+): Promise<{ lat: number; lng: number } | null> {
   if (outerSignal?.aborted) return null;
   const ctrl = new AbortController();
   const abortOuter = () => ctrl.abort();
-  outerSignal?.addEventListener('abort', abortOuter);
+  outerSignal?.addEventListener("abort", abortOuter);
   // По аудиту: таймаут 8 секунд.
   const timer = setTimeout(() => ctrl.abort(), 8000);
   try {
@@ -291,7 +372,7 @@ async function fetchPhotonPoint(query: string, outerSignal?: AbortSignal): Promi
     // supported. Supported are: default, de, en, fr» — проверено живым запросом).
     // Поэтому параметр lang не передаём вовсе: сервер отдаёт результаты на языке
     // страны поиска (для русскоязычных адресов — кириллицу), что нам и нужно.
-    const url = `https://photon.komoot.io/api/?${new URLSearchParams({ q: query, limit: '1' })}`;
+    const url = `https://photon.komoot.io/api/?${new URLSearchParams({ q: query, limit: "1" })}`;
     const response = await fetch(url, { signal: ctrl.signal });
     if (!response.ok) return null;
     const json: any = await response.json();
@@ -305,7 +386,7 @@ async function fetchPhotonPoint(query: string, outerSignal?: AbortSignal): Promi
     return null; // сеть/таймаут/отмена — считаем «резервный тоже недоступен»
   } finally {
     clearTimeout(timer);
-    outerSignal?.removeEventListener('abort', abortOuter);
+    outerSignal?.removeEventListener("abort", abortOuter);
   }
 }
 
@@ -317,37 +398,49 @@ async function fetchPhotonPoint(query: string, outerSignal?: AbortSignal): Promi
  * триггерит (адрес реально отсутствует, а сервис жив).
  * Возвращает различимый статус, чтобы UI не смешивал «не найдено» и «сервис недоступен».
  */
-export async function osmGeocode(address: string, signal?: AbortSignal): Promise<OsmGeocodeResult> {
+export async function osmGeocode(
+  address: string,
+  signal?: AbortSignal,
+): Promise<OsmGeocodeResult> {
   const { data, kind } = await fetchNominatimJson(
-    '/search',
+    "/search",
     `q=${encodeURIComponent(address)}&limit=1`,
     signal,
   );
-  if (kind === 'ok') {
+  if (kind === "ok") {
     const first = Array.isArray(data) ? data[0] : null;
     const lat = first ? parseFloat(first.lat) : NaN;
     const lng = first ? parseFloat(first.lon) : NaN;
-    if (!isFinite(lat) || !isFinite(lng)) return { point: null, kind: 'not_found' };
-    return { point: { lat, lng }, kind: 'ok' };
+    if (!isFinite(lat) || !isFinite(lng))
+      return { point: null, kind: "not_found" };
+    return { point: { lat, lng }, kind: "ok" };
   }
-  if (kind === 'not_found') return { point: null, kind: 'not_found' };
+  if (kind === "not_found") return { point: null, kind: "not_found" };
   // Сервисная ошибка (network/http) — fallback на Photon.
   const photon = await fetchPhotonPoint(address, signal);
-  if (photon) return { point: photon, kind: 'ok' };
+  if (photon) return { point: photon, kind: "ok" };
   return { point: null, kind };
 }
 
 /**
  * Обратное геокодирование через Nominatim (OSM)
  */
-export async function osmReverseGeocode(lat: number, lng: number, signal?: AbortSignal): Promise<string | null> {
-  const { data, kind } = await fetchNominatimJson('/reverse', `lat=${lat}&lon=${lng}`, signal);
-  if (kind !== 'ok') return null;
-  if (data && typeof data.display_name === 'string') return data.display_name;
+export async function osmReverseGeocode(
+  lat: number,
+  lng: number,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const { data, kind } = await fetchNominatimJson(
+    "/reverse",
+    `lat=${lat}&lon=${lng}`,
+    signal,
+  );
+  if (kind !== "ok") return null;
+  if (data && typeof data.display_name === "string") return data.display_name;
   return null;
 }
 
-export type TileStyle = 'scheme' | 'satellite' | 'hybrid';
+export type TileStyle = "scheme" | "satellite" | "hybrid";
 
 /**
  * Получение URL тайла для выбранного рабочего провайдера (все — HTTPS, без ключей).
@@ -362,8 +455,8 @@ export function getOSMTileUrl(
   zoom: number,
   x: number,
   y: number,
-  tileServer: TileServerId | 'osm' | 'carto' = DEFAULT_TILE_SERVER,
-  style: TileStyle = 'scheme'
+  tileServer: TileServerId | "osm" | "carto" = DEFAULT_TILE_SERVER,
+  style: TileStyle = "scheme",
 ): string {
   // Аудит audit/index.fixed.html: tile.openstreetmap.org и Carto УДАЛЕНЫ как URL
   // (403 по Referer для github.io / требование API-ключа). Все значения нормализуются
@@ -376,9 +469,12 @@ export function getOSMTileUrl(
   // через `void style`, и спутниковые стили молча отдавали вектурную подложку.
   // Теперь style='satellite'|'hybrid' (как и явный сервер 'esri-sat') жёстко
   // маршрутизируется на провайдер Esri World Imagery (без ключа, HTTPS).
-  if (style === 'satellite' || style === 'hybrid') {
-    const zSat = Math.min(Math.max(Math.round(zoom), 0), TILE_PROVIDERS['esri-sat'].maxNativeZoom);
-    return esriUrl(ESRI_MIRRORS[0], 'World_Imagery', zSat, x, y);
+  if (style === "satellite" || style === "hybrid") {
+    const zSat = Math.min(
+      Math.max(Math.round(zoom), 0),
+      TILE_PROVIDERS["esri-sat"].maxNativeZoom,
+    );
+    return esriUrl(ESRI_MIRRORS[0], "World_Imagery", zSat, x, y);
   }
   const server: TileServerId = normalizeTileServer(tileServer);
   // Нативный максимум берётся из реестра провайдеров — выше не поднимаемся
@@ -396,15 +492,19 @@ export function getOSMTileUrl(
  */
 export function abortTileImage(img: HTMLImageElement): void {
   const maybeAbort = (img as { abort?: () => void }).abort;
-  if (typeof maybeAbort === 'function') {
-    try { maybeAbort.call(img); } catch { /* движок отклонил отмену */ }
+  if (typeof maybeAbort === "function") {
+    try {
+      maybeAbort.call(img);
+    } catch {
+      /* движок отклонил отмену */
+    }
   }
   // removeAttribute — метод DOM-элемента; в моках/старых движках может отсутствовать,
   // поэтому сброс src выполняется защищённо (тот же эффект отмены загрузки).
-  if (typeof img.removeAttribute === 'function') {
-    img.removeAttribute('src');
+  if (typeof img.removeAttribute === "function") {
+    img.removeAttribute("src");
   } else {
-    img.src = '';
+    img.src = "";
   }
 }
 
@@ -438,7 +538,10 @@ export interface CancellableTileLoad {
   promise: Promise<HTMLImageElement | null>;
   cancel: () => void;
 }
-export function loadTileImageCancellable(url: string, timeoutMs = 8000): CancellableTileLoad {
+export function loadTileImageCancellable(
+  url: string,
+  timeoutMs = 8000,
+): CancellableTileLoad {
   const handle = startTileLoad(url, timeoutMs);
   return { promise: handle.done, cancel: () => handle.cancel() };
 }
@@ -452,11 +555,16 @@ export function loadTileImageCancellable(url: string, timeoutMs = 8000): Cancell
  */
 export function startTileLoad(url: string, timeoutMs = 8000): TileLoadHandle {
   const img = new Image();
-  img.crossOrigin = 'anonymous';
+  img.crossOrigin = "anonymous";
   let settled = false;
   let resolveFn: ((v: HTMLImageElement | null) => void) | null = null;
-  const done = new Promise<HTMLImageElement | null>((res) => { resolveFn = res; });
-  const timer: ReturnType<typeof setTimeout> = setTimeout(() => finish(false), timeoutMs);
+  const done = new Promise<HTMLImageElement | null>((res) => {
+    resolveFn = res;
+  });
+  const timer: ReturnType<typeof setTimeout> = setTimeout(
+    () => finish(false),
+    timeoutMs,
+  );
   function finish(ok: boolean): void {
     if (settled) return;
     settled = true;
@@ -482,20 +590,36 @@ export function startTileLoad(url: string, timeoutMs = 8000): TileLoadHandle {
   // в тестах с моками без onload/onerror — бесконечно). Settled-флаг делает такую
   // гонку безвредной: отменённая ручка никогда не запускает загрузку.
   if (settled) {
-    return { image: img, cancel(): void { finish(false); }, done };
+    return {
+      image: img,
+      cancel(): void {
+        finish(false);
+      },
+      done,
+    };
   }
   img.src = url;
-  return { image: img, cancel(): void { finish(false); }, done };
+  return {
+    image: img,
+    cancel(): void {
+      finish(false);
+    },
+    done,
+  };
 }
 
 /** Обратная совместимость: обёртка над startTileLoad для существующих вызовов. */
-export async function loadTileImage(url: string, timeoutMs = 8000): Promise<HTMLImageElement | null> {
+export async function loadTileImage(
+  url: string,
+  timeoutMs = 8000,
+): Promise<HTMLImageElement | null> {
   // P0-исправление wip-local: загрузка через ручку startTileLoad (гарантированная
   // отмена img.abort() по таймауту, settled-флаг) + учёт ошибок/успехов аудита
   // (noteTileError/noteTileSuccess → индикатор состояния слоя в MapCanvas).
   const handle = startTileLoad(url, timeoutMs);
   handle.done.then((img) => {
-    if (img) noteTileSuccess(); else noteTileError(url);
+    if (img) noteTileSuccess();
+    else noteTileError(url);
     return img;
   });
   return handle.done;
@@ -509,25 +633,41 @@ export async function loadTileImage(url: string, timeoutMs = 8000): Promise<HTML
 let tileErrorCount = 0;
 const tileErrorListeners = new Set<(n: number) => void>();
 
-export function getTileErrorCount(): number { return tileErrorCount; }
+export function getTileErrorCount(): number {
+  return tileErrorCount;
+}
 
 export function onTileError(cb: (n: number) => void): () => void {
   tileErrorListeners.add(cb);
-  return () => { tileErrorListeners.delete(cb); };
+  return () => {
+    tileErrorListeners.delete(cb);
+  };
 }
 
 function noteTileError(url: string): void {
   tileErrorCount++;
-  tileErrorListeners.forEach((cb) => { try { cb(tileErrorCount); } catch { /* слушатель не должен ломать загрузку */ } });
+  tileErrorListeners.forEach((cb) => {
+    try {
+      cb(tileErrorCount);
+    } catch {
+      /* слушатель не должен ломать загрузку */
+    }
+  });
   // Единичные ошибки внешних серверов — штатная ситуация: только console.warn,
   // без console.error (не засоряем консоль и не пугаем пользователя).
-  if (tileErrorCount <= 5) console.warn('Не удалось загрузить тайл:', url);
+  if (tileErrorCount <= 5) console.warn("Не удалось загрузить тайл:", url);
 }
 
 function noteTileSuccess(): void {
   if (tileErrorCount !== 0) {
     tileErrorCount = 0; // авто-возврат в состояние «ок» после первой удачи
-    tileErrorListeners.forEach((cb) => { try { cb(0); } catch { /* noop */ } });
+    tileErrorListeners.forEach((cb) => {
+      try {
+        cb(0);
+      } catch {
+        /* noop */
+      }
+    });
   }
 }
 
@@ -536,7 +676,10 @@ function noteTileSuccess(): void {
  * (основной хост иногда отдаёт 5xx под нагрузкой). Для URL других провайдеров —
  * обычная загрузка. Зеркала tile.openstreetmap.org УДАЛЕНЫ (403 по Referer).
  */
-export async function loadTileWithMirrors(url: string, timeoutMs = 8000): Promise<HTMLImageElement | null> {
+export async function loadTileWithMirrors(
+  url: string,
+  timeoutMs = 8000,
+): Promise<HTMLImageElement | null> {
   const m = url.match(/^https:\/\/(server|services)\.arcgisonline\.com\/(.+)$/);
   if (!m) return loadTileImage(url, timeoutMs);
   for (const host of ESRI_MIRRORS) {
@@ -552,11 +695,17 @@ export async function loadTileWithMirrors(url: string, timeoutMs = 8000): Promis
 export function latLngToTile(
   lat: number,
   lng: number,
-  zoom: number
+  zoom: number,
 ): { x: number; y: number } {
   const x = Math.floor(((lng + 180) / 360) * Math.pow(2, zoom));
   const y = Math.floor(
-    (1 - Math.log(Math.tan((lat * Math.PI) / 180) + 1 / Math.cos((lat * Math.PI) / 180)) / Math.PI) / 2 * Math.pow(2, zoom)
+    ((1 -
+      Math.log(
+        Math.tan((lat * Math.PI) / 180) + 1 / Math.cos((lat * Math.PI) / 180),
+      ) /
+        Math.PI) /
+      2) *
+      Math.pow(2, zoom),
   );
   return { x, y };
 }
@@ -567,7 +716,7 @@ export function latLngToTile(
 export function tileToLatLng(
   x: number,
   y: number,
-  zoom: number
+  zoom: number,
 ): { lat: number; lng: number } {
   const n = Math.pow(2, zoom);
   const lng = (x / n) * 360 - 180;
@@ -584,16 +733,20 @@ export async function loadOSMStaticMap(
   zoom: number,
   width: number,
   height: number,
-  tileServer: TileServerId | 'osm' | 'carto' = DEFAULT_TILE_SERVER
-): Promise<{ dataUrl: string; bounds: { north: number; south: number; east: number; west: number } }> {
-  console.log(`Загрузка карты OSM: сервер=${tileServer}, центр=(${center.lat}, ${center.lng}), зум=${zoom}, размер=${width}x${height}`);
-  
+  tileServer: TileServerId | "osm" | "carto" = DEFAULT_TILE_SERVER,
+): Promise<{
+  dataUrl: string;
+  bounds: { north: number; south: number; east: number; west: number };
+}> {
+  console.log(
+    `Загрузка карты OSM: сервер=${tileServer}, центр=(${center.lat}, ${center.lng}), зум=${zoom}, размер=${width}x${height}`,
+  );
+
   // Вычисляем границы (приблизительные — для совместимости сигнатуры)
   // === ТОЧНАЯ Mercator-привязка снимка к географии (исправление «сбившегося масштаба») ===
   // Снимок покрывает ровно окно обзора: world px на данном зуме = 256*2^z, из них
   // по X видно width px => долготный размах симметричен центру; по Y — через Mercator.
   const zClamped = Math.min(Math.max(Math.round(zoom), 1), 19);
-  const worldPxZ = 256 * Math.pow(2, zClamped);
   // Единая Mercator-формула с calculateBoundsFromCenter (googleMaps.ts): раньше
   // здесь был независимый расчёт через tileToLatLng — из-за этого привязка
   // снимка расходилась с живой подложкой MapCanvas (баг «сбившийся масштаб»).
@@ -607,17 +760,17 @@ export async function loadOSMStaticMap(
   const yMinWorld = latToMercatorY(north) * nTiles;
 
   // Создаем canvas и рисуем тайлы
-  const canvas = document.createElement('canvas');
+  const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext("2d");
 
   if (!ctx) {
-    throw new Error('Не удалось создать canvas');
+    throw new Error("Не удалось создать canvas");
   }
 
   // Заполняем фон
-  ctx.fillStyle = '#f2efe9';
+  ctx.fillStyle = "#f2efe9";
   ctx.fillRect(0, 0, width, height);
 
   const tilesX = Math.ceil(width / 256) + 1;
@@ -638,9 +791,9 @@ export async function loadOSMStaticMap(
       ctx.drawImage(img, pixelX, pixelY, 256, 256);
       loadedCount++;
     } else {
-      ctx.fillStyle = '#cccccc';
+      ctx.fillStyle = "#cccccc";
       ctx.fillRect(pixelX, pixelY, 256, 256);
-      ctx.strokeStyle = '#999999';
+      ctx.strokeStyle = "#999999";
       ctx.lineWidth = 1;
       ctx.strokeRect(pixelX, pixelY, 256, 256);
     }
@@ -651,43 +804,46 @@ export async function loadOSMStaticMap(
     for (let dx = 0; dx < tilesX; dx++) {
       const tileX = startTileX + dx;
       const tileY = startTileY + dy;
-      if (tileX < 0 || tileY < 0 || tileX >= nTiles || tileY >= nTiles) continue;
+      if (tileX < 0 || tileY < 0 || tileX >= nTiles || tileY >= nTiles)
+        continue;
       const base = getOSMTileUrl(zClamped, tileX, tileY, tileServer);
       jobs.push(
         withTileSlot(async () => {
           const img = await loadTileWithMirrors(base);
           drawTileAt(img, dx, dy);
-        })
+        }),
       );
     }
   }
   await Promise.all(jobs);
 
-  console.log(`Загружено ${loadedCount}/${jobs.length} тайлов для сервера ${tileServer}`);
+  console.log(
+    `Загружено ${loadedCount}/${jobs.length} тайлов для сервера ${tileServer}`,
+  );
 
   // Смещение больше не нужно: тайлы нарисованы точно под окно обзора. Старый
   // расчёт offsetX=(width-tilesX*256)/2 смещал снимок до половины тайла —
   // из-за этого привязка координат и масштаб «съезжали».
   const offsetX = 0;
   const offsetY = 0;
-  
+
   if (offsetX !== 0 || offsetY !== 0) {
-    const tempCanvas = document.createElement('canvas');
+    const tempCanvas = document.createElement("canvas");
     tempCanvas.width = width;
     tempCanvas.height = height;
-    const tempCtx = tempCanvas.getContext('2d');
-    
+    const tempCtx = tempCanvas.getContext("2d");
+
     if (tempCtx) {
-      tempCtx.fillStyle = '#f2efe9';
+      tempCtx.fillStyle = "#f2efe9";
       tempCtx.fillRect(0, 0, width, height);
       tempCtx.drawImage(canvas, offsetX, offsetY);
-      
-      const dataUrl = tempCanvas.toDataURL('image/png');
+
+      const dataUrl = tempCanvas.toDataURL("image/png");
       return { dataUrl, bounds };
     }
   }
-  
-  const dataUrl = canvas.toDataURL('image/png');
+
+  const dataUrl = canvas.toDataURL("image/png");
   return { dataUrl, bounds };
 }
 
@@ -707,6 +863,7 @@ export function isOSMLoaded(): boolean {
  * тесты ЭТАПА 1 обращаются по имени NATIVE_MAX_ZOOM_BY_SERVER — отдаём ту же
  * таблицу, производную от реестра main (без второго источника истины).
  */
-export const NATIVE_MAX_ZOOM_BY_SERVER: Record<string, number> = Object.fromEntries(
-  Object.entries(TILE_PROVIDERS).map(([id, p]) => [id, p.maxNativeZoom]),
-) as Record<string, number>;
+export const NATIVE_MAX_ZOOM_BY_SERVER: Record<string, number> =
+  Object.fromEntries(
+    Object.entries(TILE_PROVIDERS).map(([id, p]) => [id, p.maxNativeZoom]),
+  ) as Record<string, number>;

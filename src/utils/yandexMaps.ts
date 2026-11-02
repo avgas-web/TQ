@@ -1,5 +1,5 @@
 // Утилиты для работы с Яндекс.Картами API
-import { calculateBoundsFromCenter } from './googleMaps';
+import { calculateBoundsFromCenter } from "./googleMaps";
 
 export interface YandexMapsConfig {
   apiKey: string;
@@ -7,7 +7,7 @@ export interface YandexMapsConfig {
 }
 
 const yandexMapsConfig: YandexMapsConfig = {
-  apiKey: '',
+  apiKey: "",
   loaded: false,
 };
 
@@ -22,7 +22,7 @@ export function loadYandexMapsApi(apiKey: string): Promise<void> {
     }
 
     if (!apiKey) {
-      reject(new Error('API ключ не указан'));
+      reject(new Error("API ключ не указан"));
       return;
     }
 
@@ -35,9 +35,15 @@ export function loadYandexMapsApi(apiKey: string): Promise<void> {
     yandexMapsConfig.apiKey = apiKey;
 
     // Проверяем, не загружен ли уже скрипт С ЭТИМ ЖЕ ключом
-    const existing = document.querySelector<HTMLScriptElement>(`script[src*="api-maps.yandex.ru"]`);
+    const existing = document.querySelector<HTMLScriptElement>(
+      `script[src*="api-maps.yandex.ru"]`,
+    );
     if (existing) {
-      if (existing.src.includes(`apikey=${apiKey}`) && (window as any).ymaps && (window as any).ymaps.ready) {
+      if (
+        existing.src.includes(`apikey=${apiKey}`) &&
+        (window as any).ymaps &&
+        (window as any).ymaps.ready
+      ) {
         yandexMapsConfig.loaded = true;
         resolve();
         return;
@@ -46,7 +52,7 @@ export function loadYandexMapsApi(apiKey: string): Promise<void> {
       delete (window as any).ymaps;
     }
 
-    const script = document.createElement('script');
+    const script = document.createElement("script");
     script.src = `https://api-maps.yandex.ru/2.1/?apikey=${apiKey}&lang=ru_RU`;
     script.async = true;
     script.defer = true;
@@ -62,7 +68,7 @@ export function loadYandexMapsApi(apiKey: string): Promise<void> {
         // чтобы повторный вызов мог начать заново, а не мгновенно падать на
         // том же кэшированном rejection (раньше все ретраисы были невозможны).
         script.remove();
-        reject(new Error('Yandex Maps API не загружен'));
+        reject(new Error("Yandex Maps API не загружен"));
       }
     };
 
@@ -71,7 +77,7 @@ export function loadYandexMapsApi(apiKey: string): Promise<void> {
       // document.querySelector('script[src*=...]') ниже решит, что API уже
       // «в процессе загрузки», и все последующие попытки зависнут навсегда.
       script.remove();
-      reject(new Error('Ошибка загрузки Yandex Maps API'));
+      reject(new Error("Ошибка загрузки Yandex Maps API"));
     };
 
     document.head.appendChild(script);
@@ -81,15 +87,18 @@ export function loadYandexMapsApi(apiKey: string): Promise<void> {
 /**
  * Геокодирование адреса в координаты (Яндекс)
  */
-export async function yandexGeocode(address: string): Promise<{ lat: number; lng: number } | null> {
+export async function yandexGeocode(
+  address: string,
+): Promise<{ lat: number; lng: number } | null> {
   if (!yandexMapsConfig.loaded) {
-    throw new Error('Yandex Maps API не загружен');
+    throw new Error("Yandex Maps API не загружен");
   }
 
   return new Promise((resolve, reject) => {
     const geocoder = new (window as any).ymaps.Geocoder();
-    
-    geocoder.geocode(address)
+
+    geocoder
+      .geocode(address)
       .then((result: any) => {
         if (result.geoObjects.getLength() > 0) {
           const coords = result.geoObjects.get(0).geometry.getCoordinates();
@@ -101,7 +110,7 @@ export async function yandexGeocode(address: string): Promise<{ lat: number; lng
           resolve(null);
         }
       })
-      .catch((error: any) => {
+      .catch(() => {
         resolve(null);
       });
   });
@@ -110,15 +119,19 @@ export async function yandexGeocode(address: string): Promise<{ lat: number; lng
 /**
  * Обратное геокодирование (координаты в адрес) - Яндекс
  */
-export async function yandexReverseGeocode(lat: number, lng: number): Promise<string | null> {
+export async function yandexReverseGeocode(
+  lat: number,
+  lng: number,
+): Promise<string | null> {
   if (!yandexMapsConfig.loaded) {
-    throw new Error('Yandex Maps API не загружен');
+    throw new Error("Yandex Maps API не загружен");
   }
 
   return new Promise((resolve, reject) => {
     const geocoder = new (window as any).ymaps.Geocoder();
-    
-    geocoder.geocode([lat, lng])
+
+    geocoder
+      .geocode([lat, lng])
       .then((result: any) => {
         if (result.geoObjects.getLength() > 0) {
           const address = result.geoObjects.get(0).getAddressLine();
@@ -127,7 +140,7 @@ export async function yandexReverseGeocode(lat: number, lng: number): Promise<st
           resolve(null);
         }
       })
-      .catch((error: any) => {
+      .catch(() => {
         resolve(null);
       });
   });
@@ -142,19 +155,19 @@ export function getYandexStaticMapUrl(
   width: number,
   height: number,
   apiKey: string,
-  mapType: 'map' | 'satellite' | 'hybrid' = 'satellite'
+  mapType: "map" | "satellite" | "hybrid" = "satellite",
 ): string {
   const params = new URLSearchParams({
     ll: `${center.lng},${center.lat}`,
     z: zoom.toString(),
     size: `${width},${height}`,
     l: mapType,
-    lang: 'ru_RU',
+    lang: "ru_RU",
   });
 
   // Статический API Яндекс.Карт требует API-ключ (иначе возвращает 403)
   if (apiKey) {
-    params.set('key', apiKey);
+    params.set("key", apiKey);
   }
 
   return `https://static-maps.yandex.ru/1.x/?${params.toString()}`;
@@ -169,43 +182,53 @@ export async function loadYandexStaticMap(
   width: number,
   height: number,
   apiKey: string,
-  mapType: 'map' | 'satellite' | 'hybrid' = 'satellite'
-): Promise<{ dataUrl: string; bounds: { north: number; south: number; east: number; west: number } }> {
-  const url = getYandexStaticMapUrl(center, zoom, width, height, apiKey, mapType);
+  mapType: "map" | "satellite" | "hybrid" = "satellite",
+): Promise<{
+  dataUrl: string;
+  bounds: { north: number; south: number; east: number; west: number };
+}> {
+  const url = getYandexStaticMapUrl(
+    center,
+    zoom,
+    width,
+    height,
+    apiKey,
+    mapType,
+  );
 
   return new Promise((resolve, reject) => {
     const img = new Image();
-    img.crossOrigin = 'anonymous';
-    
+    img.crossOrigin = "anonymous";
+
     img.onload = () => {
-      const canvas = document.createElement('canvas');
+      const canvas = document.createElement("canvas");
       canvas.width = width;
       canvas.height = height;
-      const ctx = canvas.getContext('2d');
-      
+      const ctx = canvas.getContext("2d");
+
       if (!ctx) {
-        reject(new Error('Не удалось создать canvas'));
+        reject(new Error("Не удалось создать canvas"));
         return;
       }
-      
+
       ctx.drawImage(img, 0, 0);
-      
+
       try {
-        const dataUrl = canvas.toDataURL('image/png');
-        
+        const dataUrl = canvas.toDataURL("image/png");
+
         // Вычисляем границы карты (Web Mercator — та же проекция, что у Яндекс.Карт)
         const bounds = calculateBoundsFromCenter(center, zoom, width, height);
-        
+
         resolve({ dataUrl, bounds });
       } catch (e) {
-        reject(new Error('Ошибка конвертации изображения'));
+        reject(new Error("Ошибка конвертации изображения"));
       }
     };
-    
+
     img.onerror = () => {
-      reject(new Error('Ошибка загрузки карты'));
+      reject(new Error("Ошибка загрузки карты"));
     };
-    
+
     img.src = url;
   });
 }

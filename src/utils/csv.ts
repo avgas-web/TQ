@@ -28,7 +28,7 @@ function needsQuoting(field: string, delimiter: string): boolean {
   );
 }
 
-function quoteField(field: string, delimiter: string): string {
+function quoteField(field: string): string {
   // RFC 4180: кавычки внутри значения удваиваются, поле оборачивается в кавычки.
   return '"' + field.replace(/"/g, '""') + '"';
 }
@@ -46,7 +46,7 @@ function sanitizeCell(
     escapeInjection &&
     FORMULA_INJECTION_PREFIXES.some((p) => value.startsWith(p));
   if (dangerous || needsQuoting(value, delimiter)) {
-    const quoted = quoteField(value, delimiter);
+    const quoted = quoteField(value);
     return dangerous ? "'" + quoted : quoted;
   }
   return value;

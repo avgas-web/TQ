@@ -4,7 +4,7 @@
 // «Cannot read properties of undefined» на битых/старых снапшотах.
 // ═══════════════════════════════════════════════════════════════
 import { z } from "zod";
-import type { Project, ViewState } from "../types";
+import type { ViewState } from "../types";
 
 const finiteNumber = z.number().finite();
 /** Координаты — с диапазоном; null допустим (маркер ещё не геопривязан). */

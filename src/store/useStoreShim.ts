@@ -9,23 +9,34 @@
 // результата селектора по Object.is — как в zustand).
 // Новый код должен импортировать useMapStore/useMissionStore/useFleetStore напрямую.
 // ═══════════════════════════════════════════════════════════════
-import { useSyncExternalStore } from 'react';
-import type { Project, Tool, ViewState, Point } from '../types';
-import { useMapStore, invalidateZoneCache as invalidateZoneCacheLocal, selectViewForRender as selectMapView, defaultMapSettings } from './useMapStore';
-import { useMissionStore, rerouteAllNow } from './useMissionStore';
-import { useFleetStore } from './useFleetStore';
+import { useSyncExternalStore } from "react";
+import type { Project, Tool, ViewState, Point } from "../types";
+import {
+  useMapStore,
+  invalidateZoneCache as invalidateZoneCacheLocal,
+  selectViewForRender as selectMapView,
+  defaultMapSettings,
+} from "./useMapStore";
+import { useMissionStore, rerouteAllNow } from "./useMissionStore";
+import { useFleetStore } from "./useFleetStore";
 import {
   clearAllStoredMaps,
-  saveUserLayerToIndexedDB, loadUserLayerFromIndexedDB, deleteUserLayerFromIndexedDB,
+  saveUserLayerToIndexedDB,
+  loadUserLayerFromIndexedDB,
+  deleteUserLayerFromIndexedDB,
   listUserLayerIds,
-} from '../utils/storage';
-import type { UserMapLayer, UserMapLayerRecord } from '../types';
-import { latToMercatorY } from '../utils/googleMaps';
-import { sanitizeProjectData } from '../utils/projectSchema';
+} from "../utils/storage";
+import type { UserMapLayer, UserMapLayerRecord } from "../types";
+import { sanitizeProjectData } from "../utils/projectSchema";
 
 // Реэкспорт публичных утилит старого модуля — компоненты/тесты импортируют их из './useStore'
-export { getActiveZonesCached, invalidateZoneCache, normalizeViewState, selectViewForRender } from './useMapStore';
-export { scheduleRerouteAll } from './useMissionStore';
+export {
+  getActiveZonesCached,
+  invalidateZoneCache,
+  normalizeViewState,
+  selectViewForRender,
+} from "./useMapStore";
+export { scheduleRerouteAll } from "./useMissionStore";
 
 type MapS = ReturnType<typeof useMapStore.getState>;
 type MisS = ReturnType<typeof useMissionStore.getState>;
@@ -35,23 +46,14 @@ type FltS = ReturnType<typeof useFleetStore.getState>;
 // Метаданные слоёв живут здесь (module-level mirror: useMapStore из main их не
 // знает), тяжёлые payload'ы — в IndexedDB store «userlayers». Реестр blobKnownIds
 // позволяет userLayerRecords() определять наличие данных без чтения IDB.
-const MIN_MAP_ZOOM_FLOOR = 6;
 const userLayersRef: UserMapLayer[] = [];
 const blobKnownIds = new Set<string>();
 export const __userLayerBlobRegistry = blobKnownIds;
 
-/** Последний известный размер канваса карты (пишет MapCanvas при resize). */
-let lastCanvasSizeForView = { width: 1200, height: 800 };
-export function setCanvasSizeForView(w: number, h: number): void {
-  if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
-    lastCanvasSizeForView = { width: w, height: h };
-  }
-}
-
 /** Агрегат = прежний AppState проекта + UI-состояние (для selector-совместимости). */
 export interface LegacySnapshot {
   project: Project;
-  droneAssignments: FltS['droneAssignments'];
+  droneAssignments: FltS["droneAssignments"];
   currentTool: Tool;
   activeRestrictionId: string | null;
   selectedMarkerId: string | null;
@@ -68,20 +70,24 @@ export interface LegacySnapshot {
   routeWarnings: Record<string, string[]>;
   redoDrawingStack: Point[];
   _currentMapId?: string;
-  routeDraft: MisS['routeDraft'];
+  routeDraft: MisS["routeDraft"];
   /** Глобальный флаг «идёт тяжёлая/сетевая операция» (upload миссии, пересчёт
    *  высот) — проксируется из useMissionStore для UI-блокировок. */
   isProcessing: boolean;
 }
 
-const projectNameRef = { value: 'Новый проект', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+const projectNameRef = {
+  value: "Новый проект",
+  createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+};
 
 function buildSnapshot(): LegacySnapshot {
   const m = useMapStore.getState();
   const mi = useMissionStore.getState();
   const f = useFleetStore.getState();
   const project: Project = {
-    version: '1.1',
+    version: "1.1",
     projectName: projectNameRef.value,
     createdAt: projectNameRef.createdAt,
     updatedAt: projectNameRef.updatedAt,
@@ -160,32 +166,40 @@ useFleetStore.subscribe(scheduleEmit);
 // пусты, а старый есть — разбираем старый project по доменам и удаляем legacy.
 export function migrateLegacyStorage(): void {
   try {
-    if (localStorage.getItem('tq-map')) return; // уже мигрировано
-    const raw = localStorage.getItem('totalquadro-storage');
+    if (localStorage.getItem("tq-map")) return; // уже мигрировано
+    const raw = localStorage.getItem("totalquadro-storage");
     if (!raw) return;
-    const parsed = JSON.parse(raw) as { state?: Record<string, any>; version?: number };
+    const parsed = JSON.parse(raw) as {
+      state?: Record<string, any>;
+      version?: number;
+    };
     const st = parsed.state ?? {};
     const p = (st.project ?? {}) as Partial<Project>;
     const geo = {
       map: p.map ?? null,
       markers: p.markers ?? [],
       restrictions: p.restrictions ?? [],
-      layers: p.layers?.length ? p.layers : [{ id: 'default', name: 'Основной', visible: true, locked: false }],
+      layers: p.layers?.length
+        ? p.layers
+        : [{ id: "default", name: "Основной", visible: true, locked: false }],
       calibration: p.calibration ?? { enabled: false, points: [] },
       // ЭТАП 1.2: из legacy-снапшота берём ТОЛЬКО enabled; apiKey вырезается.
       googleMaps: { enabled: !!p.googleMaps?.enabled },
       yandexMaps: { enabled: !!p.yandexMaps?.enabled },
-      openStreetMap: p.openStreetMap ?? { enabled: false, tileServer: 'osm' as const },
+      openStreetMap: p.openStreetMap ?? {
+        enabled: false,
+        tileServer: "osm" as const,
+      },
       settings: p.settings ?? undefined,
       _currentMapId: st._currentMapId,
-      currentTool: st.currentTool ?? 'pan',
+      currentTool: st.currentTool ?? "pan",
       viewState: st.viewState ?? { offsetX: 0, offsetY: 0, scale: 1 },
       activeRestrictionId: st.activeRestrictionId ?? null,
-      searchQuery: st.searchQuery ?? '',
-      filterType: st.filterType ?? '',
+      searchQuery: st.searchQuery ?? "",
+      filterType: st.filterType ?? "",
     };
     useMapStore.setState(geo as never);
-    projectNameRef.value = p.projectName ?? 'Новый проект';
+    projectNameRef.value = p.projectName ?? "Новый проект";
     projectNameRef.createdAt = p.createdAt ?? projectNameRef.createdAt;
     useMissionStore.setState({
       routes: p.routes ?? [],
@@ -195,15 +209,16 @@ export function migrateLegacyStorage(): void {
     if (Array.isArray(st.droneAssignments)) {
       useFleetStore.setState({ droneAssignments: st.droneAssignments });
     }
-    localStorage.removeItem('totalquadro-storage');
+    localStorage.removeItem("totalquadro-storage");
     emit();
   } catch (e) {
-    console.warn('[useStore shim] legacy migration failed:', e);
+    console.warn("[useStore shim] legacy migration failed:", e);
   }
 }
 
 // ─── setState-маршрутизация (обратная совместимость прямых setState из компонентов) ──
-type SetArg = Partial<LegacySnapshot> | ((s: LegacySnapshot) => Partial<LegacySnapshot>);
+type SetArg =
+  Partial<LegacySnapshot> | ((s: LegacySnapshot) => Partial<LegacySnapshot>);
 
 function applyPatch(patch: Partial<LegacySnapshot>): void {
   const m: Record<string, unknown> = {};
@@ -211,9 +226,10 @@ function applyPatch(patch: Partial<LegacySnapshot>): void {
   const f: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(patch)) {
     switch (k) {
-      case 'project': {
+      case "project": {
         const proj = v as Project;
-        if (proj.projectName !== undefined) projectNameRef.value = proj.projectName;
+        if (proj.projectName !== undefined)
+          projectNameRef.value = proj.projectName;
         if (proj.createdAt) projectNameRef.createdAt = proj.createdAt;
         if (proj.updatedAt) projectNameRef.updatedAt = proj.updatedAt;
         // Слайс ЭТАПа 2: project.userLayers — прямой mirror (см. userLayersRef).
@@ -221,33 +237,81 @@ function applyPatch(patch: Partial<LegacySnapshot>): void {
           userLayersRef.length = 0;
           for (const l of proj.userLayers) userLayersRef.push(l);
         }
-        m.map = proj.map; m.markers = proj.markers; m.restrictions = proj.restrictions;
-        m.layers = proj.layers; m.calibration = proj.calibration; m.googleMaps = proj.googleMaps;
-        m.yandexMaps = proj.yandexMaps; m.openStreetMap = proj.openStreetMap; m.settings = proj.settings;
-        mi.routes = proj.routes ?? []; mi.importLists = proj.importLists;
+        m.map = proj.map;
+        m.markers = proj.markers;
+        m.restrictions = proj.restrictions;
+        m.layers = proj.layers;
+        m.calibration = proj.calibration;
+        m.googleMaps = proj.googleMaps;
+        m.yandexMaps = proj.yandexMaps;
+        m.openStreetMap = proj.openStreetMap;
+        m.settings = proj.settings;
+        mi.routes = proj.routes ?? [];
+        mi.importLists = proj.importLists;
         break;
       }
-      case 'droneAssignments': f.droneAssignments = v; break;
-      case 'routes': mi.routes = v; break;
-      case 'activeRouteId': mi.activeRouteId = v; break;
-      case 'routeWarnings': mi.routeWarnings = v; break;
-      case 'routeDraft': mi.routeDraft = v; break;
-      case 'importLists': mi.importLists = v; break;
-      case 'currentTool': m.currentTool = v; break;
-      case 'viewState': m.viewState = v; break;
-      case 'viewTick': m.viewTick = v; break;
-      case 'cursorPosition': m.cursorPosition = v; break;
-      case 'isDrawing': m.isDrawing = v; break;
-      case 'drawingPoints': m.drawingPoints = v; break;
-      case 'redoDrawingStack': m.redoDrawingStack = v; break;
-      case 'measurementPoints': m.measurementPoints = v; break;
-      case 'searchQuery': m.searchQuery = v; break;
-      case 'filterType': m.filterType = v; break;
-      case 'selectedMarkerId': m.selectedMarkerId = v; break;
-      case 'selectedRestrictionId': m.selectedRestrictionId = v; break;
-      case 'activeRestrictionId': m.activeRestrictionId = v; break;
-      case '_currentMapId': m._currentMapId = v; break;
-      default: break; // неизвестные поля игнорируются (как раньше — zustand merge их не ждал)
+      case "droneAssignments":
+        f.droneAssignments = v;
+        break;
+      case "routes":
+        mi.routes = v;
+        break;
+      case "activeRouteId":
+        mi.activeRouteId = v;
+        break;
+      case "routeWarnings":
+        mi.routeWarnings = v;
+        break;
+      case "routeDraft":
+        mi.routeDraft = v;
+        break;
+      case "importLists":
+        mi.importLists = v;
+        break;
+      case "currentTool":
+        m.currentTool = v;
+        break;
+      case "viewState":
+        m.viewState = v;
+        break;
+      case "viewTick":
+        m.viewTick = v;
+        break;
+      case "cursorPosition":
+        m.cursorPosition = v;
+        break;
+      case "isDrawing":
+        m.isDrawing = v;
+        break;
+      case "drawingPoints":
+        m.drawingPoints = v;
+        break;
+      case "redoDrawingStack":
+        m.redoDrawingStack = v;
+        break;
+      case "measurementPoints":
+        m.measurementPoints = v;
+        break;
+      case "searchQuery":
+        m.searchQuery = v;
+        break;
+      case "filterType":
+        m.filterType = v;
+        break;
+      case "selectedMarkerId":
+        m.selectedMarkerId = v;
+        break;
+      case "selectedRestrictionId":
+        m.selectedRestrictionId = v;
+        break;
+      case "activeRestrictionId":
+        m.activeRestrictionId = v;
+        break;
+      case "_currentMapId":
+        m._currentMapId = v;
+        break;
+      default:
+        break; // неизвестные поля игнорируются (как раньше — zustand merge их не ждал)
     }
   }
   if (Object.keys(m).length) useMapStore.setState(m as never);
@@ -258,21 +322,26 @@ function applyPatch(patch: Partial<LegacySnapshot>): void {
 // ─── Публичный API шима ────────────────────────────────────────
 
 /** Тип аргумента экшена/селектора: снапшот + все экшены доменных сторов. */
-export type StoreView = LegacySnapshot & MapS & MisS & FltS & {
-  // Проектные экшены верхнего уровня (навешиваются на useStore ниже)
-  setProjectName: (name: string) => void;
-  exportProject: () => Project;
-  importProject: (project: Project) => void;
-  resetProject: () => void;
-  __rerouteAllRoutesNow: () => void;
-};
+export type StoreView = LegacySnapshot &
+  MapS &
+  MisS &
+  FltS & {
+    // Проектные экшены верхнего уровня (навешиваются на useStore ниже)
+    setProjectName: (name: string) => void;
+    exportProject: () => Project;
+    importProject: (project: Project) => void;
+    resetProject: () => void;
+    __rerouteAllRoutesNow: () => void;
+  };
 
 interface UseStoreShim {
   <T>(selector: (s: StoreView) => T): T;
   (): StoreView;
   getState(): StoreView;
   setState: (arg: SetArg) => void;
-  subscribe: (listener: (s: LegacySnapshot, prev: LegacySnapshot) => void) => () => void;
+  subscribe: (
+    listener: (s: LegacySnapshot, prev: LegacySnapshot) => void,
+  ) => () => void;
 }
 
 function buildMerged(): StoreView {
@@ -287,7 +356,12 @@ function buildMerged(): StoreView {
   const facade = useStore as unknown as Record<string, unknown>;
   const facadeOnly: Record<string, unknown> = {};
   for (const k of Object.keys(facade)) {
-    if (typeof facade[k] === 'function' && !(k in useMapStore.getState()) && !(k in useMissionStore.getState()) && !(k in useFleetStore.getState())) {
+    if (
+      typeof facade[k] === "function" &&
+      !(k in useMapStore.getState()) &&
+      !(k in useMissionStore.getState()) &&
+      !(k in useFleetStore.getState())
+    ) {
       facadeOnly[k] = facade[k];
     }
   }
@@ -325,7 +399,7 @@ export function readProjectView(): Project {
   const m = useMapStore.getState();
   const mi = useMissionStore.getState();
   return {
-    version: '1.1',
+    version: "1.1",
     projectName: projectNameRef.value,
     createdAt: projectNameRef.createdAt,
     updatedAt: projectNameRef.updatedAt,
@@ -365,12 +439,14 @@ export function readProjectViewWithActions(): ProjectViewWithActions {
     project: base,
     moveRoutePoint: (id: string, index: number, p: Point) => {
       // Фасад шима содержит guarded-обёртку (isProcessing-страж сохранён).
-      (shimActions as unknown as Record<string, (...a: unknown[]) => unknown>)
-        .moveRoutePoint(id, index, p);
+      (
+        shimActions as unknown as Record<string, (...a: unknown[]) => unknown>
+      ).moveRoutePoint(id, index, p);
     },
     removeRoutePoint: (id: string, index: number) => {
-      (shimActions as unknown as Record<string, (...a: unknown[]) => unknown>)
-        .removeRoutePoint(id, index);
+      (
+        shimActions as unknown as Record<string, (...a: unknown[]) => unknown>
+      ).removeRoutePoint(id, index);
     },
   };
 }
@@ -385,7 +461,9 @@ export function syncShimSnapshot(): void {
   emit();
 }
 
-const subscribeImpl = (listener: (s: LegacySnapshot, prev: LegacySnapshot) => void) => {
+const subscribeImpl = (
+  listener: (s: LegacySnapshot, prev: LegacySnapshot) => void,
+) => {
   let prev = snapshot;
   const wrapped = () => {
     const cur = snapshot;
@@ -393,12 +471,16 @@ const subscribeImpl = (listener: (s: LegacySnapshot, prev: LegacySnapshot) => vo
     prev = cur;
   };
   listeners.add(wrapped);
-  return () => { listeners.delete(wrapped); };
+  return () => {
+    listeners.delete(wrapped);
+  };
 };
 
 const subscribePlain = (cb: () => void) => {
   listeners.add(cb);
-  return () => { listeners.delete(cb); };
+  return () => {
+    listeners.delete(cb);
+  };
 };
 
 // Кэш результата селектора по Object.is (как equality-fn в zustand): без него
@@ -412,9 +494,13 @@ let hasLast = false;
 function readSelected<T>(selector?: (s: StoreView) => T): T | StoreView {
   const snap = getMerged();
   if (!selector) return snap as unknown as T | StoreView;
-  if (hasLast && snap === lastSnapRef && selector === lastSel) return lastResult as T;
+  if (hasLast && snap === lastSnapRef && selector === lastSel)
+    return lastResult as T;
   const res = selector(snap);
-  lastSel = selector; lastSnapRef = snap; lastResult = res; hasLast = true;
+  lastSel = selector;
+  lastSnapRef = snap;
+  lastResult = res;
+  hasLast = true;
   return res;
 }
 
@@ -426,11 +512,11 @@ function useStoreHook<T>(selector?: (s: StoreView) => T): T | StoreView {
   );
 }
 
-export const useStore = (useStoreHook as unknown) as UseStoreShim;
+export const useStore = useStoreHook as unknown as UseStoreShim;
 
 (useStore as any).getState = getMerged;
 (useStore as any).setState = (arg: SetArg) => {
-  const patch = typeof arg === 'function' ? arg(snapshot) : arg;
+  const patch = typeof arg === "function" ? arg(snapshot) : arg;
   applyPatch(patch);
 };
 (useStore as any).subscribe = subscribeImpl;
@@ -456,29 +542,34 @@ shimActions.importProject = (project: Project) => {
   try {
     geo = sanitizeProjectData(project);
   } catch (e) {
-    console.warn('[importProject] schema sanitize failed:', e);
+    console.warn("[importProject] schema sanitize failed:", e);
     geo = project as unknown as Record<string, unknown>;
   }
   const p = geo as unknown as Project;
-  projectNameRef.value = p.projectName ?? 'Новый проект';
+  projectNameRef.value = p.projectName ?? "Новый проект";
   projectNameRef.createdAt = p.createdAt ?? projectNameRef.createdAt;
   projectNameRef.updatedAt = p.updatedAt ?? new Date().toISOString();
   useMapStore.setState({
     map: p.map ?? null,
     markers: p.markers ?? [],
     restrictions: p.restrictions ?? [],
-    layers: p.layers?.length ? p.layers : [{ id: 'default', name: 'Основной', visible: true, locked: false }],
+    layers: p.layers?.length
+      ? p.layers
+      : [{ id: "default", name: "Основной", visible: true, locked: false }],
     calibration: p.calibration ?? { enabled: false, points: [] },
     // ЭТАП 1.2: секрет не мигрирует — только флаг enabled.
     googleMaps: { enabled: !!p.googleMaps?.enabled },
     yandexMaps: { enabled: !!p.yandexMaps?.enabled },
-    openStreetMap: p.openStreetMap ?? { enabled: false, tileServer: 'osm' },
+    openStreetMap: p.openStreetMap ?? { enabled: false, tileServer: "osm" },
     settings: p.settings ?? useMapStore.getState().settings,
     viewState: { offsetX: 0, offsetY: 0, scale: 1 },
     selectedMarkerId: null,
     selectedRestrictionId: null,
   });
-  useMissionStore.setState({ routes: p.routes ?? [], importLists: p.importLists });
+  useMissionStore.setState({
+    routes: p.routes ?? [],
+    importLists: p.importLists,
+  });
 };
 
 shimActions.resetProject = () => {
@@ -486,7 +577,11 @@ shimActions.resetProject = () => {
   // операция (пересчёт высот / загрузка миссии). Снимаем флаг и отменяем
   // фоновые прогоны высот, чтобы они не дописали данные после очистки.
   useMissionStore.setState({ isProcessing: false });
-  try { useMissionStore.getState().cancelAltitudeRun(); } catch { /* noop */ }
+  try {
+    useMissionStore.getState().cancelAltitudeRun();
+  } catch {
+    /* noop */
+  }
   // ВАЖНО (баг «кнопка Сброс не работает»): снимаем страж guarded-экшенов.
   // lastGuardPassTs обновляется КАЖДЫМ пропущенным mutate-экшеном, поэтому
   // при непрерывной работе он всегда молод (<120 с) и зависший isProcessing
@@ -494,17 +589,17 @@ shimActions.resetProject = () => {
   // навсегда. Сброс обязан снимать блокировку принудительно.
   lastGuardPassTs = Date.now() + MUTATE_GUARD_MS;
   invalidateZoneCacheLocal();
-  projectNameRef.value = 'Новый проект';
+  projectNameRef.value = "Новый проект";
   projectNameRef.createdAt = new Date().toISOString();
   projectNameRef.updatedAt = projectNameRef.createdAt;
   useMapStore.setState({
     map: null,
     markers: [],
     restrictions: [],
-    layers: [{ id: 'default', name: 'Основной', visible: true, locked: false }],
+    layers: [{ id: "default", name: "Основной", visible: true, locked: false }],
     calibration: { enabled: false, points: [] },
     settings: { ...useMapStore.getState().settings },
-    currentTool: 'pan',
+    currentTool: "pan",
     activeRestrictionId: null,
     selectedMarkerId: null,
     selectedRestrictionId: null,
@@ -528,12 +623,14 @@ shimActions.resetProject = () => {
   // оставляет профильные настройки (craftType, высоты), а в map-части могли
   // остаться legacy-поля elevationAuto/altitudeClearanceM, перезаписывающие
   // дефолты при гидрации persist. Возвращаем обе группы к чистым значениям.
-  useMissionStore.setState({ craftType: 'drone' });
+  useMissionStore.setState({ craftType: "drone" });
   useMapStore.setState((cur) => {
     const rest = { ...cur.settings } as Record<string, unknown>;
     delete rest.elevationAuto;
     delete rest.altitudeClearanceM;
-    return { settings: { ...defaultMapSettings, ...rest } as typeof cur.settings };
+    return {
+      settings: { ...defaultMapSettings, ...rest } as typeof cur.settings,
+    };
   });
   // КРИТИЧЕСКИЙ ФИКС «Сброс не удаляет данные»: очистка СОСТОЯНИЯ в памяти
   // без записи в persist-storage. zustand persist подписан на каждый set(),
@@ -548,16 +645,16 @@ shimActions.resetProject = () => {
   // точки/маршруты («Сброс не работает» после перезагрузки страницы).
   void clearAllStoredMaps().finally(() => {
     try {
-      localStorage.removeItem('tq-map');
-      localStorage.removeItem('tq-mission');
-      localStorage.removeItem('tq-fleet');
-      localStorage.removeItem('totalquadro-storage');
+      localStorage.removeItem("tq-map");
+      localStorage.removeItem("tq-mission");
+      localStorage.removeItem("tq-fleet");
+      localStorage.removeItem("totalquadro-storage");
       for (let i = localStorage.length - 1; i >= 0; i--) {
         const k = localStorage.key(i);
-        if (k && k.startsWith('totalquadro-backup')) localStorage.removeItem(k);
+        if (k && k.startsWith("totalquadro-backup")) localStorage.removeItem(k);
       }
     } catch (e) {
-      console.warn('[resetProject] persist storage cleanup failed:', e);
+      console.warn("[resetProject] persist storage cleanup failed:", e);
     }
   });
 };
@@ -576,13 +673,25 @@ const MUTATE_GUARD_MS = 120_000; // страховка: зависший про�
 // сразу после сброса или во время фоновых операций. Внутри она сама отменяет
 // троттлер и перезапускает прогоны высот через штатный race-guard стора.
 const BLOCKED_MUTATORS: Array<keyof MisS> = [
-  'addRoute', 'deleteRoute', 'appendRoutePoint', 'insertRoutePointAt',
-  'removeRoutePoint', 'commitRouteDraft', 'generateScanRoute', 'optimizeRouteOrder',
-  'importRoutes', 'resetMissions', 'setMissionMode',
-  'addStartPointAt', 'addGoalPointAt', 'removeStartPoint', 'removeGoalPoint', 'autoPlanRoutes',
+  "addRoute",
+  "deleteRoute",
+  "appendRoutePoint",
+  "insertRoutePointAt",
+  "removeRoutePoint",
+  "commitRouteDraft",
+  "generateScanRoute",
+  "optimizeRouteOrder",
+  "importRoutes",
+  "resetMissions",
+  "setMissionMode",
+  "addStartPointAt",
+  "addGoalPointAt",
+  "removeStartPoint",
+  "removeGoalPoint",
+  "autoPlanRoutes",
 ];
 /** Синхронные mutate-экшены карты: во время тяжёлой операции тоже блокируются. */
-const BLOCKED_MAP_MUTATORS: Array<keyof MapS> = ['deleteRestriction'];
+const BLOCKED_MAP_MUTATORS: Array<keyof MapS> = ["deleteRestriction"];
 const guardWrapped = new Map<string, (...a: unknown[]) => unknown>();
 
 // ИСПРАВЛЕНИЕ краша «Cannot read properties of undefined (reading 'addRoute')»:
@@ -597,42 +706,63 @@ const guardWrapped = new Map<string, (...a: unknown[]) => unknown>();
 // Теперь оригиналы захватываются один раз при загрузке модуля (до любых
 // setState), а обёртки существуют ТОЛЬКО в shimActions — фасадном объекте
 // legacy-совместимости. Доменные сторы остаются нетронутыми.
-const missionOriginals: Record<string, ((...a: unknown[]) => unknown) | undefined> = {};
+const missionOriginals: Record<
+  string,
+  ((...a: unknown[]) => unknown) | undefined
+> = {};
 for (const key of BLOCKED_MUTATORS) {
-  const v = (useMissionStore.getState() as unknown as Record<string, unknown>)[key];
-  if (typeof v === 'function') missionOriginals[key] = v as (...a: unknown[]) => unknown;
+  const v = (useMissionStore.getState() as unknown as Record<string, unknown>)[
+    key
+  ];
+  if (typeof v === "function")
+    missionOriginals[key] = v as (...a: unknown[]) => unknown;
 }
-const mapOriginals: Record<string, ((...a: unknown[]) => unknown) | undefined> = {};
+const mapOriginals: Record<string, ((...a: unknown[]) => unknown) | undefined> =
+  {};
 for (const key of BLOCKED_MAP_MUTATORS) {
   const v = (useMapStore.getState() as unknown as Record<string, unknown>)[key];
-  if (typeof v === 'function') mapOriginals[key] = v as (...a: unknown[]) => unknown;
+  if (typeof v === "function")
+    mapOriginals[key] = v as (...a: unknown[]) => unknown;
 }
 
-function makeGuarded(key: string, domain: 'mission' | 'map'): (...a: unknown[]) => unknown {
+function makeGuarded(
+  key: string,
+  domain: "mission" | "map",
+): (...a: unknown[]) => unknown {
   const cacheKey = `${key}@${domain}`;
   const cached = guardWrapped.get(cacheKey);
   if (cached) return cached;
-  const orig = domain === 'mission' ? missionOriginals[key] : mapOriginals[key];
+  const orig = domain === "mission" ? missionOriginals[key] : mapOriginals[key];
   // Если метод вдруг отсутствует в снимке — фолбэк всегда резолвится через
   // ЖИВОЙ getState(), так что undefined/рекурсия невозможны.
-  const fallback = (store: { getState(): object }): ((...a: unknown[]) => unknown) | undefined =>
-    (store.getState() as unknown as Record<string, unknown>)[key] as ((...a: unknown[]) => unknown) | undefined;
+  const fallback = (store: {
+    getState(): object;
+  }): ((...a: unknown[]) => unknown) | undefined =>
+    (store.getState() as unknown as Record<string, unknown>)[key] as
+      ((...a: unknown[]) => unknown) | undefined;
   const wrapped = function (this: unknown, ...args: unknown[]): unknown {
     const st = useMissionStore.getState();
     // Страж-фолбэк: если isProcessing завис (прогон упал без endProcessing),
     // а за MUTATE_GUARD_MS не было ни одного пропущенного экшена — разблокируем
     // UI автоматически, иначе приложение осталось бы «замороженным» навсегда.
     if (st.isProcessing && Date.now() - lastGuardPassTs < MUTATE_GUARD_MS) {
-      console.warn(`[mission] экшен «${String(key)}» отклонён: идёт тяжёлая операция (пересчёт высот / загрузка миссии)`);
+      console.warn(
+        `[mission] экшен «${String(key)}» отклонён: идёт тяжёлая операция (пересчёт высот / загрузка миссии)`,
+      );
       return null;
     }
     if (st.isProcessing) {
-      console.warn(`[mission] isProcessing завис > ${MUTATE_GUARD_MS} мс — принудительная разблокировкаguarded-экшенов`);
+      console.warn(
+        `[mission] isProcessing завис > ${MUTATE_GUARD_MS} мс — принудительная разблокировкаguarded-экшенов`,
+      );
       useMissionStore.setState({ isProcessing: false });
     }
     lastGuardPassTs = Date.now();
-    const fn = typeof orig === 'function' ? orig : fallback(domain === 'mission' ? useMissionStore : useMapStore);
-    if (typeof fn !== 'function') return null;
+    const fn =
+      typeof orig === "function"
+        ? orig
+        : fallback(domain === "mission" ? useMissionStore : useMapStore);
+    if (typeof fn !== "function") return null;
     return fn.apply(this, args);
   };
   guardWrapped.set(cacheKey, wrapped);
@@ -646,10 +776,16 @@ function makeGuarded(key: string, domain: 'mission' | 'map'): (...a: unknown[]) 
  */
 export function installMissionGuards(): void {
   for (const key of BLOCKED_MUTATORS) {
-    (shimActions as Record<string, unknown>)[key] = makeGuarded(key as string, 'mission');
+    (shimActions as Record<string, unknown>)[key] = makeGuarded(
+      key as string,
+      "mission",
+    );
   }
   for (const key of BLOCKED_MAP_MUTATORS) {
-    (shimActions as Record<string, unknown>)[key] = makeGuarded(key as string, 'map');
+    (shimActions as Record<string, unknown>)[key] = makeGuarded(
+      key as string,
+      "map",
+    );
   }
 }
 installMissionGuards();
@@ -662,7 +798,9 @@ installMissionGuards();
 
 /** Кладёт слой в реестр; растровые данные принудительно выгружаются в IDB,
  *  из стора вычищаются (в persist не должны попадать base64/ArrayBuffer). */
-shimActions.addOrUpdateUserLayer = async (layer: UserMapLayer): Promise<void> => {
+shimActions.addOrUpdateUserLayer = async (
+  layer: UserMapLayer,
+): Promise<void> => {
   const hasPayload = !!layer.imageDataUrl || !!layer.sourceBlob;
   if (hasPayload) {
     const ok = await saveUserLayerToIndexedDB({
@@ -678,7 +816,8 @@ shimActions.addOrUpdateUserLayer = async (layer: UserMapLayer): Promise<void> =>
   delete stored.imageDataUrl;
   delete stored.sourceBlob;
   const idx = userLayersRef.findIndex((x) => x.id === layer.id);
-  if (idx >= 0) userLayersRef[idx] = stored; else userLayersRef.push(stored);
+  if (idx >= 0) userLayersRef[idx] = stored;
+  else userLayersRef.push(stored);
   emit();
 };
 
@@ -724,7 +863,9 @@ shimActions.restoreUserLayers = async (): Promise<void> => {
 };
 
 /** Бинарные данные слоя: сначала in-memory, иначе из IndexedDB. */
-shimActions.loadUserLayerSource = async (id: string): Promise<ArrayBuffer | null> => {
+shimActions.loadUserLayerSource = async (
+  id: string,
+): Promise<ArrayBuffer | null> => {
   const l = userLayersRef.find((x) => x.id === id);
   if (l?.sourceBlob instanceof ArrayBuffer) return l.sourceBlob;
   const rec = await loadUserLayerFromIndexedDB(id);
@@ -746,13 +887,17 @@ shimActions.gcUserLayerStorage = async (): Promise<void> => {
 /** Только метаданные + флаги наличия данных (для панели списков без чтения blob). */
 shimActions.userLayerRecords = (): UserMapLayerRecord[] =>
   userLayersRef.map((l) => {
-    const hasBlob = blobKnownIds.has(l.id) || !!l.imageDataUrl || !!l.sourceBlob;
-    const rec: UserMapLayerRecord = { layer: { ...l }, hasBlob, bytes: l.meta.fileSize || 0 };
+    const hasBlob =
+      blobKnownIds.has(l.id) || !!l.imageDataUrl || !!l.sourceBlob;
+    const rec: UserMapLayerRecord = {
+      layer: { ...l },
+      hasBlob,
+      bytes: l.meta.fileSize || 0,
+    };
     delete rec.layer.imageDataUrl;
     delete rec.layer.sourceBlob;
     return rec;
   });
-
 
 /** Селектор вида для React-компонентов (прежний API, делегирует map-стор). */
 export { selectMapView };

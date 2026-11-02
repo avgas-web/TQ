@@ -27,11 +27,7 @@ import {
 } from "../../utils/openStreetMap";
 import { ensureDefaultTileMap } from "../../hooks/useAppInitialization";
 import { wizardClickToGeo } from "../../utils/mapGeoPick";
-import {
-  findBuildingAt,
-  type BuildingInfo,
-  type BuildingResult,
-} from "../../utils/buildingLookup";
+import { findBuildingAt, type BuildingInfo } from "../../utils/buildingLookup";
 import BuildingPopupCard from "./BuildingPopupCard";
 
 /**
