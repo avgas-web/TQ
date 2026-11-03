@@ -24,6 +24,15 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
+
+      # ФАЗА 5.3: деплой только если код чист, типизирован и тесты зелёные
+      - name: Lint (critical errors block deploy)
+        run: npx eslint . --quiet
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests
+        run: npm run test
+
       - run: npm run build
       - run: touch dist/.nojekyll
       - uses: actions/upload-pages-artifact@v3

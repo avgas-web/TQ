@@ -1,13 +1,16 @@
 import React, { useRef, useEffect, useCallback, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
+// ФАЗА 5.D: прямые доменные сторы вместо legacy-фасада useStoreShim.
+// isProcessing-страж mutate-экшенов навешан на сам useMissionStore
+// (installMissionGuards), поэтому guarded-поведение сохраняется.
+import { scheduleRerouteAll } from "../store/useMissionStore";
 import {
-  useStore,
-  scheduleRerouteAll,
+  useMapStore,
   getActiveZonesCached,
-} from "../store/useStore";
-import {
-  readProjectView,
-  readProjectViewWithActions,
-} from "../store/useStoreShim";
+  selectViewForRender,
+} from "../store/useMapStore";
+import { readProject } from "../store/projectView";
+import { touchProjectUpdatedAt } from "../store/projectActions";
 import { useMissionStore } from "../store/useMissionStore";
 import { useFleetStore } from "../store/useFleetStore";
 import {
@@ -15,38 +18,29 @@ import {
   distanceBetween,
 } from "../utils/geometry";
 import { pixelToGeoFromBounds } from "../utils/googleMaps";
-import {
-  haversineDistanceM,
-  bearingDeg,
-  boundsFromPoints,
-} from "../utils/actionMode";
+import { haversineDistanceM } from "../utils/actionMode";
 import {
   pixelToGeoExact,
   geoToPixelExact,
   routeLengthM,
   zonesCrossedBy,
-  planPathAroundZones,
   smoothPolyline,
 } from "../utils/routing";
 import {
   getOSMTileUrl,
   startTileLoad,
   abortTileImage,
-  loadTileWithMirrors,
   normalizeTileServer,
   TILE_PROVIDERS,
   onTileError,
   getTileErrorCount,
-  type TileStyle,
   type TileLoadHandle,
   type TileServerId,
 } from "../utils/openStreetMap";
-import { useMapStore } from "../store/useMapStore";
 import { ensureDefaultTileMap } from "../hooks/useAppInitialization";
 import MiniMapPanel, {
   MiniOverlayLine,
   MiniOverlayPoint,
-  type MiniZone,
 } from "./MiniMapPanel";
 import { zoomForGroundMpp, GROUND_MPP_1CM_2KM } from "../utils/pannelli";
 import {
@@ -58,351 +52,44 @@ import {
   evictOverlayRaster,
 } from "../utils/tacticalOverlayRender";
 import { eventBus } from "../utils/eventBus";
+import { drawRoutesLayer } from "./map/routesLayer";
+import { MapObjectPopup, type PopupData } from "./map/popupLayer";
 import type { Point, Route, RoutePoint, MapBounds, ViewState } from "../types";
 
-/** Границы зума тайловой карты: minZoom 3 (вся страна/регион), maxZoom 19 (уровни OSM).
- *  Раньше нижняя граница была z10 — поэтому «большая карта» (страна/область) не
- *  загружалась целиком и не отдалялась дальше крупного города. */
-const MIN_ZOOM = 3;
-const MAX_ZOOM = 19;
-
-/** Палитра цветов маршрутов (повторяется циклически при большом числе маршрутов) */
-const ROUTE_PALETTE = [
-  "#22d3ee",
-  "#a78bfa",
-  "#f472b6",
-  "#4ade80",
-  "#facc15",
-  "#fb923c",
-  "#38bdf8",
-  "#e879f9",
-];
-
-/** Нативный max zoom рабочих тайловых серверов (выше НЕ поднимаемся — нет данных,
- *  только растяжение). Реестр по аудиту audit/index.fixed.html: tile.openstreetmap.org
- *  и Carto удалены; legacy-значения ('osm', 'carto') сохраняются как
- *  совместимость со старыми проектами. */
-const NATIVE_MAX_BY_SERVER: Record<string, number> = {
-  ...(Object.fromEntries(
-    Object.entries(TILE_PROVIDERS).map(([id, p]) => [id, p.maxNativeZoom]),
-  ) as Record<string, number>),
-  osm: 19,
-  carto: 18, // legacy-алиасы (нормализуются normalizeTileServer); '2gis' УДАЛЁН ПОЛНОСТЬЮ (ТЗ)
-};
-
-/** КЛЮЧ сохранённого вида в localStorage. Раньше состояние камеры жило ТОЛЬКО в
- *  zustand-persist ('tq-map'): любое зависание гонки гидрации/сброса сторов
- *  приводило к viewState {offsetX:0, offsetY:0, scale:1} — при активной тайловой
- *  карте width=height=4·2^26 px это ~268 млн пикселей на экран, т.е. растр
- *  bounds-привязки уходил за десятки тысяч экранов и «загруженная» карта была
- *  не видна. Теперь вид дублируется здесь же, независимо от persist-стора. */
-const VIEW_STORAGE_KEY = "tq-view";
-
-/** Санация произвольного числа в конечное (NaN/Infinity → fallback). */
-function finiteOr(v: unknown, fallback: number): number {
-  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
-}
-
-/** Нормализация произвольного объекта вида в валидный ViewState. */
-function sanitizeView(o: any): ViewState | null {
-  if (!o || typeof o !== "object") return null;
-  const offsetX = finiteOr(o.offsetX, NaN);
-  const offsetY = finiteOr(o.offsetY, NaN);
-  const scale = finiteOr(o.scale, NaN);
-  if (!Number.isFinite(offsetX) || !Number.isFinite(offsetY) || !(scale > 0))
-    return null;
-  const z0 =
-    typeof o.z0 === "number" && Number.isFinite(o.z0) ? o.z0 : undefined;
-  return { offsetX, offsetY, scale, z0 };
-}
-
-/** Чтение сохранённого вида из localStorage (независимо от persist-стора). */
-function readSavedView(): ViewState | null {
-  try {
-    const raw = localStorage.getItem(VIEW_STORAGE_KEY);
-    if (!raw) return null;
-    return sanitizeView(JSON.parse(raw));
-  } catch {
-    return null;
-  }
-}
-
-/** Запись вида в localStorage (частые записи троттлятся rAF-скобкой в компоненте). */
-function writeSavedView(v: ViewState): void {
-  try {
-    localStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify(v));
-  } catch {
-    /* quota/privacy mode */
-  }
-}
-
-/** Дефолтный стартовый зум активной карты (как в режиме планирования). */
-const DEFAULT_TILE_MAP_ZOOM = 10;
-/** Изначальная фокусировка всех окон карты — Санкт-Петербург (СПб). */
-const SPB_GEO_CONST = { lat: 59.9398, lng: 30.3146 };
-
-/** Fallback-вид над СПб при невалидных данных (битый localStorage / гидрация).
- *  Раньше вместо него подставлялся нейтральный {offsetX:0, offsetY:0, scale:1}:
- *  при мире z10 это ~2^12 экранов от подложки — камера уходила в «бесконечность»,
- *  очередь тайлов переполнялась каждый кадр → вечный спиннер («виснет намертво»).
- *  Формула идентична инварианту вида: worldPx = vh·2^zoom, zoom = ZOOM_REF + log2(scale),
- *  центр экрана привязан к mercator-доле СПб. */
-function spbFallbackView(canvasH: number): ViewState {
-  const zoom = clampZoom(DEFAULT_TILE_MAP_ZOOM);
-  const worldPx = Math.max(256, canvasH * Math.pow(2, zoom));
-  const fx = (SPB_GEO_CONST.lng + 180) / 360;
-  const fy = latToMerc(SPB_GEO_CONST.lat);
-  return {
-    scale: worldPx / (canvasH * Math.pow(2, ZOOM_REF)),
-    offsetX: 0, // задаётся вызывающим кодом после замера ширины контейнера
-    offsetY: canvasH / 2 - fy * worldPx,
-    z0: ZOOM_REF,
-  };
-}
-
-/** Ключ «пары карт» (источник + гео-привязка), по которому ведётся учёт
- *  стартовых фиксаций вида. Совпадает с fitKey эффекта автоподгонки. */
-function mapFitKey(
-  m: { dataUrl?: string; bounds?: MapBounds } | null | undefined,
-): string {
-  if (!m || !m.bounds) return "";
-  const b = m.bounds;
-  return `${m.dataUrl ? "img" : "tiles"}|${b.north},${b.south},${b.west},${b.east}`;
-}
-
-/** Санация восстановленного из localStorage вида перед его применением.
- *  Возвращает null, если вид нельзя использовать и нужна повторная
- *  автоподгонка (стартовая фиксация над объектом загрузки / СПб):
- *   • сам вид отсутствует или невалиден (NaN/Infinity/scale<=0);
- *   • масштаб абсурден: zoom вне [MIN_ZOOM−1, MAX_ZOOM+2] — такой вид мог
- *     возникнуть только от битой формулы подгонки (например scale≈3700 ⇔
- *     z≈25.8 при мире z10) и разгоняет растровый цикл канваса до зависания;
- *   • вид сохранён для ДРУГОЙ карты (ключ пары сменился) — иначе stale-вид
- *     от предыдущей карты уводит камеру за пределы подложки («не видно»). */
-function sanitizeSavedView(
-  v: ViewState | null,
-  curKey: string,
-  savedKey: string | null,
-): ViewState | null {
-  if (!v) return null;
-  if (curKey && savedKey !== curKey) return null;
-  const z = zoomOfView(v.scale, v.z0 ?? ZOOM_REF);
-  if (!Number.isFinite(z) || z < MIN_ZOOM - 1 || z > MAX_ZOOM + 2) return null;
-  return v;
-}
-// Параметры аккуратной очереди загрузки тайлов (как на openstreetmap.org):
-// максимум параллельных загрузок и дебаунс новых волн во время жеста.
-const MAX_PARALLEL = 6;
-const TILE_DEBOUNCE_MS = 150;
-
-/**
- * ЕДИНАЯ инвариантная привязка вида «экран ↔ география» (Web Mercator EPSG:3857).
- * ИСПРАВЛЕНИЕ КЛЮЧЕВОЙ ОШИБКИ: раньше world-size по X считался от ширины канваса
- * (canvasWidth·scale·2^z0), а по Y — от высоты растра карты (map.height·scale).
- * Эти две величины совпадали ТОЛЬКО если растр покрывал ровно весь мир — при любой
- * реальной карте (bounds уже всего мира) они расходились в разы. Следствия: тайлы
- * ехали относительно объектов, «сбивался масштаб», при загрузке большой карты
- * требовались тысячи тайлов (карта не загружалась), а привязка к координатам
- * нарушалась. Теперь размер мира в экранных px определяется ЗУМОМ и высотой
- * канваса — как во всех стандартных тайловых картах (Leaflet/MapLibre):
- *   worldPx = canvasHeight · 2^zoom,  zoom = z0 + log2(scale)  (z0 = 14 — эталон).
- * Объекты хранятся в пикселях растра map.width×map.height, покрывающего bounds;
- * растр географически корректен (Web Mercator), поэтому его пиксели переводятся
- * в world-пиксели точно: sx = map.width·(lngSpan/360), sy = map.height·(mercSpanY).
- * Всё (тайлы, сетка, линейка, зум, курсор, объекты) считается через одну формулу —
- * масштаб не может «сбиться», привязка строга на любом зуме от z3 до z19+.
- */
-const ZOOM_REF = 14; // эталонный стартовый zoom: scale=1 ⇔ мир = canvasHeight·2^14 px
-
-/** Нейтральный фолбэк-вид: только для типового сужения nullable-viewRef.
- *  К моменту любого чтения вида компонент уже гарантированно инициализирован
- *  (ленивая ветка `if (viewRef.current === null)` выполняется до рендера),
- *  поэтому это значение фактически недостижимо — но делает все обращения к
- *  `v.offsetX/v.scale` типобезопасными без точечных guard'ов в 30+ местах. */
-const NEUTRAL_VIEW: ViewState = {
-  offsetX: 0,
-  offsetY: 0,
-  scale: 1,
-  z0: ZOOM_REF,
-};
-function zoomOfView(scale: number, z0?: number): number {
-  return (z0 ?? ZOOM_REF) + Math.log2(Math.max(scale, 1e-12));
-}
-function worldPxOf(canvasH: number, scale: number, z0?: number): number {
-  return Math.max(256, canvasH * Math.pow(2, zoomOfView(scale, z0)));
-}
-function zoomAtWorldPx(worldPx: number): number {
-  return Math.log2(Math.max(worldPx / 256, 1e-9));
-}
-/** Метров на ЭКРАННЫЙ пиксель (учёт широты обязателен — иначе линейка врёт) */
-function metersPerPixelFromWorld(worldPx: number, latRef: number): number {
-  const z = zoomAtWorldPx(worldPx);
-  return (
-    (156543.0339280412 / Math.pow(2, z)) * Math.cos((latRef * Math.PI) / 180)
-  );
-}
-/** Обратное преобразование: мир в px под целевые м/пиксель */
-function worldPxForMetersPerPixel(mpp: number, latRef: number): number {
-  const mppEq = mpp / Math.max(0.05, Math.cos((latRef * Math.PI) / 180));
-  return (
-    256 * Math.pow(2, Math.log2(156543.0339280412 / Math.max(mppEq, 1e-9)))
-  );
-}
-/** Границы scale для minZoom..maxNativeZoom (не выше нативного уровня сервера) */
-function scaleBoundsForZooms(
-  canvasH: number,
-  z0: number | undefined,
-  server: string,
-): { min: number; max: number } {
-  void canvasH; // границы задаются zoom'ом, а не размером окна — scale относительна z0=14
-  const nativeMax = Math.min(
-    MAX_ZOOM,
-    NATIVE_MAX_BY_SERVER[server] ?? MAX_ZOOM,
-  );
-  return {
-    min: Math.pow(2, MIN_ZOOM - (z0 ?? ZOOM_REF)),
-    max: Math.pow(2, nativeMax - (z0 ?? ZOOM_REF)),
-  };
-}
-
-/** Человекочитаемая подпись масштаба */
-function scaleLabel(mpp: number): string {
-  if (mpp >= 1000) return `1 px ≈ ${(mpp / 1000).toFixed(1)} км`;
-  if (mpp >= 1) return `1 px ≈ ${mpp.toFixed(1)} м`;
-  if (mpp >= 0.01) return `1 px ≈ ${Math.round(mpp * 100)} см`;
-  return `1 px ≈ ${(mpp * 1000).toFixed(1)} мм`;
-}
-
-/** Широта центра bounds — для точного расчёта метров/пиксель */
-function centerLatOf(bounds: { north: number; south: number }): number {
-  return (bounds.north + bounds.south) / 2;
-}
-
-/**
- * Автоподбор вида под все объекты (маршруты, маркеры, зоны) — карта загружается
- * НЕ статичной картинкой «в размер окна», а активным видом, охватывающим данные.
- * Привязка — та же строгая формула, что и у тайлов/объектов: пиксель растра
- * переводится в world-пиксели текущего зума через mercWorldPx (мировая Mercator-
- * высота растра), поэтому fit корректен на ЛЮБОМ зуме (z3..z19+) и не «сбивает»
- * масштаб. Ограничение: целевой zoom держим в [MIN_ZOOM, MAX_ZOOM].
- */
-function fitViewToData(
-  mapW: number,
-  mapH: number,
-  bounds: MapBounds,
-  pts: Point[],
-  vw: number,
-  vh: number,
-  z0?: number,
-): { scale: number; offsetX: number; offsetY: number; z0: number } | null {
-  if (pts.length === 0 || mapW <= 0 || mapH <= 0) return null;
-  // Пиксели объектов -> география через точную Mercator-привязку растра к bounds
-  const north = bounds.north,
-    south = bounds.south;
-  const east = bounds.east ?? 180;
-  const west = bounds.west ?? -180;
-  const topY = latToMerc(north);
-  const botY = latToMerc(south);
-  const mercSpanY = Math.max(1e-12, botY - topY); // высота мира (0..1) на всю карту
-  const lngSpanX = Math.max(1e-12, (east - west) / 360); // ширина мира (0..1) на всю карту
-  const toWorldFrac = (p: Point): [number, number] => [
-    west / 360 + 0.5 + (p.x / mapW - 0.5) * lngSpanX, // долгота -> [0..1] мира
-    topY + (p.y / mapH) * mercSpanY, // широта -> mercator [0..1] мира
-  ];
-  let minFx = Infinity,
-    maxFx = -Infinity,
-    minFy = Infinity,
-    maxFy = -Infinity;
-  for (const p of pts) {
-    const [fx, fy] = toWorldFrac(p);
-    if (fx < minFx) minFx = fx;
-    if (fx > maxFx) maxFx = fx;
-    if (fy < minFy) minFy = fy;
-    if (fy > maxFy) maxFy = fy;
-  }
-  if (!isFinite(minFx) || !isFinite(minFy)) return null;
-  const pad = 0.05;
-  minFx -= (maxFx - minFx) * pad || 1e-4;
-  maxFx += (maxFx - minFx) * pad || 1e-4;
-  minFy -= (maxFy - minFy) * pad || 1e-4;
-  maxFy += (maxFy - minFy) * pad || 1e-4;
-  const wFrac = Math.max(1e-9, maxFx - minFx);
-  const hFrac = Math.max(1e-9, maxFy - minFy);
-  // КРИТ. ФИКС пропорций: world-px изотропны (квадратные тайлы Mercator), т.е.
-  // width_px = height_px = worldPx. Поэтому целевой размер мира считаем как
-  // Math.min от независимых требований ширины и высоты — иначе подбор только по
-  // высоте (vh / hFrac) гарантированно НЕ вмещает bbox по ширине, и «компенсация»
-  // растяжением давала бы искажение aspect ratio (сплющивание/растягивание).
-  const worldTargetW = vw / wFrac;
-  const worldTargetH = vh / hFrac;
-  const worldTarget = Math.min(worldTargetW, worldTargetH);
-  let zoom = zoomAtWorldPx(worldTarget);
-  zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));
-  // Ограничение зумом может оставить мир крупнее окна — тогда bbox физически не
-  // влезает (ниже MIN_ZOOM опускаться нельзя): центрируем по минимуму и честно
-  // показываем обрезку, вместо того чтобы искажать пропорции не-равномерным scale.
-  const worldPx = Math.max(256, Math.min(worldTarget, 256 * Math.pow(2, zoom)));
-  // ЕДИНАЯ инвариантная привязка вида: worldPx = vh · 2^(z0 + log2(scale)),
-  // где z0 передаётся вызывающим кодом из АКТУАЛЬНОГО viewState (см. worldPxOf).
-  // Раньше здесь жёстко подставлялся ZOOM_REF=14 (и тем более bounds.z0, которого
-  // в MapBounds нет), из-за чего fitToAll давал scale, который render-путь
-  // пересчитывал в ДРУГОЙ worldPx при z0≠14 — «компенсация» растягивала карту
-  // за пределы экрана, и тайлы улетали в бесконечную перезагрузку
-  // (зависание подложки при старте мастера с z0=3).
-  const baseZ0 = Number.isFinite(z0) ? (z0 as number) : ZOOM_REF;
-  const scale = worldPx / (vh * Math.pow(2, baseZ0)); // scale относительно z0
-  // центр bbox в world-px -> смещение, чтобы центр оказался в центре экрана
-  const cxW = ((minFx + maxFx) / 2) * worldPx;
-  const cyW = ((minFy + maxFy) / 2) * worldPx;
-  return { scale, offsetX: vw / 2 - cxW, offsetY: vh / 2 - cyW, z0: baseZ0 };
-}
-
-/** Нормализованная Mercator Y широты (0..1) */
-function latToMerc(lat: number): number {
-  const s = Math.sin((lat * Math.PI) / 180);
-  return 0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI);
-}
-
-/** Обратная Mercator: нормализованная Y -> широта */
-function mercToLat(y: number): number {
-  const n = Math.PI - 2 * Math.PI * y;
-  return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
-}
-
-/** Ограничение зума диапазоном [MIN_ZOOM, MAX_ZOOM] — единый источник правды */
-function clampZoom(z: number): number {
-  return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
-}
-
-/** Подпись «1 см на экране = N м» при текущем масштабе (96 css px = 2.54 см) */
-function rulerScaleText(mpp: number): string {
-  const m1cm = mpp * (2.54 / 96) * 100; // метров в 1 см экрана
-  if (m1cm >= 1000)
-    return `1 см ≈ ${(m1cm / 1000).toFixed(m1cm >= 10000 ? 0 : 1)} км`;
-  if (m1cm >= 1) return `1 см ≈ ${m1cm.toFixed(m1cm < 10 ? 1 : 0)} м`;
-  return `1 см ≈ ${(m1cm * 100).toFixed(0)} см`;
-}
-
-/**
- * Расстояние в экранных пикселях от точки до ломаной маршрута.
- * Используется для «прицела» к точкам и сегментам маршрута при редактировании.
- */
-function distPxToPolyline(p: Point, pts: Point[]): number {
-  if (pts.length === 0) return Infinity;
-  let best = Math.hypot(p.x - pts[0].x, p.y - pts[0].y);
-  for (let i = 0; i < pts.length - 1; i++) {
-    const a = pts[i],
-      b = pts[i + 1];
-    const dx = b.x - a.x,
-      dy = b.y - a.y;
-    const len2 = dx * dx + dy * dy || 1e-9;
-    let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
-    t = Math.max(0, Math.min(1, t));
-    const d = Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
-    if (d < best) best = d;
-  }
-  return best;
-}
+import {
+  MIN_ZOOM,
+  MAX_ZOOM,
+  ROUTE_PALETTE,
+  NATIVE_MAX_BY_SERVER,
+  VIEW_STORAGE_KEY,
+  finiteOr,
+  sanitizeView,
+  readSavedView,
+  writeSavedView,
+  DEFAULT_TILE_MAP_ZOOM,
+  SPB_GEO_CONST,
+  spbFallbackView,
+  mapFitKey,
+  sanitizeSavedView,
+  MAX_PARALLEL,
+  TILE_DEBOUNCE_MS,
+  ZOOM_REF,
+  NEUTRAL_VIEW,
+  zoomOfView,
+  worldPxOf,
+  zoomAtWorldPx,
+  metersPerPixelFromWorld,
+  worldPxForMetersPerPixel,
+  scaleBoundsForZooms,
+  scaleLabel,
+  centerLatOf,
+  fitViewToData,
+  latToMerc,
+  mercToLat,
+  clampZoom,
+  rulerScaleText,
+  distPxToPolyline,
+} from "./map/viewMath";
 
 export interface MapCanvasProps {
   /** Публикует флаг фактической загрузки подложки (тайлы или растр) наружу —
@@ -537,12 +224,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     index: number;
   } | null>(null);
   // Popup по клику на объект (координаты, высота, расстояние)
-  const [popup, setPopup] = useState<{
-    x: number;
-    y: number;
-    title: string;
-    lines: string[];
-  } | null>(null);
+  const [popup, setPopup] = useState<PopupData | null>(null);
   // Кэш тайлов подложки: url -> изображение (или undefined при ошибке)
   const tileCache = useRef<Map<string, HTMLImageElement>>(new Map());
   // CIRCUIT BREAKER загрузки тайлов (шаг П3 ТЗ): если запросы к CDN «молчат»
@@ -671,11 +353,68 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     acc: number;
   } | null>(null);
 
+  // ─── ФАЗА 5.D: прямые доменные селекторы (вместо фасада useStoreShim) ────
+  // `project` — проектный читатель readProject() + подписка на map/mission-сторы
+  // (useShallow по «срезам» доменов: ре-рендер только при реальном изменении).
+  // Экшены берутся из доменных сторов; mutate-экшены миссии проходят через
+  // isProcessing-страж, навешанный на сам useMissionStore (installMissionGuards).
+  const mapSnap = useMapStore(
+    useShallow((s) => ({
+      map: s.map,
+      calibration: s.calibration,
+      restrictions: s.restrictions,
+      markers: s.markers,
+      layers: s.layers,
+      settings: s.settings,
+      googleMaps: s.googleMaps,
+      yandexMaps: s.yandexMaps,
+      openStreetMap: s.openStreetMap,
+      tacticalOverlays: s.tacticalOverlays,
+      projectName: s.projectName,
+      projectCreatedAt: s.projectCreatedAt,
+      projectUpdatedAt: s.projectUpdatedAt,
+      currentTool: s.currentTool,
+      selectedMarkerId: s.selectedMarkerId,
+      isDrawing: s.isDrawing,
+      drawingPoints: s.drawingPoints,
+      cursorPosition: s.cursorPosition,
+      measurementPoints: s.measurementPoints,
+      setViewState: s.setViewState,
+      setCursorPosition: s.setCursorPosition,
+      addMarker: s.addMarker,
+      updateMarker: s.updateMarker,
+      selectMarker: s.selectMarker,
+      addRestriction: s.addRestriction,
+      deleteRestriction: s.deleteRestriction,
+      addDrawingPoint: s.addDrawingPoint,
+      undoDrawingPoint: s.undoDrawingPoint,
+      clearDrawingPoints: s.clearDrawingPoints,
+      setDrawing: s.setDrawing,
+      setMeasurementPoints: s.setMeasurementPoints,
+      loadMap: s.loadMap,
+      loadActiveTileMap: s.loadActiveTileMap,
+      getTacticalOverlayPayload: s.getTacticalOverlayPayload,
+      hydrateTacticalOverlays: s.hydrateTacticalOverlays,
+    })),
+  );
+  const missionSnap = useMissionStore(
+    useShallow((s) => ({
+      routes: s.routes,
+      importLists: s.importLists,
+      activeRouteId: s.activeRouteId,
+      appendRoutePoint: s.appendRoutePoint,
+      moveRoutePoint: s.moveRoutePoint,
+      removeRoutePoint: s.removeRoutePoint,
+      setActiveRoute: s.setActiveRoute,
+      addRoute: s.addRoute,
+      flushReroute: s.flushReroute,
+      updateRouteAltitudes: s.updateRouteAltitudes,
+    })),
+  );
+  const project = readProject();
   const {
-    project,
     currentTool,
     selectedMarkerId,
-    activeRouteId,
     isDrawing,
     drawingPoints,
     cursorPosition,
@@ -686,6 +425,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     updateMarker,
     selectMarker,
     addRestriction,
+    deleteRestriction,
     addDrawingPoint,
     undoDrawingPoint,
     clearDrawingPoints,
@@ -695,7 +435,11 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     moveRoutePoint,
     removeRoutePoint,
     setActiveRoute,
-  } = useStore();
+    activeRouteId,
+    addRoute,
+    flushReroute,
+    updateRouteAltitudes,
+  } = { ...mapSnap, ...missionSnap };
 
   // Рабочий тайловый провайдер без API-ключей (реестр TILE_PROVIDERS, аудит
   // audit/index.fixed.html): legacy 'osm'/'carto' нормализуются в Esri/OSM France.
@@ -810,7 +554,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // контейнера вид принудительно фиксируется над СПб (как в режиме
     // планирования). См. applySizes в эффекте ResizeObserver.
     const restoredOrStore =
-      restored ?? sanitizeView(useStore.getState().viewState);
+      restored ?? sanitizeView(useMapStore.getState().viewState);
     if (restoredOrStore) {
       viewRef.current = restoredOrStore;
     } else {
@@ -824,7 +568,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   useEffect(() => {
     const v = viewRef.current ?? NEUTRAL_VIEW;
     if (!v) return;
-    const sv = useStore.getState().viewState;
+    const sv = useMapStore.getState().viewState;
     if (
       sv.offsetX !== v.offsetX ||
       sv.offsetY !== v.offsetY ||
@@ -849,7 +593,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       // Принудительное чтение стора: если он уже содержит наш вид (или более
       // свежий валидный жест) — принимаем его как источник, иначе оставляем
       // viewRef (зеркало остаётся истиной до первого жеста).
-      const next = sanitizeView(useStore.getState().viewState);
+      const next = sanitizeView(useMapStore.getState().viewState);
       if (next && mirrorResolvedRef.current) {
         const cur = viewRef.current;
         const same =
@@ -858,8 +602,8 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
           cur.offsetY === next.offsetY &&
           cur.scale === next.scale &&
           cur.z0 === next.z0;
-        if (same && cur !== useStore.getState().viewState)
-          viewRef.current = useStore.getState().viewState;
+        if (same && cur !== useMapStore.getState().viewState)
+          viewRef.current = useMapStore.getState().viewState;
       }
       mirrorResolvedRef.current = false;
     };
@@ -942,9 +686,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   useEffect(() => {
     if (!hydratedOnceRef.current) {
       hydratedOnceRef.current = true;
-      const st = useStore.getState() as unknown as {
-        hydrateTacticalOverlays?: () => Promise<void>;
-      };
+      const st = useMapStore.getState();
       if (typeof st.hydrateTacticalOverlays === "function") {
         st.hydrateTacticalOverlays()
           .then(() => setRenderTick((t) => t + 1))
@@ -975,7 +717,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // (mirrorResolvedRef), изменения вида из стора игнорируются: источник
     // истины на этом этапе — сам компонент. После публикации стор штатно
     // догоняется зеркалом, и обратного затирания уже невозможно добиться.
-    const unsub = useStore.subscribe((s) => {
+    const unsub = useMapStore.subscribe((s) => {
       // ── ФИКС «ВИСНЕТ НАМЕРТВО» (корень #1, достройка) ────────────────────
       // Валидация на входе: NaN/Infinity/scale<=0 из гидрируемого/битого стора
       // никогда не попадают в viewRef — один NaN в offsetX делал transform DOM-
@@ -1045,7 +787,6 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   const tilesEnabled =
     !!project.settings?.tilesEnabled && !!project.map?.bounds;
   // Только стандартная схема OSM (режимы «спутник/гибрид» удалены из приложения)
-  const tileStyle: TileStyle = "scheme";
   // ЕДИНАЯ инвариантная привязка вида (см. комментарий над worldPxOf):
   //   zoom = z0 + log2(scale),  worldPx = canvasHeight · 2^zoom.
   const effZ0 = vs.z0 ?? ZOOM_REF;
@@ -1053,9 +794,6 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   // НЕПРЕРЫВНЫЙ зум как на openstreetmap.org: тайлы берутся с целочисленного
   // уровня round(zoom), но рисуются в масштабе 2^(zoom-level) — плавное
   // масштабирование без «прыжков» между уровнями.
-  const contZoom = clampZoom(zoomAtWorldPx(worldPx));
-
-  const boundsRef = project.map?.bounds;
 
   // ─── DOM-слой подложки OSM («как на openstreetmap.org») ────────────────────
   // Подложка — настоящие <img>-тайлы внутри абсолютно спозиционированного div
@@ -1071,7 +809,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     const cs = canvasSizeRef.current;
     // rAF/DOM-колбэк: читаем project безопасным читателем — сборка merged
     // агрегата шима здесь вызывала бы getSnapshot в фазе рендера (React #127).
-    const st = readProjectView();
+    const st = readProject();
     const mapBounds = st.map?.bounds;
     const tilesOn = !!st.settings?.tilesEnabled && !!mapBounds;
     if (!tilesOn || !mapBounds || cs.height <= 0) {
@@ -1132,7 +870,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     const el = tileLayerRef.current;
     if (!el) return;
     // syncTileDom вызывается из rAF-колбэков — merged-агрегат шима здесь опасен.
-    const proj = readProjectView();
+    const proj = readProject();
     const mapBounds = proj.map?.bounds;
     const tilesOn = !!proj.settings?.tilesEnabled && !!mapBounds;
     if (!tilesOn || !mapBounds) {
@@ -1463,7 +1201,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   const [droneCount, setDroneCount] = useState(4);
   const [sharedGoal, setSharedGoal] = useState(true);
   // Общий старт для всего роя (по умолчанию) — либо индивидуальные старты дронов
-  const [sharedStart, setSharedStart] = useState(true);
+  const [sharedStart] = useState(true);
   const [activeUav, setActiveUav] = useState(0);
   const [startGeo, setStartGeo] = useState<{ lat: number; lng: number } | null>(
     null,
@@ -1613,15 +1351,6 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       }));
   }, [tripleMode, project.routes, project.map]);
 
-  // Все гео-точки миссии (маршруты проекта + старт + цель) — для PNG-экспорта
-  const tripleAllGeoPts = React.useMemo(() => {
-    const out: { lat: number; lng: number }[] = [];
-    for (const r of tripleRoutes) out.push(...r.geo);
-    if (startGeo) out.push(startGeo);
-    if (goalGeo) out.push(goalGeo);
-    return out;
-  }, [tripleRoutes, startGeo, goalGeo]);
-
   // ─── Пошаговый мастер: старт → маршрут → цель → ЗАПУСК ──────────────────────
   // step: 0 = выбор старта (панель СТАРТ сфокусирована), 1 = редактирование
   // маршрута (панель ВЕСЬ МАРШРУТ), 2 = выбор цели (панель ЦЕЛЬ),
@@ -1666,7 +1395,6 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     );
     return sm.map((q) => ({ lat: q.x, lng: q.y }));
   };
-  const addRoute = useStore((s) => s.addRoute);
   const mapBounds = project.map?.bounds;
 
   // Черновик маршрута из реальных маршрутов проекта при входе в шаг 1
@@ -1681,7 +1409,6 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tripleStep, approvedSteps]);
 
-  const focusPanelIdx = tripleStep === 3 ? -1 : tripleStep;
   // Зоны ограничения, поставленные на ЛЮБОЙ из трёх карт (в т.ч. неактивной),
   // ждут утверждения — рисуем кандидатов-полигоны во всех окнах с id для удаления.
   const pendingZoneMini = pendingZones.map((pz) => ({
@@ -1713,7 +1440,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         const pxPts = pz.pts.map((g) =>
           geoToPixelExact(g.lat, g.lng, map.bounds!, map.width, map.height),
         );
-        useStore.getState().addRestriction({
+        useMapStore.getState().addRestriction({
           type: "polygon",
           points: pxPts,
           color: "#ff000080",
@@ -1721,7 +1448,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         });
       }
       // немедленная перестройка маршрутов вокруг новых зон (без троттлинга)
-      useStore.getState().flushReroute();
+      useMissionStore.getState().flushReroute();
       return true;
     },
     [project.map],
@@ -1766,17 +1493,10 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       const existing =
         tripleRoutes[Math.min(activeUav, tripleRoutes.length - 1)];
       if (existing) {
-        useStore.setState((cur) => ({
-          project: {
-            ...cur.project,
-            routes: (cur.project.routes || []).map((r) =>
-              r.id === existing.id ? { ...r, points: pts } : r,
-            ),
-            updatedAt: new Date().toISOString(),
-          },
-        }));
+        useMissionStore.getState().setRoutePoints(existing.id, pts);
+        touchProjectUpdatedAt();
         // обход ограничений + высоты для этого маршрута (async)
-        void useStore.getState().updateRouteAltitudes(existing.id);
+        void useMissionStore.getState().updateRouteAltitudes(existing.id);
       } else {
         addRoute(
           pts,
@@ -1956,7 +1676,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
             return n;
           });
           setDroneGoalAt(activeUavRef.current, g); // store-first
-          const st = readProjectViewWithActions();
+          const st = readProject();
           const map = st.map;
           const r = (st.routes || [])[activeUavRef.current];
           if (r && map?.bounds && r.points.length >= 2) {
@@ -1968,7 +1688,9 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
               map.width,
               map.height,
             );
-            st.moveRoutePoint(r.id, r.points.length - 1, { x: px.x, y: px.y });
+            useMissionStore
+              .getState()
+              .moveRoutePoint(r.id, r.points.length - 1, { x: px.x, y: px.y });
           } else {
             setGoalGeo(g);
           }
@@ -2077,17 +1799,17 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         return;
       }
       if (id.startsWith("zone:")) {
-        useStore.getState().deleteRestriction(id.slice(5));
-        useStore.getState().flushReroute();
+        useMapStore.getState().deleteRestriction(id.slice(5));
+        useMissionStore.getState().flushReroute();
         return;
       }
       if (id.startsWith("drone-goal:")) {
         // удаление цели дрона = удаление последней путевой точки его маршрута
         const rid = id.slice("drone-goal:".length);
-        const st = readProjectViewWithActions();
+        const st = readProject();
         const r = (st.routes || []).find((rr) => rr.id === rid);
         if (r && r.points.length > 0)
-          st.removeRoutePoint(rid, r.points.length - 1);
+          useMissionStore.getState().removeRoutePoint(rid, r.points.length - 1);
       }
     },
     [setSharedStartPoint, setSharedGoalPoint],
@@ -2098,8 +1820,8 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       setPendingZones((prev) => prev.filter((pz) => pz.uid !== uid));
       return;
     }
-    useStore.getState().deleteRestriction(id);
-    useStore.getState().flushReroute();
+    useMapStore.getState().deleteRestriction(id);
+    useMissionStore.getState().flushReroute();
   }, []);
 
   // «ЗАПУСК»: загрузка данных миссии в дроны (имитация телеметрической загрузки).
@@ -2110,7 +1832,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     if (launchState !== "idle") return;
     setLaunchState("uploading");
     useMissionStore.getState().beginProcessing();
-    const st = readProjectViewWithActions();
+    const st = readProject();
     const mission = {
       start: startGeo,
       goal: goalGeo,
@@ -2124,24 +1846,24 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
           waypoints: r.points.map((p) => ({ lat: p.lat, lng: p.lng })),
         })),
       // все поставленные зоны (флаг active устарел — см. types/Restriction)
-      zones: st.project.restrictions
-        .filter((z) => z.points.length > 0)
+      zones: useMapStore
+        .getState()
+        .restrictions.filter((z) => z.points.length > 0)
         .map((z) => ({
           id: z.id,
           name: z.name,
           type: z.type,
-          geoPoints:
-            mapBounds && st.project.map
-              ? z.points.map((pt) => {
-                  const g = pixelToGeoExact(
-                    pt,
-                    mapBounds,
-                    st.project.map!.width,
-                    st.project.map!.height,
-                  );
-                  return { lat: g.lat, lng: g.lng };
-                })
-              : [],
+          geoPoints: mapBounds
+            ? z.points.map((pt) => {
+                const g = pixelToGeoExact(
+                  pt,
+                  mapBounds,
+                  project.map!.width,
+                  project.map!.height,
+                );
+                return { lat: g.lat, lng: g.lng };
+              })
+            : [],
         })),
       createdAt: new Date().toISOString(),
     };
@@ -2204,7 +1926,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     setLaunchState("idle");
     setActiveUav(0);
     // маршруты предыдущей миссии удаляем из проекта (зоны-ограничения остаются)
-    useStore.setState((cur) => ({ project: { ...cur.project, routes: [] } }));
+    useMissionStore.getState().clearRoutes();
     setPopup({
       x: canvasSize.width / 2 - 160,
       y: 60,
@@ -2215,57 +1937,6 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       ],
     });
   }, [launchState, canvasSize]);
-
-  // Перенос гео-объектов проекта (маршруты/маркеры/зоны) в виртуальный растр
-  // новой активной карты при включении режима — иначе объекты останутся в
-  // пикселях старого растра и будут вне bounds («карты пустые»).
-  const remapProjectToRaster = useCallback(() => {
-    const st = readProjectView();
-    const map = st.map;
-    if (!map?.bounds || map.width <= 0 || map.height <= 0) return;
-    const b = map.bounds;
-    const routes = (st.routes || []).map((r) => ({
-      ...r,
-      points: r.points.map((p) => ({
-        ...p,
-        ...geoToPixelExact(p.lat, p.lng, b, map.width, map.height),
-      })),
-    }));
-    const markers = st.markers.map((m) =>
-      m.lat != null && m.lon != null
-        ? { ...m, ...geoToPixelExact(m.lat, m.lon, b, map.width, map.height) }
-        : m,
-    );
-    const restrictions = st.restrictions.map((r) => {
-      if (r.points.length === 0) return r;
-      const geoPts = r.points.map((p) =>
-        pixelToGeoExact(p, b, map.width, map.height),
-      );
-      const pts = geoPts.map((g) =>
-        geoToPixelExact(g.lat, g.lng, b, map.width, map.height),
-      );
-      let radius = r.radius;
-      if (r.type === "circle" && r.radius) {
-        const cLat = geoPts[0].lat;
-        const dM =
-          r.radius *
-          metersPerPixelFromWorld(256 * Math.pow(2, ZOOM_REF + 10), cLat); // приблизительный перенос в метрах
-        const edge = { lat: cLat + dM / 111320, lng: geoPts[0].lng };
-        const pe = geoToPixelExact(
-          edge.lat,
-          edge.lng,
-          b,
-          map.width,
-          map.height,
-        );
-        radius = Math.hypot(pe.x - pts[0].x, pe.y - pts[0].y);
-      }
-      return { ...r, points: pts, radius };
-    });
-    useStore.setState((cur) => ({
-      project: { ...cur.project, routes, markers, restrictions },
-    }));
-  }, []);
 
   // Инициализация тайловой карты при старте приложения (режим трёх окон всегда включён):
   // если активной тайловой карты нет — создаём под текущий центр вида.
@@ -2281,7 +1952,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // already be working». Выносим автозагрузку за пределы render-фазы.
     const t = window.setTimeout(() => {
       // КОРНЕВОЙ ФИКС «призрачной карты» в тестах готовности: состояние читаем
-      // НАПРЯМУЮ из доменного useMapStore, а не через фасад readProjectView().
+      // НАПРЯМУЮ из доменного useMapStore, а не через фасад readProject().
       // Агрегат шима обновляется асинхронными подписками — сразу после
       // синхронного setState({map:null}) из beforeEach он ещё показывал старую
       // карту («tilesOn=true»), и MapCanvas не запускал автозагрузку. В итоге
@@ -2308,7 +1979,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     const onClick = (e: MouseEvent) => {
       const what = pickWhatRef.current;
       if (what === "none") return;
-      const st = readProjectView();
+      const st = readProject();
       const map = st.map;
       if (!map?.bounds || map.width <= 0 || map.height <= 0) return;
       const r = canvas.getBoundingClientRect();
@@ -2615,41 +2286,53 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   useEffect(() => {
     let vTimer: ReturnType<typeof setTimeout> | null = null;
     let lastVKey = "";
-    const unsub = useStore.subscribe((s, prev) => {
-      if (s.project.restrictions !== prev.project.restrictions)
-        scheduleRerouteAll();
+    let lastVKeyRestr = "";
+    let lastClearance: number | undefined = undefined;
+    // Две доменные подписки вместо одной на merged-агрегат шима:
+    // map.restrictions — перестройка маршрутов вокруг зон.
+    const unsubRestr = useMapStore.subscribe((s, prev) => {
+      if (s.restrictions !== prev.restrictions) scheduleRerouteAll();
+    });
+    const unsub = useMissionStore.subscribe((s, prev) => {
+      void prev;
       // Автокоррекция высот: изменились ВЕРТИКАЛЬНЫЕ лимиты зон, настройки
       // высот или геометрия маршрутов — пересчитать требуемые ABS-высоты
       // по рельефу (Open-Elevation; кэш высот делает повторные прогоны дешёвыми).
       // Троттлинг 600 мс: при drag точек маршрута запросы не должны сыпаться
       // на каждый mousemove (публичный API тротлится; altitudeRunId отменяет
       // устаревшие прогоны, но сетевой шторм всё равно недопустим).
-      const vKey = (rs: typeof s.project.restrictions) =>
+      // settings/restrictions живут в домене карты (useMapStore), читаем их
+      // напрямую — подписка на mission реагирует только на геометрию маршрутов.
+      const mapSt = useMapStore.getState();
+      const vKey = (rs: typeof mapSt.restrictions) =>
         rs.reduce(
           (acc, r) =>
             acc +
             `${r.active ? 1 : 0}:${r.minHeightAGL ?? ""}:${r.maxHeightAGL ?? ""}|`,
           "",
         );
-      const geoKey = (s.project.routes || [])
+      const geoKey = (s.routes || [])
         .map(
           (r) =>
             `${r.id}:${r.points.length}:${r.points.reduce((a, p) => a + `${p.lat.toFixed(4)},${p.lng.toFixed(4)};`, "")}`,
         )
         .join("|");
-      const elevAuto = s.project.settings.elevationAuto === true;
+      const elevAuto = mapSt.settings.elevationAuto === true;
+      const curVKey = vKey(mapSt.restrictions);
+      const clearance = mapSt.settings.altitudeClearanceM;
       const needAlt =
         elevAuto &&
-        (vKey(s.project.restrictions) !== vKey(prev.project.restrictions) ||
-          s.project.settings.altitudeClearanceM !==
-            prev.project.settings.altitudeClearanceM ||
+        (curVKey !== lastVKeyRestr ||
+          clearance !== lastClearance ||
           geoKey !== lastVKey);
+      lastVKeyRestr = curVKey;
+      lastClearance = clearance;
       if (needAlt) {
         lastVKey = geoKey;
         if (vTimer) clearTimeout(vTimer);
         vTimer = setTimeout(() => {
           vTimer = null;
-          void useStore.getState().updateRouteAltitudes();
+          void useMissionStore.getState().updateRouteAltitudes();
         }, 600);
       } else if (!elevAuto && vTimer) {
         clearTimeout(vTimer);
@@ -2666,6 +2349,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     });
     return () => {
       unsub();
+      unsubRestr();
       offZoomBus();
     };
   }, [zoomAt]);
@@ -2705,7 +2389,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
               Math.max(256, h * Math.pow(2, DEFAULT_TILE_MAP_ZOOM)),
         };
         viewRef.current = v;
-        useStore.getState().setViewState({ ...v });
+        useMapStore.getState().setViewState({ ...v });
         // ФИКС «СИНИЙ ЭКРАН» (копия пути режима трёх окон): MiniMapPanel при
         // каждом применении вида синхронно переставляет свой слой подложки.
         // Здесь раньше этого не было: transform DOM-слоя оставался от
@@ -2736,7 +2420,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
             offsetY: v.offsetY + (h - prev.height) / 2,
           };
           viewRef.current = nextV;
-          useStore.getState().setViewState({ ...nextV });
+          useMapStore.getState().setViewState({ ...nextV });
           tileLayerPositionRef.current?.();
         }
         // ФИКС «не удалось определить размер карты»: зеркало 'tq-view' обязано
@@ -3088,7 +2772,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         // если гидрация persist уже отдала идентичный viewState) и выходим.
         const v = viewRef.current ?? NEUTRAL_VIEW;
         if (v) {
-          const sv = useStore.getState().viewState;
+          const sv = useMapStore.getState().viewState;
           if (
             sv.offsetX !== v.offsetX ||
             sv.offsetY !== v.offsetY ||
@@ -3342,7 +3026,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   const fallbackButtonsRef = useRef<FallbackBtn[]>([]);
   const fallbackFileInputRef = useRef<HTMLInputElement | null>(null);
   const loadActiveTileHere = useCallback((): void => {
-    const st = useStore.getState();
+    const st = useMapStore.getState();
     const cs = canvasSizeRef.current;
     const v = viewRef.current ?? NEUTRAL_VIEW;
     const wp = worldPxOf(cs.height, v.scale, v.z0 ?? ZOOM_REF);
@@ -3369,7 +3053,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         const dataUrl = ev.target?.result as string;
         const img = new Image();
         img.onload = () => {
-          useStore.getState().loadMap({
+          useMapStore.getState().loadMap({
             name: file.name,
             width: img.width,
             height: img.height,
@@ -3577,9 +3261,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     {
       const tacticalLayers = project.tacticalOverlays || [];
       if (tacticalLayers.length > 0) {
-        const stT = useStore.getState() as unknown as {
-          getTacticalOverlayPayload?: (id: string) => string | null;
-        };
+        const stT = useMapStore.getState();
         const wpT = worldPxOf(canvasSize.height, vs.scale, vs.z0 ?? ZOOM_REF);
         for (const tl of tacticalLayers) {
           if (!tl.visible) continue;
@@ -4326,224 +4008,21 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // ─── Маршруты миссии (три окна карты) ────────────────────────────────────
     // Все точки маршрутов хранятся в WGS-84; пиксельные координаты (x, y)
     // пересчитаны из bounds при загрузке — привязка строго географическая.
+    // Фаза 5.C: реализация слоя маршрутов вынесена в ./map/routesLayer (чистая
+    // функция, покрыта тестами). Здесь остаётся только делегат с замыканиями на
+    // текущие refs/сторы — поведение 1:1 совпадает с исходным кодом.
     function drawRoutes(ctx: CanvasRenderingContext2D) {
-      const routes = project.routes || [];
-      if (routes.length === 0) return;
-
-      ctx.save();
-      ctx.translate(vs.offsetX, vs.offsetY);
-      ctx.scale(vs.scale, vs.scale);
-      const s = vs.scale;
-
-      for (let ri = 0; ri < routes.length; ri++) {
-        const route = routes[ri];
-        if (!route.visible || route.points.length < 2) continue;
-
-        const color = route.color || ROUTE_PALETTE[ri % ROUTE_PALETTE.length];
-        const isActive = route.id === activeRouteId;
-
-        // Предупреждения о пересечении зон ограничений.
-        // П.7: НЕ вызываем analyzeRoute на каждый кадр — он пересчитывает
-        // haversine-длины всех сегментов (O(N)) только ради crossedZones.
-        // Активные зоны берутся из кэша (инвалидируется при изменении зон),
-        // проверка отрезок↔зона выполняется сразу на пиксельных точках.
-        let crossed: { name: string }[] = [];
-        try {
-          const activeZonesForDraw = getActiveZonesCached(project.restrictions);
-          if (activeZonesForDraw.length > 0) {
-            crossed = zonesCrossedBy(
-              route.points.map((p) => ({ x: p.x, y: p.y })),
-              activeZonesForDraw,
-            );
-          }
-        } catch {
-          /* зоны могут быть невалидными — не роняем отрисовку */
-        }
-
-        // Ограничение по дальности (max/min) — нарушение помечаем красным
-        let rangeViolation = false;
-        if (
-          route.rangeMode &&
-          route.rangeMode !== "off" &&
-          route.rangeM &&
-          route.rangeM > 0
-        ) {
-          const len = routeLengthM(
-            route.points.map((p) => ({ lat: p.lat, lng: p.lng })),
-          );
-          rangeViolation =
-            route.rangeMode === "max" ? len > route.rangeM : len < route.rangeM;
-        }
-
-        // Линии сегментов: авто-обходные сегменты — пунктир, ключевые — сплошные.
-        // shape==='curve': рисуем сглаженную кривую Catmull-Rom через все точки
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
-        if (route.shape === "curve") {
-          ctx.strokeStyle = rangeViolation ? "#ff4d4d" : color;
-          ctx.lineWidth = (isActive ? 3.5 : 2.2) / s;
-          ctx.setLineDash([]);
-          ctx.beginPath();
-          const cp = route.points;
-          ctx.moveTo(cp[0].x, cp[0].y);
-          for (let i = 0; i < cp.length - 1; i++) {
-            const p0 = cp[Math.max(0, i - 1)];
-            const p1 = cp[i];
-            const p2 = cp[i + 1];
-            const p3 = cp[Math.min(cp.length - 1, i + 2)];
-            const c1x = p1.x + (p2.x - p0.x) / 6,
-              c1y = p1.y + (p2.y - p0.y) / 6;
-            const c2x = p2.x - (p3.x - p1.x) / 6,
-              c2y = p2.y - (p3.y - p1.y) / 6;
-            ctx.bezierCurveTo(c1x, c1y, c2x, c2y, p2.x, p2.y);
-          }
-          ctx.stroke();
-        } else {
-          for (let i = 0; i < route.points.length - 1; i++) {
-            const a = route.points[i];
-            const b = route.points[i + 1];
-            ctx.strokeStyle = rangeViolation ? "#ff4d4d" : color;
-            ctx.lineWidth = (isActive ? 3.5 : 2.2) / s;
-            if (a.auto || b.auto) ctx.setLineDash([8 / s, 5 / s]);
-            else ctx.setLineDash([]);
-            ctx.beginPath();
-            ctx.moveTo(a.x, a.y);
-            ctx.lineTo(b.x, b.y);
-            ctx.stroke();
-          }
-          ctx.setLineDash([]);
-        }
-
-        // Точки маршрута: ключевые (ставит пользователь) — цветные и чуть
-        // крупнее; авто-обходные (результат обхода ограничений) — мелкие
-        // полупрозрачные, их видно как «цепочку» вокруг зон.
-        const drawR = (isActive ? 5 : 3.5) / s;
-        for (let i = 0; i < route.points.length; i++) {
-          const p = route.points[i];
-          const rPt = p.auto ? drawR * 0.55 : drawR;
-          // Drag-обратная связь: захваченная точка маршрута — пульсирующая
-          // cyan-подсветка + увеличенный радиус, видно что элемент «схвачен».
-          const drag = draggingRouteRef.current;
-          const isDragPt =
-            isActive && !!drag && drag.routeId === route.id && drag.index === i;
-          if (isDragPt) {
-            ctx.beginPath();
-            ctx.arc(p.x, p.y, rPt * 2.4, 0, Math.PI * 2);
-            ctx.fillStyle = "rgba(0, 208, 255, 0.30)";
-            ctx.fill();
-            ctx.setLineDash([4 / s, 3 / s]);
-            ctx.strokeStyle = "rgba(0, 208, 255, 0.95)";
-            ctx.lineWidth = 2 / s;
-            ctx.stroke();
-            ctx.setLineDash([]);
-          }
-          ctx.beginPath();
-          ctx.arc(p.x, p.y, isDragPt ? rPt * 1.6 : rPt, 0, Math.PI * 2);
-          ctx.fillStyle = p.auto ? "rgba(255,255,255,0.45)" : color;
-          ctx.fill();
-          ctx.lineWidth = (isDragPt ? 2.2 : 1.2) / s;
-          ctx.strokeStyle = isDragPt ? "#00d0ff" : "rgba(0,0,0,0.6)";
-          ctx.stroke();
-          // Подписи высот (Open-Elevation): у активного маршрута — рельеф/ABS;
-          // ручной AGL на этапе помечается стрелкой ↑
-          if (isActive && typeof p.altitudeAbs === "number") {
-            const fsA = Math.max(8, 9 / s);
-            ctx.font = `${fsA}px sans-serif`;
-            ctx.textAlign = "center";
-            ctx.fillStyle = "rgba(0,0,0,0.75)";
-            const manualTag =
-              typeof p.altitudeAGL === "number"
-                ? ` ↑${Math.round(p.altitudeAGL)}`
-                : "";
-            const tTxt =
-              p.terrainM != null
-                ? `${Math.round(p.altitudeAbs)} м (з ${Math.round(p.terrainM)})${manualTag}`
-                : `${Math.round(p.altitudeAbs)} м${manualTag}`;
-            const twA = ctx.measureText(tTxt).width;
-            ctx.fillRect(
-              p.x - twA / 2 - 2 / s,
-              p.y + drawR + 1 / s,
-              twA + 4 / s,
-              fsA + 3 / s,
-            );
-            ctx.fillStyle = "#7dd3fc";
-            ctx.fillText(tTxt, p.x, p.y + drawR + 1 / s + fsA + 1 / s);
-            ctx.textAlign = "left";
-          }
-        }
-
-        // Стрелка направления на финише
-        const last = route.points[route.points.length - 1];
-        const prev = route.points[route.points.length - 2];
-        const ang = Math.atan2(last.y - prev.y, last.x - prev.x);
-        const ah = 12 / s;
-        ctx.fillStyle = color;
-        ctx.beginPath();
-        ctx.moveTo(last.x, last.y);
-        ctx.lineTo(
-          last.x - ah * Math.cos(ang - 0.4),
-          last.y - ah * Math.sin(ang - 0.4),
-        );
-        ctx.lineTo(
-          last.x - ah * Math.cos(ang + 0.4),
-          last.y - ah * Math.sin(ang + 0.4),
-        );
-        ctx.closePath();
-        ctx.fill();
-
-        // Подписи показываем только для активного маршрута или при малом числе маршрутов
-        if (isActive || routes.length <= 20) {
-          const fs = Math.max(10, 12 / s);
-          const first = route.points[0];
-          ctx.font = `bold ${fs}px sans-serif`;
-          ctx.textAlign = "left";
-          const label = `${route.name}${isActive ? " ●" : ""}`;
-          const tw = ctx.measureText(label).width;
-          const lx = first.x + 8 / s;
-          const ly = first.y - 8 / s;
-          ctx.fillStyle = "rgba(0,0,0,0.7)";
-          ctx.fillRect(lx - 3 / s, ly - fs, tw + 6 / s, fs + 5 / s);
-          ctx.fillStyle = color;
-          ctx.fillText(label, lx, ly);
-        }
-
-        // Предупреждение о зонах ограничений прямо на карте (для активного маршрута)
-        if (isActive && crossed.length > 0) {
-          const mid = route.points[Math.floor(route.points.length / 2)];
-          const fs = Math.max(11, 13 / s);
-          const warn = `⚠ Пересекает: ${crossed.map((z) => z.name).join(", ")}`;
-          ctx.font = `bold ${fs}px sans-serif`;
-          const tw = ctx.measureText(warn).width;
-          ctx.fillStyle = "rgba(120,20,20,0.85)";
-          ctx.fillRect(
-            mid.x - tw / 2 - 5 / s,
-            mid.y - fs - 5 / s,
-            tw + 10 / s,
-            fs + 9 / s,
-          );
-          ctx.fillStyle = "#ffd166";
-          ctx.textAlign = "center";
-          ctx.fillText(warn, mid.x, mid.y - 2 / s);
-          ctx.textAlign = "left";
-        }
-
-        // Отметка нарушения ограничения по дальности (красный маркер у финиша)
-        if (rangeViolation) {
-          const len = routeLengthM(
-            route.points.map((p) => ({ lat: p.lat, lng: p.lng })),
-          );
-          const txt = `${route.rangeMode === "max" ? ">" : "<"} лимита: ${Math.round(len)} м / ${Math.round(route.rangeM || 0)} м`;
-          const fs = Math.max(10, 12 / s);
-          ctx.font = `bold ${fs}px sans-serif`;
-          const tw = ctx.measureText(txt).width;
-          ctx.fillStyle = "rgba(150,20,20,0.9)";
-          ctx.fillRect(last.x + 8 / s, last.y + 4 / s, tw + 8 / s, fs + 6 / s);
-          ctx.fillStyle = "#ffb3b3";
-          ctx.fillText(txt, last.x + 12 / s, last.y + 4 / s + fs + 1 / s);
-        }
-      }
-
-      ctx.restore();
+      drawRoutesLayer({
+        ctx,
+        vs,
+        routes: project.routes || [],
+        activeRouteId: activeRouteId ?? null,
+        restrictions: project.restrictions,
+        dragging: draggingRouteRef.current,
+        layerCtx: {
+          getActiveZones: (rs) => getActiveZonesCached(rs || []),
+        },
+      });
     }
   }, [
     project,
@@ -4938,30 +4417,26 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   // первый клик — точка старта (маршрут-заготовка), каждый следующий — новая точка.
   const pendingRouteRef = useRef<string | null>(null);
   const addRouteFromClick = useCallback((mapPoint: Point) => {
-    const st = useStore.getState();
-    if (!st.project.map) return;
+    const mapSt = useMapStore.getState();
+    const ms = useMissionStore.getState();
+    if (!mapSt.map) return;
     if (pendingRouteRef.current) {
       // уже есть заготовка — добавляем точку
-      st.appendRoutePoint(pendingRouteRef.current, mapPoint);
-      st.setActiveRoute(pendingRouteRef.current);
+      ms.appendRoutePoint(pendingRouteRef.current, mapPoint);
+      ms.setActiveRoute(pendingRouteRef.current);
       return;
     }
     const rp: RoutePoint = (() => {
-      const bounds = st.project.map!.bounds;
+      const bounds = mapSt.map!.bounds;
       const geo = bounds
-        ? pixelToGeoExact(
-            mapPoint,
-            bounds,
-            st.project.map!.width,
-            st.project.map!.height,
-          )
+        ? pixelToGeoExact(mapPoint, bounds, mapSt.map!.width, mapSt.map!.height)
         : { lat: NaN, lng: NaN };
       return { x: mapPoint.x, y: mapPoint.y, lat: geo.lat, lng: geo.lng };
     })();
-    const id = st.addRoute([rp], undefined, undefined);
+    const id = ms.addRoute([rp], undefined, undefined);
     if (id) {
       pendingRouteRef.current = id;
-      st.setActiveRoute(id);
+      ms.setActiveRoute(id);
     }
   }, []);
 
@@ -5245,12 +4720,6 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     if (r && r.geo.length > 0) return r.geo[r.geo.length - 1];
     return goalGeo;
   };
-  // Стартовая точка i-го дрона: общая (весь рой взлетает с одной точки) или
-  // индивидуальная (задана кликом по окну «Старт», когда общий старт выключен).
-  const startForUav = (i: number): { lat: number; lng: number } | null => {
-    if (sharedStart) return startGeo;
-    return droneStarts[i] ?? startGeo;
-  };
   // Изначальная фокусировка всех окон карты — Санкт-Петербург. Ключевой источник
   // данных окна: старт/цель — их точка (пока не задана — СПб); маршрут — точки
   // маршрута (проект + черновик; пока пусто — СПб). Только ЭТОТ источник участвует
@@ -5346,7 +4815,6 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
           .filter(Boolean) as MiniOverlayPoint[])
       : []),
   ];
-  const panelH = 260;
 
   return (
     // ФИКС «Не удалось определить размер контейнера карты» в режиме мастера:
@@ -5507,25 +4975,13 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         onContextMenu={handleContextMenu}
       />
 
-      {/* Popup объекта: координаты, высота, расстояние */}
-      {popup && (
-        <div
-          className="absolute z-20 max-w-[260px] rounded-lg bg-gray-900/95 border border-cyan-500/50 text-gray-100 text-xs shadow-xl p-2 pointer-events-auto"
-          style={{
-            left: Math.min(popup.x + 12, canvasSize.width - 270),
-            top: Math.min(popup.y + 12, canvasSize.height - 120),
-          }}
-          onClick={() => setPopup(null)}
-        >
-          <div className="font-bold text-cyan-300 mb-1">{popup.title}</div>
-          {popup.lines.map((l, i) => (
-            <div key={i} className="leading-relaxed">
-              {l}
-            </div>
-          ))}
-          <div className="text-gray-400 mt-1">клик — закрыть</div>
-        </div>
-      )}
+      {/* Popup объекта: координаты, высота, расстояние (Фаза 5.C → ./map/popupLayer) */}
+      <MapObjectPopup
+        popup={popup}
+        canvasWidth={canvasSize.width}
+        canvasHeight={canvasSize.height}
+        onClose={() => setPopup(null)}
+      />
 
       {/* Индикатор состояния слоя подложки (пункт C аудита): загружается/загружен/ошибка.
         Временные сообщения (геолокация и т.п.) показываются поверх статуса слоя. */}

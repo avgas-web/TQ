@@ -7,6 +7,10 @@
 import { create } from "zustand";
 import type { StateCreator } from "zustand";
 import { persist } from "zustand/middleware";
+// ФАЗА 5.D (миграция из useStoreShim): синхронные mutate-экшены карты тоже
+// блокируются на время тяжёлой операции миссии (isProcessing). Динамический
+// import() — без статической циклической зависимости map → mission.
+import { withMissionGuard } from "./missionGuard";
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 import { v4 as uuidv4 } from "uuid";
 import type {
@@ -38,7 +42,7 @@ import {
   getMapParsersTransport,
   lastWorkerNotice,
 } from "../hooks/useMapParsersWorker";
-import { mercatorYToLat, calculateBoundsFromCenter } from "../utils/googleMaps";
+import { calculateBoundsFromCenter } from "../utils/googleMaps";
 import { sanitizeProjectData } from "../utils/projectSchema";
 // ФАЗА 4.2 (аудит): безопасный persist-storage (quota-spill + storage:error)
 import { createSafeStorage } from "../utils/safeStorage";
@@ -174,11 +178,23 @@ export interface MapState {
   selectedMarkerId: string | null;
   selectedRestrictionId: string | null;
   activeRestrictionId: string | null;
+  /** Метаданные проекта (ФАЗА 5.D: миграция из module-level mirror шима). */
+  projectName: string;
+  projectCreatedAt: string;
+  projectUpdatedAt: string;
 }
 
 export interface MapActions {
   setTool: (tool: Tool) => void;
   setViewState: (viewState: Partial<ViewState>) => void;
+  /** Мгновенная запись вида (полный ViewState, без merge) — для MapCanvas. */
+  setViewStateImmediate: (viewState: ViewState) => void;
+  // ── ФАЗА 5.D (аудит): метапроекта перенесена из шима useStoreShim ──
+  // Имя/временные метки проекта жили в module-level mirror шима; теперь —
+  // персистимое состояние домена карты (единственный источник истины).
+  setProjectName: (name: string) => void;
+  importProjectGeo: (p: Partial<Project>) => void;
+  resetProjectMeta: () => void;
   /** Публикация готовности подложки (источник истины для Мастера). */
   publishMapLoaded: (loaded: boolean) => void;
   setCursorPosition: (pos: Point | null) => void;
@@ -219,6 +235,8 @@ export interface MapActions {
    *  ('osm', 'carto') — MapCanvas нормализует их normalizeTileServer(). */
   setOSMTileServer: (server: string) => void;
   setMapBounds: (bounds: MapBounds) => void;
+  /** ФАЗА 5.D: точечное обновление поля source у активной карты. */
+  setMapSource: (source: MapData["source"]) => void;
   loadMap: (mapData: MapData) => void;
   loadMapWithStorage: (mapData: MapData) => Promise<void>;
   /** Активная тайловая карта без снимка: центр (lat/lng) + зум 6..19 */
@@ -278,6 +296,9 @@ const initialMapState: MapState = {
   currentTool: "pan",
   viewState: { offsetX: 0, offsetY: 0, scale: 1 },
   viewTick: 0,
+  projectName: "Новый проект",
+  projectCreatedAt: new Date().toISOString(),
+  projectUpdatedAt: new Date().toISOString(),
   // Флаг готовности тайловой подложки публикуется MapCanvas СИНХРОННО при
   // любом изменении состояния карты (ready/not ready). Это источник истины
   // для decision-логики (isMapReadyNow): React-state этапов обновляется
@@ -312,6 +333,51 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (
       // гидрированный viewState (краш «viewState is not defined» на проде)
       viewTick: state.viewTick + 1,
     })),
+
+  /** Мгновенная запись полного вида (без merge) — MapCanvas (зеркало tq-view). */
+  setViewStateImmediate: (viewState) =>
+    set((state) => ({ viewState, viewTick: state.viewTick + 1 })),
+
+  // ─── Метаданные проекта (ФАЗА 5.D: миграция из шима useStoreShim) ────────
+  setProjectName: (name) =>
+    set({ projectName: name, projectUpdatedAt: new Date().toISOString() }),
+
+  /** Импорт географической части проекта из .tqproj (частичный патч домена). */
+  importProjectGeo: (p) =>
+    set({
+      map: p.map ?? null,
+      markers: p.markers ?? [],
+      restrictions: p.restrictions ?? [],
+      layers: p.layers?.length
+        ? p.layers
+        : [{ id: "default", name: "Основной", visible: true, locked: false }],
+      calibration: p.calibration ?? { enabled: false, points: [] },
+      // ЭТАП 1.2: секрет не мигрирует — только флаг enabled.
+      googleMaps: { enabled: !!p.googleMaps?.enabled },
+      yandexMaps: { enabled: !!p.yandexMaps?.enabled },
+      openStreetMap: p.openStreetMap ?? {
+        enabled: false,
+        tileServer: "osm",
+      },
+      settings: p.settings ?? get().settings,
+      projectName: p.projectName ?? "Новый проект",
+      projectCreatedAt: p.createdAt ?? get().projectCreatedAt,
+      // ФАЗА 5.D: updatedAt — производная метка (обновляется при каждой
+      // мутации проекта через setProjectName / touchProjectUpdatedAt).
+      // Импорт всегда актуален на момент применения: игнорируем поле файла.
+      projectUpdatedAt: new Date().toISOString(),
+      viewState: { offsetX: 0, offsetY: 0, scale: 1 },
+      selectedMarkerId: null,
+      selectedRestrictionId: null,
+    }),
+
+  /** Сброс метаданных проекта к чистым значениям (resetProject). */
+  resetProjectMeta: () =>
+    set({
+      projectName: "Новый проект",
+      projectCreatedAt: new Date().toISOString(),
+      projectUpdatedAt: new Date().toISOString(),
+    }),
 
   publishMapLoaded: (loaded) => {
     // Синхронная публикация флага готовности в стор. Используется MapCanvas
@@ -587,6 +653,12 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (
     if (s.mapLoaded && !tilesBacked) get().publishMapLoaded(false);
   },
 
+  /** ФАЗА 5.D: точечное обновление поля source у активной карты
+   *  (MapsPanel отмечает osm-подложку вместо setState merged-агрегата). */
+  setMapSource: (source: MapData["source"]) =>
+    set((state) => ({
+      map: state.map ? { ...state.map, source } : null,
+    })),
   setMapBounds: (bounds) =>
     set((state) => ({
       map: state.map ? { ...state.map, bounds } : null,
@@ -817,6 +889,10 @@ export const useMapStore = create<MapStore>()(
       selectedMarkerId: null,
       selectedRestrictionId: null,
       activeRestrictionId: s.activeRestrictionId,
+      // ФАЗА 5.D: метаданные проекта (перенесены из шима useStoreShim)
+      projectName: s.projectName,
+      projectCreatedAt: s.projectCreatedAt,
+      projectUpdatedAt: s.projectUpdatedAt,
     }),
     migrate: (persistedState: unknown, version: number) => {
       const p = persistedState as Record<string, unknown>;

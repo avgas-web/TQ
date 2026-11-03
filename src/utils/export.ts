@@ -1,5 +1,5 @@
 // Утилиты экспорта/импорта
-import type { Marker, Project, Route, Restriction } from "../types";
+import type { Marker, Project } from "../types";
 import { pixelToGeoFromBounds } from "./googleMaps";
 import { toCsv, parseCsv, FORMULA_INJECTION_PREFIXES } from "./csv";
 import {

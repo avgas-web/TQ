@@ -21,7 +21,6 @@ import {
   boundsFromCorners,
   clampBounds,
   normalizeBoundsToWgs84,
-  pixelToGeoByCorners,
   tiepointMapper,
   transformationMapper,
   worldRectToBounds,
@@ -345,7 +344,6 @@ function styleOf(
 ): { fill?: string; stroke?: string } {
   const inline = node.getElementsByTagName("Style")[0];
   if (inline) {
-    const id = inline.getAttribute("id") || "";
     const hex = (v?: string | null) =>
       v && /^[0-9a-f]{8}$/i.test(v)
         ? `#${v.slice(6, 8)}${v.slice(4, 6)}${v.slice(2, 4)}`.toLowerCase()

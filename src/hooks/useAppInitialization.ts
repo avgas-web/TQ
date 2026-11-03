@@ -5,11 +5,12 @@
 // (перестройка маршрутов) и авто-пересчёт высот при включённом elevationAuto.
 // Вызывается ровно один раз из корня приложения (App.tsx).
 // ═══════════════════════════════════════════════════════════════
-import { useEffect } from 'react';
-import { useMapStore, invalidateZoneCache } from '../store/useMapStore';
-import { useMissionStore, scheduleRerouteAll } from '../store/useMissionStore';
-import { useFleetStore } from '../store/useFleetStore';
-import { syncShimSnapshot as rebuildShimSnapshot } from '../store/useStoreShim';
+import { useEffect } from "react";
+import { useMapStore, invalidateZoneCache } from "../store/useMapStore";
+import { useMissionStore, scheduleRerouteAll } from "../store/useMissionStore";
+import { useFleetStore } from "../store/useFleetStore";
+import { syncProjectSnapshot } from "../store/useProjectStore";
+import { migrateLegacyStorage } from "../store/projectActions";
 
 /**
  * Автозагрузка тайловой карты по умолчанию (OSM): если в хранилище нет ни
@@ -36,7 +37,7 @@ export function ensureDefaultTileMap(): void {
   }
   if (st.map) return; // уже есть растровая или тайловая карта
   st.toggleOpenStreetMap(true);
-  st.setOSMTileServer(st.openStreetMap.tileServer ?? 'osm');
+  st.setOSMTileServer(st.openStreetMap.tileServer ?? "osm");
   // ФИКСАЦИЯ НАД СПБ при автозагрузке — ЕДИНЫЙ путь для ВСЕХ режимов
   // (редактор и мастер планирования миссий вызывают именно эту функцию).
   // Раньше здесь стоял центр по умолчанию «Москва» (55.7558, 37.6173), из-за
@@ -47,16 +48,12 @@ export function ensureDefaultTileMap(): void {
 let initialized = false;
 
 /**
- * КОРНЕВОЙ ФИКС «stale snapshot» шима (useStoreShim): zustand persist
+ * КОРНЕВОЙ ФИКС «stale snapshot» проекционного кэша (useProjectStore): zustand persist
  * гидрирует каждый доменный стор АСИНХРОННО (чтение localStorage — promise),
- * а гидрация может произойти ПОСЛЕ любых setState (в т.ч. resetProject).
- * До этого shim-агрегат (snapshot/mergedCache) перестраивался только при
- * синхронных set() сторов — после async-гидрации фасад useStore продолжал
- * отдавать устаревший снапшот («Сброс не удаляет данные», точки «воскресали»
- * в UI, readiness-оверлей Мастера не реагировал на загрузку карты).
- * Лечим причиной, а не симптомом: подписываемся на ГИДРАЦИЮ каждого persist-стора
- * (onRehydrateStorage) + ставим safety-net подписку на любые изменения сторов —
- * любая внешняя мутация вызывает emit() шима, пересобирая агрегат.
+ * а гидрация может произойти ПОСЛЕ любых setState (в.т.ч. resetProject).
+ * Кэш useProject инвалидируется синхронными подписками на set() сторов, но
+ * async-гидрацию persist ловим явно: подписка onFinishHydration + safety-net
+ * subscribe на любые изменения — любая внешняя мутация сбрасывает кэш.
  */
 let hydrationSyncInstalled = false;
 function installHydrationSync(): void {
@@ -68,7 +65,7 @@ function installHydrationSync(): void {
     pending = true;
     queueMicrotask(() => {
       pending = false;
-      rebuildShimSnapshot();
+      syncProjectSnapshot();
     });
   };
   // onFinishHydration вызывается внутри set() гидрации → повторный set
@@ -89,11 +86,9 @@ let migrationDone = false;
 function migrateLegacyStorageOnce(): void {
   if (migrationDone) return;
   migrationDone = true;
-  import('../store/useStoreShim').then(({ migrateLegacyStorage }) => {
-    migrateLegacyStorage();
-    rebuildShimSnapshot(); // сбросить снапшот шима после миграции
-    installHydrationSync(); // реактивность на async-гидрацию persist
-  });
+  migrateLegacyStorage();
+  syncProjectSnapshot(); // сбросить кэш проекта после миграции
+  installHydrationSync(); // реактивность на async-гидрацию persist
 }
 
 export function useAppInitialization(): void {
@@ -113,11 +108,14 @@ export function useAppInitialization(): void {
         initialized = true;
         migrateLegacyStorageOnce();
       }
-      void useMapStore.getState().restoreMapFromStorage().then(() => {
-        if (cancelled) return;
-        ensureDefaultTileMap();
-        rebuildShimSnapshot(); // карта из IndexedDB/persist видна фасаду немедленно
-      });
+      void useMapStore
+        .getState()
+        .restoreMapFromStorage()
+        .then(() => {
+          if (cancelled) return;
+          ensureDefaultTileMap();
+          syncProjectSnapshot(); // карта из IndexedDB/persist видна проекту немедленно
+        });
     };
     // setTimeout(0) — выход за пределы commit-фазы React (исключает setState
     // во время рендера, краш React #127) и детерминированная отмена при unmount.
@@ -156,6 +154,9 @@ export function useAppInitialization(): void {
         }
       }
     });
-    return () => { unsubMap(); unsubMission(); };
+    return () => {
+      unsubMap();
+      unsubMission();
+    };
   }, []);
 }

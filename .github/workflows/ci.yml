@@ -1,0 +1,48 @@
+name: CI — lint / typecheck / test / build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+
+      # ФАЗА 5.3: критические ошибки линтера блокируют сборку
+      - name: Lint (errors block CI)
+        run: npx eslint . --quiet
+        # --quiet: падает только на errors; warnings (any/exhaustive-deps)
+        # отслеживаются отдельным non-blocking шагом ниже
+
+      - name: Report warnings (non-blocking budget watch)
+        if: always()
+        run: |
+          npx eslint . -f json > eslint-report.json || true
+          WARNINGS=$(node -e "const r=require('./eslint-report.json');console.log(r.reduce((a,f)=>a+f.warningCount,0))")
+          echo "Total warnings: $WARNINGS"
+          echo "warnings=$WARNINGS" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm run test
+
+      - name: Build
+        run: npm run build

@@ -13,6 +13,7 @@ import { v4 as uuidv4 } from "uuid";
 // ФАЗА 4.2 (аудит): безопасный persist-storage + мягкая санация снапшота
 import { createSafeStorage } from "../utils/safeStorage";
 import { sanitizeMissionPersistData } from "../utils/projectSchema";
+import { withMissionGuard } from "./missionGuard";
 import type {
   Route,
   RoutePoint,
@@ -247,6 +248,12 @@ export interface MissionActions {
     color?: string,
   ) => string | null;
   deleteRoute: (id: string) => void;
+  /** Полная замена точек маршрута (ФАЗА 5.D: утверждение черновика мастера
+   *  вместо прямого setState агрегата проекта из шима). */
+  setRoutePoints: (id: string, points: RoutePoint[]) => void;
+  /** Сброс только маршрутов (новая миссия): importLists и общие точки
+   *  старта/цели сохраняются — в отличие от полного resetMissions. */
+  clearRoutes: () => void;
   renameRoute: (id: string, name: string) => void;
   setRouteColor: (id: string, color: string) => void;
   toggleRouteVisible: (id: string) => void;
@@ -597,7 +604,6 @@ function rerouteAllRoutesNow(): void {
     const w = getRoutingWorker();
     if (w) {
       let pending = heavy.length;
-      let anyOk = false;
       // Пока есть незавершённые worker-обходы, троттлер не должен отменять
       // уже запланированную перестройку (см. scheduleRerouteAll).
       workerReroutePending = true;
@@ -610,7 +616,6 @@ function rerouteAllRoutesNow(): void {
           map.height,
         ).then((path) => {
           if (path && path.length >= 2) {
-            anyOk = true;
             useMissionStore.setState((cur) => ({
               routes: cur.routes.map((r) => {
                 if (r.id !== h.routeId) return r;
@@ -1053,6 +1058,14 @@ const createMissionActions: StateCreator<
         routes: state.routes.filter((r) => r.id !== id),
         activeRouteId: state.activeRouteId === id ? null : state.activeRouteId,
       })),
+
+    setRoutePoints: (id, points) =>
+      set((state) => ({
+        routes: state.routes.map((r) => (r.id === id ? { ...r, points } : r)),
+      })),
+
+    clearRoutes: () =>
+      set({ routes: [], activeRouteId: null, routeWarnings: {} }),
 
     renameRoute: (id, name) =>
       set((state) => ({
@@ -2183,6 +2196,37 @@ const createMissionActions: StateCreator<
 
 // ─── Стор + persist ────────────────────────────────────────────
 
+/**
+ * ФАЗА 5.D (миграция из useStoreShim): список mutate-экшенов, блокируемых
+ * isProcessing-стражом. Обёртки навешаны НИЖЕ на сам стор (см. install),
+ * поэтому вызовы вида `useMissionStore.getState().addRoute(...)` проходят
+ * через гард. ВНУТРЕННИЕ вызовы стора идут через proxy-mirror (`actions.x`),
+ * который резолвится в сырой target — они гард НЕ обходят и не вызывают
+ * рекурсии (оригиналы не читаются из state).
+ * setRoutePointAltitude / autoFixRoute НЕ блокируются: ручная регулировка
+ * высоты и аварийная автокоррекция должны работать всегда.
+ */
+const BLOCKED_MUTATOR_KEYS = [
+  "addRoute",
+  "deleteRoute",
+  "setRoutePoints",
+  "clearRoutes",
+  "appendRoutePoint",
+  "insertRoutePointAt",
+  "removeRoutePoint",
+  "commitRouteDraft",
+  "generateScanRoute",
+  "optimizeRouteOrder",
+  "importRoutes",
+  "resetMissions",
+  "setMissionMode",
+  "addStartPointAt",
+  "addGoalPointAt",
+  "removeStartPoint",
+  "removeGoalPoint",
+  "autoPlanRoutes",
+] as const satisfies readonly (keyof MissionActions)[];
+
 export const useMissionStore = create<MissionStore>()(
   persist(
     (...a) => ({ ...initialMissionState, ...createMissionActions(...a) }),
@@ -2244,3 +2288,24 @@ registerRoutesForFleet(useMissionStore.getState().routes);
 useMissionStore.subscribe((s, prev) => {
   if (s.routes !== prev.routes) registerRoutesForFleet(s.routes);
 });
+
+// ─── ФАЗА 5.D: установка isProcessing-стража на самом сторе ─────────────────
+// Обёртки withMissionGuard навешаны ОДИН РАЗ поверх getState() и переживают
+// setState/persist-rehydrate (не хранятся в state → не теряются при spread).
+// Идемпотентно: повторные вызовы не удваивают обёртку (флаг __guarded).
+let guardsInstalled = false;
+export function installMissionGuards(): void {
+  if (guardsInstalled) return;
+  guardsInstalled = true;
+  const rawState = useMissionStore.getState();
+  const wrapped: Record<string, unknown> = {};
+  for (const key of BLOCKED_MUTATOR_KEYS) {
+    const fn = rawState[key] as (...a: never[]) => unknown;
+    const g = withMissionGuard(String(key), fn as (...a: unknown[]) => unknown);
+    (g as unknown as Record<string, boolean>).__guarded = true;
+    wrapped[key] = g;
+  }
+  const gs = useMissionStore.getState.bind(useMissionStore);
+  useMissionStore.getState = () => ({ ...gs(), ...wrapped }) as MissionStore;
+}
+installMissionGuards();
