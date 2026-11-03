@@ -1,16 +1,30 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
-import MapCanvas from './components/MapCanvas';
-import MapsPanel from './components/MapsPanel';
-import Toolbar from './components/Toolbar';
-import Sidebar from './components/Sidebar';
-import StatusBar from './components/StatusBar';
-import { MissionWizard } from './components/wizard/MissionWizard';
-import { useStore } from './store/useStore';
-import { initOpenStreetMap } from './utils/openStreetMap';
-import { eventBus } from './utils/eventBus';
-import { useAppInitialization } from './hooks/useAppInitialization';
-import OfflineIndicator from './components/OfflineIndicator';
+import React, {
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { createPortal } from "react-dom";
+import MapCanvas from "./components/MapCanvas";
+import MapsPanel from "./components/MapsPanel";
+import Toolbar from "./components/Toolbar";
+import Sidebar from "./components/Sidebar";
+import StatusBar from "./components/StatusBar";
+// ФАЗА 5.4 (оптимизация бандла): мастер миссий — самый тяжёлый модуль
+// (9 этапов + сериализаторы экспорта). Грузим его лениво: в режиме
+// «Редактор» (~дефолтный вход) код мастера не попадает в initial chunk.
+const MissionWizard = lazy(() =>
+  import("./components/wizard/MissionWizard").then((m) => ({
+    default: m.MissionWizard,
+  })),
+);
+import { useStore } from "./store/useStore";
+import { initOpenStreetMap } from "./utils/openStreetMap";
+import { eventBus } from "./utils/eventBus";
+import { useAppInitialization } from "./hooks/useAppInitialization";
+import OfflineIndicator from "./components/OfflineIndicator";
 
 /** Компактная полоса загрузки карт для Мастера миссий.
  *  ФИКС #1 «полоса скрыта за строкой „Далее“»: раньше это был выпадающий
@@ -28,11 +42,19 @@ import OfflineIndicator from './components/OfflineIndicator';
  *  режима, поэтому карта загружается и видна одинаково везде. */
 const WizardMapsStrip: React.FC = () => {
   const [open, setOpen] = useState<boolean>(() => {
-    try { return localStorage.getItem('tq-wizard-maps-open') === '1'; } catch { return false; }
+    try {
+      return localStorage.getItem("tq-wizard-maps-open") === "1";
+    } catch {
+      return false;
+    }
   });
   const btnRef = useRef<HTMLButtonElement>(null);
   const popRef = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState<{ top: number; left: number; maxHeight: number }>({ top: 0, left: 0, maxHeight: 0 });
+  const [pos, setPos] = useState<{
+    top: number;
+    left: number;
+    maxHeight: number;
+  }>({ top: 0, left: 0, maxHeight: 0 });
 
   const measure = useCallback(() => {
     const el = btnRef.current;
@@ -46,7 +68,10 @@ const WizardMapsStrip: React.FC = () => {
     // панели — полоса уходит ВВЕРХ и никогда не прячется под футером «Далее».
     const openUp = availableBelow < Math.min(availableAbove, 420);
     const maxHeight = Math.max(240, openUp ? availableAbove : availableBelow);
-    const left = Math.min(Math.max(margin, r.left), Math.max(margin, window.innerWidth - WIDTH - margin));
+    const left = Math.min(
+      Math.max(margin, r.left),
+      Math.max(margin, window.innerWidth - WIDTH - margin),
+    );
     setPos(
       openUp
         ? { top: Math.max(margin, r.top - maxHeight - 4), left, maxHeight }
@@ -59,11 +84,11 @@ const WizardMapsStrip: React.FC = () => {
     if (!open) return;
     measure();
     const onReflow = (): void => measure();
-    window.addEventListener('resize', onReflow);
-    window.addEventListener('scroll', onReflow, true);
+    window.addEventListener("resize", onReflow);
+    window.addEventListener("scroll", onReflow, true);
     return () => {
-      window.removeEventListener('resize', onReflow);
-      window.removeEventListener('scroll', onReflow, true);
+      window.removeEventListener("resize", onReflow);
+      window.removeEventListener("scroll", onReflow, true);
     };
   }, [open, measure]);
 
@@ -77,14 +102,20 @@ const WizardMapsStrip: React.FC = () => {
       const t = e.target as Node;
       if (popRef.current?.contains(t) || btnRef.current?.contains(t)) return;
       setOpen(false);
-      try { localStorage.setItem('tq-wizard-maps-open', '0'); } catch { /* ignore */ }
+      try {
+        localStorage.setItem("tq-wizard-maps-open", "0");
+      } catch {
+        /* ignore */
+      }
     };
-    const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') setOpen(false); };
-    document.addEventListener('mousedown', onDocDown);
-    document.addEventListener('keydown', onKey);
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDocDown);
+    document.addEventListener("keydown", onKey);
     return () => {
-      document.removeEventListener('mousedown', onDocDown);
-      document.removeEventListener('keydown', onKey);
+      document.removeEventListener("mousedown", onDocDown);
+      document.removeEventListener("keydown", onKey);
     };
   }, [open]);
 
@@ -97,32 +128,41 @@ const WizardMapsStrip: React.FC = () => {
         className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 border border-gray-600 rounded text-xs text-white"
         onClick={() => {
           setOpen((o) => {
-            try { localStorage.setItem('tq-wizard-maps-open', o ? '0' : '1'); } catch { /* ignore */ }
+            try {
+              localStorage.setItem("tq-wizard-maps-open", o ? "0" : "1");
+            } catch {
+              /* ignore */
+            }
             return !o;
           });
         }}
         title="Загрузка карт: тот же путь, что в режиме планирования (бесплатные подложки Esri/OSM France/OpenTopoMap — выбор на Этапе 1 мастера)"
       >
-        🗺️ Карты {open ? '▾' : '▸'}
+        🗺️ Карты {open ? "▾" : "▸"}
       </button>
-      {open && createPortal(
-        <div
-          ref={popRef}
-          data-testid="wizard-maps-dropdown"
-          className="fixed z-[2147483647] overflow-y-auto overscroll-contain rounded-lg border border-cyan-700/60 bg-gray-900 p-2 shadow-2xl text-white"
-          style={{ top: pos.top, left: pos.left, width: Math.min(336, window.innerWidth - 16), maxHeight: pos.maxHeight }}
-        >
-          {/* КОПИЯ способа загрузки: точь-в-точь панель режима планирования
+      {open &&
+        createPortal(
+          <div
+            ref={popRef}
+            data-testid="wizard-maps-dropdown"
+            className="fixed z-[2147483647] overflow-y-auto overscroll-contain rounded-lg border border-cyan-700/60 bg-gray-900 p-2 shadow-2xl text-white"
+            style={{
+              top: pos.top,
+              left: pos.left,
+              width: Math.min(336, window.innerWidth - 16),
+              maxHeight: pos.maxHeight,
+            }}
+          >
+            {/* КОПИЯ способа загрузки: точь-в-точь панель режима планирования
               (MapsPanel) — единый обработчик handleLoadMap → loadActiveTileMap
               с фиксацией над СПб и непрерывным зумом/панорамой. */}
-          <MapsPanel />
-        </div>,
-        document.body,
-      )}
+            <MapsPanel />
+          </div>,
+          document.body,
+        )}
     </div>
   );
 };
-
 
 /**
  * Тост-уведомление об ошибках хранилища (quota-exceeded и т.п.).
@@ -132,7 +172,7 @@ const WizardMapsStrip: React.FC = () => {
 const StorageToast: React.FC = () => {
   const [message, setMessage] = useState<string | null>(null);
   useEffect(() => {
-    const off = eventBus.on('storage:error', ({ message: msg }) => {
+    const off = eventBus.on("storage:error", ({ message: msg }) => {
       if (msg) {
         setMessage(msg);
         window.setTimeout(() => setMessage(null), 6000);
@@ -154,7 +194,7 @@ const StorageToast: React.FC = () => {
 const App: React.FC = () => {
   // Режим мастера планирования миссий (по умолчанию — новый мастер; legacy-редактор доступен через переключатель в шапке)
   const [wizardMode, setWizardMode] = useState<boolean>(
-    () => localStorage.getItem('tq-ui-mode') !== 'legacy',
+    () => localStorage.getItem("tq-ui-mode") !== "legacy",
   );
   const {
     currentTool,
@@ -175,132 +215,172 @@ const App: React.FC = () => {
   useAppInitialization();
 
   // Keyboard shortcuts
-  const handleKeyDown = useCallback((e: KeyboardEvent) => {
-    // Ignore if typing in input
-    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent) => {
+      // Ignore if typing in input
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement
+      )
+        return;
 
-    // Нормализуем клавишу: нижний регистр + транслит русской раскладки в физическую клавишу QWERTY
-    const k = e.key.toLowerCase();
-    const RU_TO_EN: Record<string, string> = {
-      // Ctrl+И / Ctrl+Я = Undo (физическая клавиша Z), Ctrl+Н = Redo (клавиша Y)
-      и: 'z', я: 'z', н: 'y',
-      ф: 'a', ы: 's', у: 'd', к: 'f', е: 't', г: 'u', ш: 'i', щ: 'o', з: 'p',
-      х: 'h', ж: 'j', э: 'k', м: 'l', б: 'b', ю: 'm',
-    };
-    const key = RU_TO_EN[k] ?? k;
+      // Нормализуем клавишу: нижний регистр + транслит русской раскладки в физическую клавишу QWERTY
+      const k = e.key.toLowerCase();
+      const RU_TO_EN: Record<string, string> = {
+        // Ctrl+И / Ctrl+Я = Undo (физическая клавиша Z), Ctrl+Н = Redo (клавиша Y)
+        и: "z",
+        я: "z",
+        н: "y",
+        ф: "a",
+        ы: "s",
+        у: "d",
+        к: "f",
+        е: "t",
+        г: "u",
+        ш: "i",
+        щ: "o",
+        з: "p",
+        х: "h",
+        ж: "j",
+        э: "k",
+        м: "l",
+        б: "b",
+        ю: "m",
+      };
+      const key = RU_TO_EN[k] ?? k;
 
-    // Undo/redo для рисования полигонов (Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z, включая русскую раскладку)
-    if ((e.ctrlKey || e.metaKey) && key === 'z') {
-      e.preventDefault();
-      if (e.shiftKey) redoDrawingPoint();
-      else undoDrawingPoint();
-      return;
-    }
-    if ((e.ctrlKey || e.metaKey) && key === 'y') {
-      e.preventDefault();
-      redoDrawingPoint();
-      return;
-    }
-
-    // Ctrl/Meta+буквы — браузерные связки (Ctrl+T новая вкладка, Ctrl+O открыть файл,
-    // Ctrl+S сохранить и т.п.): не перехватываем их транслитерацией русской раскладки.
-    // (кроме разобранных выше Ctrl+Z / Ctrl+Y)
-    if (e.ctrlKey || e.metaKey) return;
-
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      clearDrawingPoints();
-      setMeasurementPoints([]);
-      setTool('pan');
-      return;
-    }
-
-    if (e.key === 'Delete' && selectedMarkerId) {
-      e.preventDefault();
-      deleteMarker(selectedMarkerId);
-      return;
-    }
-
-    // Зум с клавиатуры — через единый обработчик канваса (zoomAt): фиксация на центре
-    // окна + ограничение в тех же границах minZoom..maxNativeZoom, что и у колеса мыши.
-    // Раньше здесь были жёсткие Math.min(50)/Math.max(0.01) без привязки к зум-шкале
-    // тайловой карты — лимиты расходились с канвасом, а центр «прыгал» из-за смены
-    // scale без корректировки offset.
-    if (e.key === '+' || e.key === '=' || e.key === '§') {
-      e.preventDefault();
-      eventBus.emit('map:zoom-request', { factor: 1.2 });
-      return;
-    }
-
-    if (e.key === '-' || e.key === '_' || e.key === '–') {
-      e.preventDefault();
-      eventBus.emit('map:zoom-request', { factor: 1 / 1.2 });
-      return;
-    }
-
-    // Tool shortcuts (без drawRect/drawCircle: ограничения — только NFZ-полигоны)
-    if (['1', '2', '3', '4', '5'].includes(e.key)) {
-      e.preventDefault();
-      const tools = ['pan', 'select', 'addMarker', 'drawPolygon', 'measure'] as const;
-      setTool(tools[Number(e.key) - 1]);
-      return;
-    }
-
-    // Одиночные горячие клавиши срабатывают ТОЛЬКО без Ctrl/Meta/Alt.
-    // Раньше транслитерация перехватывала связки: Ctrl+T (новая вкладка),
-    // Alt+F (меню браузера), Ctrl+S и т.п. — браузерные комбинации не должны
-    // подменять действия приложения.
-    if (!(e.ctrlKey || e.metaKey || e.altKey)) {
-      // Grid toggle: G (и русская П на той же клавише)
-      if (key === 'g') {
+      // Undo/redo для рисования полигонов (Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z, включая русскую раскладку)
+      if ((e.ctrlKey || e.metaKey) && key === "z") {
         e.preventDefault();
-        updateSettings({ showGrid: !project.settings?.showGrid });
+        if (e.shiftKey) redoDrawingPoint();
+        else undoDrawingPoint();
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && key === "y") {
+        e.preventDefault();
+        redoDrawingPoint();
         return;
       }
 
-      // Тема: T / M (транслит покрывает русские Е/Ь на тех же клавишах)
-      if (key === 't' || key === 'm') {
+      // Ctrl/Meta+буквы — браузерные связки (Ctrl+T новая вкладка, Ctrl+O открыть файл,
+      // Ctrl+S сохранить и т.п.): не перехватываем их транслитерацией русской раскладки.
+      // (кроме разобранных выше Ctrl+Z / Ctrl+Y)
+      if (e.ctrlKey || e.metaKey) return;
+
+      if (e.key === "Escape") {
         e.preventDefault();
-        updateSettings({ theme: project.settings?.theme === 'light' ? 'dark' : 'light' });
+        clearDrawingPoints();
+        setMeasurementPoints([]);
+        setTool("pan");
         return;
       }
 
-      // Полный экран: F (транслит покрывает русскую А)
-      if (key === 'f') {
+      if (e.key === "Delete" && selectedMarkerId) {
         e.preventDefault();
-        const el = document.getElementById('map-container');
-        if (el && document.fullscreenElement) document.exitFullscreen().catch(() => {});
-        else if (el) el.requestFullscreen?.().catch(() => {});
+        deleteMarker(selectedMarkerId);
         return;
       }
-    }
-  }, [currentTool, selectedMarkerId, setTool,
-    clearDrawingPoints, setMeasurementPoints, deleteMarker, project.settings?.showGrid,
-    project.settings?.theme, updateSettings,
-    undoDrawingPoint, redoDrawingPoint]);
+
+      // Зум с клавиатуры — через единый обработчик канваса (zoomAt): фиксация на центре
+      // окна + ограничение в тех же границах minZoom..maxNativeZoom, что и у колеса мыши.
+      // Раньше здесь были жёсткие Math.min(50)/Math.max(0.01) без привязки к зум-шкале
+      // тайловой карты — лимиты расходились с канвасом, а центр «прыгал» из-за смены
+      // scale без корректировки offset.
+      if (e.key === "+" || e.key === "=" || e.key === "§") {
+        e.preventDefault();
+        eventBus.emit("map:zoom-request", { factor: 1.2 });
+        return;
+      }
+
+      if (e.key === "-" || e.key === "_" || e.key === "–") {
+        e.preventDefault();
+        eventBus.emit("map:zoom-request", { factor: 1 / 1.2 });
+        return;
+      }
+
+      // Tool shortcuts (без drawRect/drawCircle: ограничения — только NFZ-полигоны)
+      if (["1", "2", "3", "4", "5"].includes(e.key)) {
+        e.preventDefault();
+        const tools = [
+          "pan",
+          "select",
+          "addMarker",
+          "drawPolygon",
+          "measure",
+        ] as const;
+        setTool(tools[Number(e.key) - 1]);
+        return;
+      }
+
+      // Одиночные горячие клавиши срабатывают ТОЛЬКО без Ctrl/Meta/Alt.
+      // Раньше транслитерация перехватывала связки: Ctrl+T (новая вкладка),
+      // Alt+F (меню браузера), Ctrl+S и т.п. — браузерные комбинации не должны
+      // подменять действия приложения.
+      if (!(e.ctrlKey || e.metaKey || e.altKey)) {
+        // Grid toggle: G (и русская П на той же клавише)
+        if (key === "g") {
+          e.preventDefault();
+          updateSettings({ showGrid: !project.settings?.showGrid });
+          return;
+        }
+
+        // Тема: T / M (транслит покрывает русские Е/Ь на тех же клавишах)
+        if (key === "t" || key === "m") {
+          e.preventDefault();
+          updateSettings({
+            theme: project.settings?.theme === "light" ? "dark" : "light",
+          });
+          return;
+        }
+
+        // Полный экран: F (транслит покрывает русскую А)
+        if (key === "f") {
+          e.preventDefault();
+          const el = document.getElementById("map-container");
+          if (el && document.fullscreenElement)
+            document.exitFullscreen().catch(() => {});
+          else if (el) el.requestFullscreen?.().catch(() => {});
+          return;
+        }
+      }
+    },
+    [
+      currentTool,
+      selectedMarkerId,
+      setTool,
+      clearDrawingPoints,
+      setMeasurementPoints,
+      deleteMarker,
+      project.settings?.showGrid,
+      project.settings?.theme,
+      updateSettings,
+      undoDrawingPoint,
+      redoDrawingPoint,
+    ],
+  );
 
   useEffect(() => {
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, [handleKeyDown]);
 
   // Адаптив: на мобильных (<768px) — карта фикс. высотой 300–400 px + панель слоёв снизу;
   // на десктопе — 2 колонки (карта + сайдбар) либо полный экран по клавише F.
   const [isMobile, setIsMobile] = useState(false);
   useEffect(() => {
-    const mq = window.matchMedia('(max-width: 767px)');
+    const mq = window.matchMedia("(max-width: 767px)");
     const apply = () => setIsMobile(mq.matches);
     apply();
-    mq.addEventListener('change', apply);
-    return () => mq.removeEventListener('change', apply);
+    mq.addEventListener("change", apply);
+    return () => mq.removeEventListener("change", apply);
   }, []);
 
   // Apply theme (dark по умолчанию, light — переключается кнопкой или клавишей T)
-  const theme = project.settings?.theme || 'dark';
+  const theme = project.settings?.theme || "dark";
   useEffect(() => {
     const root = document.documentElement;
-    root.classList.toggle('dark', theme === 'dark');
-    root.setAttribute('data-theme', theme);
+    root.classList.toggle("dark", theme === "dark");
+    root.setAttribute("data-theme", theme);
   }, [theme]);
 
   // Restore map from IndexedDB on app load
@@ -327,9 +407,22 @@ const App: React.FC = () => {
   }, []);
 
   return (
-    <div className={theme === "dark" ? "h-screen w-screen flex flex-col bg-gray-900 text-white overflow-hidden" : "h-screen w-screen flex flex-col bg-gray-100 text-gray-900 overflow-hidden"}>
+    <div
+      className={
+        theme === "dark"
+          ? "h-screen w-screen flex flex-col bg-gray-900 text-white overflow-hidden"
+          : "h-screen w-screen flex flex-col bg-gray-100 text-gray-900 overflow-hidden"
+      }
+    >
       {/* Header */}
-      <div className={(theme === "dark" ? "flex items-center px-3 py-1 bg-gray-900 border-b border-gray-700" : "flex items-center px-3 py-1 bg-white border-b border-gray-300") + " relative"}>
+      <div
+        className={
+          (theme === "dark"
+            ? "flex items-center px-3 py-1 bg-gray-900 border-b border-gray-700"
+            : "flex items-center px-3 py-1 bg-white border-b border-gray-300") +
+          " relative"
+        }
+      >
         <h1 className="text-sm font-bold text-cyan-400">
           🎯 TotalQuadro Mission Planner
         </h1>
@@ -338,20 +431,22 @@ const App: React.FC = () => {
           onClick={() => {
             const next = !wizardMode;
             setWizardMode(next);
-            localStorage.setItem('tq-ui-mode', next ? 'wizard' : 'legacy');
+            localStorage.setItem("tq-ui-mode", next ? "wizard" : "legacy");
             // ФИКС (этап 4): событие для слушателя в MapCanvas — синхронизация
             // wizardActive в том же окне ('storage' срабатывает только на ДРУГИЕ
             // вкладки). Без этого оверлей трёх окон/стартовый fit основной карты
             // работали на stale-значении режима.
-            window.dispatchEvent(new Event('tq-ui-mode-changed'));
+            window.dispatchEvent(new Event("tq-ui-mode-changed"));
           }}
           className="ml-3 px-2 py-0.5 bg-cyan-800 hover:bg-cyan-700 border border-cyan-600 rounded text-xs text-white"
           title="Переключить мастер планирования миссий / классический редактор"
         >
-          {wizardMode ? '🧭 Мастер миссий' : '🗺️ Редактор'}
+          {wizardMode ? "🧭 Мастер миссий" : "🗺️ Редактор"}
         </button>
         {wizardMode && (
-          <span className="relative ml-2"><WizardMapsStrip /></span>
+          <span className="relative ml-2">
+            <WizardMapsStrip />
+          </span>
         )}
         <div className="flex-1" />
         <div className="flex items-center gap-2">
@@ -374,7 +469,9 @@ const App: React.FC = () => {
           <select
             title="Шаг гео-сетки в метрах (0 = автоподбор под масштаб)"
             value={String(project.settings?.gridSize ?? 0)}
-            onChange={(e) => updateSettings({ gridSize: Number(e.target.value) })}
+            onChange={(e) =>
+              updateSettings({ gridSize: Number(e.target.value) })
+            }
             className="px-1 py-0.5 bg-gray-800 border border-gray-600 rounded text-xs text-white"
           >
             <option value="0">Сетка: авто</option>
@@ -387,11 +484,13 @@ const App: React.FC = () => {
             <option value="5000">5 км</option>
           </select>
           <button
-            onClick={() => updateSettings({ theme: theme === 'dark' ? 'light' : 'dark' })}
+            onClick={() =>
+              updateSettings({ theme: theme === "dark" ? "light" : "dark" })
+            }
             className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 border border-gray-600 rounded text-xs text-white"
             title="Переключить тему (клавиша T)"
           >
-            {theme === 'dark' ? '🌙 Тёмная' : '☀️ Светлая'}
+            {theme === "dark" ? "🌙 Тёмная" : "☀️ Светлая"}
           </button>
         </div>
       </div>
@@ -401,42 +500,85 @@ const App: React.FC = () => {
 
       {wizardMode ? (
         <div className="flex-1 min-h-0 overflow-hidden">
-          <MissionWizard />
+          <Suspense
+            fallback={
+              <div
+                data-testid="wizard-loading"
+                className="p-6 text-sm text-gray-400"
+              >
+                Загрузка мастера миссий…
+              </div>
+            }
+          >
+            <MissionWizard />
+          </Suspense>
         </div>
       ) : (
-      /* Main content: desktop — 2 колонки; mobile — вертикально, карта 300–400 px + панель */
-      <div className={"flex-1 flex overflow-hidden relative " + (isMobile ? "flex-col" : "flex-row")}>
-        {/* Canvas */}
-        <div className={isMobile ? "relative w-full shrink-0" : "flex-1 relative"} style={isMobile ? { height: 350 } : undefined}>
-          <MapCanvas />
+        /* Main content: desktop — 2 колонки; mobile — вертикально, карта 300–400 px + панель */
+        <div
+          className={
+            "flex-1 flex overflow-hidden relative " +
+            (isMobile ? "flex-col" : "flex-row")
+          }
+        >
+          {/* Canvas */}
+          <div
+            className={
+              isMobile ? "relative w-full shrink-0" : "flex-1 relative"
+            }
+            style={isMobile ? { height: 350 } : undefined}
+          >
+            <MapCanvas />
 
-          {/* Help overlay */}
-          {!project.map && (
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-              <div className="bg-gray-800/90 border border-gray-600 rounded-lg p-6 max-w-md text-center">
-                <h2 className="text-xl font-bold text-cyan-400 mb-3">Добро пожаловать!</h2>
-                <p className="text-gray-300 text-sm mb-4">
-                  Загрузите карту местности, затем добавляйте точки и ограничения.
-                </p>
-                <div className="text-left text-xs text-gray-400 space-y-1">
-                  <p>🗺️ <strong>Карта</strong> — загрузить изображение</p>
-                  <p>📍 <strong>Точка</strong> — кликнуть по карте для добавления</p>
-                  <p>▭ <strong>Прям.</strong> — нарисовать прямоугольное ограничение</p>
-                  <p>⬡ <strong>Полиг.</strong> — нарисовать полигональное ограничение</p>
-                  <p>⭕ <strong>Круг</strong> — нарисовать круглое ограничение</p>
-                  <p>📏 <strong>Линейка</strong> — измерить расстояние</p>
-                  <p className="mt-2 text-gray-500">Горячие клавиши: 1–7 — инструменты · R — режим действий · T — тема · Ctrl+Z/Ctrl+Y — undo/redo рисования · +/- — зум · G — сетка · Del — удалить · Esc — отмена</p>
+            {/* Help overlay */}
+            {!project.map && (
+              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                <div className="bg-gray-800/90 border border-gray-600 rounded-lg p-6 max-w-md text-center">
+                  <h2 className="text-xl font-bold text-cyan-400 mb-3">
+                    Добро пожаловать!
+                  </h2>
+                  <p className="text-gray-300 text-sm mb-4">
+                    Загрузите карту местности, затем добавляйте точки и
+                    ограничения.
+                  </p>
+                  <div className="text-left text-xs text-gray-400 space-y-1">
+                    <p>
+                      🗺️ <strong>Карта</strong> — загрузить изображение
+                    </p>
+                    <p>
+                      📍 <strong>Точка</strong> — кликнуть по карте для
+                      добавления
+                    </p>
+                    <p>
+                      ▭ <strong>Прям.</strong> — нарисовать прямоугольное
+                      ограничение
+                    </p>
+                    <p>
+                      ⬡ <strong>Полиг.</strong> — нарисовать полигональное
+                      ограничение
+                    </p>
+                    <p>
+                      ⭕ <strong>Круг</strong> — нарисовать круглое ограничение
+                    </p>
+                    <p>
+                      📏 <strong>Линейка</strong> — измерить расстояние
+                    </p>
+                    <p className="mt-2 text-gray-500">
+                      Горячие клавиши: 1–7 — инструменты · R — режим действий ·
+                      T — тема · Ctrl+Z/Ctrl+Y — undo/redo рисования · +/- — зум
+                      · G — сетка · Del — удалить · Esc — отмена
+                    </p>
+                  </div>
                 </div>
               </div>
-            </div>
-          )}
-        </div>
+            )}
+          </div>
 
-        {/* Sidebar */}
-        <div className={isMobile ? "flex-1 min-h-0 overflow-y-auto" : ""}>
-          <Sidebar />
+          {/* Sidebar */}
+          <div className={isMobile ? "flex-1 min-h-0 overflow-y-auto" : ""}>
+            <Sidebar />
+          </div>
         </div>
-      </div>
       )}
 
       {!wizardMode && <StatusBar />}

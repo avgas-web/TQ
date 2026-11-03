@@ -100,7 +100,22 @@ export default defineConfig(() => ({
   // `build.worker.format` молча игнорируется (проверено на vite@6.4.5),
   // и сборка падала: Invalid value "iife" for option "worker.format".
   worker: { format: "es" },
-  build: {},
+  build: {
+    // ФАЗА 5.4 (оптимизация бандла): разделяем тяжёлые vendor-модули на
+    // отдельные кэшируемые чанки. geotiff/sql.js/jszip уже подгружаются
+    // динамически из userMapLoader — для них это явные границы чанков;
+    // react/zustand вынесены, чтобы их кэш не сбрасывался при каждом
+    // изменении кода приложения.
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          "vendor-react": ["react", "react-dom"],
+          "vendor-state": ["zustand"],
+        },
+      },
+    },
+    chunkSizeWarningLimit: 700,
+  },
   // Юнит-тесты (Vitest): математика координат, батчи высот, парсеры тактических карт
   test: {
     environment: "node",
