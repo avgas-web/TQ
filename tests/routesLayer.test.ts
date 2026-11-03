@@ -119,7 +119,7 @@ describe("routesLayer: контракт чистой функции (без ст
   });
 
   it("нарушение лимита дальности («max») красит сегменты в #ff4d4d", () => {
-    const { ctx, state } = makeCtx();
+    const { ctx, calls } = makeCtx();
     // Москва → СПб по координатам ≈ 600 км, лимит 10 км — явное превышение
     drawRoutesLayer(
       baseParams({

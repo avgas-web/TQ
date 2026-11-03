@@ -51,6 +51,7 @@ import {
 } from "../utils/tacticalOverlayRender";
 import { eventBus } from "../utils/eventBus";
 import { drawRoutesLayer } from "./map/routesLayer";
+import { MapObjectPopup, type PopupData } from "./map/popupLayer";
 import type { Point, Route, RoutePoint, MapBounds, ViewState } from "../types";
 
 import {
@@ -221,12 +222,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     index: number;
   } | null>(null);
   // Popup по клику на объект (координаты, высота, расстояние)
-  const [popup, setPopup] = useState<{
-    x: number;
-    y: number;
-    title: string;
-    lines: string[];
-  } | null>(null);
+  const [popup, setPopup] = useState<PopupData | null>(null);
   // Кэш тайлов подложки: url -> изображение (или undefined при ошибке)
   const tileCache = useRef<Map<string, HTMLImageElement>>(new Map());
   // CIRCUIT BREAKER загрузки тайлов (шаг П3 ТЗ): если запросы к CDN «молчат»
@@ -4916,25 +4912,13 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         onContextMenu={handleContextMenu}
       />
 
-      {/* Popup объекта: координаты, высота, расстояние */}
-      {popup && (
-        <div
-          className="absolute z-20 max-w-[260px] rounded-lg bg-gray-900/95 border border-cyan-500/50 text-gray-100 text-xs shadow-xl p-2 pointer-events-auto"
-          style={{
-            left: Math.min(popup.x + 12, canvasSize.width - 270),
-            top: Math.min(popup.y + 12, canvasSize.height - 120),
-          }}
-          onClick={() => setPopup(null)}
-        >
-          <div className="font-bold text-cyan-300 mb-1">{popup.title}</div>
-          {popup.lines.map((l, i) => (
-            <div key={i} className="leading-relaxed">
-              {l}
-            </div>
-          ))}
-          <div className="text-gray-400 mt-1">клик — закрыть</div>
-        </div>
-      )}
+      {/* Popup объекта: координаты, высота, расстояние (Фаза 5.C → ./map/popupLayer) */}
+      <MapObjectPopup
+        popup={popup}
+        canvasWidth={canvasSize.width}
+        canvasHeight={canvasSize.height}
+        onClose={() => setPopup(null)}
+      />
 
       {/* Индикатор состояния слоя подложки (пункт C аудита): загружается/загружен/ошибка.
         Временные сообщения (геолокация и т.п.) показываются поверх статуса слоя. */}
