@@ -20,7 +20,8 @@ const MissionWizard = lazy(() =>
     default: m.MissionWizard,
   })),
 );
-import { useStore } from "./store/useStore";
+import { useMapStore } from "./store/useMapStore";
+import { useProject } from "./store/useProjectStore";
 import { initOpenStreetMap } from "./utils/openStreetMap";
 import { eventBus } from "./utils/eventBus";
 import { useAppInitialization } from "./hooks/useAppInitialization";
@@ -196,19 +197,18 @@ const App: React.FC = () => {
   const [wizardMode, setWizardMode] = useState<boolean>(
     () => localStorage.getItem("tq-ui-mode") !== "legacy",
   );
-  const {
-    currentTool,
-    setTool,
-    clearDrawingPoints,
-    setMeasurementPoints,
-    project,
-    updateSettings,
-    setProjectName,
-    deleteMarker,
-    selectedMarkerId,
-    undoDrawingPoint,
-    redoDrawingPoint,
-  } = useStore();
+  // ФАЗА 5.D: прямые доменные селекторы вместо фасада useStoreShim.
+  const currentTool = useMapStore((s) => s.currentTool);
+  const setTool = useMapStore((s) => s.setTool);
+  const clearDrawingPoints = useMapStore((s) => s.clearDrawingPoints);
+  const setMeasurementPoints = useMapStore((s) => s.setMeasurementPoints);
+  const updateSettings = useMapStore((s) => s.updateSettings);
+  const deleteMarker = useMapStore((s) => s.deleteMarker);
+  const selectedMarkerId = useMapStore((s) => s.selectedMarkerId);
+  const undoDrawingPoint = useMapStore((s) => s.undoDrawingPoint);
+  const redoDrawingPoint = useMapStore((s) => s.redoDrawingPoint);
+  const setProjectName = useMapStore((s) => s.setProjectName);
+  const project = useProject();
 
   // Стартовая инициализация доменных сторов: миграция legacy-хранилища,
   // восстановление карты из IndexedDB, кросс-стор подписки (зоны→маршруты).
@@ -386,7 +386,7 @@ const App: React.FC = () => {
   // Restore map from IndexedDB on app load
   useEffect(() => {
     const restoreMap = async () => {
-      await useStore.getState().restoreMapFromStorage();
+      await useMapStore.getState().restoreMapFromStorage();
     };
     restoreMap();
   }, []);
@@ -398,8 +398,9 @@ const App: React.FC = () => {
   useEffect(() => {
     const initOSM = async () => {
       await initOpenStreetMap();
-      const st = useStore.getState();
-      if (!st.project.openStreetMap.enabled) {
+      // ФАЗА 5.D: состояние OSM живёт в useMapStore (персистимое поле).
+      const st = useMapStore.getState();
+      if (!st.openStreetMap.enabled) {
         st.toggleOpenStreetMap(true);
       }
     };

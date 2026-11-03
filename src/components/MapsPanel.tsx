@@ -1,5 +1,7 @@
 import React, { useState } from "react";
-import { useStore } from "../store/useStore";
+// ФАЗА 5.D: прямые доменные селекторы вместо фасада useStoreShim.
+import { useMapStore } from "../store/useMapStore";
+import { useProject } from "../store/useProjectStore";
 import {
   loadGoogleMapsApi,
   geocodeAddress,
@@ -51,15 +53,14 @@ const MapsPanel: React.FC = () => {
   // Счётчик фоновых снимков: результат применяется только если это всё ещё
   // последний запрос (защита от гонки при быстром двойном нажатии)
 
-  const {
-    project,
-    toggleGoogleMaps,
-    toggleYandexMaps,
-    setOSMTileServer,
-    loadMapWithStorage,
-    loadActiveTileMap,
-    setMapBounds,
-  } = useStore();
+  const project = useProject();
+  const toggleGoogleMaps = useMapStore((s) => s.toggleGoogleMaps);
+  const toggleYandexMaps = useMapStore((s) => s.toggleYandexMaps);
+  const setOSMTileServer = useMapStore((s) => s.setOSMTileServer);
+  const loadMapWithStorage = useMapStore((s) => s.loadMapWithStorage);
+  const loadActiveTileMap = useMapStore((s) => s.loadActiveTileMap);
+  const setMapBounds = useMapStore((s) => s.setMapBounds);
+  const setMapSource = useMapStore((s) => s.setMapSource);
 
   // Инициализация настроек подложки. ВАЖНО (ЭТАП 1.2): API-ключи больше
   // НЕ читаются из проекта/localStorage — секреты живут только в сессионном
@@ -273,11 +274,7 @@ const MapsPanel: React.FC = () => {
         // «2ГИС» УДАЛЁН ПОЛНОСТЬЮ (ТЗ): источник — только 'osm' (активная тайловая
         // карта рабочих HTTPS-подложек без ключей; legacy-значения из старых
         // сохранений нормализует normalizeTileServer()).
-        useStore.setState((cur) => ({
-          project: cur.project.map
-            ? { ...cur.project, map: { ...cur.project.map, source: "osm" } }
-            : cur.project,
-        }));
+        setMapSource("osm");
 
         // Снимок-подложка для OSM НЕ загружается: активная тайловая карта уже
         // является основной подложкой (как на openstreetmap.org). Фоновый big-PNG

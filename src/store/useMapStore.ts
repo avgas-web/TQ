@@ -235,6 +235,8 @@ export interface MapActions {
    *  ('osm', 'carto') — MapCanvas нормализует их normalizeTileServer(). */
   setOSMTileServer: (server: string) => void;
   setMapBounds: (bounds: MapBounds) => void;
+  /** ФАЗА 5.D: точечное обновление поля source у активной карты. */
+  setMapSource: (source: MapData["source"]) => void;
   loadMap: (mapData: MapData) => void;
   loadMapWithStorage: (mapData: MapData) => Promise<void>;
   /** Активная тайловая карта без снимка: центр (lat/lng) + зум 6..19 */
@@ -651,6 +653,12 @@ const createMapActions: StateCreator<MapStore, [], [], MapActions> = (
     if (s.mapLoaded && !tilesBacked) get().publishMapLoaded(false);
   },
 
+  /** ФАЗА 5.D: точечное обновление поля source у активной карты
+   *  (MapsPanel отмечает osm-подложку вместо setState merged-агрегата). */
+  setMapSource: (source: MapData["source"]) =>
+    set((state) => ({
+      map: state.map ? { ...state.map, source } : null,
+    })),
   setMapBounds: (bounds) =>
     set((state) => ({
       map: state.map ? { ...state.map, bounds } : null,

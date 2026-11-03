@@ -15,9 +15,8 @@
 //    клики этапов конвертируются utils/mapGeoPick по той же Mercator-формуле.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import MapCanvas from "../MapCanvas";
-import { useStore } from "../../store/useStore";
+// ФАЗА 5.D: только доменные сторы — фасад useStoreShim удалён.
 import { useMapStore } from "../../store/useMapStore";
-import { syncShimSnapshot } from "../../store/useStoreShim";
 import { useMissionWizardStore } from "../../store/useMissionWizardStore";
 import { getProviderStatus } from "../../utils/mapProviders";
 import {
@@ -56,11 +55,11 @@ const SERVER_SHORT_LABELS: Record<TileServerId, string> = {
  *  Список = рабочие серверы аудита (TILE_SERVER_ORDER); 2ГИС удалён полностью. */
 const ProviderSwitcher: React.FC = () => {
   const tileServer = normalizeTileServer(
-    useStore((s) => s.project.openStreetMap?.tileServer ?? "osm"),
+    useMapStore((s) => s.openStreetMap?.tileServer ?? "osm"),
   );
 
-  const google = useStore((s) => s.project.googleMaps);
-  const yandex = useStore((s) => s.project.yandexMaps);
+  const google = useMapStore((s) => s.googleMaps);
+  const yandex = useMapStore((s) => s.yandexMaps);
 
   // Graceful degradation: Google/Яндекс показаны, но помечены как требующие
   // ключа — при отсутствии ключа система НЕ падает, а подсказывает рабочие XYZ.
@@ -84,11 +83,9 @@ const ProviderSwitcher: React.FC = () => {
           type="button"
           data-testid={`wizard-tiles-${id}`}
           onClick={() => {
-            // Пишем прямо в доменный стор — он источник истины рендера тайлов;
-            // legacy-фасад useStore.setOSMTileServer обновлял только снапшот
-            // project.openStreetMap, не трогая useMapStore (см. wizardMap.test).
+            // ФАЗА 5.D: useMapStore — единственный источник истины рендера
+            // тайлов (legacy-фасад со снапшотами удалён, см. wizardMap.test).
             useMapStore.getState().setOSMTileServer(id);
-            syncShimSnapshot();
           }}
           className={
             "rounded px-2 py-0.5 text-[11px] transition " +
@@ -136,7 +133,10 @@ const MapPanelBody: React.FC<{
   hint?: string;
   onMapLoaded?: (loaded: boolean) => void;
 }> = ({ hint, onMapLoaded }) => {
-  const project = useStore((s) => s.project);
+  // ФАЗА 5.D: провайдерские предпочтения читаются напрямую из map-стора.
+  const googleMaps = useMapStore((s) => s.googleMaps);
+  const yandexMaps = useMapStore((s) => s.yandexMaps);
+  const openStreetMap = useMapStore((s) => s.openStreetMap);
 
   // ── Клик по карте = «умный поиск здания» (Overpass), как в эталоне ────────
   const [statusMsg, setStatusMsg] = useState<string>(
@@ -183,11 +183,8 @@ const MapPanelBody: React.FC<{
       useMapStore.getState().openStreetMap.tileServer,
     );
     if (current !== primary) {
-      // Пишем ПРЯМО в доменный стор: legacy-фасад useStore.setOSMTileServer
-      // обновляет только снапшот project.openStreetMap и НЕ трогает
-      // useMapStore (источник истины рендера тайлов).
+      // ФАЗА 5.D: пишем прямо в доменный стор (единственный источник истины).
       useMapStore.getState().setOSMTileServer(primary);
-      syncShimSnapshot(); // синхронизируем фасад/снапшот с новым значением
     }
   }, []);
   // КЛЮЧЕВОЙ ФИКС «мастер не показывает карту»: ensureDefaultTileMap идемпотентен
@@ -210,9 +207,8 @@ const MapPanelBody: React.FC<{
       useMapStore.getState().openStreetMap.tileServer,
     );
     if (current !== wizardPrimaryMap) {
-      // Пишем прямо в доменный стор (источник истины рендера), синхронизируем фасад.
+      // ФАЗА 5.D: пишем прямо в доменный стор (источник истины рендера).
       useMapStore.getState().setOSMTileServer(wizardPrimaryMap);
-      syncShimSnapshot();
     }
   }, [wizardPrimaryMap]);
 
@@ -283,9 +279,9 @@ const MapPanelBody: React.FC<{
     [],
   );
   // Все серверы из TILE_SERVER_ORDER — публичные XYZ без ключей; getProviderStatus
-  // принимает legacy-идентификаторы ('osm' и т.п.), поэтому нормализованное
-  // значение прокидывается как 'osm' (готовность = ready всегда для keyless).
-  const status = getProviderStatus(project, "osm");
+  // принимает legacy-идентификаторы ('osm' и т.п.), поэтому прокидываем
+  // синтетический проект только с провайдерскими полями из map-стора.
+  const status = getProviderStatus({ googleMaps, yandexMaps }, "osm");
   return (
     <>
       <ProviderSwitcher />

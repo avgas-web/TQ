@@ -1,5 +1,12 @@
 import React, { useState, useMemo } from "react";
-import { useStore } from "../store/useStore";
+// ФАЗА 5.D: прямые доменные селекторы вместо фасада useStoreShim.
+import { useMapStore } from "../store/useMapStore";
+import { useMissionStore } from "../store/useMissionStore";
+import { readProject } from "../store/projectView";
+import {
+  importProject as doImportProject,
+  exportProject as buildProjectFile,
+} from "../store/projectActions";
 import { decimalToDMS } from "../utils/geometry";
 import { pixelToGeoFromBounds } from "../utils/googleMaps";
 import {
@@ -38,25 +45,26 @@ const Sidebar: React.FC = () => {
   const [editComment, setEditComment] = useState("");
   const [editType, setEditType] = useState("");
 
-  const {
-    project,
-    selectedMarkerId,
-    searchQuery,
-    filterType,
-    activeRestrictionId,
-    selectMarker,
-    updateMarker,
-    deleteMarker,
-    deleteRestriction,
-    setActiveRestriction,
-    updateRestriction,
-    updateSettings,
-    updateRouteAltitudes,
-    addMarker,
-    setSearchQuery,
-    setFilterType,
-    importProject: doImportProject,
-  } = useStore();
+  // ─── ФАЗА 5.D: прямые доменные селекторы (map + mission) ────────────────
+  const selectedMarkerId = useMapStore((s) => s.selectedMarkerId);
+  const searchQuery = useMapStore((s) => s.searchQuery);
+  const filterType = useMapStore((s) => s.filterType);
+  const activeRestrictionId = useMapStore((s) => s.activeRestrictionId);
+  const selectMarker = useMapStore((s) => s.selectMarker);
+  const updateMarker = useMapStore((s) => s.updateMarker);
+  const deleteMarker = useMapStore((s) => s.deleteMarker);
+  const deleteRestriction = useMapStore((s) => s.deleteRestriction);
+  const setActiveRestriction = useMapStore((s) => s.setActiveRestriction);
+  const updateRestriction = useMapStore((s) => s.updateRestriction);
+  const updateSettings = useMapStore((s) => s.updateSettings);
+  const addMarker = useMapStore((s) => s.addMarker);
+  const setSearchQuery = useMapStore((s) => s.setSearchQuery);
+  const setFilterType = useMapStore((s) => s.setFilterType);
+  const updateRouteAltitudes = useMissionStore((s) => s.updateRouteAltitudes);
+
+  // Агрегированный вид проекта — чистый читатель поверх доменных сторов
+  // (замена merged-снапшота legacy-фасада).
+  const project = readProject();
 
   // Filtered markers
   const filteredMarkers = useMemo(() => {

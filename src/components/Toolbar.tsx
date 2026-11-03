@@ -1,18 +1,17 @@
-import React, { useRef } from 'react';
-import { useStore } from '../store/useStore';
-import type { Tool, MapData } from '../types';
+import React, { useRef } from "react";
+// ФАЗА 5.D: прямые доменные селекторы вместо фасада useStoreShim.
+import { useMapStore } from "../store/useMapStore";
+import { resetProject } from "../store/projectActions";
+import type { Tool, MapData } from "../types";
 
 const Toolbar: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const {
-    currentTool,
-    project,
-    setTool,
-    loadMapWithStorage,
-    resetProject,
-    clearDrawingPoints,
-    setMeasurementPoints,
-  } = useStore();
+  const currentTool = useMapStore((s) => s.currentTool);
+  const map = useMapStore((s) => s.map);
+  const setTool = useMapStore((s) => s.setTool);
+  const loadMapWithStorage = useMapStore((s) => s.loadMapWithStorage);
+  const clearDrawingPoints = useMapStore((s) => s.clearDrawingPoints);
+  const setMeasurementPoints = useMapStore((s) => s.setMeasurementPoints);
 
   const handleLoadMap = () => {
     fileInputRef.current?.click();
@@ -22,9 +21,9 @@ const Toolbar: React.FC = () => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const validTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/bmp'];
+    const validTypes = ["image/png", "image/jpeg", "image/webp", "image/bmp"];
     if (!validTypes.includes(file.type)) {
-      alert('Поддерживаются только форматы: PNG, JPG, JPEG, WebP, BMP');
+      alert("Поддерживаются только форматы: PNG, JPG, JPEG, WebP, BMP");
       return;
     }
 
@@ -38,7 +37,7 @@ const Toolbar: React.FC = () => {
           width: img.width,
           height: img.height,
           dataUrl,
-          source: 'local',
+          source: "local",
         };
         // Сохраняем карту в IndexedDB (для персистентности)
         await loadMapWithStorage(mapData);
@@ -46,15 +45,36 @@ const Toolbar: React.FC = () => {
       img.src = dataUrl;
     };
     reader.readAsDataURL(file);
-    e.target.value = '';
+    e.target.value = "";
   };
 
   const tools: { id: Tool; label: string; icon: string; title: string }[] = [
-    { id: 'pan', label: 'Пан', icon: '✋', title: 'Панорамирование (пробел+ЛКМ)' },
-    { id: 'select', label: 'Выбор', icon: '👆', title: 'Выбор и перемещение точек' },
-    { id: 'addMarker', label: 'Точка', icon: '📍', title: 'Добавить точку' },
-    { id: 'drawPolygon', label: 'ADIZ', icon: '⬡', title: 'Зона ПВО / Эшелонированная зона запрета полётов (ADIZ; произвольный полигон; двойной клик — завершить)' },
-    { id: 'measure', label: 'Линейка', icon: '📏', title: 'Измерение расстояний' },
+    {
+      id: "pan",
+      label: "Пан",
+      icon: "✋",
+      title: "Панорамирование (пробел+ЛКМ)",
+    },
+    {
+      id: "select",
+      label: "Выбор",
+      icon: "👆",
+      title: "Выбор и перемещение точек",
+    },
+    { id: "addMarker", label: "Точка", icon: "📍", title: "Добавить точку" },
+    {
+      id: "drawPolygon",
+      label: "ADIZ",
+      icon: "⬡",
+      title:
+        "Зона ПВО / Эшелонированная зона запрета полётов (ADIZ; произвольный полигон; двойной клик — завершить)",
+    },
+    {
+      id: "measure",
+      label: "Линейка",
+      icon: "📏",
+      title: "Измерение расстояний",
+    },
   ];
 
   return (
@@ -78,7 +98,7 @@ const Toolbar: React.FC = () => {
       <div className="w-px h-8 bg-gray-600 mx-1" />
 
       {/* Tools */}
-      {tools.map(tool => (
+      {tools.map((tool) => (
         <button
           key={tool.id}
           onClick={() => {
@@ -88,8 +108,8 @@ const Toolbar: React.FC = () => {
           }}
           className={`px-3 py-2 rounded text-sm font-medium transition-colors ${
             currentTool === tool.id
-              ? 'bg-cyan-600 text-white'
-              : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+              ? "bg-cyan-600 text-white"
+              : "bg-gray-700 hover:bg-gray-600 text-gray-200"
           }`}
           title={tool.title}
         >
@@ -101,35 +121,33 @@ const Toolbar: React.FC = () => {
       <div className="w-px h-8 bg-gray-600 mx-1" />
 
       {/* Map info */}
-      {project.map && (
+      {map && (
         <span className="text-xs text-gray-400 px-2">
-          {project.map.name || 'Карта'} ({project.map.width || 0}×{project.map.height || 0})
+          {map.name || "Карта"} ({map.width || 0}×{map.height || 0})
         </span>
       )}
 
       <div className="flex-1" />
 
       {/* Map source indicator */}
-      {project.map?.source === 'google' && (
-        <span className="text-xs text-green-400 px-2">
-          🌍 Google Maps
-        </span>
+      {map?.source === "google" && (
+        <span className="text-xs text-green-400 px-2">🌍 Google Maps</span>
       )}
-      {project.map?.source === 'yandex' && (
-        <span className="text-xs text-yellow-400 px-2">
-          🗺️ Яндекс.Карты
-        </span>
+      {map?.source === "yandex" && (
+        <span className="text-xs text-yellow-400 px-2">🗺️ Яндекс.Карты</span>
       )}
-      {project.map?.source === 'osm' && (
-        <span className="text-xs text-blue-400 px-2">
-          🌐 OpenStreetMap
-        </span>
+      {map?.source === "osm" && (
+        <span className="text-xs text-blue-400 px-2">🌐 OpenStreetMap</span>
       )}
 
       {/* Abort Mission / Scrub Sector */}
       <button
         onClick={() => {
-          if (confirm('ОТМЕНА БОЕВОЙ ЗАДАЧИ (Abort Mission / Scrub Sector): стереть сектор? Будут удалены ВСЕ данные: карта, точки старта/цели, все маршруты, зоны ПВО (ADIZ), парк боевых аппаратов и настройки.')) {
+          if (
+            confirm(
+              "ОТМЕНА БОЕВОЙ ЗАДАЧИ (Abort Mission / Scrub Sector): стереть сектор? Будут удалены ВСЕ данные: карта, точки старта/цели, все маршруты, зоны ПВО (ADIZ), парк боевых аппаратов и настройки.",
+            )
+          ) {
             resetProject();
           }
         }}
