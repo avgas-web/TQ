@@ -453,6 +453,11 @@ describe("Этап 6 UI — NFZAndRoutesStep", () => {
         acknowledged: false,
       })),
     }));
+    // Индикатор пересчёта гаснет только после завершения calculateRoutes() —
+    // без ожидания кнопка подтверждения не рендерится (flaky на медленных CI).
+    await waitFor(() =>
+      expect(screen.queryByTestId("recalc-indicator")).toBeNull(),
+    );
     await waitFor(() =>
       expect(screen.getByTestId("range-warning-banner")).toBeTruthy(),
     );
