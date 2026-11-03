@@ -94,7 +94,7 @@ export async function yandexGeocode(
     throw new Error("Yandex Maps API не загружен");
   }
 
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const geocoder = new (window as any).ymaps.Geocoder();
 
     geocoder
@@ -127,7 +127,7 @@ export async function yandexReverseGeocode(
     throw new Error("Yandex Maps API не загружен");
   }
 
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const geocoder = new (window as any).ymaps.Geocoder();
 
     geocoder

@@ -2,15 +2,15 @@
 // загруженную карту. До готовности подложки клики по области живой карты
 // игнорируются, поверх показывается оверлей с причиной; после загрузки OSM
 // (ensureDefaultTileMap → mapLoaded) клик добавляет точку.
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { act } from 'react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import React from 'react';
-import { MissionWizard } from '../src/components/wizard/MissionWizard';
-import { StartPointsStep } from '../src/components/wizard/StartPointsStep';
-import { TargetPointsStep } from '../src/components/wizard/TargetPointsStep';
-import { useMissionWizardStore } from '../src/store/useMissionWizardStore';
-import { useMapStore } from '../src/store/useMapStore';
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import React from "react";
+import { MissionWizard } from "../src/components/wizard/MissionWizard";
+import { StartPointsStep } from "../src/components/wizard/StartPointsStep";
+import { TargetPointsStep } from "../src/components/wizard/TargetPointsStep";
+import { useMissionWizardStore } from "../src/store/useMissionWizardStore";
+import { useMapStore } from "../src/store/useMapStore";
 
 // ═══════════════════════════════════════════════════════════════
 // РЕЦЕПТ А: fake timers + mock модуля автозагрузки.
@@ -42,12 +42,12 @@ import { useMapStore } from '../src/store/useMapStore';
 // синхронно; публикация готовности подложки имитирует onload тайла
 // (сеть в happy-dom недоступна физически).
 // ═══════════════════════════════════════════════════════════════
-vi.mock('../src/hooks/useAppInitialization', () => ({
+vi.mock("../src/hooks/useAppInitialization", () => ({
   ensureDefaultTileMap: () => {
     const st = useMapStore.getState();
     if (st.map) return; // идемпотентность — как в проде
     st.toggleOpenStreetMap(true);
-    st.setOSMTileServer(st.openStreetMap.tileServer ?? 'osm');
+    st.setOSMTileServer(st.openStreetMap.tileServer ?? "osm");
     st.loadActiveTileMap({ lat: 55.7558, lng: 37.6173 }, 10);
   },
   useAppInitialization: () => undefined,
@@ -72,33 +72,47 @@ vi.mock('../src/hooks/useAppInitialization', () => ({
 // isLoading гаснет, а готовность подложки публикуется детерминированно.
 function makeFakeTileImage(): HTMLImageElement {
   const img = new Image();
-  Object.defineProperty(img, 'complete', { value: true });
-  Object.defineProperty(img, 'naturalWidth', { value: 256 });
-  Object.defineProperty(img, 'naturalHeight', { value: 256 });
+  Object.defineProperty(img, "complete", { value: true });
+  Object.defineProperty(img, "naturalWidth", { value: 256 });
+  Object.defineProperty(img, "naturalHeight", { value: 256 });
   return img;
 }
-vi.mock('../src/utils/openStreetMap', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../src/utils/openStreetMap')>();
+vi.mock("../src/utils/openStreetMap", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../src/utils/openStreetMap")>();
   return {
     ...actual,
-    loadTileImage: async (): Promise<HTMLImageElement | null> => makeFakeTileImage(),
-    loadTileWithMirrors: async (): Promise<HTMLImageElement | null> => makeFakeTileImage(),
+    loadTileImage: async (): Promise<HTMLImageElement | null> =>
+      makeFakeTileImage(),
+    loadTileWithMirrors: async (): Promise<HTMLImageElement | null> =>
+      makeFakeTileImage(),
   };
 });
 
 const realSetTimeout = window.setTimeout.bind(window);
-const realClearTimeout = window.clearTimeout.bind(window);
+const _realClearTimeout = window.clearTimeout.bind(window);
 class PendingTimer {
   readonly fn: () => void;
   readonly ms: number;
-  constructor(fn: () => void, ms: number) { this.fn = fn; this.ms = ms; }
+  constructor(fn: () => void, ms: number) {
+    this.fn = fn;
+    this.ms = ms;
+  }
 }
 let pendingTimers = new Map<number, PendingTimer>();
 let timerSeq = 1;
-window.setTimeout = ((fn: TimerHandler, ms?: number, ...args: unknown[]): number => {
-  if (typeof fn !== 'function') return realSetTimeout(fn as (...a: unknown[]) => void, ms, ...args);
+window.setTimeout = ((
+  fn: TimerHandler,
+  ms?: number,
+  ...args: unknown[]
+): number => {
+  if (typeof fn !== "function")
+    return realSetTimeout(fn as (...a: unknown[]) => void, ms, ...args);
   const id = timerSeq++;
-  pendingTimers.set(id, new PendingTimer(() => fn(...(args as never[])), ms ?? 0));
+  pendingTimers.set(
+    id,
+    new PendingTimer(() => fn(...(args as never[])), ms ?? 0),
+  );
   return id;
 }) as typeof window.setTimeout;
 window.clearTimeout = ((id?: number): void => {
@@ -149,15 +163,36 @@ function simulateTilesLoaded(): void {
  *  Акт-цикл исполняет все очередь React-обновлений синхронно и завершается. */
 async function flushReact(times = 6): Promise<void> {
   for (let i = 0; i < times; i++) {
-    await act(async () => { await Promise.resolve(); });
+    await act(async () => {
+      await Promise.resolve();
+    });
   }
 }
 
 class ROShim {
   private cb: (entries: ResizeObserverEntry[]) => void;
-  constructor(cb: (entries: ResizeObserverEntry[]) => void) { this.cb = cb; }
+  constructor(cb: (entries: ResizeObserverEntry[]) => void) {
+    this.cb = cb;
+  }
   observe(el: Element): void {
-    this.cb([{ target: el, contentRect: { x: 0, y: 0, top: 0, left: 0, width: 800, height: 600, bottom: 600, right: 800 }, borderBoxSize: [], contentBoxSize: [], devicePixelContentBoxSize: [] } as unknown as ResizeObserverEntry]);
+    this.cb([
+      {
+        target: el,
+        contentRect: {
+          x: 0,
+          y: 0,
+          top: 0,
+          left: 0,
+          width: 800,
+          height: 600,
+          bottom: 600,
+          right: 800,
+        },
+        borderBoxSize: [],
+        contentBoxSize: [],
+        devicePixelContentBoxSize: [],
+      } as unknown as ResizeObserverEntry,
+    ]);
   }
   unobserve(): void {}
   disconnect(): void {}
@@ -167,15 +202,23 @@ beforeEach(() => {
   // Пере-создаём очередь таймеров между тестами: «хвост» прошлого теста
   // не должен исполняться в новом дереве (защита от setState-on-unmounted).
   pendingTimers = new Map();
-  vi.stubGlobal('ResizeObserver', ROShim);
-  try { localStorage.clear(); } catch { /* noop */ }
+  vi.stubGlobal("ResizeObserver", ROShim);
+  try {
+    localStorage.clear();
+  } catch {
+    /* noop */
+  }
   useMissionWizardStore.setState(useMissionWizardStore.getInitialState());
   // ВАЖНО: setState(getInitialState()) НЕ отменяет уже запланированную
   // zustand-persist запись в localStorage (она ставится через setTimeout
   // внутри set()). Без purge() на следующем set() мок-карта из предыдущего
   // теста «воскресала» бы в сторе и readiness-оверлей не появлялся.
   useMapStore.persist.clearStorage();
-  useMapStore.setState({ ...useMapStore.getInitialState(), map: null, mapLoaded: false });
+  useMapStore.setState({
+    ...useMapStore.getInitialState(),
+    map: null,
+    mapLoaded: false,
+  });
 });
 
 afterEach(() => {
@@ -188,20 +231,20 @@ async function gotoStartPointsStep(): Promise<void> {
   // Этап 1 — выбор карт: штатный путь пользователя (клик по карточке Esri).
   // ВНИМАНИЕ: не менять на прямой setState в этом файле — здесь мок-таймеры
   // (flushTimers), и тест обязан проходить через реальный UI-контракт этапа.
-  fireEvent.click(screen.getByTestId('map-choice-esri'));
+  fireEvent.click(screen.getByTestId("map-choice-esri"));
   await flushReact(2);
-  fireEvent.click(screen.getByRole('button', { name: /Далее/ }));
+  fireEvent.click(screen.getByRole("button", { name: /Далее/ }));
   await flushReact(2);
   // Этап 2 — тип аппарата
-  fireEvent.click(screen.getByTestId('craft-card-drone'));
+  fireEvent.click(screen.getByTestId("craft-card-drone"));
   await flushReact(2);
-  fireEvent.click(screen.getByRole('button', { name: 'Продолжить' }));
+  fireEvent.click(screen.getByRole("button", { name: "Продолжить" }));
   await flushTimers();
   await flushReact(4);
-  expect(screen.getByRole('button', { name: /Далее/ })).toBeEnabled();
-  fireEvent.click(screen.getByRole('button', { name: /Далее/ }));
+  expect(screen.getByRole("button", { name: /Далее/ })).toBeEnabled();
+  fireEvent.click(screen.getByRole("button", { name: /Далее/ }));
   await flushReact(4);
-  expect(useMissionWizardStore.getState().currentStep).toBe('start-points');
+  expect(useMissionWizardStore.getState().currentStep).toBe("start-points");
   // КАРТА ДОЛЖНА БЫТЬ ГОТОВА до любых кликов (требование ТЗ: точки ставятся
   // только на загруженную подложку). Прокручиваем отложенные эффекты
   // автозагрузки (fake timers), а затем детерминированно публикуем готовность
@@ -210,13 +253,27 @@ async function gotoStartPointsStep(): Promise<void> {
   await flushTimers();
   simulateTilesLoaded();
   await flushReact(6);
-  expect(screen.queryByTestId('wizard-map-not-ready-overlay')).toBeNull();
+  expect(screen.queryByTestId("wizard-map-not-ready-overlay")).toBeNull();
 }
 
 /** Клик по области ЖИВОЙ карты (не mini-map) ДО готовности подложки. */
-function clickLiveMapBlind(testId: string, clientX: number, clientY: number): boolean {
+function clickLiveMapBlind(
+  testId: string,
+  clientX: number,
+  clientY: number,
+): boolean {
   const live = screen.getByTestId(testId);
-  live.getBoundingClientRect = () => ({ left: 0, top: 0, width: 640, height: 480, x: 0, y: 0, right: 640, bottom: 480, toJSON: () => ({}) });
+  live.getBoundingClientRect = () => ({
+    left: 0,
+    top: 0,
+    width: 640,
+    height: 480,
+    x: 0,
+    y: 0,
+    right: 640,
+    bottom: 480,
+    toJSON: () => ({}),
+  });
   const w = useMissionWizardStore.getState();
   const before = w.startPoints.length + w.targetPoints.length;
   fireEvent.click(live, { clientX, clientY });
@@ -225,76 +282,86 @@ function clickLiveMapBlind(testId: string, clientX: number, clientY: number): bo
 }
 
 /** Клик по области ЖИВОЙ карты (не mini-map). Возвращает true, если точка добавилась. */
-function clickLiveMap(testId: string, clientX: number, clientY: number): boolean {
+function clickLiveMap(
+  testId: string,
+  clientX: number,
+  clientY: number,
+): boolean {
   return clickLiveMapBlind(testId, clientX, clientY);
 }
 
-describe('Работа с картой в режиме Мастера', () => {
-  it('до загрузки подложки клик по живой карте НЕ добавляет точку и показывает оверлей', async () => {
+describe("Работа с картой в режиме Мастера", () => {
+  it("до загрузки подложки клик по живой карте НЕ добавляет точку и показывает оверлей", async () => {
     // Контракт: пока readiness.ready === false — клики игнорируются, поверх
     // карты оверлей с причиной. Монтируем карту этапов БЕЗ мастера (мастер сам
     // автозагружает OSM на mount — это другой, позитивный сценарий, покрыт
     // следующим тестом), map=null → блокировка активна сразу.
     render(<StartPointsStep />);
     await flushReact(4);
-    const panel = screen.getByTestId('wizard-map-panel');
+    const panel = screen.getByTestId("wizard-map-panel");
     expect(panel).toBeTruthy();
 
-    const overlay = screen.getByTestId('wizard-map-not-ready-overlay');
+    const overlay = screen.getByTestId("wizard-map-not-ready-overlay");
     expect(overlay.textContent).toMatch(/Карта ещё не за|дождитесь/i);
-    expect(clickLiveMapBlind('wizard-live-map-start', 200, 150)).toBe(false);
+    expect(clickLiveMapBlind("wizard-live-map-start", 200, 150)).toBe(false);
     expect(useMissionWizardStore.getState().startPoints).toHaveLength(0);
 
     // Продакшен-путь: автозагрузка OSM (мок выполняет те же действия стора,
     // что реальный ensureDefaultTileMap) + публикация готовности подложки —
     // оверлей исчезает, клик ставит точку.
-    act(() => { useMapStore.getState().toggleOpenStreetMap(true); });
+    act(() => {
+      useMapStore.getState().toggleOpenStreetMap(true);
+    });
     await flushTimers();
     simulateTilesLoaded();
     await flushReact(6);
-    expect(screen.queryByTestId('wizard-map-not-ready-overlay')).toBeNull();
-    expect(clickLiveMapBlind('wizard-live-map-start', 200, 150)).toBe(true);
+    expect(screen.queryByTestId("wizard-map-not-ready-overlay")).toBeNull();
+    expect(clickLiveMapBlind("wizard-live-map-start", 200, 150)).toBe(true);
     expect(useMissionWizardStore.getState().startPoints).toHaveLength(1);
   });
 
-  it('после готовности OSM-подложки клик по живой карте добавляет точку', async () => {
+  it("после готовности OSM-подложки клик по живой карте добавляет точку", async () => {
     render(<MissionWizard />);
     await gotoStartPointsStep(); // внутри — прокрутка автозагрузки + ожидание готовности
-    expect(screen.queryByTestId('wizard-map-not-ready-overlay')).toBeNull();
-    expect(clickLiveMap('wizard-live-map-start', 200, 150)).toBe(true);
+    expect(screen.queryByTestId("wizard-map-not-ready-overlay")).toBeNull();
+    expect(clickLiveMap("wizard-live-map-start", 200, 150)).toBe(true);
     expect(useMissionWizardStore.getState().startPoints).toHaveLength(1);
   });
 
-  it('Google без API-ключа: оверлей требует ключ и предлагает бесплатную подложку, точки не ставятся', async () => {
+  it("Google без API-ключа: оверлей требует ключ и предлагает бесплатную подложку, точки не ставятся", async () => {
     render(<MissionWizard />);
     await gotoStartPointsStep();
-    act(() => { useMapStore.getState().setOSMTileServer('google'); });
+    act(() => {
+      useMapStore.getState().setOSMTileServer("google");
+    });
     await flushReact(6);
-    const overlay = screen.getByTestId('wizard-map-not-ready-overlay');
+    const overlay = screen.getByTestId("wizard-map-not-ready-overlay");
     expect(overlay.textContent).toMatch(/API-ключ Google/);
     // ТЗ: 2ГИС удалён полностью — подсказка ведёт на бесплатные Esri/OSM-подложки.
     expect(overlay.textContent).not.toMatch(/2ГИС/);
     expect(overlay.textContent).toMatch(/Esri\/OSM|бесплатн/i);
-    expect(clickLiveMap('wizard-live-map-start', 300, 200)).toBe(false);
+    expect(clickLiveMap("wizard-live-map-start", 300, 200)).toBe(false);
   });
 
-  it('Этап целей: клики блокируются до готовности карты, после загрузки OSM цель ставится', async () => {
+  it("Этап целей: клики блокируются до готовности карты, после загрузки OSM цель ставится", async () => {
     const w = useMissionWizardStore.getState();
     // Этап 1 (выбор карт) проходит через UI-экшены стора; в этом файле
     // мок-таймеры, поэтому синхронизация подложки догоняется flushTimers ниже.
-    w.toggleMapChoice('esri');
-    w.setCraftType('drone');
+    w.toggleMapChoice("esri");
+    w.setCraftType("drone");
     w.goToNextStep(); // start-points
-    w.addStartPoint({ name: 'С1', lat: 55.75, lon: 37.6, x: 100, y: 100 });
+    w.addStartPoint({ name: "С1", lat: 55.75, lon: 37.6, x: 100, y: 100 });
     // Монтируем карту целей на гарантированно незагруженной подложке
     // (map=null в beforeEach — см. комментарий к первому тесту).
     render(<TargetPointsStep />);
     await flushReact(4);
-    expect(screen.getByTestId('wizard-live-map-target')).toBeTruthy();
+    expect(screen.getByTestId("wizard-live-map-target")).toBeTruthy();
 
-    const overlay = screen.getByTestId('wizard-map-not-ready-overlay-target');
-    expect(overlay.textContent).toMatch(/Карта ещё не загружена|Загрузка тайлов/);
-    expect(clickLiveMapBlind('wizard-live-map-target', 200, 150)).toBe(false);
+    const overlay = screen.getByTestId("wizard-map-not-ready-overlay-target");
+    expect(overlay.textContent).toMatch(
+      /Карта ещё не загружена|Загрузка тайлов/,
+    );
+    expect(clickLiveMapBlind("wizard-live-map-target", 200, 150)).toBe(false);
     expect(useMissionWizardStore.getState().targetPoints).toHaveLength(0);
 
     // Продакшен-путь автозагрузки OSM выполняется самим WizardMapPanel при
@@ -304,12 +371,14 @@ describe('Работа с картой в режиме Мастера', () => {
     await flushTimers();
     simulateTilesLoaded();
     await flushReact(6);
-    expect(screen.queryByTestId('wizard-map-not-ready-overlay-target')).toBeNull();
-    expect(clickLiveMapBlind('wizard-live-map-target', 200, 150)).toBe(true);
+    expect(
+      screen.queryByTestId("wizard-map-not-ready-overlay-target"),
+    ).toBeNull();
+    expect(clickLiveMapBlind("wizard-live-map-target", 200, 150)).toBe(true);
     expect(useMissionWizardStore.getState().targetPoints).toHaveLength(1);
   });
 
-  it('мастер при монтировании сам гарантирует загрузку карты (без ручного вызова)', async () => {
+  it("мастер при монтировании сам гарантирует загрузку карты (без ручного вызова)", async () => {
     // Корневой фикс UX-требования: в режиме мастера точки ставятся только на
     // загруженную карту — и карта загружается автоматически, пользователю не
     // нужен legacy-«Редактор». Проверяем полный путь через MissionWizard без
@@ -318,24 +387,24 @@ describe('Работа с картой в режиме Мастера', () => {
     // имитировать onload первого тайла (сеть в jsdom недоступна физически).
     render(<MissionWizard />);
     // Этап 1: выбор карты — штатный путь UI (см. gotoStartPointsStep выше)
-    fireEvent.click(screen.getByTestId('map-choice-esri'));
+    fireEvent.click(screen.getByTestId("map-choice-esri"));
     await flushReact(2);
-    fireEvent.click(screen.getByRole('button', { name: /Далее/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Далее/ }));
     await flushReact(2);
-    fireEvent.click(screen.getByTestId('craft-card-drone'));
+    fireEvent.click(screen.getByTestId("craft-card-drone"));
     await flushReact(2);
-    fireEvent.click(screen.getByRole('button', { name: 'Продолжить' }));
+    fireEvent.click(screen.getByRole("button", { name: "Продолжить" }));
     await flushTimers();
     await flushReact(4);
-    expect(screen.getByRole('button', { name: /Далее/ })).toBeEnabled();
-    fireEvent.click(screen.getByRole('button', { name: /Далее/ }));
+    expect(screen.getByRole("button", { name: /Далее/ })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: /Далее/ }));
     await flushReact(4);
-    expect(screen.getByTestId('wizard-map-panel')).toBeTruthy();
+    expect(screen.getByTestId("wizard-map-panel")).toBeTruthy();
     expect(useMapStore.getState().map?.bounds).not.toBeNull(); // автозагрузка сработала сама
     simulateTilesLoaded();
     await flushReact(6);
-    expect(screen.queryByTestId('wizard-map-not-ready-overlay')).toBeNull();
-    expect(clickLiveMapBlind('wizard-live-map-start', 200, 150)).toBe(true);
+    expect(screen.queryByTestId("wizard-map-not-ready-overlay")).toBeNull();
+    expect(clickLiveMapBlind("wizard-live-map-start", 200, 150)).toBe(true);
     expect(useMissionWizardStore.getState().startPoints).toHaveLength(1);
   });
 });
