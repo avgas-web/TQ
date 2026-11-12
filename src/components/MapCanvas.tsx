@@ -2366,12 +2366,28 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     // на кадр даже при серии resize-событий (запрет «RO loop» — callback больше
     // не вызывает синхронный re-render внутри RO-колбэка).
     let roRaf = 0;
-    const applySizes = (w: number, h: number): void => {
+    const applySizes = (wRaw: number, hRaw: number): void => {
       if (!mounted) return;
       // ЖЁСТКАЯ ВАЛИДАЦИЯ РАЗМЕРОВ (шаг П1 ТЗ): NaN/отрицательные значения
       // от битого contentRect игнорируются полностью — иначе worldPx становится
       // NaN и вся математика тайлов зависает в бесконечном цикле перерисовок.
-      if (!Number.isFinite(w) || !Number.isFinite(h) || w < 0 || h < 0) return;
+      if (
+        !Number.isFinite(wRaw) ||
+        !Number.isFinite(hRaw) ||
+        wRaw < 0 ||
+        hRaw < 0
+      )
+        return;
+      // КОРНЕВОЙ ФИКС (Задача 0.5): гарантированные размеры контейнера по
+      // образу MiniMapPanel (там Math.max(120, ...)). В Мастере flex-высота
+      // calc(100vh - 300px) может разрешиться в схлопнутый layout (<280px),
+      // и тогда fit-to-bounds/zoom считают worldPx по заведомо битому базису.
+      // НЕНУЛЕВОЙ замер принудительно поднимается до минимального рабочего
+      // размера (совпадает с min-h-[280px]/min-w-[320px] корневого div).
+      // Нулевой замер сохраняется как есть — он нужен circuit breaker'у
+      // размеров (>5 с нулевых → оверлей ошибки) и очистке очереди тайлов.
+      const w = wRaw > 0 ? Math.max(320, wRaw) : 0;
+      const h = hRaw > 0 ? Math.max(280, hRaw) : 0;
       // ── ФИКС «ВИСНЕТ НАМЕРТВО» (корень #2, применение СПб-фолбэка) ────────
       // Первый РЕАЛЬНЫЙ замер контейнера: если при маунте не удалось восстановить
       // валидный вид (битый localStorage / stale-гидрация), фиксируем камеру над
