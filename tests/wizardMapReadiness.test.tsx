@@ -9,6 +9,7 @@ import React from "react";
 import { MissionWizard } from "../src/components/wizard/MissionWizard";
 import { StartPointsStep } from "../src/components/wizard/StartPointsStep";
 import { TargetPointsStep } from "../src/components/wizard/TargetPointsStep";
+import { isMapReadyNow } from "../src/components/wizard/mapReadiness";
 import { useMissionWizardStore } from "../src/store/useMissionWizardStore";
 import { useMapStore } from "../src/store/useMapStore";
 
@@ -406,5 +407,53 @@ describe("Работа с картой в режиме Мастера", () => {
     expect(screen.queryByTestId("wizard-map-not-ready-overlay")).toBeNull();
     expect(clickLiveMapBlind("wizard-live-map-start", 200, 150)).toBe(true);
     expect(useMissionWizardStore.getState().startPoints).toHaveLength(1);
+  });
+
+  // ── НОВЫЙ ТЕСТ (Задача 2.3): direct-store чтение в isMapReadyNow ─────────
+  // Регрессия «точки вслепую»: React-state этапа (loaded=true) устаревает при
+  // сбросе карты (map=null), но decision-логика обязана читать источник истины
+  // — useMapStore.getState() — напрямую и аннулировать stale-флаг.
+  it("isMapReadyNow читает стор напрямую: stale loaded=true при map===null блокирует клик", () => {
+    const tilesSettings = {
+      settings: { tilesEnabled: true },
+      map: { bounds: { north: 60.2, south: 59.7, west: 29.5, east: 30.8 } },
+      openStreetMap: { tileServer: "esri" },
+      googleMaps: {},
+      yandexMaps: {},
+    } as unknown as Parameters<typeof isMapReadyNow> extends never
+      ? never
+      : object;
+    void tilesSettings;
+
+    // Стор: подложка активна, mapLoaded=true → готово (даже если React-state
+    // этапа ещё stale=false — приоритет у стора, не у аргумента).
+    act(() => {
+      useMapStore.setState({
+        settings: {
+          ...(useMapStore.getState().settings ?? {}),
+          tilesEnabled: true,
+        },
+        map: {
+          ...(useMapStore.getState().map ?? ({} as object)),
+          bounds: { north: 60.2, south: 59.7, west: 29.5, east: 30.8 },
+        } as never,
+        mapLoaded: true,
+      });
+    });
+    expect(isMapReadyNow(false)).toBe(true);
+
+    // КАРТА СБРОШЕНА (map=null), но React-state этапа всё ещё loaded=true
+    // (setMapLoaded из macrotask не отработал) → readiness обязан сказать false.
+    act(() => {
+      useMapStore.setState({ map: null, mapLoaded: false });
+    });
+    expect(isMapReadyNow(true)).toBe(false);
+
+    // И даже если persist-гидрация оставила mapLoaded=true без карты — флаг
+    // аннулируется на уровне computeMapReadiness (tilesBacked === false).
+    act(() => {
+      useMapStore.setState({ map: null, mapLoaded: true });
+    });
+    expect(isMapReadyNow(true)).toBe(false);
   });
 });

@@ -6,35 +6,63 @@
 //     НЕ оставляет незавершённых загрузок тайлов: cleanup при unmount обязан
 //     отменить все in-flight загрузки (img.abort()) — иначе утечка памяти и
 //     setState на размонтированном компоненте.
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import React from 'react';
-import { MissionWizard } from '../src/components/wizard/MissionWizard';
-import { useMissionWizardStore } from '../src/store/useMissionWizardStore';
-import { useMapStore } from '../src/store/useMapStore';
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import React from "react";
+import { MissionWizard } from "../src/components/wizard/MissionWizard";
+import { useMissionWizardStore } from "../src/store/useMissionWizardStore";
+import { useMapStore } from "../src/store/useMapStore";
+import MapCanvas from "../src/components/MapCanvas";
+import { mapFitKey, type ViewState } from "../src/components/map/viewMath";
+import type { Project } from "../src/types";
 
 // ── Мок Image со счётчиком активных/отменённых загрузок ─────────────────────
 class TrackedImage {
   static active = 0;
   static abortedCount = 0;
-  crossOrigin = '';
+  crossOrigin = "";
   onload: (() => void) | null = null;
   onerror: (() => void) | null = null;
   private _live = true;
-  set src(_v: string) { /* никогда не отвечает — имитируем медленный CDN */ }
-  get src(): string { return ''; }
-  removeAttribute(_n: string): void { /* noop */ }
-  abort(): void {
-    if (this._live) { this._live = false; TrackedImage.abortedCount++; TrackedImage.active--; }
+  set src(_v: string) {
+    /* никогда не отвечает — имитируем медленный CDN */
   }
-  constructor() { TrackedImage.active++; }
+  get src(): string {
+    return "";
+  }
+  removeAttribute(_n: string): void {
+    /* noop */
+  }
+  abort(): void {
+    if (this._live) {
+      this._live = false;
+      TrackedImage.abortedCount++;
+      TrackedImage.active--;
+    }
+  }
+  constructor() {
+    TrackedImage.active++;
+  }
 }
 
 /** ResizeObserver-заглушка: НИКОГДА не вызывает callback → размеры останутся 0. */
 class SilentROShim {
-  observe(): void { /* молчим: первый замер тоже mock'аем через getBoundingClientRect=0 */ }
-  unobserve(): void { /* noop */ }
-  disconnect(): void { /* noop */ }
+  observe(): void {
+    /* молчим: первый замер тоже mock'аем через getBoundingClientRect=0 */
+  }
+  unobserve(): void {
+    /* noop */
+  }
+  disconnect(): void {
+    /* noop */
+  }
 }
 
 /** RO-заглушка с немедленной доставкой ненулевых размеров (нормальный путь). */
@@ -49,15 +77,41 @@ class DeliveringROShim {
   observe(el: Element): void {
     DeliveringROShim.deliver(this.cb, el);
   }
-  unobserve(): void { /* noop */ }
-  disconnect(): void { /* noop */ }
-  private static deliver(cb: (entries: ResizeObserverEntry[]) => void, el: Element): void {
-    cb([{ target: el, contentRect: { x: 0, y: 0, top: 0, left: 0, width: 800, height: 600, bottom: 600, right: 800 }, borderBoxSize: [], contentBoxSize: [], devicePixelContentBoxSize: [] } as unknown as ResizeObserverEntry]);
+  unobserve(): void {
+    /* noop */
+  }
+  disconnect(): void {
+    /* noop */
+  }
+  private static deliver(
+    cb: (entries: ResizeObserverEntry[]) => void,
+    el: Element,
+  ): void {
+    cb([
+      {
+        target: el,
+        contentRect: {
+          x: 0,
+          y: 0,
+          top: 0,
+          left: 0,
+          width: 800,
+          height: 600,
+          bottom: 600,
+          right: 800,
+        },
+        borderBoxSize: [],
+        contentBoxSize: [],
+        devicePixelContentBoxSize: [],
+      } as unknown as ResizeObserverEntry,
+    ]);
   }
   /** Принудительная повторная доставка размеров на все наблюдаемые элементы. */
   static forceDeliver(): void {
     for (const inst of DeliveringROShim.instances) {
-      const els = Array.from(document.querySelectorAll('#map-container, canvas'));
+      const els = Array.from(
+        document.querySelectorAll("#map-container, canvas"),
+      );
       for (const el of els) DeliveringROShim.deliver(inst.cb, el);
     }
   }
@@ -71,15 +125,21 @@ class DeliveringROShim {
  * штатный UI-путь Этапа 1 покрыт кликами в wizardMapReadiness/wizardUI.
  */
 async function gotoStartPointsStep(): Promise<void> {
-  act(() => { useMissionWizardStore.getState().toggleMapChoice('esri'); });
-  await waitFor(() => expect(screen.getByRole('button', { name: /Далее/ })).toBeEnabled());
-  fireEvent.click(screen.getByRole('button', { name: /Далее/ })); // → craft-selection
-  fireEvent.click(screen.getByTestId('craft-card-drone'));
-  fireEvent.click(await screen.findByRole('button', { name: 'Продолжить' }));
-  await waitFor(() => expect(screen.getByRole('button', { name: /Далее/ })).toBeEnabled());
-  fireEvent.click(screen.getByRole('button', { name: /Далее/ }));
+  act(() => {
+    useMissionWizardStore.getState().toggleMapChoice("esri");
+  });
   await waitFor(() =>
-    expect(useMissionWizardStore.getState().currentStep).toBe('start-points'),
+    expect(screen.getByRole("button", { name: /Далее/ })).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: /Далее/ })); // → craft-selection
+  fireEvent.click(screen.getByTestId("craft-card-drone"));
+  fireEvent.click(await screen.findByRole("button", { name: "Продолжить" }));
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: /Далее/ })).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: /Далее/ }));
+  await waitFor(() =>
+    expect(useMissionWizardStore.getState().currentStep).toBe("start-points"),
   );
 }
 
@@ -88,7 +148,11 @@ beforeEach(() => {
   TrackedImage.abortedCount = 0;
   useMissionWizardStore.getState().resetWizard();
   useMapStore.setState(useMapStore.getInitialState());
-  try { localStorage.clear(); } catch { /* noop */ }
+  try {
+    localStorage.clear();
+  } catch {
+    /* noop */
+  }
 });
 
 afterEach(() => {
@@ -97,14 +161,14 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe('wizardFreeze — защита от зависаний в Мастере', () => {
-  it('нулевые размеры контейнера: без краша, вместо вечной загрузки — явная ошибка с кнопкой повтора', async () => {
-    vi.stubGlobal('ResizeObserver', SilentROShim);
-    vi.stubGlobal('Image', TrackedImage);
+describe("wizardFreeze — защита от зависаний в Мастере", () => {
+  it("нулевые размеры контейнера: без краша, вместо вечной загрузки — явная ошибка с кнопкой повтора", async () => {
+    vi.stubGlobal("ResizeObserver", SilentROShim);
+    vi.stubGlobal("Image", TrackedImage);
     // happy-dom может иметь нативный rAF с реальным дренажом — подменяем no-op,
     // чтобы гарантировать «RO никогда не доставил размеры».
-    vi.stubGlobal('requestAnimationFrame', () => 0);
-    vi.stubGlobal('cancelAnimationFrame', () => undefined);
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => undefined);
 
     render(<MissionWizard />);
     await gotoStartPointsStep();
@@ -115,18 +179,34 @@ describe('wizardFreeze — защита от зависаний в Мастер�
     // того, как тест обнулит контейнер, — и начнёт качать тайлы «в пустоту».
     useMapStore.setState({ map: null });
 
-    const panel = await screen.findByTestId('wizard-map-panel');
+    const panel = await screen.findByTestId("wizard-map-panel");
     // Контейнер КАРТЫ (map-container внутри панели) обнуляем до 0×0 — имитация
     // «display:none у родителя» / сломанного layout. Именно его измеряет MapCanvas.
-    const mapContainer = panel.querySelector('#map-container') ?? panel;
+    const mapContainer = panel.querySelector("#map-container") ?? panel;
     mapContainer.getBoundingClientRect = () => ({
-      left: 0, top: 0, width: 0, height: 0, x: 0, y: 0, right: 0, bottom: 0, toJSON: () => ({}),
+      left: 0,
+      top: 0,
+      width: 0,
+      height: 0,
+      x: 0,
+      y: 0,
+      right: 0,
+      bottom: 0,
+      toJSON: () => ({}),
     });
-    Object.defineProperty(mapContainer, 'clientWidth', { value: 0, configurable: true });
-    Object.defineProperty(mapContainer, 'clientHeight', { value: 0, configurable: true });
+    Object.defineProperty(mapContainer, "clientWidth", {
+      value: 0,
+      configurable: true,
+    });
+    Object.defineProperty(mapContainer, "clientHeight", {
+      value: 0,
+      configurable: true,
+    });
 
     // Карта НЕ должна грузить тайлы при нулевом размере (защита от NaN-математики)
-    await act(async () => { await new Promise((r) => setTimeout(r, 50)); });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
     expect(TrackedImage.active).toBe(0);
 
     // Явная детерминированная активация подложки ПОСЛЕ обнуления размеров:
@@ -134,24 +214,32 @@ describe('wizardFreeze — защита от зависаний в Мастер�
     // которые в этом тесте заглушены (SilentROShim + no-op rAF). Если бы MapCanvas
     // читал размеры асинхронно «на живую», он бы начал качать тайлы при 0×0.
     act(() => {
-      useMapStore.getState().loadActiveTileMap({ lat: 55.7558, lng: 37.6173 }, 10);
+      useMapStore
+        .getState()
+        .loadActiveTileMap({ lat: 55.7558, lng: 37.6173 }, 10);
     });
-    await act(async () => { await new Promise((r) => setTimeout(r, 50)); });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
     expect(TrackedImage.active).toBe(0);
 
     // И НЕ должна висеть вечно: circuit breaker показывает ошибку + кнопку повтора
-    const overlay = await screen.findByTestId('map-size-error-overlay', {}, { timeout: 3000 });
+    const overlay = await screen.findByTestId(
+      "map-size-error-overlay",
+      {},
+      { timeout: 3000 },
+    );
     expect(overlay.textContent).toMatch(/размер контейнера/i);
-    expect(screen.getByTestId('map-retry-measure')).toBeTruthy();
+    expect(screen.getByTestId("map-retry-measure")).toBeTruthy();
   });
 
-  it('быстрое переключение шагов: unmount карты отменяет ВСЕ in-flight загрузки тайлов (нет утечек)', async () => {
-    vi.stubGlobal('ResizeObserver', DeliveringROShim);
-    vi.stubGlobal('Image', TrackedImage);
+  it("быстрое переключение шагов: unmount карты отменяет ВСЕ in-flight загрузки тайлов (нет утечек)", async () => {
+    vi.stubGlobal("ResizeObserver", DeliveringROShim);
+    vi.stubGlobal("Image", TrackedImage);
 
     render(<MissionWizard />);
     await gotoStartPointsStep();
-    await screen.findByTestId('wizard-map-panel');
+    await screen.findByTestId("wizard-map-panel");
 
     // Детерминизм (та же причина, что и в тесте №1): первичный замер размеров в
     // MapCanvas выполняется в серии отложенных повторов [0,60,...,1300] мс, а
@@ -159,15 +247,21 @@ describe('wizardFreeze — защита от зависаний в Мастер�
     // подложки canvasSize ещё может быть нулевым, и syncTileDom по «гейту
     // размера» не создаст ни одного Image (started=0). Форсируем штатную
     // публикацию ненулевых размеров синхронным вызовом колбэка RO.
-    act(() => { DeliveringROShim.forceDeliver(); });
+    act(() => {
+      DeliveringROShim.forceDeliver();
+    });
     // Тайловая подложка активна: карта с ненулевыми размерами начнёт качать
     // тайлы, которые НИКОГДА не завершатся (медленный CDN) — стресс-тест cleanup.
     act(() => {
-      useMapStore.getState().loadActiveTileMap({ lat: 55.7558, lng: 37.6173 }, 10);
+      useMapStore
+        .getState()
+        .loadActiveTileMap({ lat: 55.7558, lng: 37.6173 }, 10);
     });
 
     // Даём карте поставить загрузки в очередь
-    await act(async () => { await new Promise((r) => setTimeout(r, 100)); });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 100));
+    });
     const started = TrackedImage.active;
     expect(started).toBeGreaterThan(0); // загрузка реально стартовала
 
@@ -176,15 +270,76 @@ describe('wizardFreeze — защита от зависаний в Мастер�
     // Клик по «← Назад» из footer здесь НЕ годится: валидация этапа «Точки
     // старта» требует непустой startPoints, кнопка disabled, и клик молча
     // ничего не делает → unmount не происходит → in-flight остаются живыми.
-    act(() => { useMissionWizardStore.getState().goToPreviousStep(); });
+    act(() => {
+      useMissionWizardStore.getState().goToPreviousStep();
+    });
     await waitFor(() =>
-      expect(useMissionWizardStore.getState().currentStep).toBe('craft-selection'),
+      expect(useMissionWizardStore.getState().currentStep).toBe(
+        "craft-selection",
+      ),
     );
-    await act(async () => { await new Promise((r) => setTimeout(r, 50)); });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
 
     // Ключевое утверждение P0: после unmount НЕ осталось ни одной живой загрузки —
     // все отменены (img.abort()), слоты очереди освобождены, память не течёт.
     expect(TrackedImage.active).toBe(0);
     expect(TrackedImage.abortedCount).toBeGreaterThanOrEqual(started);
+  });
+
+  // ── НОВЫЙ ТЕСТ (Задача 0.2): пересчёт fitKey при СМЕНЕ КАРТЫ без remount ──
+  // Регрессия «синий экран»: зеркало tq-view с ключом СТАРОЙ карты должно
+  // отвергаться sanitizeSavedView и триггерить повторную инициализацию вида
+  // (viewRef ⇔ fitKeyNow), а не оставаться на stale-виде прежней карты.
+  it("смена карты без remount: fitKey пересчитывается, stale-вид старой карты отвергается", async () => {
+    vi.stubGlobal("ResizeObserver", DeliveringROShim);
+    vi.stubGlobal("Image", TrackedImage);
+
+    const bA = { north: 60.2, south: 59.7, west: 29.5, east: 30.8 }; // СПб
+    const bB = { north: 56.1, south: 55.4, west: 36.9, east: 38.2 }; // Москва
+    const viewA: ViewState = {
+      offsetX: 12345,
+      offsetY: 6789,
+      scale: 2,
+      z0: 10,
+    };
+
+    // Зеркало 'tq-view' + его ключ: вид, валидный ТОЛЬКО для карты A.
+    localStorage.setItem("tq-view", JSON.stringify(viewA));
+    localStorage.setItem("tq-view-map", mapFitKey({ bounds: bA }));
+
+    const projectMapA = { bounds: bA } as unknown as Project["map"];
+    const projectMapB = { bounds: bB } as unknown as Project["map"];
+
+    const { rerender } = render(<MapCanvas />);
+    // Маунт на карте A: зеркало совпадает по ключу → viewRestored берёт viewA.
+    act(() => {
+      useMapStore.setState({ map: projectMapA });
+    });
+    rerender(<MapCanvas />);
+    await waitFor(() =>
+      expect(useMapStore.getState().viewState.offsetX).toBe(viewA.offsetX),
+    );
+
+    // СМЕНА КАРТЫ БЕЗ REMOUNT (ключ B ≠ ключ зеркала): старый код оставлял
+    // viewRef на stale-виде A; новый — fitKeyNow пересчитывается каждый рендер
+    // и condition `lastFitKeyInitRef.current !== fitKeyNow` триггерит заново
+    // readSavedView → sanitizeSavedView(null по ключу) → фолбэк-ветку.
+    act(() => {
+      useMapStore.setState({ map: projectMapB });
+    });
+    rerender(<MapCanvas />);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    });
+
+    const v = useMapStore.getState().viewState;
+    // Stale-вид карты A НЕ сохранён: камера переинициализирована (offsetX
+    // пересчитан под новый fitKey/фолбэк, scale конечный и не равен viewA).
+    expect(v.offsetX).not.toBe(viewA.offsetX);
+    expect(Number.isFinite(v.scale) && v.scale > 0).toBe(true);
+    // Ключ зеркала обновлён на карту B — следующее восстановление корректно.
+    expect(localStorage.getItem("tq-view-map")).toBe(mapFitKey({ bounds: bB }));
   });
 });
