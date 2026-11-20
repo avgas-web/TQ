@@ -91,12 +91,25 @@ export function useMapReadiness(loaded: boolean): MapReadiness {
 }
 
 /** Стор-значение флага загрузки с нормализацией stale-значений.
- *  useMapStore.mapLoaded — источник истины, который MapCanvas публикует
- *  синхронно; но при гидрации persist в него мог попасть «true» с прошлого
- *  сеанса, когда карта уже сброшена (map=null) — такой флаг аннулируется,
- *  иначе decision-логика кликов обходила бы блокировку. */
+ *  КОРНЕВОЙ ФИКС T1 (единый источник истины): авторитет готовности — ТОЛЬКО
+ *  стор. Прежняя логика `storeLoaded && map ? storeLoaded : loaded` при
+ *  storeLoaded=false и существующей карте откатывалась к локальному
+ *  React-state `loaded`, который может быть stale-true с прошлого
+ *  монтирования (remount шага мастера) → оверлей готовности обходился,
+ *  клики разблокировались до реальной загрузки подложки.
+ *  Теперь:
+ *   • карта существует → готовность определяется ИСКЛЮЧИТЕЛЬНО
+ *     store.mapLoaded (MapCanvas публикует его синхронно);
+ *   • stale storeLoaded=true без карты (след пере-гидрации persist) —
+ *     аннулируется;
+ *   • fallback на локальный `loaded` допускается только когда map == null
+ *     (изолированный рендер панели вне стора / тесты). При этом готовность
+ *     всё равно закроется отсутствием bounds в computeMapReadiness —
+ *     fallback здесь нужен лишь как оптимистичный UI-хинт, чтобы чистые
+ *     unit-сценарии computeMapReadiness не ломались. */
 export function effectiveLoadedFlag(storeLoaded: boolean, loaded: boolean): boolean {
-  return storeLoaded && !!useMapStore.getState().map ? storeLoaded : loaded;
+  if (useMapStore.getState().map) return storeLoaded;
+  return storeLoaded || loaded;
 }
 
 /** КОРНЕВОЙ ФИКС «точки вслепую»: React-дерево мастера может ещё не быть

@@ -456,4 +456,52 @@ describe("Работа с картой в режиме Мастера", () => {
     });
     expect(isMapReadyNow(true)).toBe(false);
   });
+
+  // ── T1 (P0): единый источник истины готовности — стор, а не React-state ──
+  // Обратная сторона предыдущего теста: при СУЩЕСТВУЮЩЕЙ карте явный
+  // store.mapLoaded=false обязан блокировать готовность, даже если локальный
+  // React-state этапа ещё хранит stale-true с прошлого монтирования (remount
+  // шага мастера). Иначе оверлей готовности обходится и клики разблокируются
+  // до реальной загрузки подложки.
+  it("T1: stale loaded=true + store.mapLoaded=false + карта существует → НЕ готово", async () => {
+    act(() => {
+      useMapStore.setState({
+        settings: { ...(useMapStore.getState().settings ?? {}), tilesEnabled: true },
+        map: {
+          ...(useMapStore.getState().map ?? ({} as object)),
+          bounds: { north: 60.2, south: 59.7, west: 29.5, east: 30.8 },
+        } as never,
+        openStreetMap: { ...useMapStore.getState().openStreetMap, tileServer: "esri" } as never,
+        mapLoaded: false,
+      });
+    });
+    // Стор явно говорит «не загружено» — stale React-true не имеет веса.
+    expect(isMapReadyNow(true)).toBe(false);
+    // Тот же контракт для decision-логики кликов этапов: клик игнорируется.
+    // (mapLoaded=false при существующей карте — реальное состояние «подложка
+    // переключена/пересоздана и ещё не отрисована»: loadActiveTileMap
+    // публикует true только вместе с картой, здесь мы явно сбрасываем флаг.)
+    render(<StartPointsStep />);
+    await flushReact(4);
+    act(() => {
+      useMapStore.getState().publishMapLoaded(false);
+    });
+    await flushReact(6);
+    const overlay = screen.getByTestId("wizard-map-not-ready-overlay");
+    expect(overlay.textContent).toMatch(/Загрузка тайлов/i);
+    expect(clickLiveMapBlind("wizard-live-map-start", 200, 150)).toBe(false);
+    expect(useMissionWizardStore.getState().startPoints).toHaveLength(0);
+  });
+
+  it("T1: map=null → fallback на локальный flag не крашится (изолированный рендер)", () => {
+    act(() => {
+      useMapStore.setState({ map: null, mapLoaded: false });
+    });
+    // Без карты локальный флаг — единственный доступный сигнал; функция
+    // обязана вернуть false без исключения (readiness всё равно закрыт
+    // отсутствием bounds, но путь fallback не должен падать).
+    expect(() => isMapReadyNow(true)).not.toThrow();
+    expect(isMapReadyNow(true)).toBe(false);
+    expect(isMapReadyNow(false)).toBe(false);
+  });
 });
