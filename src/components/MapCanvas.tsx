@@ -28,15 +28,18 @@ import {
 } from "../utils/routing";
 import {
   getOSMTileUrl,
-  startTileLoad,
   abortTileImage,
   normalizeTileServer,
   TILE_PROVIDERS,
   onTileError,
   getTileErrorCount,
-  type TileLoadHandle,
   type TileServerId,
 } from "../utils/openStreetMap";
+import {
+  acquireTile,
+  peekTile,
+  type TileSubscription,
+} from "../utils/tileCache";
 import { ensureDefaultTileMap } from "../hooks/useAppInitialization";
 import MiniMapPanel, {
   MiniOverlayLine,
@@ -225,8 +228,9 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   } | null>(null);
   // Popup по клику на объект (координаты, высота, расстояние)
   const [popup, setPopup] = useState<PopupData | null>(null);
-  // Кэш тайлов подложки: url -> изображение (или undefined при ошибке)
-  const tileCache = useRef<Map<string, HTMLImageElement>>(new Map());
+  // Кэш тайлов подложки: МОДУЛЬНЫЙ utils/tileCache (T2) — переживает remount
+  // MapCanvas при переходах между этапами мастера; локальный ref больше не
+  // нужен (peekTile читает общий кэш, acquireTile загружает с дедупликацией).
   // CIRCUIT BREAKER загрузки тайлов (шаг П3 ТЗ): если запросы к CDN «молчат»
   // (429-шторм, молчащий proxy), loadTileImage завершается по своему внутреннему
   // таймауту, но синхронизация может бесконечно перепланировать pump(). Флаг
@@ -247,24 +251,19 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
   // LRU-размер кэша тайлов: Map сохраняет порядок вставки — при переполнении
   // удаляем самые старые записи, иначе при длительной работе накапливаются
   // тысячи HTMLImageElement (утечка памяти).
-  const TILE_CACHE_MAX = 1500;
   // Очередь щадящей загрузки тайлов: один общий список + счётчик активных загрузок
   const tileQueueRef = useRef<string[]>([]);
-  // ЗАГРУЗКИ В ПУТЕШЕСТВИИ (P0-фикс «зависание при загрузке карт»): каждая
-  // loadTileImage обязан регистрироваться здесь и сниматься в finally(). При
-  // размонтировании MapCanvas (быстрое переключение шагов Мастера) ВСЕ эти
-  // загрузки принудительно отменяются — иначе Image с выставленным src живёт
-  // до внутреннего таймаута (10 c), держит DOM-элементы и по завершении
-  // вызывал setState на unmounted-компоненте (утечка памяти + предупреждения
-  // React). Тест wizardFreeze проверяет именно этот инвариант.
-  // РЕЕСТР АКТИВНЫХ РУЧЕК ЗАГРУЗКИ (P0): startTileLoad возвращает handle с
-  // cancel(); при unmount/смене подложки перебираем реестр и отменяем КАЖДУЮ
-  // загрузку — промисы резолвятся в null немедленно, Image прерываются
-  // (abort), память не течёт. Именно это проверяет wizardFreeze.test.tsx.
-  const tileLoadHandlesRef = useRef<Set<TileLoadHandle>>(new Set());
-  /** Зеркало Esri (services.arcgisonline.com) с регистрацией ручки в том же
-   *  in-flight-реестре: при неудаче основного хоста пробуем зеркало, но и эту
-   *  загрузку обязан отменить cleanup при unmount (P0-инвариант wizardFreeze). */
+  // РЕЕСТР АКТИВНЫХ ПОДПИСОК ЗАГРУЗКИ (P0 + T2): acquireTile из модульного
+  // utils/tileCache возвращает подписку { done, release }. При unmount/смене
+  // подложки перебираем реестр и ОТПИСЫВАЕМ КАЖДУЮ подписку — refcount-отмена
+  // в tileCache прерывает сетевую загрузку только если это последний её
+  // потребитель (общий кэш между инстансами не убивается). Именно это
+  // проверяет wizardFreeze.test.tsx (нет in-flight после unmount) и новый
+  // тест cache-survives-unmount (кэш переживает remount шагов мастера).
+  const tileLoadHandlesRef = useRef<Set<TileSubscription>>(new Set());
+  /** Зеркало Esri (services.arcgisonline.com): при неудаче основного хоста
+   *  пробуем зеркало через тот же модульный кэш; подписка регистрируется в
+   *  реестре и обязан отменить cleanup при unmount (P0-инвариант wizardFreeze). */
   const loadEsriMirrorByHandle = useCallback(
     (u: string): Promise<HTMLImageElement | null> => {
       const m = u.match(/^https:\/\/server\.arcgisonline\.com\/(.+)$/);
@@ -274,13 +273,12 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       // mountedRef), зеркальную загрузку создавать НЕЛЬЗЯ — иначе новый Image
       // стартует ПОСЛЕ отмены всех in-flight и остаётся живым навсегда.
       if (!mountedRef.current) return Promise.resolve(null);
-      const h = startTileLoad(
-        `https://services.arcgisonline.com/${m[1]}`,
-        10000,
-      );
-      tileLoadHandlesRef.current.add(h);
-      return h.done.then((img) => {
-        tileLoadHandlesRef.current.delete(h);
+      const mirrorUrl = `https://services.arcgisonline.com/${m[1]}`;
+      const sub = acquireTile(mirrorUrl, 10000);
+      tileLoadHandlesRef.current.add(sub);
+      return sub.done.then((img) => {
+        tileLoadHandlesRef.current.delete(sub);
+        sub.release();
         return img;
       });
     },
@@ -934,8 +932,20 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         (img as any).__tilePos = true;
         el.appendChild(img);
         tileElsRef.current.set(url, img);
-        if (!tilePending.current.has(url) && !tileCache.current.has(url))
-          urls.push(url);
+        // T2: cache-hit из модульного кэша — мгновенное отображение без сети и
+        // без ожидания повторного onload (remount этапа мастера не.reload'ит тайлы).
+        const cachedImg = peekTile(url);
+        if (cachedImg !== undefined) {
+          if (cachedImg) img.src = url;
+          else {
+            // отрицательный кэш: слот пустой, но при следующей синхронизации
+            // запрос будет перезапущен (cleanup ниже удаляет элемент-заглушку)
+            img.remove();
+            tileElsRef.current.delete(url);
+          }
+          continue;
+        }
+        if (!tilePending.current.has(url)) urls.push(url);
       }
     }
     // Удаляем тайлы вне видимой области (экономим DOM и память)
@@ -969,41 +979,34 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
           const u = tileQueueRef.current.shift()!;
           const imgEl = tileElsRef.current.get(u);
           // Тайл больше не виден (ушёл с экрана) или уже загружен — пропускаем без запроса
-          if (!imgEl || tilePending.current.has(u) || tileCache.current.has(u))
+          if (!imgEl || tilePending.current.has(u) || peekTile(u) !== undefined)
             continue;
           activeTilesRef.current++;
-          // P0-фикс «зависание/утечка при загрузке карт»: загрузка регистрируется
-          // в реестре in-flight (tileLoadHandlesRef) и ПРИНУДИТЕЛЬНО отменяется
-          // через handle.cancel() при unmount / смене подложки. Раньше промис
-          // доживал до внутреннего 10-секундного таймаута, держал DOM-элементы
-          // размонтированного слоя и резолвился setState на unmounted-компоненте.
+          // P0-фикс «зависание/утечка при загрузке карт» + T2: загрузка идёт
+          // через модульный tileCache.acquireTile и регистрируется в реестре
+          // подписок (tileLoadHandlesRef). При unmount / смене подложки cleanup
+          // ОТПИСЫВАЕТ каждую подписку: refcount-отмена прерывает сетевую
+          // загрузку только если других потребителей нет — общий кэш переживает
+          // remount шагов мастера и не убивает нужные другим инстансам fetch.
           // Зеркала Esri + учёт ошибок (аналог tileerror из аудита) — внутри
-          // loadTileImage/startTileLoad (noteTileError/noteTileSuccess).
-          const handle: TileLoadHandle = startTileLoad(u, 10000); // таймаут: зависший тайл не блокирует очередь
-          tileLoadHandlesRef.current.add(handle);
-          const p = handle.done
+          // startTileLoad/openStreetMap (noteTileError/noteTileSuccess).
+          const sub: TileSubscription = acquireTile(u, 10000); // таймаут: зависший тайл не блокирует очередь
+          tileLoadHandlesRef.current.add(sub);
+          const p = sub.done
             .then((loaded0) => (loaded0 ? loaded0 : loadEsriMirrorByHandle(u)))
             .then((loaded) => {
               if (!mountedRef.current) return; // unmount — результат не нужен (см. cleanup)
               if (loaded) {
-                tileCache.current.set(u, loaded);
-                if (tileCache.current.size > TILE_CACHE_MAX) {
-                  const firstKey = tileCache.current.keys().next().value as
-                    string | undefined;
-                  if (firstKey !== undefined)
-                    tileCache.current.delete(firstKey);
-                }
+                // Кэш-запись уже сделана в tileCache.putTile (acquireTile);
+                // здесь лишь связываем DOM <img> с url (HTTP-кэш браузера — мгновенно).
                 if (tileElsRef.current.get(u) === imgEl) imgEl.src = u;
               } else {
-                // ИСПРАВЛЕНИЕ «краш/зависание при загрузке карт»: раньше в кэш
-                // писался undefined-запись, и DOM <img> получал src на тайл,
-                // который НЕ загрузился (битый CDN/429). Браузер оставлял
-                // незавершённую загрузку на элементе подложки — слой гасил
-                // canvas-оверлей и страница «висела». Теперь неудачные тайлы
-                // в кэш НЕ попадают: при следующем проходе синхронизации они
-                // будут перезапрошены (с дебаунсом), а на экране останется
-                // пустой slot без битого запроса.
-                tileCache.current.delete(u);
+                // ИСПРАВЛЕНИЕ «краш/зависание при загрузке карт»: DOM <img> НЕ
+                // должен получать src на тайл, который НЕ загрузился (битый
+                // CDN/429) — незавершённая загрузка держала бы слой вечно.
+                // Отрицательная запись в модульном кэше (null) помечена там же;
+                // при следующем проходе синхронизации слот будет перезапущен,
+                // а на экране останется пустой slot без битого запроса.
                 if (tileElsRef.current.get(u) === imgEl) {
                   abortTileImage(imgEl);
                   tileElsRef.current.delete(u);
@@ -1012,7 +1015,8 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
               }
             })
             .finally(() => {
-              tileLoadHandlesRef.current.delete(handle);
+              tileLoadHandlesRef.current.delete(sub);
+              sub.release();
               if (!mountedRef.current) return; // cleanup уже сбросил очередь/pending
               tilePending.current.delete(u);
               activeTilesRef.current--;
@@ -2140,11 +2144,12 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
     const el = tileLayerRef.current;
     if (el) for (const img of tileElsRef.current.values()) img.remove();
     tileElsRef.current.clear();
-    tileCache.current.clear();
+    // T2: модульный кэш НЕ очищается при смене подложки — ключи содержат url
+    // провайдера, записи других стилей остаются валидными и переживают remount.
     tileQueueRef.current = [];
     // Отменяем активные загрузки при смене подложки (OSM → 2ГИС): старые URL'ы
     // больше не нужны, а незакрытые Image держат соединения и память.
-    for (const h of tileLoadHandlesRef.current.values()) h.cancel();
+    for (const sub of tileLoadHandlesRef.current.values()) sub.release();
     tileLoadHandlesRef.current.clear();
     activeTilesRef.current = 0;
     tilePending.current.clear();
@@ -2532,7 +2537,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
         if (cur.width > 0 || cur.height > 0) {
           applySizes(0, 0);
           tileQueueRef.current.length = 0;
-          for (const hh of tileLoadHandlesRef.current.values()) hh.cancel();
+          for (const sub of tileLoadHandlesRef.current.values()) sub.release();
           tileLoadHandlesRef.current.clear();
           activeTilesRef.current = 0;
           tilePending.current.clear();
@@ -2632,7 +2637,7 @@ const MapCanvas: React.FC<MapCanvasProps> = ({ onMapLoaded }) => {
       // P0: отменяем ВСЕ активные загрузки тайлов через реестр handles —
       // иначе Image с выставленным src доживает до 10-секундного таймаута,
       // держит DOM размонтированного слоя и резолвится на unmounted-компоненте.
-      for (const h of tileLoadHandlesRef.current.values()) h.cancel();
+      for (const sub of tileLoadHandlesRef.current.values()) sub.release();
       tileLoadHandlesRef.current.clear();
       for (const img of tileElsRef.current.values()) {
         abortTileImage(img);
