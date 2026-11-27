@@ -4,16 +4,39 @@
 // Тайлы OSM рисуются прямо на canvas (без DOM-слоя) — три панели суммарно
 // потребляют минимум соединений (общий кэш тайлов + лимит параллельных загрузок).
 // Зум колесом/кнопками, панорама перетаскиванием — в любых пределах z3..z19+.
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { getTileUrlVariantsFor, loadTileImage, normalizeTileServer, TILE_PROVIDERS } from '../utils/openStreetMap';
-import type { TileServerId } from '../utils/openStreetMap';
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
-  PanelView, viewBox, geoToScreenPx, zoomPanelAt, panPanelBy,
-  metersPerPixel, fitView, panelViewOf, GROUND_MPP_1CM_2KM,
-} from '../utils/pannelli';
+  getTileUrlVariantsFor,
+  loadTileImage,
+  normalizeTileServer,
+  TILE_PROVIDERS,
+} from "../utils/openStreetMap";
+import type { TileServerId } from "../utils/openStreetMap";
+import {
+  PanelView,
+  viewBox,
+  geoToScreenPx,
+  zoomPanelAt,
+  panPanelBy,
+  metersPerPixel,
+  fitView,
+  panelViewOf,
+  GROUND_MPP_1CM_2KM,
+} from "../utils/pannelli";
 
-export interface MiniOverlayPoint { lat: number; lng: number; label?: string; color?: string; id?: string }
-export interface MiniOverlayLine { pts: { lat: number; lng: number }[]; color?: string; width?: number; dashed?: boolean }
+export interface MiniOverlayPoint {
+  lat: number;
+  lng: number;
+  label?: string;
+  color?: string;
+  id?: string;
+}
+export interface MiniOverlayLine {
+  pts: { lat: number; lng: number }[];
+  color?: string;
+  width?: number;
+  dashed?: boolean;
+}
 
 interface MiniMapPanelProps {
   title: string;
@@ -57,15 +80,27 @@ interface MiniMapPanelProps {
   /** Стиль подложки — рабочий тайловый провайдер из стора (Esri по умолчанию).
    *  Панели мастера обязаны использовать ТОТ ЖЕ стиль, что и большая карта
    *  (аудит audit/index.fixed.html: tile.openstreetmap.org удалён — 403 по Referer). */
-  tileServer?: TileServerId | 'osm' | 'carto';
+  tileServer?: TileServerId | "osm" | "carto";
 }
 
 /** Зоны для отрисовки: с опциональным id (для удаления кликом) */
-export interface MiniZone { pts: { lat: number; lng: number }[]; color?: string; radiusM?: number; centerGeo?: { lat: number; lng: number }; id?: string }
+export interface MiniZone {
+  pts: { lat: number; lng: number }[];
+  color?: string;
+  radiusM?: number;
+  centerGeo?: { lat: number; lng: number };
+  id?: string;
+}
 
 /** Обратное преобразование экран→гео для панели (нужно для кликов редактирования).
  *  Совпадает с screenPxToGeo из pannelli.ts (центр канваса как точка отсчёта). */
-export function screenPxToGeoPanel(vb: { fx: number; fy: number; wpx: number }, sx: number, sy: number, canvasW: number, canvasH: number): { lat: number; lng: number } {
+export function screenPxToGeoPanel(
+  vb: { fx: number; fy: number; wpx: number },
+  sx: number,
+  sy: number,
+  canvasW: number,
+  canvasH: number,
+): { lat: number; lng: number } {
   const fx = vb.fx + (sx - canvasW / 2) / vb.wpx;
   const fy = vb.fy + (sy - canvasH / 2) / vb.wpx;
   const lng = fx * 360 - 180;
@@ -74,43 +109,74 @@ export function screenPxToGeoPanel(vb: { fx: number; fy: number; wpx: number }, 
   return { lat, lng };
 }
 
-/** Общий LRU-кэш изображений тайлов для ВСЕХ мини-панелей (экономит трафик OSM) */
-const sharedTileCache = new Map<string, HTMLImageElement | null>();
-const SHARED_CACHE_MAX = 400;
-/** URL тайлов, уже загружаемые в данный момент (защита от дублей при перерисовках) */
+/** Общий LRU-кэш изображений тайлов — модульный utils/tileCache (T2/T9):
+ *  одна база на все мини-панели И MapCanvas (переживает remount шагов мастера).
+ *  Локальные: счётчик параллельных загрузок панелей + подписки для отписки. */
+import { peekTile, acquireTile } from "../utils/tileCache";
 const tileInflight = new Set<string>();
 let sharedActiveLoads = 0;
-const SHARED_MAX_PARALLEL = 4; // щадим tile.openstreetmap.org (суммарно по всем панелям)
-
-function cacheTile(url: string, img: HTMLImageElement | null): void {
-  sharedTileCache.set(url, img);
-  if (sharedTileCache.size > SHARED_CACHE_MAX) {
-    const firstKey = sharedTileCache.keys().next().value as string | undefined;
-    if (firstKey !== undefined) sharedTileCache.delete(firstKey);
-  }
-}
+const SHARED_MAX_PARALLEL = 4; // щадим CDN (суммарно по всем панелям)
 
 const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
-  title, icon, center, zoom = 11, fitPoints, minZoom = 3, maxZoom = 20,
-  points = [], lines = [], height = 260, onReady,
-  focused = false, onFocus, onMapClick, panelIdx = -1, zones = [], onPointClick, pointDeleteEnabled = true, onPointMove, onPointAltitudeDrag, onZoneClick,
+  title,
+  icon,
+  center,
+  zoom = 11,
+  fitPoints,
+  minZoom = 3,
+  maxZoom = 20,
+  points = [],
+  lines = [],
+  height = 260,
+  onReady,
+  focused = false,
+  onFocus,
+  onMapClick,
+  panelIdx = -1,
+  zones = [],
+  onPointClick,
+  pointDeleteEnabled = true,
+  onPointMove,
+  onPointAltitudeDrag,
+  onZoneClick,
   onPanelDoubleClick,
-  tileServer = 'esri',
+  tileServer = "esri",
 }) => {
   // Рабочий провайдер (legacy 'osm'/'carto' нормализуются) + его нативный максимум
   const serverId: TileServerId = normalizeTileServer(tileServer);
   const nativeMax = TILE_PROVIDERS[serverId].maxNativeZoom;
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [size, setSize] = useState({ w: 320, h: typeof height === 'number' ? height : 260 });
+  const [size, setSize] = useState({
+    w: 320,
+    h: typeof height === "number" ? height : 260,
+  });
   const sizeRef = useRef(size);
-  useEffect(() => { sizeRef.current = size; }, [size]);
+  useEffect(() => {
+    sizeRef.current = size;
+  }, [size]);
 
   // Вид панели — локальный ref (не трогает глобальный viewState основного канваса)
-  const viewRef = useRef<PanelView>({ zoom, fx: (center.lng + 180) / 360, fy: 0.5 - Math.log((1 + Math.sin(center.lat * Math.PI / 180)) / (1 - Math.sin(center.lat * Math.PI / 180))) / (4 * Math.PI) });
+  const viewRef = useRef<PanelView>({
+    zoom,
+    fx: (center.lng + 180) / 360,
+    fy:
+      0.5 -
+      Math.log(
+        (1 + Math.sin((center.lat * Math.PI) / 180)) /
+          (1 - Math.sin((center.lat * Math.PI) / 180)),
+      ) /
+        (4 * Math.PI),
+  });
+  // Подписки панели на модульный tileCache (T2): отписываемся при unmount,
+  // не убивая общие загрузки других потребителей.
+  const panelTileSubsRef = useRef<Set<{ release: () => void }>>(new Set());
   const [, forceTick] = useState(0);
   const tickRef = useRef(0);
-  const bump = useCallback(() => { tickRef.current++; forceTick(tickRef.current); }, []);
+  const bump = useCallback(() => {
+    tickRef.current++;
+    forceTick(tickRef.current);
+  }, []);
 
   // ─── Авто-фокус на введённых данных ─────────────────────────────────────────
   // Панель загружается сразу (центр/зум по умолчанию), а при вводе пользователем
@@ -118,26 +184,34 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   // Пользовательская панорама/зум НЕ перехватывается — авто-центрирование срабатывает
   // только когда меняются сами данные (или после смены фокуса панели).
   const animRef = useRef<number | null>(null);
-  const animateTo = useCallback((target: PanelView) => {
-    if (animRef.current !== null) cancelAnimationFrame(animRef.current);
-    const start = { ...viewRef.current };
-    const t0 = performance.now();
-    const DUR = 450;
-    const step = (now: number) => {
-      const k = Math.min(1, (now - t0) / DUR);
-      const e = 1 - Math.pow(1 - k, 3); // ease-out cubic
-      viewRef.current = {
-        zoom: start.zoom + (target.zoom - start.zoom) * e,
-        fx: start.fx + (target.fx - start.fx) * e,
-        fy: start.fy + (target.fy - start.fy) * e,
+  const animateTo = useCallback(
+    (target: PanelView) => {
+      if (animRef.current !== null) cancelAnimationFrame(animRef.current);
+      const start = { ...viewRef.current };
+      const t0 = performance.now();
+      const DUR = 450;
+      const step = (now: number) => {
+        const k = Math.min(1, (now - t0) / DUR);
+        const e = 1 - Math.pow(1 - k, 3); // ease-out cubic
+        viewRef.current = {
+          zoom: start.zoom + (target.zoom - start.zoom) * e,
+          fx: start.fx + (target.fx - start.fx) * e,
+          fy: start.fy + (target.fy - start.fy) * e,
+        };
+        bump();
+        if (k < 1) animRef.current = requestAnimationFrame(step);
+        else animRef.current = null;
       };
-      bump();
-      if (k < 1) animRef.current = requestAnimationFrame(step);
-      else animRef.current = null;
-    };
-    animRef.current = requestAnimationFrame(step);
-  }, [bump]);
-  useEffect(() => () => { if (animRef.current !== null) cancelAnimationFrame(animRef.current); }, []);
+      animRef.current = requestAnimationFrame(step);
+    },
+    [bump],
+  );
+  useEffect(
+    () => () => {
+      if (animRef.current !== null) cancelAnimationFrame(animRef.current);
+    },
+    [],
+  );
 
   // Ключ внешних данных для отслеживания изменений.
   // ВАЖНО (баг «фокусировка сбивается при постановке ограничения»): зоны и
@@ -145,22 +219,43 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   // камеру. Авто-наведение срабатывает только при изменении самих точек
   // (center / fitPoints / точки оверлеев).
   const dataKey = [
-    center.lat.toFixed(5), center.lng.toFixed(5), zoom.toFixed(2),
-    fitPoints ? `${fitPoints.length}:${fitPoints.map((p) => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join('|')}` : '0',
-    points.map((p) => `${p.id || ''}@${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join('|'),
-  ].join('#');
+    center.lat.toFixed(5),
+    center.lng.toFixed(5),
+    zoom.toFixed(2),
+    fitPoints
+      ? `${fitPoints.length}:${fitPoints.map((p) => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join("|")}`
+      : "0",
+    points
+      .map((p) => `${p.id || ""}@${p.lat.toFixed(5)},${p.lng.toFixed(5)}`)
+      .join("|"),
+  ].join("#");
   const lastDataKeyRef = useRef<string | null>(null);
   useEffect(() => {
     const first = lastDataKeyRef.current === null;
     if (lastDataKeyRef.current === dataKey) return;
     lastDataKeyRef.current = dataKey;
     if (fitPoints && fitPoints.length > 0) {
-      const aspect = sizeRef.current.w > 0 && sizeRef.current.h > 0 ? sizeRef.current.w / sizeRef.current.h : 1.5;
+      const aspect =
+        sizeRef.current.w > 0 && sizeRef.current.h > 0
+          ? sizeRef.current.w / sizeRef.current.h
+          : 1.5;
       const v = fitView(fitPoints, aspect, minZoom, maxZoom);
-      if (v) { if (first) { viewRef.current = v; bump(); } else { animateTo(v); } }
+      if (v) {
+        if (first) {
+          viewRef.current = v;
+          bump();
+        } else {
+          animateTo(v);
+        }
+      }
     } else {
       const v = panelViewOf(center.lat, center.lng, zoom);
-      if (first) { viewRef.current = v; bump(); } else { animateTo(v); }
+      if (first) {
+        viewRef.current = v;
+        bump();
+      } else {
+        animateTo(v);
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dataKey]);
@@ -170,7 +265,10 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   useEffect(() => {
     if (focused && !focusedForAnimRef.current) {
       if (fitPoints && fitPoints.length > 0) {
-        const aspect = sizeRef.current.w > 0 && sizeRef.current.h > 0 ? sizeRef.current.w / sizeRef.current.h : 1.5;
+        const aspect =
+          sizeRef.current.w > 0 && sizeRef.current.h > 0
+            ? sizeRef.current.w / sizeRef.current.h
+            : 1.5;
         const v = fitView(fitPoints, aspect, minZoom, maxZoom);
         if (v) animateTo(v);
       } else {
@@ -187,7 +285,10 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     if (!el) return;
     const ro = new ResizeObserver(() => {
       const r = el.getBoundingClientRect();
-      setSize({ w: Math.max(120, Math.round(r.width)), h: Math.max(120, Math.round(r.height)) });
+      setSize({
+        w: Math.max(120, Math.round(r.width)),
+        h: Math.max(120, Math.round(r.height)),
+      });
     });
     ro.observe(el);
     return () => ro.disconnect();
@@ -197,15 +298,16 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   const drawAll = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const dpr = window.devicePixelRatio || 1;
     const { w, h } = sizeRef.current;
-    const pw = Math.max(1, Math.round(w * dpr)), ph = Math.max(1, Math.round(h * dpr));
+    const pw = Math.max(1, Math.round(w * dpr)),
+      ph = Math.max(1, Math.round(h * dpr));
     if (canvas.width !== pw) canvas.width = pw;
     if (canvas.height !== ph) canvas.height = ph;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = '#0f1729';
+    ctx.fillStyle = "#0f1729";
     ctx.fillRect(0, 0, w, h);
 
     const v = viewRef.current;
@@ -222,7 +324,10 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     const n = Math.pow(2, level);
     const tileSize = vb.hpx / n; // экранных px на тайл уровня `level` (мир квадратный: hpx)
     // привязка строго от mercator-долей центра вида (та же формула, что и для объектов)
-    const toTileScreen = (tx: number, ty: number): { x: number; y: number } => ({
+    const toTileScreen = (
+      tx: number,
+      ty: number,
+    ): { x: number; y: number } => ({
       x: (tx - v.fx * n) * tileSize + w / 2,
       y: (ty - v.fy * n) * tileSize + h / 2,
     });
@@ -239,38 +344,69 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
         const sTx = Math.floor(tx / upscale);
         const sTy = Math.floor(ty / upscale);
         const url = getTileUrlVariantsFor(serverId, srcLevel, sTx, sTy)[0];
-        const img = sharedTileCache.get(url);
-        if (img === undefined) { need.push({ url, tx: sTx, ty: sTy }); continue; }
+        const img = peekTile(url);
+        if (img === undefined) {
+          need.push({ url, tx: sTx, ty: sTy });
+          continue;
+        }
         if (img === null) continue; // ошибка загрузки — пропускаем (фон остаётся)
         // Экранное положение тайла уровня `level`; для upscaled-тайлов — позиция
         // родительского тайла минус смещение внутри него (ровно 1/n мира).
         const p = toTileScreen(tx, ty);
-        ctx.drawImage(img, p.x, p.y, tileSize * upscale + 0.5, tileSize * upscale + 0.5);
+        ctx.drawImage(
+          img,
+          p.x,
+          p.y,
+          tileSize * upscale + 0.5,
+          tileSize * upscale + 0.5,
+        );
         drawnCount++;
       }
     }
     if (drawnCount === 0 && need.length === 0) {
       // ни одного тайла не отрисовано и дозагружать нечего — подсказка вместо синевы
       ctx.save();
-      ctx.fillStyle = '#64748b'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
-      ctx.fillText('Нет данных тайлов в этой области — вернитесь к объекту (⌂)', w / 2, h / 2);
+      ctx.fillStyle = "#64748b";
+      ctx.font = "12px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(
+        "Нет данных тайлов в этой области — вернитесь к объекту (⌂)",
+        w / 2,
+        h / 2,
+      );
       ctx.restore();
     }
     // Дозагрузка недостающих тайлов общей бережной очередью (Esri — с зеркалами)
     if (need.length > 0) {
-      const cxw = w / 2, cyw = h / 2;
+      const cxw = w / 2,
+        cyw = h / 2;
       need.sort((a, b) => {
-        const pa = toTileScreen(a.tx * upscale, a.ty * upscale), pb = toTileScreen(b.tx * upscale, b.ty * upscale);
-        return ((pa.x - cxw) ** 2 + (pa.y - cyw) ** 2) - ((pb.x - cxw) ** 2 + (pb.y - cyw) ** 2);
+        const pa = toTileScreen(a.tx * upscale, a.ty * upscale),
+          pb = toTileScreen(b.tx * upscale, b.ty * upscale);
+        return (
+          (pa.x - cxw) ** 2 +
+          (pa.y - cyw) ** 2 -
+          ((pb.x - cxw) ** 2 + (pb.y - cyw) ** 2)
+        );
       });
-      for (const t of need.slice(0, 24)) { // жёсткий лимит запросов на перерисовку
+      for (const t of need.slice(0, 24)) {
+        // жёсткий лимит запросов на перерисовку
         if (sharedActiveLoads >= SHARED_MAX_PARALLEL) break;
         if (tileInflight.has(t.url)) continue;
         tileInflight.add(t.url);
         sharedActiveLoads++;
-        loadTileImage(t.url, 10000)
-          .then((loaded) => { cacheTile(t.url, loaded); })
-          .finally(() => { tileInflight.delete(t.url); sharedActiveLoads--; bump(); });
+        // T2/T9: общий модульный кэш — дедупликация с MapCanvas и другими
+        // панелями; release() снимает подписку панели, но не убивает загрузку,
+        // если на неё есть другие потребители.
+        const sub = acquireTile(t.url, 10000);
+        panelTileSubsRef.current.add(sub);
+        sub.done.finally(() => {
+          panelTileSubsRef.current.delete(sub);
+          sub.release();
+          tileInflight.delete(t.url);
+          sharedActiveLoads--;
+          bump();
+        });
       }
     }
 
@@ -278,14 +414,16 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     for (const ln of lines) {
       if (ln.pts.length < 2) continue;
       ctx.save();
-      ctx.strokeStyle = ln.color || '#22d3ee';
+      ctx.strokeStyle = ln.color || "#22d3ee";
       ctx.lineWidth = ln.width || 2.5;
-      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
       if (ln.dashed) ctx.setLineDash([7, 5]);
       ctx.beginPath();
       ln.pts.forEach((p, i) => {
         const s = geoToScreenPx(p.lat, p.lng, vb, w, h);
-        if (i === 0) ctx.moveTo(s.x, s.y); else ctx.lineTo(s.x, s.y);
+        if (i === 0) ctx.moveTo(s.x, s.y);
+        else ctx.lineTo(s.x, s.y);
       });
       ctx.stroke();
       ctx.restore();
@@ -297,26 +435,43 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     const zoneHits: { id?: string; x: number; y: number; r: number }[] = [];
     for (const zn of zones) {
       ctx.save();
-      ctx.strokeStyle = zn.color || 'rgba(248,113,113,0.9)';
-      ctx.fillStyle = 'rgba(248,113,113,0.13)';
+      ctx.strokeStyle = zn.color || "rgba(248,113,113,0.9)";
+      ctx.fillStyle = "rgba(248,113,113,0.13)";
       ctx.lineWidth = 1.5;
       if (zn.radiusM && zn.centerGeo) {
         const c = geoToScreenPx(zn.centerGeo.lat, zn.centerGeo.lng, vb, w, h);
         const mppPanel = metersPerPixel(v.zoom, mercLatOf(v));
         const rScreen = zn.radiusM / Math.max(mppPanel, 1e-9);
-        ctx.beginPath(); ctx.arc(c.x, c.y, Math.min(rScreen, 4000), 0, Math.PI * 2);
-        ctx.fill(); ctx.stroke();
-        zoneHits.push({ id: zn.id, x: c.x, y: c.y, r: Math.min(rScreen, 4000) });
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, Math.min(rScreen, 4000), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        zoneHits.push({
+          id: zn.id,
+          x: c.x,
+          y: c.y,
+          r: Math.min(rScreen, 4000),
+        });
       } else if (zn.pts.length >= 2) {
-        let cxSum = 0, cySum = 0;
+        let cxSum = 0,
+          cySum = 0;
         ctx.beginPath();
         zn.pts.forEach((p, i) => {
           const s = geoToScreenPx(p.lat, p.lng, vb, w, h);
-          cxSum += s.x; cySum += s.y;
-          if (i === 0) ctx.moveTo(s.x, s.y); else ctx.lineTo(s.x, s.y);
+          cxSum += s.x;
+          cySum += s.y;
+          if (i === 0) ctx.moveTo(s.x, s.y);
+          else ctx.lineTo(s.x, s.y);
         });
-        ctx.closePath(); ctx.fill(); ctx.stroke();
-        zoneHits.push({ id: zn.id, x: cxSum / zn.pts.length, y: cySum / zn.pts.length, r: 16 });
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        zoneHits.push({
+          id: zn.id,
+          x: cxSum / zn.pts.length,
+          y: cySum / zn.pts.length,
+          r: 16,
+        });
       }
       ctx.restore();
     }
@@ -328,24 +483,32 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       const s = geoToScreenPx(pt.lat, pt.lng, vb, w, h);
       pointHits.push({ id: pt.id, x: s.x, y: s.y });
       ctx.save();
-      ctx.beginPath(); ctx.arc(s.x, s.y, focused ? 7 : 6, 0, Math.PI * 2);
-      ctx.fillStyle = pt.color || '#facc15'; ctx.fill();
-      ctx.lineWidth = 2; ctx.strokeStyle = '#0f1729'; ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, focused ? 7 : 6, 0, Math.PI * 2);
+      ctx.fillStyle = pt.color || "#facc15";
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#0f1729";
+      ctx.stroke();
       if (focused && pt.id) {
         // крестик удаления поверх точки активной карты (подсказка «клик = удалить»)
-        ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 1.5;
         ctx.beginPath();
-        ctx.moveTo(s.x - 3, s.y - 3); ctx.lineTo(s.x + 3, s.y + 3);
-        ctx.moveTo(s.x + 3, s.y - 3); ctx.lineTo(s.x - 3, s.y + 3);
+        ctx.moveTo(s.x - 3, s.y - 3);
+        ctx.lineTo(s.x + 3, s.y + 3);
+        ctx.moveTo(s.x + 3, s.y - 3);
+        ctx.lineTo(s.x - 3, s.y + 3);
         ctx.stroke();
       }
       if (pt.label) {
-        ctx.font = 'bold 11px sans-serif';
-        ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+        ctx.font = "bold 11px sans-serif";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
         const tw = ctx.measureText(pt.label).width;
-        ctx.fillStyle = 'rgba(15,23,41,0.85)';
+        ctx.fillStyle = "rgba(15,23,41,0.85)";
         ctx.fillRect(s.x + 9, s.y - 8, tw + 8, 16);
-        ctx.fillStyle = '#e2e8f0';
+        ctx.fillStyle = "#e2e8f0";
         ctx.fillText(pt.label, s.x + 13, s.y);
       }
       ctx.restore();
@@ -358,26 +521,60 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     const mpp = metersPerPixel(v.zoom, mercLatOf(v));
     // м на 1 см ЭКРАНА: 1 см = 96/2.54 css-px ⇒ m1cm = mpp·37.795
     const m1cm = mpp * (96 / 2.54);
-    const txt = m1cm >= 1000 ? `1 см ≈ ${(m1cm / 1000).toFixed(1)} км` : m1cm >= 1 ? `1 см ≈ ${m1cm.toFixed(m1cm < 10 ? 1 : 0)} м` : `1 см ≈ ${Math.round(m1cm * 100)} см`;
+    const txt =
+      m1cm >= 1000
+        ? `1 см ≈ ${(m1cm / 1000).toFixed(1)} км`
+        : m1cm >= 1
+          ? `1 см ≈ ${m1cm.toFixed(m1cm < 10 ? 1 : 0)} м`
+          : `1 см ≈ ${Math.round(m1cm * 100)} см`;
     ctx.save();
-    ctx.font = '10px sans-serif';
+    ctx.font = "10px sans-serif";
     const tw = ctx.measureText(txt).width;
-    ctx.fillStyle = 'rgba(15,23,41,0.8)';
+    ctx.fillStyle = "rgba(15,23,41,0.8)";
     ctx.fillRect(6, h - 22, tw + 12, 16);
-    ctx.fillStyle = '#7dd3fc';
-    ctx.textBaseline = 'middle';
+    ctx.fillStyle = "#7dd3fc";
+    ctx.textBaseline = "middle";
     ctx.fillText(txt, 12, h - 14);
     // масштабная линейка: отрезок ровно 1 см экрана (37.795 css-px) — подпись слева
     // показывает, сколько метров на местности в него помещается (при 1см=2км это ~100px при mpp≈52.9)
     // длина линейки ~1 см эталонного масштаба в текущих px: при mpp==GROUND_MPP_1CM_2KM это ровно 1 см экрана
-    const barPx = Math.max(20, Math.min(140, (GROUND_MPP_1CM_2KM / Math.max(mpp, 1e-9)) * (96 / 2.54)));
-    ctx.strokeStyle = '#7dd3fc'; ctx.lineWidth = 1.5;
-    ctx.beginPath(); ctx.moveTo(w - barPx - 10, h - 14); ctx.lineTo(w - 10, h - 14); ctx.stroke();
+    const barPx = Math.max(
+      20,
+      Math.min(140, (GROUND_MPP_1CM_2KM / Math.max(mpp, 1e-9)) * (96 / 2.54)),
+    );
+    ctx.strokeStyle = "#7dd3fc";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(w - barPx - 10, h - 14);
+    ctx.lineTo(w - 10, h - 14);
+    ctx.stroke();
     ctx.restore();
-  }, [lines, points, zones, minZoom, maxZoom, bump, focused, serverId, nativeMax]);
+  }, [
+    lines,
+    points,
+    zones,
+    minZoom,
+    maxZoom,
+    bump,
+    focused,
+    serverId,
+    nativeMax,
+  ]);
 
   // Смена стиля подложки — общая: кэш тайлов keyed по URL, достаточно перерисовки
-  useEffect(() => { bump(); }, [serverId, bump]);
+  useEffect(() => {
+    bump();
+  }, [serverId, bump]);
+
+  // T2: при unmount панели отписываем её подписки модульного кэша — refcount-
+  // отмена прервёт сетевую загрузку только если других потребителей нет.
+  useEffect(() => {
+    const subs = panelTileSubsRef.current;
+    return () => {
+      for (const s of subs) s.release();
+      subs.clear();
+    };
+  }, []);
 
   function mercLatOf(v: PanelView): number {
     const nn = Math.PI - 2 * Math.PI * v.fy;
@@ -385,31 +582,56 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
   }
 
   // Перерисовка на каждый тик/ресайз
-  useEffect(() => { drawAll(); }, [drawAll, size, tickRef.current]);
+  useEffect(() => {
+    drawAll();
+  }, [drawAll, size, tickRef.current]);
 
   // Управление: wheel (не-passive!), touch, кнопки зума + клики редактирования
   const focusedRef = useRef(focused);
-  useEffect(() => { focusedRef.current = focused; }, [focused]);
+  useEffect(() => {
+    focusedRef.current = focused;
+  }, [focused]);
   const onMapClickRef = useRef(onMapClick);
-  useEffect(() => { onMapClickRef.current = onMapClick; }, [onMapClick]);
+  useEffect(() => {
+    onMapClickRef.current = onMapClick;
+  }, [onMapClick]);
   const panelIdxRef = useRef(panelIdx);
-  useEffect(() => { panelIdxRef.current = panelIdx; }, [panelIdx]);
+  useEffect(() => {
+    panelIdxRef.current = panelIdx;
+  }, [panelIdx]);
   const onFocusRef = useRef(onFocus);
-  useEffect(() => { onFocusRef.current = onFocus; }, [onFocus]);
+  useEffect(() => {
+    onFocusRef.current = onFocus;
+  }, [onFocus]);
   const onPointClickRef = useRef(onPointClick);
-  useEffect(() => { onPointClickRef.current = onPointClick; }, [onPointClick]);
+  useEffect(() => {
+    onPointClickRef.current = onPointClick;
+  }, [onPointClick]);
   const pointDeleteEnabledRef = useRef(pointDeleteEnabled);
-  useEffect(() => { pointDeleteEnabledRef.current = pointDeleteEnabled; }, [pointDeleteEnabled]);
+  useEffect(() => {
+    pointDeleteEnabledRef.current = pointDeleteEnabled;
+  }, [pointDeleteEnabled]);
   const onPointMoveRef = useRef(onPointMove);
-  useEffect(() => { onPointMoveRef.current = onPointMove; }, [onPointMove]);
+  useEffect(() => {
+    onPointMoveRef.current = onPointMove;
+  }, [onPointMove]);
   const onPointAltitudeDragRef = useRef(onPointAltitudeDrag);
-  useEffect(() => { onPointAltitudeDragRef.current = onPointAltitudeDrag; }, [onPointAltitudeDrag]);
+  useEffect(() => {
+    onPointAltitudeDragRef.current = onPointAltitudeDrag;
+  }, [onPointAltitudeDrag]);
   const onZoneClickRef = useRef(onZoneClick);
-  useEffect(() => { onZoneClickRef.current = onZoneClick; }, [onZoneClick]);
+  useEffect(() => {
+    onZoneClickRef.current = onZoneClick;
+  }, [onZoneClick]);
   const onPanelDoubleClickRef = useRef(onPanelDoubleClick);
-  useEffect(() => { onPanelDoubleClickRef.current = onPanelDoubleClick; }, [onPanelDoubleClick]);
+  useEffect(() => {
+    onPanelDoubleClickRef.current = onPanelDoubleClick;
+  }, [onPanelDoubleClick]);
   // Позиции оверлеев с последнего кадра — для hit-теста клика удаления
-  const hitsRef = useRef<{ pointHits: { id?: string; x: number; y: number }[]; zoneHits: { id?: string; x: number; y: number; r: number }[] }>({ pointHits: [], zoneHits: [] });
+  const hitsRef = useRef<{
+    pointHits: { id?: string; x: number; y: number }[];
+    zoneHits: { id?: string; x: number; y: number; r: number }[];
+  }>({ pointHits: [], zoneHits: [] });
   // Идентификатор точки, которую перетаскиваем (редактирование маршрута drag-ом)
   const draggingPtRef = useRef<string | null>(null);
   useEffect(() => {
@@ -419,7 +641,16 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       const r = rectOf();
-      viewRef.current = zoomPanelAt(viewRef.current, e.deltaY < 0 ? 1.25 : 1 / 1.25, e.clientX - r.left, e.clientY - r.top, sizeRef.current.w, sizeRef.current.h, minZoom, maxZoom);
+      viewRef.current = zoomPanelAt(
+        viewRef.current,
+        e.deltaY < 0 ? 1.25 : 1 / 1.25,
+        e.clientX - r.left,
+        e.clientY - r.top,
+        sizeRef.current.w,
+        sizeRef.current.h,
+        minZoom,
+        maxZoom,
+      );
       bump();
     };
     let drag: { x: number; y: number; moved: boolean } | null = null;
@@ -429,28 +660,40 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
     const toScreen = (clientX: number, clientY: number) => {
       const r = rectOf();
       const { w, h } = sizeRef.current;
-      return { sx: (clientX - r.left) * (w / Math.max(1, r.width)), sy: (clientY - r.top) * (h / Math.max(1, r.height)) };
+      return {
+        sx: (clientX - r.left) * (w / Math.max(1, r.width)),
+        sy: (clientY - r.top) * (h / Math.max(1, r.height)),
+      };
     };
     const onDown = (e: PointerEvent) => {
       drag = { x: e.clientX, y: e.clientY, moved: false };
       canvas.setPointerCapture?.(e.pointerId);
       // Хит-тест по точкам: клик/начало drag ТОЧНО по точке НЕ должно pan-ить карту
       const { sx, sy } = toScreen(e.clientX, e.clientY);
-      const hit = [...hitsRef.current.pointHits].reverse().find((p) => p.id && (p.x - sx) ** 2 + (p.y - sy) ** 2 <= 144);
+      const hit = [...hitsRef.current.pointHits]
+        .reverse()
+        .find((p) => p.id && (p.x - sx) ** 2 + (p.y - sy) ** 2 <= 144);
       draggingPtRef.current = hit?.id ?? null;
       altAccumPx = 0;
     };
     const onMove = (e: PointerEvent) => {
       if (!drag) return;
-      const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+      const dx = e.clientX - drag.x,
+        dy = e.clientY - drag.y;
       if (Math.abs(dx) + Math.abs(dy) > 2) drag.moved = true;
       drag = { x: e.clientX, y: e.clientY, moved: drag.moved };
       // Alt-drag по точке оверлея — регулировка ВЫСОТЫ этапа этой точки
       // (вверх = выше AGL, вниз = ниже). Карта при этом не панорамится.
       if (draggingPtRef.current && e.altKey && onPointAltitudeDragRef.current) {
         altAccumPx -= dy; // экранная Y вниз → уменьшаем высоту
-        while (altAccumPx >= 12) { altAccumPx -= 12; onPointAltitudeDragRef.current(draggingPtRef.current, +12); }
-        while (altAccumPx <= -12) { altAccumPx += 12; onPointAltitudeDragRef.current(draggingPtRef.current, -12); }
+        while (altAccumPx >= 12) {
+          altAccumPx -= 12;
+          onPointAltitudeDragRef.current(draggingPtRef.current, +12);
+        }
+        while (altAccumPx <= -12) {
+          altAccumPx += 12;
+          onPointAltitudeDragRef.current(draggingPtRef.current, -12);
+        }
         return;
       }
       // Drag точки маршрута/цели: карта стоит, точка «прилипает» к курсору
@@ -463,7 +706,13 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
         return;
       }
       if (draggingPtRef.current) return;
-      viewRef.current = panPanelBy(viewRef.current, dx, dy, sizeRef.current.w, sizeRef.current.h);
+      viewRef.current = panPanelBy(
+        viewRef.current,
+        dx,
+        dy,
+        sizeRef.current.w,
+        sizeRef.current.h,
+      );
       bump();
     };
     const onUp = (e: PointerEvent) => {
@@ -474,13 +723,17 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       const draggedId = draggingPtRef.current;
       draggingPtRef.current = null;
       // Перетащили точку → она уже обновляется в onMove; клик не генерируем
-      if (wasDrag) { if (draggedId) bump(); return; }
+      if (wasDrag) {
+        if (draggedId) bump();
+        return;
+      }
       // Клик (без перетаскивания): любой панели разрешено редактирование —
       // фокус + удаление/добавление объектов работают во ВСЕХ окнах сразу.
       const r = rectOf();
       const { w, h } = sizeRef.current;
       const sc = toScreen(e.clientX, e.clientY);
-      const sx = e.clientX - r.left, sy = e.clientY - r.top;
+      const sx = e.clientX - r.left,
+        sy = e.clientY - r.top;
       if (sx < 0 || sy < 0 || sx > r.width || sy > r.height) return;
       const vb = viewBox(viewRef.current, w, h);
       // Приоритет: клик ТОЧНО по точке/объекту или зоне на карте = УДАЛИТЬ её.
@@ -488,27 +741,44 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       // сначала поднимает панель вкладкой наверх, канвас пересоздаётся и
       // указатель «теряется» (удаление не срабатывает, фокус сбивается).
       if (sc.sx >= 0 && sc.sy >= 0 && sc.sx <= w && sc.sy <= h) {
-        const hitPt = [...hitsRef.current.pointHits].reverse().find((p) => p.id && (p.x - sc.sx) ** 2 + (p.y - sc.sy) ** 2 <= 144);
+        const hitPt = [...hitsRef.current.pointHits]
+          .reverse()
+          .find((p) => p.id && (p.x - sc.sx) ** 2 + (p.y - sc.sy) ** 2 <= 144);
         if (hitPt?.id) {
           // В режиме «Установка ограничений» клик по точке НЕ удаляет её —
           // удаление доступно в режиме «Редактирование маршрута»
-          if (pointDeleteEnabledRef.current) onPointClickRef.current?.(hitPt.id);
+          if (pointDeleteEnabledRef.current)
+            onPointClickRef.current?.(hitPt.id);
           return;
         }
-        const hitZn = [...hitsRef.current.zoneHits].reverse().find((z) => z.id && ((z.x - sc.sx) ** 2 + (z.y - sc.sy) ** 2 <= Math.min(z.r, 60) ** 2));
-        if (hitZn?.id) { onZoneClickRef.current?.(hitZn.id); return; }
+        const hitZn = [...hitsRef.current.zoneHits]
+          .reverse()
+          .find(
+            (z) =>
+              z.id &&
+              (z.x - sc.sx) ** 2 + (z.y - sc.sy) ** 2 <= Math.min(z.r, 60) ** 2,
+          );
+        if (hitZn?.id) {
+          onZoneClickRef.current?.(hitZn.id);
+          return;
+        }
       }
       // Простой клик по свободному месту этой же карты (панорама не двигалась) —
       // добавляем объект без смены вкладки/фокуса: это сохраняет текущую
       // фокусировку всех окон (клик по нижней панели сначала активирует её).
-      if (Math.abs(e.clientX - downX) + Math.abs(e.clientY - downY) <= 3 && !focusedRef.current) {
+      if (
+        Math.abs(e.clientX - downX) + Math.abs(e.clientY - downY) <= 3 &&
+        !focusedRef.current
+      ) {
         onFocusRef.current?.();
         return;
       }
       if (onMapClickRef.current) {
         const geo = screenPxToGeoPanel(vb, sc.sx, sc.sy, w, h);
         const idx = panelIdxRef.current;
-        onMapClickRef.current(idx >= 0 ? ({ ...geo, panelIdx: idx } as typeof geo) : geo);
+        onMapClickRef.current(
+          idx >= 0 ? ({ ...geo, panelIdx: idx } as typeof geo) : geo,
+        );
       }
     };
     const onDblClick = (e: MouseEvent) => {
@@ -518,53 +788,102 @@ const MiniMapPanel: React.FC<MiniMapPanelProps> = ({
       e.preventDefault();
       onPanelDoubleClickRef.current?.();
     };
-    canvas.addEventListener('wheel', onWheel, { passive: false });
-    canvas.addEventListener('pointerdown', onDown);
-    canvas.addEventListener('pointermove', onMove);
-    canvas.addEventListener('pointerup', onUp);
-    canvas.addEventListener('pointercancel', onUp);
-    canvas.addEventListener('dblclick', onDblClick);
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    canvas.addEventListener("pointerdown", onDown);
+    canvas.addEventListener("pointermove", onMove);
+    canvas.addEventListener("pointerup", onUp);
+    canvas.addEventListener("pointercancel", onUp);
+    canvas.addEventListener("dblclick", onDblClick);
     return () => {
-      canvas.removeEventListener('wheel', onWheel);
-      canvas.removeEventListener('pointerdown', onDown);
-      canvas.removeEventListener('pointermove', onMove);
-      canvas.removeEventListener('pointerup', onUp);
-      canvas.removeEventListener('pointercancel', onUp);
-      canvas.removeEventListener('dblclick', onDblClick);
+      canvas.removeEventListener("wheel", onWheel);
+      canvas.removeEventListener("pointerdown", onDown);
+      canvas.removeEventListener("pointermove", onMove);
+      canvas.removeEventListener("pointerup", onUp);
+      canvas.removeEventListener("pointercancel", onUp);
+      canvas.removeEventListener("dblclick", onDblClick);
     };
   }, [bump, minZoom, maxZoom]);
 
   const zoomBy = (f: number) => {
-    viewRef.current = zoomPanelAt(viewRef.current, f, size.w / 2, size.h / 2, size.w, size.h, minZoom, maxZoom);
+    viewRef.current = zoomPanelAt(
+      viewRef.current,
+      f,
+      size.w / 2,
+      size.h / 2,
+      size.w,
+      size.h,
+      minZoom,
+      maxZoom,
+    );
     bump();
   };
   const recenter = () => {
     if (fitPoints && fitPoints.length > 0) {
       const aspect = size.w / Math.max(1, size.h);
       const v = fitView(fitPoints, aspect, minZoom, maxZoom);
-      if (v) { animateTo(v); return; }
+      if (v) {
+        animateTo(v);
+        return;
+      }
     }
     animateTo(panelViewOf(center.lat, center.lng, zoom));
   };
 
-  useEffect(() => { onReady?.(); /* панель готова к экспорту PNG */ }, [onReady, size]);
+  useEffect(() => {
+    onReady?.(); /* панель готова к экспорту PNG */
+  }, [onReady, size]);
 
-  const btn = 'w-7 h-7 flex items-center justify-center rounded bg-gray-800/90 hover:bg-gray-700 text-gray-100 border border-gray-600 text-sm select-none';
+  const btn =
+    "w-7 h-7 flex items-center justify-center rounded bg-gray-800/90 hover:bg-gray-700 text-gray-100 border border-gray-600 text-sm select-none";
   return (
     <div
-      className={`rounded-lg overflow-hidden ${focused ? 'border-2 border-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.35)]' : 'border border-gray-700'}`}
+      className={`rounded-lg overflow-hidden ${focused ? "border-2 border-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.35)]" : "border border-gray-700"}`}
       style={{ height }}
     >
       <div className="flex items-center gap-2 px-2 py-1 border-b border-gray-700 bg-gray-800/60">
-        <span className="text-xs font-bold text-cyan-300">{icon} {title}</span>
-        {focused && <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-800/80 text-emerald-100 border border-emerald-500 animate-pulse">✏️ клик по карте — добавить · клик по ✛ точки/зоны — удалить</span>}
+        <span className="text-xs font-bold text-cyan-300">
+          {icon} {title}
+        </span>
+        {focused && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-800/80 text-emerald-100 border border-emerald-500 animate-pulse">
+            ✏️ клик по карте — добавить · клик по ✛ точки/зоны — удалить
+          </span>
+        )}
         <div className="flex-1" />
-        <button className={btn} title="Приблизить" onClick={() => zoomBy(1.5)}>＋</button>
-        <button className={btn} title="Отдалить" onClick={() => zoomBy(1 / 1.5)}>－</button>
-        <button className={btn} title="Вписать объект / сбросить вид" onClick={recenter}>⌂</button>
+        <button className={btn} title="Приблизить" onClick={() => zoomBy(1.5)}>
+          ＋
+        </button>
+        <button
+          className={btn}
+          title="Отдалить"
+          onClick={() => zoomBy(1 / 1.5)}
+        >
+          －
+        </button>
+        <button
+          className={btn}
+          title="Вписать объект / сбросить вид"
+          onClick={recenter}
+        >
+          ⌂
+        </button>
       </div>
-      <div ref={wrapRef} className="relative w-full" style={{ height: `calc(100% - 30px)` }}>
-        <canvas ref={canvasRef} style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none', cursor: focused && onMapClick ? 'crosshair' : 'grab' }} aria-label={`Карта: ${title}`} />
+      <div
+        ref={wrapRef}
+        className="relative w-full"
+        style={{ height: `calc(100% - 30px)` }}
+      >
+        <canvas
+          ref={canvasRef}
+          style={{
+            width: "100%",
+            height: "100%",
+            display: "block",
+            touchAction: "none",
+            cursor: focused && onMapClick ? "crosshair" : "grab",
+          }}
+          aria-label={`Карта: ${title}`}
+        />
       </div>
     </div>
   );
